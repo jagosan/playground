@@ -7,6 +7,7 @@ import { ProximitySystem } from './systems/ProximitySystem';
 import { QuestManager } from './systems/QuestManager';
 import { HUD } from './ui/HUD';
 import { MoonBuggyScene } from './minigames/moon-buggy/MoonBuggyScene';
+import { Moonbuggy2Scene } from './minigames/moonbuggy2/Moonbuggy2Scene';
 
 function createPlaygroundEnvironment(scene: THREE.Scene): void {
   // Retro sky color
@@ -88,7 +89,7 @@ function bootstrap(): void {
     player?.setVirtualKey(code, isDown);
   });
 
-  let currentMinigame: MoonBuggyScene | null = null;
+  let currentMinigame: MoonBuggyScene | Moonbuggy2Scene | null = null;
   let inMinigame = false;
 
   // Equipment interaction trigger ('E' key)
@@ -119,6 +120,19 @@ function bootstrap(): void {
       }
 
       currentMinigame = new MoonBuggyScene(sceneManager, eventBus);
+      sceneManager.setScene(currentMinigame.scene);
+    } else if (minigameId === 'moonbuggy2') {
+      inMinigame = true;
+      if (hud) {
+        hud.destroy();
+        hud = null;
+      }
+      if (player) {
+        player.destroy();
+        player = null;
+      }
+
+      currentMinigame = new Moonbuggy2Scene(sceneManager, eventBus);
       sceneManager.setScene(currentMinigame.scene);
     }
   });
