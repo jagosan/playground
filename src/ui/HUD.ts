@@ -147,4 +147,9 @@ export class HUD {
       this.transitionModal.style.display = 'none';
     });
   }
+
+  public destroy(): void {
+    this.container.remove();
+  }
 }
+

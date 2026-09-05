@@ -186,4 +186,12 @@ export class Player {
       camera.lookAt(lookTarget);
     }
   }
+
+  public destroy(): void {
+    if (this.mesh.parent) {
+      this.mesh.parent.remove(this.mesh);
+    }
+    this.keys = {};
+  }
 }
+

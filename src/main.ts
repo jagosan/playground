@@ -6,6 +6,7 @@ import { createDefaultPlaygroundEquipment, EquipmentConfig } from './entities/Eq
 import { ProximitySystem } from './systems/ProximitySystem';
 import { QuestManager } from './systems/QuestManager';
 import { HUD } from './ui/HUD';
+import { MoonBuggyScene } from './minigames/moon-buggy/MoonBuggyScene';
 
 function createPlaygroundEnvironment(scene: THREE.Scene): void {
   // Retro sky color
@@ -67,7 +68,7 @@ function bootstrap(): void {
 
   const eventBus = new EventBus();
   const sceneManager = new SceneManager(app);
-  const lobbyScene = new THREE.Scene();
+  let lobbyScene = new THREE.Scene();
 
   // Environment & equipment
   createPlaygroundEnvironment(lobbyScene);
@@ -80,14 +81,17 @@ function bootstrap(): void {
   sceneManager.setScene(lobbyScene);
 
   // Player & Systems
-  const player = new Player(sceneManager, eventBus);
+  let player: Player | null = new Player(sceneManager, eventBus);
   const proximitySystem = new ProximitySystem(eventBus, equipmentList);
   new QuestManager(eventBus);
-  new HUD(eventBus);
+  const hud = new HUD(eventBus);
+
+  let currentMinigame: MoonBuggyScene | null = null;
+  let inMinigame = false;
 
   // Equipment interaction trigger ('E' key)
   window.addEventListener('keydown', (e) => {
-    if (e.code === 'KeyE') {
+    if (e.code === 'KeyE' && !inMinigame) {
       const active = proximitySystem.getActiveEquipment();
       if (active) {
         eventBus.emit('TRANSITION_TO_MINIGAME', {
@@ -99,15 +103,54 @@ function bootstrap(): void {
     }
   });
 
+  // Minigame Transition Listeners
+  eventBus.on('TRANSITION_TO_MINIGAME', ({ minigameId }) => {
+    if (minigameId === 'moon-buggy') {
+      inMinigame = true;
+      hud.destroy();
+      if (player) {
+        player.destroy();
+        player = null;
+      }
+
+      currentMinigame = new MoonBuggyScene(sceneManager, eventBus);
+      sceneManager.setScene(currentMinigame.scene);
+    }
+  });
+
+  eventBus.on('TRANSITION_TO_LOBBY', () => {
+    if (currentMinigame) {
+      currentMinigame.dispose();
+      currentMinigame = null;
+    }
+
+    inMinigame = false;
+
+    // Restore lobby scene
+    lobbyScene = new THREE.Scene();
+    createPlaygroundEnvironment(lobbyScene);
+    for (const eq of equipmentList) {
+      lobbyScene.add(eq.mesh);
+    }
+
+    sceneManager.setScene(lobbyScene);
+    player = new Player(sceneManager, eventBus);
+    new HUD(eventBus);
+  });
+
   // Game Loop
   sceneManager.onFrame((delta) => {
-    player.update(delta);
-    proximitySystem.update(player.position);
+    if (inMinigame && currentMinigame) {
+      currentMinigame.update(delta);
+    } else if (player) {
+      player.update(delta);
+      proximitySystem.update(player.position);
 
-    // Subtle idle animation for Merry-Go-Round
-    const roundabout = equipmentList.find((eq) => eq.id === 'eq_roundabout');
-    if (roundabout) {
-      roundabout.mesh.rotation.y += 0.3 * delta;
+      // Idle animation for Merry-Go-Round
+      const roundabout = equipmentList.find((eq) => eq.id === 'eq_roundabout');
+      if (roundabout) {
+        roundabout.mesh.rotation.y += 0.3 * delta;
+      }
     }
   });
 
