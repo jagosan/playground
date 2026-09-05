@@ -193,13 +193,70 @@ export function createDefaultPlaygroundEquipment(): EquipmentConfig[] {
   buggyGroup.position.set(8, 0, 8);
   equipment.push({
     id: 'eq_moon_buggy',
-    name: 'Moon Buggy Ride',
-    description: 'Spec 02: Lunar surface rover, 1/6th gravity rock collection.',
+    name: 'Moon Buggy Arcade (Spec 02)',
+    description: 'Retro arcade lunar rover with 1/6th gravity bounce.',
     minigameId: 'moon-buggy',
     position: [8, 0, 8],
     interactionRadius: 4.5,
     mesh: buggyGroup,
   });
 
+  // 5. Moonbuggy 2 (Spec 03 High-Fidelity Simulator Portal)
+  const buggy2Group = new THREE.Group();
+  const pedestal2 = new THREE.Mesh(
+    new THREE.CylinderGeometry(2.4, 2.7, 0.4, 12),
+    new THREE.MeshLambertMaterial({ color: 0x0284c7 }) // Apollo blue ring
+  );
+  pedestal2.position.y = 0.2;
+  pedestal2.receiveShadow = true;
+  buggy2Group.add(pedestal2);
+
+  // High-fidelity gold Kapton foil chassis marker
+  const pbrChassis = new THREE.Mesh(
+    new THREE.BoxGeometry(1.6, 0.45, 2.5),
+    new THREE.MeshStandardMaterial({
+      color: 0xf59e0b,
+      metalness: 0.85,
+      roughness: 0.3,
+    })
+  );
+  pbrChassis.position.y = 0.9;
+  pbrChassis.castShadow = true;
+  buggy2Group.add(pbrChassis);
+
+  // Parabolic high-gain antenna
+  const dish2 = new THREE.Mesh(
+    new THREE.ConeGeometry(0.5, 0.35, 12),
+    new THREE.MeshStandardMaterial({ color: 0xf59e0b, metalness: 0.9, roughness: 0.2 })
+  );
+  dish2.position.set(0.4, 1.6, -0.6);
+  dish2.rotation.x = 0.5;
+  dish2.castShadow = true;
+  buggy2Group.add(dish2);
+
+  // 4 Wheels
+  wheelOffsets.forEach(([x, y, z]) => {
+    const wheel = new THREE.Mesh(
+      wheelGeom,
+      new THREE.MeshStandardMaterial({ color: 0x27272a, roughness: 0.8, metalness: 0.5 })
+    );
+    wheel.rotation.z = Math.PI / 2;
+    wheel.position.set(x, y + 0.1, z);
+    wheel.castShadow = true;
+    buggy2Group.add(wheel);
+  });
+
+  buggy2Group.position.set(-8, 0, 14);
+  equipment.push({
+    id: 'eq_moonbuggy2',
+    name: 'Moonbuggy 2 Simulator (Spec 03)',
+    description: 'Ultra-realistic Apollo LRV physics & photorealistic PBR regolith for GPD Win Max 2.',
+    minigameId: 'moonbuggy2',
+    position: [-8, 0, 14],
+    interactionRadius: 4.5,
+    mesh: buggy2Group,
+  });
+
   return equipment;
 }
+
