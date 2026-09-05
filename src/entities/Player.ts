@@ -111,6 +111,40 @@ export class Player {
       const maxPitch = Math.PI / 2 - 0.05;
       this.pitch = Math.max(-maxPitch, Math.min(maxPitch, this.pitch));
     });
+
+    // Touch look support for mobile screens
+    let lastTouchX = 0;
+    let lastTouchY = 0;
+    let isTouchingLook = false;
+
+    canvas.addEventListener('touchstart', (e: TouchEvent) => {
+      if (e.touches.length === 1) {
+        isTouchingLook = true;
+        lastTouchX = e.touches[0].clientX;
+        lastTouchY = e.touches[0].clientY;
+      }
+    }, { passive: true });
+
+    canvas.addEventListener('touchmove', (e: TouchEvent) => {
+      if (!isTouchingLook || e.touches.length !== 1) return;
+      const dx = e.touches[0].clientX - lastTouchX;
+      const dy = e.touches[0].clientY - lastTouchY;
+      lastTouchX = e.touches[0].clientX;
+      lastTouchY = e.touches[0].clientY;
+
+      this.yaw -= dx * this.MOUSE_SENSITIVITY * 1.6;
+      this.pitch -= dy * this.MOUSE_SENSITIVITY * 1.6;
+      const maxPitch = Math.PI / 2 - 0.05;
+      this.pitch = Math.max(-maxPitch, Math.min(maxPitch, this.pitch));
+    }, { passive: true });
+
+    canvas.addEventListener('touchend', () => {
+      isTouchingLook = false;
+    });
+  }
+
+  public setVirtualKey(code: string, isDown: boolean): void {
+    this.keys[code] = isDown;
   }
 
   public toggleViewMode(): void {

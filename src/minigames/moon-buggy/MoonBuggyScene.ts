@@ -97,7 +97,7 @@ export class MoonBuggyScene {
     this.chaseCamera = new ChaseCamera(this.sceneManager.camera, this.rover);
 
     // HUD Telemetry
-    this.hud = new MoonBuggyHUD(() => {
+    this.hud = new MoonBuggyHUD(this.rover, () => {
       this.exitToLobby();
     });
   }
