@@ -84,7 +84,9 @@ function bootstrap(): void {
   let player: Player | null = new Player(sceneManager, eventBus);
   const proximitySystem = new ProximitySystem(eventBus, equipmentList);
   new QuestManager(eventBus);
-  const hud = new HUD(eventBus);
+  let hud: HUD | null = new HUD(eventBus, (code, isDown) => {
+    player?.setVirtualKey(code, isDown);
+  });
 
   let currentMinigame: MoonBuggyScene | null = null;
   let inMinigame = false;
@@ -107,7 +109,10 @@ function bootstrap(): void {
   eventBus.on('TRANSITION_TO_MINIGAME', ({ minigameId }) => {
     if (minigameId === 'moon-buggy') {
       inMinigame = true;
-      hud.destroy();
+      if (hud) {
+        hud.destroy();
+        hud = null;
+      }
       if (player) {
         player.destroy();
         player = null;
@@ -135,7 +140,9 @@ function bootstrap(): void {
 
     sceneManager.setScene(lobbyScene);
     player = new Player(sceneManager, eventBus);
-    new HUD(eventBus);
+    hud = new HUD(eventBus, (code, isDown) => {
+      player?.setVirtualKey(code, isDown);
+    });
   });
 
   // Game Loop

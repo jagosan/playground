@@ -48,13 +48,17 @@ export class MoonRover {
   public isGrounded = false;
 
   // Controls state
-  private controls: RoverControls = {
+  public controls: RoverControls = {
     forward: false,
     backward: false,
     left: false,
     right: false,
     handbrake: false,
   };
+
+  public setControl(key: keyof RoverControls, value: boolean): void {
+    this.controls[key] = value;
+  }
 
   // Chassis and wheel meshes
   private wheels: WheelConfig[] = [];
