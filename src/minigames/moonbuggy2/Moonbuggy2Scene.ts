@@ -5,7 +5,10 @@ import { PhotorealisticTerrain } from './PhotorealisticTerrain';
 import { ApolloRoverModel } from './ApolloRoverModel';
 import { LRVPhysics } from './LRVPhysics';
 import { GamepadController } from './GamepadController';
-import { Moonbuggy2HUD } from './Moonbuggy2HUD';
+import { Moonbuggy2HUD, HUDNotificationState } from './Moonbuggy2HUD';
+import { LunarRockField, LunarRock } from './LunarRockField';
+import { ScienceDropStation } from './ScienceDropStation';
+import { RoboticArmController } from './RoboticArmController';
 
 export class Moonbuggy2Scene {
   readonly scene: THREE.Scene;
@@ -17,6 +20,9 @@ export class Moonbuggy2Scene {
   private physics!: LRVPhysics;
   private gamepad!: GamepadController;
   private hud!: Moonbuggy2HUD;
+  private rockField!: LunarRockField;
+  private dropStation!: ScienceDropStation;
+  private armController!: RoboticArmController;
 
   private cameraMode: 'chase' | 'cockpit' = 'chase';
   private chaseCamPos = new THREE.Vector3();
@@ -25,6 +31,10 @@ export class Moonbuggy2Scene {
   private keydownHandler!: (e: KeyboardEvent) => void;
   private keyupHandler!: (e: KeyboardEvent) => void;
   private isDisposed = false;
+
+  private activeTargetRock: LunarRock | null = null;
+  private dockingMessage = '';
+  private dockingMessageTimer = 0;
 
   constructor(sceneManager: SceneManager, eventBus: EventBus) {
     this.sceneManager = sceneManager;
@@ -58,42 +68,34 @@ export class Moonbuggy2Scene {
     const starMat = new THREE.PointsMaterial({
       color: 0xffffff,
       size: 1.2,
-      sizeAttenuation: false,
+      transparent: true,
+      opacity: 0.9,
     });
-    this.scene.add(new THREE.Points(starGeom, starMat));
+    const starField = new THREE.Points(starGeom, starMat);
+    this.scene.add(starField);
 
-    // 2. Distant Earth (Photorealistic Blue Marble)
-    const earthGeom = new THREE.SphereGeometry(18, 32, 32);
-    const earthMat = new THREE.MeshStandardMaterial({
-      color: 0x38bdf8,
-      roughness: 0.6,
-      metalness: 0.2,
-    });
-    const earthMesh = new THREE.Mesh(earthGeom, earthMat);
-    earthMesh.position.set(160, 220, -380);
-    this.scene.add(earthMesh);
-
-    // 3. Harsh Direct Sun (Collimated Vacuum Radiation)
-    const sunLight = new THREE.DirectionalLight(0xfffdf5, 2.8);
-    sunLight.position.set(120, 150, 70);
+    // 2. Collimated Directional Sunlight
+    const sunLight = new THREE.DirectionalLight(0xfffaed, 3.8);
+    sunLight.position.set(180, 75, 120);
     sunLight.castShadow = true;
-    sunLight.shadow.mapSize.width = 4096;
-    sunLight.shadow.mapSize.height = 4096;
-    sunLight.shadow.camera.near = 1;
+    sunLight.shadow.mapSize.width = 2048;
+    sunLight.shadow.mapSize.height = 2048;
+    sunLight.shadow.camera.near = 10;
     sunLight.shadow.camera.far = 400;
-    sunLight.shadow.camera.left = -70;
-    sunLight.shadow.camera.right = 70;
-    sunLight.shadow.camera.top = 70;
-    sunLight.shadow.camera.bottom = -70;
+    sunLight.shadow.camera.left = -60;
+    sunLight.shadow.camera.right = 60;
+    sunLight.shadow.camera.top = 60;
+    sunLight.shadow.camera.bottom = -60;
     sunLight.shadow.bias = -0.0003;
     this.scene.add(sunLight);
 
-    // 4. Earthshine & Deep Regolith Ambient Bounce
-    const earthShine = new THREE.DirectionalLight(0x0284c7, 0.45);
-    earthShine.position.set(-160, -220, 380);
-    this.scene.add(earthShine);
+    // 3. Earthshine Lunar Rim Lighting
+    const earthshine = new THREE.DirectionalLight(0x38bdf8, 0.45);
+    earthshine.position.set(-150, 40, -100);
+    this.scene.add(earthshine);
 
-    const ambientLight = new THREE.AmbientLight(0x111827, 0.35);
+    // 4. Subtle Ambient Fill for Lunar Surface Shadows
+    const ambientLight = new THREE.AmbientLight(0x0c1322, 0.28);
     this.scene.add(ambientLight);
   }
 
@@ -102,13 +104,25 @@ export class Moonbuggy2Scene {
     this.terrain = new PhotorealisticTerrain(400, 180);
     this.scene.add(this.terrain.mesh);
 
-    // 3D Apollo LRV Master Model
+    // 3D Apollo LRV Master Model (loads apollo_lrv.glb asynchronously)
     this.model = new ApolloRoverModel();
     this.scene.add(this.model.group);
 
-    // Analytical Multi-Body Physics
-    const spawnY = this.terrain.getHeightAt(0, 0) + 1.2;
-    this.physics = new LRVPhysics(this.terrain, new THREE.Vector3(0, spawnY, 0));
+    // Robotic Arm Controller
+    this.armController = new RoboticArmController(this.model);
+
+    // Lunar Rocks Field (loads lunar_rocks.glb asynchronously)
+    this.rockField = new LunarRockField(this.terrain, 45);
+    this.scene.add(this.rockField.group);
+
+    // Science Drop Station at (0, 0) (loads lunar_drop_station.glb)
+    this.dropStation = new ScienceDropStation(this.terrain);
+    this.scene.add(this.dropStation.group);
+
+    // Analytical Multi-Body Physics with Spec 06 Dynamic Mass
+    const spawnY = this.terrain.calculateHeight(0, 0) + 1.2;
+    // Spawn 10m north of drop station facing south towards base
+    this.physics = new LRVPhysics(this.terrain, new THREE.Vector3(0, spawnY, 10));
 
     // Gamepad controller with GPD Win Max 2 analog triggers
     this.gamepad = new GamepadController(() => {
@@ -167,7 +181,50 @@ export class Moonbuggy2Scene {
     // 3. Step 120Hz Physics
     this.physics.step(delta, throttle, brake, steer, handbrake, reverse);
 
-    // 4. Synchronize 3D Mesh Transforms
+    // 4. Update Drop Station & Arm Controller
+    this.dropStation.update(delta);
+    this.armController.update(delta);
+
+    // 5. Check Science Drop Station Interaction at (0, 0)
+    const inDockingZone = this.dropStation.isInDockingZone(this.physics.position);
+    if (inDockingZone) {
+      // Recharge power at +15%/s
+      this.physics.rechargeBattery(this.physics.rechargeRate * delta);
+
+      // Unload cargo rocks if any
+      if (this.physics.rockCount > 0) {
+        const unloaded = this.physics.clearCargoRocks();
+        this.dockingMessage = `STATION DOCKED: +${unloaded * 35} kg CARGO STORED & RECHARGING`;
+        this.dockingMessageTimer = 3.5;
+      }
+    }
+
+    if (this.dockingMessageTimer > 0) {
+      this.dockingMessageTimer -= delta;
+    }
+
+    // 6. Check Rock Sampling Proximity
+    this.activeTargetRock = this.rockField.getNearestUncollectedRock(this.physics.position, 3.8);
+    const speedKmh = Math.abs(this.physics.forwardSpeed) * 3.6;
+    const canSample = Boolean(
+      this.activeTargetRock &&
+      speedKmh < 10.0 &&
+      this.physics.rockCount < this.physics.maxRocks &&
+      !this.armController.isBusy() &&
+      this.physics.batteryLevel > 0.02
+    );
+
+    // Trigger Robotic Arm pickup on Button A or Space
+    if (canSample && (gp.handbrake || this.keyState['Space'])) {
+      const target = this.activeTargetRock!;
+      this.armController.triggerPickup(() => {
+        this.rockField.collectRock(target.id);
+        this.physics.addCargoRock();
+        this.physics.drainBattery(0.015); // 1.5% action cost
+      });
+    }
+
+    // 7. Synchronize 3D Mesh Transforms
     this.model.group.position.copy(this.physics.position);
     this.model.group.rotation.set(0, 0, 0);
     this.model.group.rotation.y = this.physics.heading;
@@ -185,7 +242,7 @@ export class Moonbuggy2Scene {
       this.physics.steerAngle
     );
 
-    // 5. Update Camera Rig (Chase or Cockpit)
+    // 8. Update Camera Rig (Chase or Cockpit)
     const camera = this.sceneManager.camera;
     const heading = this.physics.heading;
 
@@ -222,8 +279,27 @@ export class Moonbuggy2Scene {
       camera.lookAt(camera.position.clone().add(lookDir));
     }
 
-    // 6. Update Cockpit HUD
-    this.hud.update(this.physics, gp, this.cameraMode);
+    // 9. Calculate Base Navigation Compass
+    const toBase = new THREE.Vector3(0, 0, 0).sub(this.physics.position);
+    const distToBase = Math.sqrt(toBase.x * toBase.x + toBase.z * toBase.z);
+    const baseAngle = Math.atan2(toBase.x, toBase.z);
+    let relAngleDeg = ((baseAngle - heading) * 180) / Math.PI;
+    while (relAngleDeg < -180) relAngleDeg += 360;
+    while (relAngleDeg > 180) relAngleDeg -= 360;
+
+    const navState: HUDNotificationState = {
+      rockPrompt: canSample,
+      dockingPrompt: inDockingZone || this.dockingMessageTimer > 0,
+      dockingText:
+        this.dockingMessageTimer > 0
+          ? this.dockingMessage
+          : 'SCIENCE DROP STATION: CHARGING POWER (+15%/s)',
+      compassDegrees: relAngleDeg,
+      distanceToBase: distToBase,
+    };
+
+    // 10. Update Cockpit HUD
+    this.hud.update(this.physics, gp, this.cameraMode, navState);
   }
 
   public exitToLobby(): void {

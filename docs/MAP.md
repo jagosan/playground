@@ -38,10 +38,14 @@
 - `src/minigames/moon-buggy/MoonBuggyHUD.ts`: Cockpit instruments (speedometer, lunar gravity readout, pitch/roll, exit button).
 - `src/minigames/moon-buggy/MoonBuggyScene.ts`: Full minigame scene container, lighting, starfield, game loop integration.
 
-## Moonbuggy 2 High-Fidelity Modules (Spec 03)
-- `src/minigames/moonbuggy2/LRVPhysics.ts`: 120Hz sub-stepped analytical multi-body dynamics, Pacejka slip, double-wishbone suspension.
+## Moonbuggy 2 High-Fidelity Modules (Spec 03 / 06)
+- `src/minigames/moonbuggy2/GLTFAssetLoader.ts`: Async loader with Three.js `GLTFLoader` + fallback for `/models/*.glb`.
+- `src/minigames/moonbuggy2/LRVPhysics.ts`: 120Hz sub-stepped dynamics, Pacejka slip, double-wishbone suspension, dynamic cargo mass (+35kg/rock), 25km/h governor, battery gauge.
 - `src/minigames/moonbuggy2/PhotorealisticTerrain.ts`: PBR lunar regolith terrain with Hapke retro-reflection, micro-craters, normal map generation.
-- `src/minigames/moonbuggy2/ApolloRoverModel.ts`: High-detail Apollo 15/16/17 LRV geometry (Kapton foil, wire-mesh zinc tires, dish antenna).
+- `src/minigames/moonbuggy2/LunarRockField.ts`: Instanced lunar boulder scatter from `lunar_rocks.glb`, proximity spatial query.
+- `src/minigames/moonbuggy2/RoboticArmController.ts`: 3-joint boom kinematics (`RoboticArm_Base`, `RoboticArm_Bicep`, `RoboticArm_Claw`), rock pickup trigger.
+- `src/minigames/moonbuggy2/ScienceDropStation.ts`: Drop station at (0, 0) from `lunar_drop_station.glb`, 6m docking beacon, cargo unload & battery recharge loop.
+- `src/minigames/moonbuggy2/ApolloRoverModel.ts`: High-detail Apollo 15/16/17 LRV geometry + asynchronous GLB hierarchy binding (`apollo_lrv.glb`).
 - `src/minigames/moonbuggy2/GamepadController.ts`: GPD Win Max 2 / Xbox gamepad polling with analog trigger throttle/braking.
-- `src/minigames/moonbuggy2/Moonbuggy2Scene.ts`: Photorealistic vacuum lighting, Earthshine bounce, dual camera modes (chase/cockpit).
-- `src/minigames/moonbuggy2/Moonbuggy2HUD.ts`: Advanced Apollo LRV digital/analog glass cockpit telemetry.
+- `src/minigames/moonbuggy2/Moonbuggy2Scene.ts`: Photorealistic vacuum lighting, Earthshine bounce, dual camera modes (chase/cockpit), game loop coordinator.
+- `src/minigames/moonbuggy2/Moonbuggy2HUD.ts`: Advanced Apollo LRV digital/analog glass cockpit telemetry (speedometer, battery bar, rock payload, station compass).
