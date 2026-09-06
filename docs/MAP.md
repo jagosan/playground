@@ -4,6 +4,7 @@
 - `docs/architecture/01-playground-lobby.md`: 3D lobby architecture, Three.js engine ADR, equipment contracts.
 - `docs/architecture/02-moon-buggy.md`: Lunar rover raycast suspension, 1/6th gravity, procedural terrain.
 - `docs/architecture/03-moonbuggy2.md`: High-fidelity Apollo LRV simulation, Pacejka slip, PBR regolith, Win Max 2 gamepad.
+- `docs/architecture/08-artemis-ltv-and-robotic-arm.md`: Next-gen Artemis LTV skin, airless lattice wheels, directed robotic arm retrieval rig.
 - `specs/`:
   - `specs/00-system-overview.md`: Project vision, minigame architecture, rendering stack.
   - `specs/01-playground-lobby.md`: 3D retro playground hub, equipment-to-minigame selector.
