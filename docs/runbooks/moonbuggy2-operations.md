@@ -53,21 +53,36 @@ The built-in gamepad on `chubbs` maps automatically via the W3C Gamepad API (XIn
 - **Recharge:** the drop station restores the gauge at **15 %/s** (reaches 100 % in ~6.7 s).
 - Plan sample runs around the `(0, 0)` station: drive to a rock field, grab up to 8 rocks, then return to the station to dump payload and fully recharge.
 
-## 5. Blender 4.2 Asset Pipeline
-Master Apollo LRV and lunar-rock models are regenerated headlessly in **Blender 4.2** via `scripts/generate_blender_assets.py`:
+## 5. Headless Blender Asset Pipeline (Spec 05)
+The master Apollo LRV, rock field, terrain tile, and drop-station GLBs are generated headlessly with the bundled **Blender 4.2** toolchain (`/home/jagosan/.hermes/toolchains/bpy_env/bin/python`, bpy 4.2.0 — no system `blender` binary required):
 
 ```bash
-# Full pipeline (rover + rock)
-blender --background --python scripts/generate_blender_assets.py all
+# Full pipeline: 4 GLBs + Cycles previews + manifest.json (~2 min)
+bash scripts/run_blender_pipeline.sh            # hardened wrapper (timeout, process group, memory audit)
 
-# Individual assets
-blender --background --python scripts/generate_blender_assets.py rover   # -> public/models/apollo_lrv.glb
-blender --background --python scripts/generate_blender_assets.py rock    # -> public/models/lunar_rock.glb
+# Standalone one-liner builders (each ~5-20 s)
+/home/jagosan/.hermes/toolchains/bpy_env/bin/python scripts/lunar_assets/rover_builder.py
+/home/jagosan/.hermes/toolchains/bpy_env/bin/python scripts/lunar_assets/rocks_builder.py
+/home/jagosan/.hermes/toolchains/bpy_env/bin/python scripts/lunar_assets/terrain_station_builder.py
+
+# Orchestrator with individual phases (re-export one GLB + re-render its preview)
+/home/jagosan/.hermes/toolchains/bpy_env/bin/python scripts/build_lunar_assets.py --rover
 ```
 
-This bakes the **PBR Principled BSDF** materials (Gold Kapton foil `Metallic 0.95 / Rough 0.22`, anodized aluminum tub, woven zinc-wire tires) and the high-poly lunar rock (high-frequency photogrammetry basalt, `Rough 0.94`) into GLB under `public/models/`. Run on `beehive`/`chunkito` where Blender is installed, then restart `playground.service` to serve the fresh assets.
+- Wrapper timeout is overridable: `PIPELINE_TIMEOUT_S=1800 bash scripts/run_blender_pipeline.sh` (default 900 s). Prints `PIPELINE_STATUS=OK` on success and audits peak RSS, pre/post memory, and orphan `bpy_env` processes (isolation via `setsid` process group; `kill -TERM` then `kill -KILL` on timeout).
+- Outputs: `public/models/*.glb` (4 assets, ~0.76 MB total vs 15 MB target), `public/models/previews/*_preview.png` (Cycles/CPU 1024x768, 24 samples), `public/models/manifest.json` (bytes vs size budget, vertex counts, material slots).
+- **Regenerate previews only:** run the orchestrator with a phase flag (e.g. `--rover`) — builders are idempotent: re-export GLB, re-render preview, rewrite manifest.
+- Verification pass (Spec 05 §2.3 contracts): `/home/jagosan/.hermes/toolchains/bpy_env/bin/python tests/verify_m3_assets.py` (5 checks: glTF magic + size budget, node hierarchy, manifest consistency, PNG previews, standalone re-run determinism).
 
-> Legacy Spec 03 exporter: `blender --background --python scripts/export_lrv.py` (rover GLB only).
+### 5.1 Troubleshooting (failure modes observed, Spec 07 §0.2)
+1. **Chunkito inference timeout** — parallel `@tigger` children saturated the single llama-server (runs hit 2000+ s, > 900 s client timeout). Rule: max 1-2 concurrent `@tigger` children.
+2. **Session storage write failures** — concurrent sibling subagents opened competing `SessionDB` handles on the same profile `state.db` ("session storage could not be written"). Fixed in `delegate_tool.py` (shared SessionDB cache); requires `hermes gateway restart` to activate.
+3. **Ollama 500 chat-template parse errors** (`Failed to parse input at pos 30`) — beehive `ERNIE-4.5-Thinking` chokes on long multi-line prompts. Rule: keep prompts under ~1500 chars, one short paragraph each; point children at files on disk instead of embedding code blocks.
+4. **Blender 4.2 segfault on interpreter teardown** — builders finish with `os._exit(0)` (Spec 05 §2.1); never `sys.exit()` in bpy scripts (C++ worker threads outlive the interpreter).
+
+Dispatch rules (Spec 07 §0.3): `@tigger` for code build, `@eeyore` for audit (short prompts only), `@piglet` for verification, `@pooh` for runbook/commit. Never run `@pooh`/`@jagular` concurrently with `@tigger` (chunkito VRAM mutual exclusion).
+
+> Legacy exporters (pre-Spec 05): `scripts/generate_blender_assets.py` and `scripts/export_lrv.py` — superseded, kept for reference. `public/models/lunar_rock.glb` is a legacy single-rock artifact (not part of the pipeline output).
 
 ## 6. Automated Physics & Regression Testing
 Run the 120Hz dynamics benchmark suite:

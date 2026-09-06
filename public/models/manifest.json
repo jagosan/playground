@@ -1,0 +1,76 @@
+{
+  "generated_at": "2026-09-06T17:23:04.969119+00:00",
+  "pipeline_duration_s": 8.9,
+  "blender_version": "4.2.0",
+  "toolchain": ".",
+  "assets": [
+    {
+      "file": "apollo_lrv.glb",
+      "path": "public/models/apollo_lrv.glb",
+      "bytes": 87312,
+      "size_mb": 0.083,
+      "size_target_mb": 4.0,
+      "objects": 20,
+      "total_vertices": 720,
+      "materials": [
+        "AnodizedAluminum",
+        "AstronautSeatFabric",
+        "KaptonGoldFoil",
+        "TitaniumDark",
+        "WovenZincWireTire"
+      ],
+      "preview": "public/models/previews/apollo_lrv_preview.png",
+      "preview_bytes": 711506
+    },
+    {
+      "file": "lunar_rocks.glb",
+      "path": "public/models/lunar_rocks.glb",
+      "bytes": 45996,
+      "size_mb": 0.044,
+      "size_target_mb": 2.0,
+      "objects": 4,
+      "total_vertices": 288,
+      "materials": [
+        "LunarBasalt"
+      ],
+      "preview": "public/models/previews/lunar_rocks_preview.png",
+      "preview_bytes": 711681
+    },
+    {
+      "file": "lunar_terrain_tile.glb",
+      "path": "public/models/lunar_terrain_tile.glb",
+      "bytes": 574656,
+      "size_mb": 0.548,
+      "size_target_mb": 5.0,
+      "objects": 1,
+      "total_vertices": 4225,
+      "materials": [
+        "LunarRegolith"
+      ],
+      "preview": "public/models/previews/lunar_terrain_tile_preview.png",
+      "preview_bytes": 780822
+    },
+    {
+      "file": "lunar_drop_station.glb",
+      "path": "public/models/lunar_drop_station.glb",
+      "bytes": 85772,
+      "size_mb": 0.082,
+      "size_target_mb": 3.0,
+      "objects": 14,
+      "total_vertices": 714,
+      "materials": [
+        "LanderKaptonGold",
+        "LanderSilverFoil",
+        "NavBeaconStrobe",
+        "SolarArrayBlue",
+        "TitaniumStrut"
+      ],
+      "preview": "public/models/previews/lunar_drop_station_preview.png",
+      "preview_bytes": 741439
+    }
+  ],
+  "total_payload_bytes": 793736,
+  "total_payload_mb": 0.757,
+  "total_target_mb": 15.0,
+  "within_total_target": true
+}
