@@ -9,6 +9,17 @@
   - `specs/01-playground-lobby.md`: 3D retro playground hub, equipment-to-minigame selector.
   - `specs/02-moon-buggy.md`: 1/6th gravity lunar rover physics, controls, rock collection loop.
   - `specs/03-moonbuggy2.md`: Realistic Apollo LRV physics, photorealistic rendering, GPD Win Max 2.
+  - `specs/04-moonbuggy2-m2.md`: Milestone 2 feedback: 25 km/h speed, dynamic mass, robotic arm, drop station.
+  - `specs/05-blender-asset-pipeline.md`: Headless Blender 4.2 asset generator (bpy), PBR materials, GLB export.
+  - `specs/06-moonbuggy2-engine-m2.md`: Three.js GLTF loader integration, articulated kinematics, HUD telemetry.
+
+## Blender Asset Pipeline (Spec 05)
+- `scripts/build_lunar_assets.py`: Standalone Blender 4.2 headless asset generator (`--all` / per-phase flags; previews + `manifest.json`).
+- `scripts/lunar_assets/`: bpy builders — `rover_builder.build_apollo_lrv(out)`, `rocks_builder.build_lunar_rocks(out)`, `terrain_station_builder.build_terrain(out)`/`build_station(out)`; each main `os._exit(0)`-guarded (Blender 4.2 teardown).
+- `scripts/run_blender_pipeline.sh`: hardened wrapper (setsid process group, `PIPELINE_TIMEOUT_S`, RSS sampling, orphan check, `PIPELINE_STATUS=OK|FAIL:<reason>`).
+- `tests/verify_m3_assets.py`: Spec 05 contract verification (glTF magic, node hierarchy, manifest consistency, PNG previews, re-run determinism).
+- `public/models/`: Exported binary glTF assets (`apollo_lrv.glb`, `lunar_rocks.glb`, `lunar_terrain_tile.glb`, `lunar_drop_station.glb`).
+- `public/models/manifest.json`: Asset metadata, polygon counts, material slots, file sizes.
 
 ## Core Modules & Entities
 - `src/main.ts`: Application bootstrap, scene loop, minigame transition switching.
