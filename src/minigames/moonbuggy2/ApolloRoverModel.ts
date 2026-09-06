@@ -4,17 +4,17 @@ import { GLTFAssetLoader } from './GLTFAssetLoader';
 export interface ApolloRoverVisuals {
   rootGroup: THREE.Group;
   chassisBody: THREE.Group;
-  wheelMeshes: THREE.Mesh[];
+  wheelMeshes: THREE.Object3D[];
   antennaDish: THREE.Mesh;
-  steeringWheels: THREE.Mesh[];
+  steeringWheels: THREE.Object3D[];
 }
 
 export class ApolloRoverModel {
   public readonly group: THREE.Group;
   public readonly chassis: THREE.Group;
-  public readonly wheelMeshes: THREE.Mesh[] = [];
-  public readonly frontWheels: THREE.Mesh[] = [];
-  public readonly rearWheels: THREE.Mesh[] = [];
+  public readonly wheelMeshes: THREE.Object3D[] = [];
+  public readonly frontWheels: THREE.Object3D[] = [];
+  public readonly rearWheels: THREE.Object3D[] = [];
   public readonly dishMesh: THREE.Mesh;
 
   // Procedural container to toggle visibility once GLB loads
@@ -25,9 +25,13 @@ export class ApolloRoverModel {
   public gltfRoot: THREE.Group | null = null;
   public gltfWheels: (THREE.Object3D | null)[] = [null, null, null, null]; // FL, FR, RL, RR
   public armBaseNode: THREE.Object3D | null = null;
-  public armBicepNode: THREE.Object3D | null = null;
+  public armBoomNode: THREE.Object3D | null = null;
+  public armForearmNode: THREE.Object3D | null = null;
   public armClawNode: THREE.Object3D | null = null;
+  public armLaserNode: THREE.Object3D | null = null;
+  public heldRockNode: THREE.Object3D | null = null;
   public highGainDishNode: THREE.Object3D | null = null;
+  public cargoRocks: THREE.Object3D[] = [];
 
   constructor() {
     this.group = new THREE.Group();
@@ -120,42 +124,43 @@ export class ApolloRoverModel {
       this.proceduralChassis.add(seatGroup);
     });
 
-    // High-Gain Parabolic Telemetry Antenna Dish
-    const dishGeom = new THREE.ConeGeometry(0.38, 0.18, 16, 1, true);
-    dishGeom.rotateX(Math.PI / 2);
+    // Parabolic High-Gain Antenna Dish
+    const dishGeom = new THREE.ConeGeometry(0.48, 0.16, 16, 1, true);
     this.dishMesh = new THREE.Mesh(dishGeom, goldKaptonMat);
-    this.dishMesh.position.set(-0.52, 1.12, -0.92);
-    this.dishMesh.rotation.set(-0.4, 0.3, 0);
+    this.dishMesh.position.set(0.45, 1.25, -0.95);
+    this.dishMesh.rotation.set(-0.55, 0.25, 0.4);
     this.dishMesh.castShadow = true;
     this.proceduralChassis.add(this.dishMesh);
 
-    // Rollbar & Handrail Framework
-    const rollbarGeom = new THREE.CylinderGeometry(0.025, 0.025, 0.82, 8);
-    const rollbarLeft = new THREE.Mesh(rollbarGeom, aluminumMat);
-    rollbarLeft.position.set(-chassisWidth * 0.46, 0.78, 0.28);
-    const rollbarRight = new THREE.Mesh(rollbarGeom, aluminumMat);
-    rollbarRight.position.set(chassisWidth * 0.46, 0.78, 0.28);
-    this.proceduralChassis.add(rollbarLeft, rollbarRight);
-
-    // 4 Procedural Wire Mesh Wheels
+    // 3. Four Wire-Mesh Tires (Apollo LRV specs: 0.818m diameter, 0.23m wide)
     const wheelRadius = 0.41;
-    const wheelWidth = 0.26;
-    const wheelGeom = new THREE.CylinderGeometry(wheelRadius, wheelRadius, wheelWidth, 20);
+    const wheelWidth = 0.23;
+    const wheelGeom = new THREE.CylinderGeometry(
+      wheelRadius,
+      wheelRadius,
+      wheelWidth,
+      24
+    );
     wheelGeom.rotateZ(Math.PI / 2);
 
-    const hubGeom = new THREE.CylinderGeometry(0.14, 0.14, wheelWidth + 0.04, 10);
+    const hubGeom = new THREE.CylinderGeometry(0.16, 0.16, wheelWidth * 1.05, 16);
     hubGeom.rotateZ(Math.PI / 2);
 
-    const offsets: THREE.Vector3[] = [
-      new THREE.Vector3(-1.02, 0, -1.15), // Front-Left
-      new THREE.Vector3(1.02, 0, -1.15),  // Front-Right
-      new THREE.Vector3(-1.02, 0, 1.15),  // Rear-Left
-      new THREE.Vector3(1.02, 0, 1.15),   // Rear-Right
+    const wheelOffsets = [
+      new THREE.Vector3(-0.95, 0.41, -1.15), // Front Left
+      new THREE.Vector3(0.95, 0.41, -1.15),  // Front Right
+      new THREE.Vector3(-0.95, 0.41, 1.15),  // Rear Left
+      new THREE.Vector3(0.95, 0.41, 1.15),   // Rear Right
     ];
 
-    for (let i = 0; i < offsets.length; i++) {
-      const wheelGroup = new THREE.Mesh(wheelGeom, wireMeshTireMat);
-      wheelGroup.castShadow = true;
+    for (let i = 0; i < 4; i++) {
+      const wheelGroup = new THREE.Group();
+      wheelGroup.position.copy(wheelOffsets[i]);
+
+      const tire = new THREE.Mesh(wheelGeom, wireMeshTireMat);
+      tire.castShadow = true;
+      tire.receiveShadow = true;
+      wheelGroup.add(tire);
 
       const hub = new THREE.Mesh(hubGeom, titaniumMat);
       wheelGroup.add(hub);
@@ -180,6 +185,8 @@ export class ApolloRoverModel {
       const model = await loader.loadGLTF('/models/apollo_lrv.glb');
       this.gltfRoot = model;
 
+      this.cargoRocks = [];
+
       // Scan and bind named nodes
       this.gltfRoot.traverse((child) => {
         const name = child.name;
@@ -188,10 +195,23 @@ export class ApolloRoverModel {
         else if (name === 'Wheel_RL') this.gltfWheels[2] = child;
         else if (name === 'Wheel_RR') this.gltfWheels[3] = child;
         else if (name === 'RoboticArm_Base') this.armBaseNode = child;
-        else if (name === 'RoboticArm_Bicep') this.armBicepNode = child;
+        else if (name === 'RoboticArm_Boom') this.armBoomNode = child;
+        else if (name === 'RoboticArm_Forearm') this.armForearmNode = child;
         else if (name === 'RoboticArm_Claw') this.armClawNode = child;
-        else if (name === 'HighGain_Dish') this.highGainDishNode = child;
+        else if (name === 'RoboticArm_LaserEmitter') this.armLaserNode = child;
+        else if (name === 'RoboticArm_HeldRock') {
+          this.heldRockNode = child;
+          child.visible = false; // Initially hidden until a rock is grabbed
+        } else if (name === 'HighGain_Dish') {
+          this.highGainDishNode = child;
+        } else if (name.startsWith('Cargo_Rock_')) {
+          this.cargoRocks.push(child);
+          child.visible = false; // Hidden until collected into cargo
+        }
       });
+
+      // Sort cargo rocks by index
+      this.cargoRocks.sort((a, b) => a.name.localeCompare(b.name));
 
       // Add the GLTF model to the chassis group
       this.chassis.add(this.gltfRoot);
@@ -208,9 +228,27 @@ export class ApolloRoverModel {
       }
 
       this.gltfLoaded = true;
-      console.log('[ApolloRoverModel] High-fidelity Blender 4.2 GLTF rover loaded successfully');
+      console.log(`[ApolloRoverModel] High-fidelity Artemis LTV loaded successfully (bound ${this.cargoRocks.length} cargo slots)`);
     } catch (err) {
       console.warn('[ApolloRoverModel] Failed to load apollo_lrv.glb, running with procedural fallback', err);
+    }
+  }
+
+  public setCargoRockCount(count: number): void {
+    for (let i = 0; i < this.cargoRocks.length; i++) {
+      this.cargoRocks[i].visible = i < count;
+    }
+  }
+
+  public setHeldRockVisible(visible: boolean): void {
+    if (this.heldRockNode) {
+      this.heldRockNode.visible = visible;
+    }
+  }
+
+  public setLaserActive(active: boolean): void {
+    if (this.armLaserNode) {
+      this.armLaserNode.visible = active;
     }
   }
 

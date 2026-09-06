@@ -217,4 +217,8 @@ export class Moonbuggy2HUD {
   public destroy(): void {
     this.container.remove();
   }
+
+  public dispose(): void {
+    this.destroy();
+  }
 }
