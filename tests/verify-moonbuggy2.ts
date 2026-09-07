@@ -19,7 +19,7 @@ console.log('  ✓ PhotorealisticTerrain: Multi-octave fBm and crater displaceme
 const spawnPos = new THREE.Vector3(0, 15, 0);
 const physics = new LRVPhysics(terrain, spawnPos);
 assert.strictEqual(physics.gravity, 1.622, 'Lunar gravity must equal measured 1.622 m/s^2');
-assert.strictEqual(physics.totalMass, 460.0, 'Loaded Apollo LRV mass must equal 460 kg');
+assert.strictEqual(physics.totalMass, 360.0, 'Base Apollo LRV mass must equal 360 kg');
 assert.strictEqual(physics.tires.length, 4, 'Vehicle must feature 4 independent wheels');
 
 // 3. Freefall Lunar Gravity & Suspension Settling Test

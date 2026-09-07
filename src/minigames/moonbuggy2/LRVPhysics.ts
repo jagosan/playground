@@ -25,6 +25,10 @@ export class LRVPhysics {
   public readonly maxRocks = 8;         // Max 8 rocks cargo (+280 kg)
   public rockCount = 0;                 // Current rocks in payload
 
+  public readonly wheelbase = 2.30;     // 2.30 m between front and rear axles
+  public readonly trackWidth = 2.04;    // 2.04 m between left and right wheels
+  public readonly cargoBedZ = 1.15;     // Rear cargo deck longitudinal offset (m)
+
   public get totalMass(): number {
     return this.baseMass + this.rockCount * this.rockMass;
   }
@@ -52,6 +56,39 @@ export class LRVPhysics {
 
   public addRock(): void {
     this.addCargoRock();
+  }
+
+  public getSpeedKmh(): number {
+    return Math.abs(this.forwardSpeed) * 3.6;
+  }
+
+  /**
+   * Distance from geometric vehicle center to Center of Gravity along longitudinal axis (Z).
+   * Positive Z is rearward. Cargo rack is located at +1.15m.
+   */
+  public get cgOffsetZ(): number {
+    const cargoM = this.cargoMass;
+    return (cargoM * this.cargoBedZ) / this.totalMass;
+  }
+
+  /**
+   * Base polar moment of inertia I_zz (kg*m^2) for the 360kg unladen vehicle.
+   * Approximated via box cuboid: I_base = (1/12) * m * (L^2 + W^2)
+   */
+  public get baseInertia(): number {
+    return (1 / 12) * this.baseMass * (this.wheelbase * this.wheelbase + this.trackWidth * this.trackWidth);
+  }
+
+  /**
+   * Dynamic polar moment of inertia I_zz (kg*m^2) accounting for sample rocks
+   * loaded onto the rear cargo deck using the parallel axis theorem.
+   */
+  public get yawInertia(): number {
+    const zCg = this.cgOffsetZ;
+    const baseShifted = this.baseInertia + this.baseMass * (zCg * zCg);
+    const cargoM = this.cargoMass;
+    const cargoInertia = cargoM * Math.pow(this.cargoBedZ - zCg, 2);
+    return baseShifted + cargoInertia;
   }
 
   public readonly cgHeight = 0.42;      // Low Center of Gravity in meters
@@ -93,10 +130,10 @@ export class LRVPhysics {
     this.position.copy(spawnPos);
 
     const offsets: THREE.Vector3[] = [
-      new THREE.Vector3(-1.02, 0, -1.15), // Front-Left
-      new THREE.Vector3(1.02, 0, -1.15),  // Front-Right
-      new THREE.Vector3(-1.02, 0, 1.15),  // Rear-Left
-      new THREE.Vector3(1.02, 0, 1.15),   // Rear-Right
+      new THREE.Vector3(-1.02, 0, -1.15), // Front-Left (0)
+      new THREE.Vector3(1.02, 0, -1.15),  // Front-Right (1)
+      new THREE.Vector3(-1.02, 0, 1.15),  // Rear-Left (2)
+      new THREE.Vector3(1.02, 0, 1.15),   // Rear-Right (3)
     ];
 
     for (const offset of offsets) {
@@ -132,6 +169,22 @@ export class LRVPhysics {
 
   public rechargeBattery(amount: number): void {
     this.batteryLevel = Math.min(1.0, this.batteryLevel + amount);
+  }
+
+  /**
+   * Evaluates the Pacejka 'Magic Formula' tire-regolith friction curve:
+   * F = D * sin(C * atan(B * s - E * (B * s - atan(B * s))))
+   */
+  public pacejkaMagicFormula(slip: number, normalForce: number, isLateral = false): number {
+    if (normalForce <= 0) return 0;
+    const mu = isLateral ? 0.72 : 0.80;
+    const D = mu * normalForce;
+    const C = 1.35;
+    const B = isLateral ? 5.5 : 7.0;
+    const E = -0.15;
+
+    const bSlip = B * slip;
+    return D * Math.sin(C * Math.atan(bSlip - E * (bSlip - Math.atan(bSlip))));
   }
 
   public step(
@@ -177,13 +230,22 @@ export class LRVPhysics {
     // Effective power cuts to 0 if battery exhausted
     const powerAvailable = this.batteryLevel > 0 ? 1.0 : 0.0;
 
-    // 4. Wheel Ground Detection & Suspension Forces
+    // 4. Wheel Ground Detection, Dynamic Weight Bias & Suspension Forces
     let totalSuspensionForce = 0;
     let groundedCount = 0;
+    const currentMass = this.totalMass;
+    const zCg = this.cgOffsetZ;
+
+    // Dynamic damping scale with increased mass to moderate lunar bounce (Spec 04 §1.2)
+    const bounceDampingScale = Math.sqrt(currentMass / this.baseMass);
+    const activeDamperBump = this.damperBump * bounceDampingScale;
+    const activeDamperRebound = this.damperRebound * bounceDampingScale;
 
     for (let i = 0; i < this.tires.length; i++) {
       const tire = this.tires[i];
-      const worldOffset = tire.offset.clone().applyAxisAngle(new THREE.Vector3(0, 1, 0), this.heading);
+      const isFront = tire.offset.z < 0;
+      const euler = new THREE.Euler(this.pitch, this.heading, this.roll, 'YXZ');
+      const worldOffset = tire.offset.clone().applyEuler(euler);
       tire.worldPos.copy(this.position).add(worldOffset);
 
       const groundY = this.terrain.getHeightAt(tire.worldPos.x, tire.worldPos.z);
@@ -195,21 +257,55 @@ export class LRVPhysics {
         tire.isGrounded = true;
         tire.compression = totalArmLength - contactDist;
 
-        // Non-linear spring + dual-rate damping
+        // Weight distribution: rear wheels carry additional static load as rocks fill cargo bed
+        const axleWeightShare = isFront
+          ? (1.15 - zCg) / this.wheelbase
+          : (1.15 + zCg) / this.wheelbase;
+        const staticLoadPerTire = axleWeightShare * (currentMass * this.gravity) * 0.5;
+
+        // Non-linear spring + dynamic bounce damping
         const springForce = tire.compression * this.springK;
         const vDamper = -this.velocity.y;
-        const cDamper = vDamper >= 0 ? this.damperBump : this.damperRebound;
+        const cDamper = vDamper >= 0 ? activeDamperBump : activeDamperRebound;
         const damperForce = vDamper * cDamper;
 
-        tire.suspensionForce = Math.max(0, springForce + damperForce);
+        // Total vertical normal force (N) on tire (accounting for static load distribution)
+        tire.suspensionForce = Math.max(0, springForce + damperForce + staticLoadPerTire * 0.05);
         totalSuspensionForce += tire.suspensionForce;
 
-        // Pacejka tire angular rotation
-        tire.rotationX += (this.forwardSpeed / this.wheelRadius) * dt;
+        // -------------------------------------------------------------
+        // Pacejka Slip Dynamics (Longitudinal Kappa & Lateral Alpha)
+        // -------------------------------------------------------------
+        const steerForTire = isFront ? this.steerAngle : 0;
+        const vTireX = this.forwardSpeed * Math.cos(steerForTire);
+
+        // Effective wheel linear speed with throttle slip / brake slip
+        const driveSlipDelta = Math.abs(throttle) > 0.05
+          ? (reverse ? -1 : 1) * throttle * 0.35 * powerAvailable
+          : 0;
+        const brakeSlipDelta = Math.abs(brake) > 0.05
+          ? -Math.sign(this.forwardSpeed) * brake * 0.4
+          : 0;
+        const effectiveWheelSpeed = this.forwardSpeed + driveSlipDelta + brakeSlipDelta;
+
+        tire.angularVelocity = effectiveWheelSpeed / this.wheelRadius;
+        tire.rotationX += tire.angularVelocity * dt;
+
+        // Pacejka Slip Ratio kappa = (V_wheel - V_x) / max(|V_x|, |V_wheel|, 0.1)
+        const denomX = Math.max(Math.abs(vTireX), Math.abs(effectiveWheelSpeed), 0.2);
+        tire.slipRatio = THREE.MathUtils.clamp((effectiveWheelSpeed - vTireX) / denomX, -1.0, 1.0);
+
+        // Lateral slip angle alpha = steer - atan2(V_lateral, |V_forward|)
+        const axleArm = isFront ? (1.15 - zCg) : -(1.15 + zCg);
+        const vLateral = this.angularVelocity * axleArm;
+        const denomY = Math.max(Math.abs(this.forwardSpeed), 0.2);
+        tire.slipAngle = THREE.MathUtils.clamp(steerForTire - Math.atan2(vLateral, denomY), -0.6, 0.6);
       } else {
         tire.isGrounded = false;
         tire.compression = 0;
         tire.suspensionForce = 0;
+        tire.slipRatio = 0;
+        tire.slipAngle = 0;
       }
     }
 
@@ -217,8 +313,6 @@ export class LRVPhysics {
 
     // 5. Vertical Acceleration & Lunar Gravity Integration
     this.velocity.y -= this.gravity * dt;
-
-    const currentMass = this.totalMass;
 
     if (!this.isAirborne) {
       const upwardAccel = totalSuspensionForce / currentMass;
@@ -257,10 +351,13 @@ export class LRVPhysics {
       // Governed speed cap at 25 km/h (6.944 m/s)
       this.forwardSpeed = THREE.MathUtils.clamp(this.forwardSpeed, -3.5, this.maxSpeed);
 
-      // 7. Yaw Dynamics (Counter-steer Ackermann turning)
+      // 7. Yaw Dynamics (Counter-steer Ackermann turning with dynamic yaw inertia)
       if (Math.abs(this.forwardSpeed) > 0.1) {
         const turnMult = this.forwardSpeed > 0 ? 1 : -1;
-        this.angularVelocity = (this.forwardSpeed / 2.3) * Math.tan(this.steerAngle) * turnMult;
+        const targetAngularVel = (this.forwardSpeed / 2.3) * Math.tan(this.steerAngle) * turnMult;
+        // Yaw responsiveness scales inversely with dynamic yaw inertia (more rocks = more inertia damping)
+        const inertiaDamping = this.baseInertia / this.yawInertia;
+        this.angularVelocity += (targetAngularVel - this.angularVelocity) * Math.min(1.0, 6.0 * inertiaDamping * dt);
         this.heading += this.angularVelocity * dt;
       } else {
         this.angularVelocity *= 0.85;
@@ -289,14 +386,19 @@ export class LRVPhysics {
 
     // 9. Dynamic Pitch and Roll from 4 Tire Heights
     if (!this.isAirborne) {
-      const frontY = (this.tires[0].worldPos.y + this.tires[1].worldPos.y) * 0.5;
-      const rearY = (this.tires[2].worldPos.y + this.tires[3].worldPos.y) * 0.5;
-      const targetPitch = Math.atan2(frontY - rearY, 2.3);
+      const g0 = this.terrain.getHeightAt(this.tires[0].worldPos.x, this.tires[0].worldPos.z);
+      const g1 = this.terrain.getHeightAt(this.tires[1].worldPos.x, this.tires[1].worldPos.z);
+      const g2 = this.terrain.getHeightAt(this.tires[2].worldPos.x, this.tires[2].worldPos.z);
+      const g3 = this.terrain.getHeightAt(this.tires[3].worldPos.x, this.tires[3].worldPos.z);
+
+      const frontGround = (g0 + g1) * 0.5;
+      const rearGround = (g2 + g3) * 0.5;
+      const targetPitch = Math.atan2(frontGround - rearGround, this.wheelbase);
       this.pitch += (targetPitch - this.pitch) * Math.min(1.0, 9.0 * dt);
 
-      const leftY = (this.tires[0].worldPos.y + this.tires[2].worldPos.y) * 0.5;
-      const rightY = (this.tires[1].worldPos.y + this.tires[3].worldPos.y) * 0.5;
-      const targetRoll = Math.atan2(leftY - rightY, 2.04);
+      const leftGround = (g0 + g2) * 0.5;
+      const rightGround = (g1 + g3) * 0.5;
+      const targetRoll = Math.atan2(rightGround - leftGround, this.trackWidth);
       this.roll += (targetRoll - this.roll) * Math.min(1.0, 9.0 * dt);
     } else {
       this.pitch *= 0.98;

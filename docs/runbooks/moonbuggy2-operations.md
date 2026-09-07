@@ -84,9 +84,21 @@ Dispatch rules (Spec 07 §0.3): `@tigger` for code build, `@eeyore` for audit (s
 
 > Legacy exporters (pre-Spec 05): `scripts/generate_blender_assets.py` and `scripts/export_lrv.py` — superseded, kept for reference. `public/models/lunar_rock.glb` is a legacy single-rock artifact (not part of the pipeline output).
 
-## 6. Automated Physics & Regression Testing
+## 6. Next-Gen Artemis LTV & Robotic Arm Rig (Spec 08)
+- **Blueprint:** [`docs/architecture/08-artemis-ltv-and-robotic-arm.md`](../architecture/08-artemis-ltv-and-robotic-arm.md)
+- **Asset Source:** Procedural Blender builder in `scripts/lunar_assets/rover_builder.py` (`build_apollo_lrv()`).
+- **Hierarchy & Features:**
+  - White thermal composite aerodynamic hood and contoured wheel fenders.
+  - Airless lattice titanium mesh tweels with radial curved spring blades and chevron cleats.
+  - Avionics bay with gold MLI Kapton foil, sensor mast with LiDAR dome and NavCams.
+  - Dual astronaut cockpit with bucket seats and safety harnesses.
+  - 4-DOF robotic arm: base azimuth turret, boom spar, forearm spar, 3-finger claw, targeting laser, and rock pickup node.
+- **GLTF Runtime Pivot Compensation:** `ApolloRoverModel.ts` executes `applyGltfPivotCompensation()` to re-center flattened glTF arm spar pivots to their authored joint centers, resolving origin-rotation bugs in Three.js.
+
+## 7. Automated Physics & Regression Testing
 Run the 120Hz dynamics benchmark suite:
 ```bash
+npx --prefix /home/jagosan/repos/playground tsx /home/jagosan/repos/playground/tests/verify-moonbuggy2-m2.ts
 npx --prefix /home/jagosan/repos/playground tsx /home/jagosan/repos/playground/tests/verify-moonbuggy2.ts
 ```
 

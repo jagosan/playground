@@ -13,6 +13,8 @@
   - `specs/04-moonbuggy2-m2.md`: Milestone 2 feedback: 25 km/h speed, dynamic mass, robotic arm, drop station.
   - `specs/05-blender-asset-pipeline.md`: Headless Blender 4.2 asset generator (bpy), PBR materials, GLB export.
   - `specs/06-moonbuggy2-engine-m2.md`: Three.js GLTF loader integration, articulated kinematics, HUD telemetry.
+  - `specs/07-asset-pipeline-handoff.md`: Multi-agent handoff, Blender 4.2 pipeline execution, verification.
+  - `specs/08-artemis-ltv-and-robotic-arm.md`: Artemis LTV 3D model hierarchy, PBR materials, 4-DOF arm kinematics, sample collection.
 
 ## Blender Asset Pipeline (Spec 05)
 - `scripts/build_lunar_assets.py`: Standalone Blender 4.2 headless asset generator (`--all` / per-phase flags; previews + `manifest.json`).
