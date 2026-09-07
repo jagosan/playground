@@ -23,6 +23,7 @@ export class ApolloRoverModel {
   // GLTF nodes bound after asynchronous load
   public gltfLoaded = false;
   public gltfRoot: THREE.Group | null = null;
+  public gltfKnuckles: (THREE.Object3D | null)[] = [null, null, null, null]; // FL, FR, RL, RR
   public gltfWheels: (THREE.Object3D | null)[] = [null, null, null, null]; // FL, FR, RL, RR
   public armBaseNode: THREE.Object3D | null = null;
   public armBoomNode: THREE.Object3D | null = null;
@@ -32,25 +33,6 @@ export class ApolloRoverModel {
   public heldRockNode: THREE.Object3D | null = null;
   public highGainDishNode: THREE.Object3D | null = null;
   public cargoRocks: THREE.Object3D[] = [];
-
-  // One-time GLB-local-space translations that re-anchor the flattened glTF
-  // arm nodes onto their true joint centers. The Blender rig (rover_builder.py)
-  // authors a proper parent chain
-  //   RoboticArm_Base -> RoboticArm_Boom -> RoboticArm_Forearm -> RoboticArm_Claw
-  // but the Blender 4.2 glTF exporter flattens it: every node ends up at the
-  // scene root with its authored local transform. RoboticArmController then
-  // writes absolute rotations (rest = identity), so each node's pivot MUST be
-  // at its joint center or the motion swings the wrong point.
-  //
-  // Compensation (GLB local space, Blender -Y -> three +Z):
-  //   RoboticArm_Base   +z 0.26   joint at chassis-local (0.78, -0.35, 0.55)
-  //   RoboticArm_Boom   +y 0.13   elbow axis above the base housing
-  //   RoboticArm_Forearm -z 0.92  wrist at the far end of the 0.92m boom
-  //   RoboticArm_Claw   -z 0.82   grip at the far end of the 0.82m forearm
-  //   RoboticArm_LaserEmitter -z 0.17  (cosmetic, at the claw face)
-  //   RoboticArm_HeldRock -z 0.10      (cosmetic, inside the grip)
-  // Applied exactly once, in GLB local space, before any runtime writes.
-  private gltfPivotApplied = false;
 
   constructor() {
     this.group = new THREE.Group();
@@ -209,7 +191,11 @@ export class ApolloRoverModel {
       // Scan and bind named nodes
       this.gltfRoot.traverse((child) => {
         const name = child.name;
-        if (name === 'Wheel_FL') this.gltfWheels[0] = child;
+        if (name === 'SteeringKnuckle_FL') this.gltfKnuckles[0] = child;
+        else if (name === 'SteeringKnuckle_FR') this.gltfKnuckles[1] = child;
+        else if (name === 'SteeringKnuckle_RL') this.gltfKnuckles[2] = child;
+        else if (name === 'SteeringKnuckle_RR') this.gltfKnuckles[3] = child;
+        else if (name === 'Wheel_FL') this.gltfWheels[0] = child;
         else if (name === 'Wheel_FR') this.gltfWheels[1] = child;
         else if (name === 'Wheel_RL') this.gltfWheels[2] = child;
         else if (name === 'Wheel_RR') this.gltfWheels[3] = child;
@@ -235,11 +221,6 @@ export class ApolloRoverModel {
       // Add the GLTF model to the chassis group
       this.chassis.add(this.gltfRoot);
 
-      // Shift arm pivots onto their true joint centers (see gltfPivotApplied
-      // comment). Applied exactly once in GLB local space, before any
-      // runtime rotation writes from RoboticArmController.
-      this.applyGltfPivotCompensation();
-
       // Hide procedural chassis meshes
       this.proceduralChassis.visible = false;
 
@@ -256,38 +237,6 @@ export class ApolloRoverModel {
     } catch (err) {
       console.warn('[ApolloRoverModel] Failed to load apollo_lrv.glb, running with procedural fallback', err);
     }
-  }
-
-  /**
-   * One-time GLB-local-space translations that move the flattened glTF arm
-   * node pivots onto their authored joint centers (see rover_builder.py
-   * hierarchy + class-level comment). Pure local translations in a flat
-   * hierarchy keep the rest pose bit-identical while re-anchoring every
-   * runtime rotation on its own joint.
-   */
-  private applyGltfPivotCompensation(): void {
-    if (this.gltfPivotApplied) return;
-    this.gltfPivotApplied = true;
-
-    const shift = (node: THREE.Object3D | null, dx: number, dy: number, dz: number): void => {
-      if (node) {
-        node.position.x += dx;
-        node.position.y += dy;
-        node.position.z += dz;
-      }
-    };
-
-    // Azimuth joint at chassis-local (0.78, -0.35, 0.55) => GLB local (0.78, 0.29, 0.61)
-    shift(this.armBaseNode, 0, 0, 0.26);
-    // Elbow axis +0.13 along the base housing axis (GLB +Y)
-    shift(this.armBoomNode, 0, 0.13, 0);
-    // Wrist joint at the far end of the 0.92m boom (authored toward -Z)
-    shift(this.armForearmNode, 0, 0, -0.92);
-    // Grip joint at the far end of the 0.82m forearm
-    shift(this.armClawNode, 0, 0, -0.82);
-    // Cosmetic children: keep them riding the claw face
-    shift(this.armLaserNode, 0, 0, -0.17);
-    shift(this.heldRockNode, 0, 0, -0.10);
   }
 
   public setCargoRockCount(count: number): void {
@@ -326,20 +275,18 @@ export class ApolloRoverModel {
       }
     }
 
-    // 2. Update GLTF wheel nodes if bound
-    // The Blender glTF exporter flattens the hierarchy, so Wheel_* nodes sit at
-    // the glTF scene root (not under this.chassis) — their position must be
-    // synchronized from the physics tire offsets as well as their rotation.
+    // 2. Update GLTF wheel and knuckle nodes if bound
+    // Knuckles handle steering yaw, wheels handle forward rolling pitch.
+    // Wheels sit at (0, 0, 0) relative to knuckles, with zero lateral offset.
     for (let i = 0; i < 4; i++) {
-      const gltfWheel = this.gltfWheels[i];
-      if (gltfWheel) {
-        gltfWheel.position.copy(wheelPositions[i]);
-        gltfWheel.rotation.x = wheelRotations[i].x;
-        if (i < 2) {
-          gltfWheel.rotation.y = steerAngle;
-        } else {
-          gltfWheel.rotation.y = -steerAngle * 0.7;
-        }
+      const knuckle = this.gltfKnuckles[i];
+      const wheel = this.gltfWheels[i];
+      if (knuckle) {
+        knuckle.rotation.y = i < 2 ? steerAngle : -steerAngle * 0.7;
+      }
+      if (wheel) {
+        wheel.rotation.x = wheelRotations[i].x;
+        wheel.position.set(0, 0, 0);
       }
     }
   }

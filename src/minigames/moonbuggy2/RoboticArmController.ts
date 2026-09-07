@@ -63,11 +63,12 @@ export class RoboticArmController {
       const armRelZ = localZ - (-0.35);
 
       // Desired azimuth from arm base turret
-      const rawAngle = Math.atan2(armRelX, -armRelZ);
-      // Clamp to mechanical limits (-0.8 to +1.8 rad)
-      this.targetAzimuth = THREE.MathUtils.clamp(rawAngle, -0.8, 1.8);
+      // Facing forward along -Z, turning right (starboard +X) is negative yaw around +Y:
+      const rawAngle = Math.atan2(-armRelX, -armRelZ);
+      // Clamp to mechanical limits (-1.4 to +2.8 rad)
+      this.targetAzimuth = THREE.MathUtils.clamp(rawAngle, -1.4, 2.8);
     } else {
-      this.targetAzimuth = 0.45;
+      this.targetAzimuth = -0.45;
     }
 
     this.model.setLaserActive(true);
@@ -92,10 +93,10 @@ export class RoboticArmController {
       const easeT = THREE.MathUtils.smoothstep(t, 0, 1);
 
       if (base) base.rotation.y = THREE.MathUtils.lerp(0, this.targetAzimuth, easeT);
-      if (boom) boom.rotation.x = THREE.MathUtils.lerp(0, -0.92, easeT);
-      if (forearm) forearm.rotation.x = THREE.MathUtils.lerp(0, -0.75, easeT);
+      if (boom) boom.rotation.x = THREE.MathUtils.lerp(0, -0.65, easeT);
+      if (forearm) forearm.rotation.x = THREE.MathUtils.lerp(0, -0.55, easeT);
       if (claw) {
-        claw.rotation.x = THREE.MathUtils.lerp(0, 0.45, easeT);
+        claw.rotation.x = THREE.MathUtils.lerp(0, 0.75, easeT);
         claw.scale.set(1.25, 1.25, 1.25); // Fingers open wide
       }
     } else if (progress < 0.55) {
@@ -122,14 +123,14 @@ export class RoboticArmController {
       const t = (progress - 0.55) / 0.30;
       const easeT = THREE.MathUtils.smoothstep(t, 0, 1);
 
-      // Turret swings toward rear cargo deck (~ +2.6 rad)
-      if (base) base.rotation.y = THREE.MathUtils.lerp(this.targetAzimuth, 2.65, easeT);
+      // Turret swings toward rear cargo deck (~ +2.55 rad)
+      if (base) base.rotation.y = THREE.MathUtils.lerp(this.targetAzimuth, 2.55, easeT);
       // Boom lifts high to clear chassis rollbars, then lowers over cargo bay
       const boomArc = Math.sin(easeT * Math.PI) * 0.45;
-      if (boom) boom.rotation.x = THREE.MathUtils.lerp(-0.92, 0.45, easeT) + boomArc;
-      if (forearm) forearm.rotation.x = THREE.MathUtils.lerp(-0.75, 0.85, easeT);
+      if (boom) boom.rotation.x = THREE.MathUtils.lerp(-0.65, 0.40, easeT) + boomArc;
+      if (forearm) forearm.rotation.x = THREE.MathUtils.lerp(-0.55, 0.70, easeT);
       if (claw) {
-        claw.rotation.x = THREE.MathUtils.lerp(0.45, -0.65, easeT);
+        claw.rotation.x = THREE.MathUtils.lerp(0.75, -0.50, easeT);
         claw.rotation.z = 0;
       }
     } else if (progress < 1.0) {
@@ -145,9 +146,9 @@ export class RoboticArmController {
       }
 
       if (claw) claw.scale.set(1.0, 1.0, 1.0);
-      if (base) base.rotation.y = THREE.MathUtils.lerp(2.65, 0, easeT);
-      if (boom) boom.rotation.x = THREE.MathUtils.lerp(0.45, 0, easeT);
-      if (forearm) forearm.rotation.x = THREE.MathUtils.lerp(0.85, 0, easeT);
+      if (base) base.rotation.y = THREE.MathUtils.lerp(2.55, 0, easeT);
+      if (boom) boom.rotation.x = THREE.MathUtils.lerp(0.40, 0, easeT);
+      if (forearm) forearm.rotation.x = THREE.MathUtils.lerp(0.70, 0, easeT);
       if (claw) claw.rotation.set(0, 0, 0);
     } else {
       // Sequence Finished

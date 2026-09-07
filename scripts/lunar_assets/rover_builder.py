@@ -1,41 +1,45 @@
 #!/usr/bin/env python3
 """Next-Generation Artemis Lunar Terrain Vehicle (LTV) Master Rig Builder for Blender 4.2.
 
-Phase 1 / Artemis LTV Blender Rig Overhaul
-==========================================
+Phase 1 / Artemis LTV Blender Rig Overhaul & Kinematics Rectification
+====================================================================
 Photorealistic next-gen Artemis LTV inspired by Astrolab FLEX and Lunar Outpost
 Lunar Dawn concepts:
 
 - Sleek aerodynamic composite spaceframe with Artemis White & Matte Carbon bodywork
+- Coordinate system aligned with Khronos glTF 2.0 / Three.js standards:
+    Blender +Y = Forward (glTF -Z)
+    Blender -Y = Rear (glTF +Z)
+    Blender -X = Port / Left (glTF -X)
+    Blender +X = Starboard / Right (glTF +X)
+    Blender +Z = Up (glTF +Y)
 - Kapton gold/copper thermal multi-layer insulation (MLI) avionics bay
-- Dual high-back astronaut flight seats with 5-point harness relief and center
-  control yoke
+- Dual high-back astronaut flight seats with 5-point harness relief and center control yoke
 - Heavy-duty front bullbar with high-intensity LED lightbars
-- Autonomous navigation sensor mast (LiDAR dome, stereo nav-cams, high-gain
-  parabolic dish)
+- Autonomous navigation sensor mast (LiDAR dome, stereo nav-cams, high-gain dish)
 - Rear modular science deck with 8 dedicated sample container docks
 - 4-wheel independent double-wishbone suspension with coilover dampers
-- Compliant airless lattice tweels with titanium chevron traction grousers
-- 4-DOF articulated robotic arm (turret, shoulder boom, forearm, 3-finger
-  claw, laser guide) with a CORRECT pivot hierarchy:
-    RoboticArm_Base (azimuth) -> RoboticArm_Boom (elbow pitch) ->
-    RoboticArm_Forearm (wrist pitch) -> RoboticArm_Claw (grip)
-  so each Three.js rotation lands at its own joint.
-- Embedded sample holding node and 8 cargo bay rock specimen meshes, all
-  authored at rest-pose LOCAL offsets (Blender exports the authored local
-  transform as the glTF node transform; runtime keyframes are applied on top).
-- Wheels are authored at the axle center with the X axis along the axle, so
-  Three.js rotation.x = forward roll and rotation.y = steer, exactly as
-  LRVPhysics/ApolloRoverModel expect.
-- Low-poly collision proxy box (wire display) for Three.js broadphase.
+- Compliant airless lattice tweels with titanium chevron traction grousers:
+    Axle geometry baked along local X axis.
+    Each Wheel_* has origin at (0, 0, 0) inside SteeringKnuckle_*, so
+    Three.js knuckle.rotation.y = steer and wheel.rotation.x = forward roll.
+    Zero lateral floating displacement.
+- 4-DOF articulated robotic arm with identity rest poses and physical joint centers:
+    RoboticArm_Base (azimuth yaw, Y) @ chassis (0.78, 0.35, 0.29)
+      -> RoboticArm_Boom (shoulder pitch, X) @ base (0, 0, 0.13)
+        -> RoboticArm_Forearm (elbow pitch, X) @ boom (0, 0.92, 0)
+          -> RoboticArm_Claw (wrist pitch, X) @ forearm (0, 0.82, 0)
+            -> RoboticArm_LaserEmitter @ (0, 0.17, 0)
+            -> RoboticArm_HeldRock @ (0, 0.10, 0)
+- Low-poly collision proxy box for Three.js broadphase.
 
 Exports binary glTF 2.0 to public/models/apollo_lrv.glb.
 
-Backward-compatible node names (required by ApolloRoverModel.ts /
-RoboticArmController.ts):
-    LRV_Root, Chassis, Wheel_{FL,FR,RL,RR}, RoboticArm_Base, RoboticArm_Boom,
-    RoboticArm_Forearm, RoboticArm_Claw, RoboticArm_LaserEmitter,
-    RoboticArm_HeldRock, HighGain_Dish, Cargo_Rock_{1..8}, Cargo_Ring_{1..8}
+Backward-compatible node names (required by ApolloRoverModel.ts / RoboticArmController.ts / verify_m3_assets.py):
+    LRV_Root, Chassis, Wheel_{FL,FR,RL,RR}, SteeringKnuckle_{FL,FR,RL,RR},
+    RoboticArm_Base, RoboticArm_Boom, RoboticArm_Forearm, RoboticArm_Claw,
+    RoboticArm_LaserEmitter, RoboticArm_HeldRock, HighGain_Dish,
+    Cargo_Rock_{1..8}, Cargo_Ring_{1..8}, LRV_Collision_Box
 """
 
 import math
@@ -51,11 +55,7 @@ import bpy
 # ---------------------------------------------------------------------------
 
 def _set_pivot(obj, pivot_local: tuple[float, float, float]):
-    """Shift the object's local origin to the given local-space point.
-
-    Moves the mesh data so the origin (and therefore the glTF node pivot)
-    sits at pivot_local, leaving the mesh visually unchanged.
-    """
+    """Shift the object's local origin to the given local-space point."""
     dx, dy, dz = pivot_local
     for v in obj.data.vertices:
         v.co.x -= dx
@@ -71,8 +71,10 @@ def add_box(name, loc, scale, mat, parent, rot=(0.0, 0.0, 0.0)):
     o = bpy.context.active_object
     o.name = name
     o.scale = scale
-    o.data.materials.append(mat)
-    o.parent = parent
+    if mat:
+        o.data.materials.append(mat)
+    if parent:
+        o.parent = parent
     return o
 
 
@@ -82,8 +84,10 @@ def add_cyl(name, loc, radius, depth, mat, parent, rot=(0.0, 0.0, 0.0), verts=24
     )
     o = bpy.context.active_object
     o.name = name
-    o.data.materials.append(mat)
-    o.parent = parent
+    if mat:
+        o.data.materials.append(mat)
+    if parent:
+        o.parent = parent
     return o
 
 
@@ -92,14 +96,13 @@ def add_empty(name, loc, parent, scale=1.0):
     o = bpy.context.active_object
     o.name = name
     o.scale = (scale, scale, scale)
-    o.parent = parent
+    if parent:
+        o.parent = parent
     return o
 
 
 def add_rock(name, loc, radius, mat, parent, seed):
     """Deterministic, jagged basalt specimen (displaced icosphere)."""
-    import bmesh
-
     bpy.ops.mesh.primitive_ico_sphere_add(subdivisions=2, radius=radius, location=loc)
     o = bpy.context.active_object
     o.name = name
@@ -115,8 +118,10 @@ def add_rock(name, loc, radius, mat, parent, seed):
         v.co.x *= f
         v.co.y *= (0.78 + 0.45 * (abs(hash((seed, round(v.co.y, 3))) % 991) / 991.0))
         v.co.z *= 0.72 + 0.38 * n
-    o.data.materials.append(mat)
-    o.parent = parent
+    if mat:
+        o.data.materials.append(mat)
+    if parent:
+        o.parent = parent
     return o
 
 
@@ -172,214 +177,209 @@ def build_apollo_lrv(out_path: str):
     root = add_empty("LRV_Root", (0.0, 0.0, 0.0), None)
 
     # 2. Main Chassis Spaceframe & Underbody Skid Plate -----------------------
+    # Center chassis origin at z = 0.26 (axle height z = 0.12 relative to chassis)
     chassis = add_box("Chassis", (0, 0, 0.26), (1.56, 2.75, 0.24), mat_carbon, root)
-    skid = add_box("Chassis_SkidPlate", (0, 0, -0.14), (1.35, 2.60, 0.04), mat_titanium, chassis)
+    add_box("Chassis_SkidPlate", (0, 0, -0.14), (1.35, 2.60, 0.04), mat_titanium, chassis)
 
     # 3. Aerodynamic White Composite Cowlings & Front Nose Fascia -------------
-    hood = add_box(
+    # Forward is Blender +Y
+    add_box(
         "Body_FrontHood",
-        (0, -1.05, 0.22),
+        (0, 1.05, 0.22),
         (1.45, 0.85, 0.25),
         mat_white,
         chassis,
-        rot=(math.radians(12), 0, 0),
+        rot=(-math.radians(12), 0, 0),
     )
-    # Nose tip wedge (Lunar Dawn pointed snout)
-    nose = add_box("Body_NoseTip", (0, -1.48, 0.06), (0.90, 0.30, 0.14), mat_white, chassis)
+    # Nose tip wedge (pointed forward snout)
+    add_box("Body_NoseTip", (0, 1.48, 0.06), (0.90, 0.30, 0.14), mat_white, chassis)
 
     for side, x in (("L", -0.72), ("R", 0.72)):
-        pod = add_box(f"Body_SidePod_{side}", (x, 0, 0.16), (0.24, 2.40, 0.28), mat_white, chassis)
-        # Wheel arch fairings
-        for wy, wl in ((-1.05, 0.95), (1.05, 0.95)):
-            arch = add_box(
-                f"Body_Arch_{side}_{'F' if wy < 0 else 'R'}",
-                (x * 1.06, wl, 0.06),
-                (0.16, wl and 0.98, 0.34),
+        add_box(f"Body_SidePod_{side}", (x, 0, 0.16), (0.24, 2.40, 0.28), mat_white, chassis)
+        # Wheel arch fairings (+Y = Front, -Y = Rear)
+        for wy, wl in ((1.05, 0.95), (-1.05, 0.95)):
+            add_box(
+                f"Body_Arch_{side}_{'F' if wy > 0 else 'R'}",
+                (x * 1.06, wy, 0.06),
+                (0.16, 0.98, 0.34),
                 mat_carbon,
                 chassis,
             )
 
-    # Gold Thermal MLI Avionics Bay (between hood and cockpit, local to chassis)
-    avionics = add_box("Avionics_GoldBay", (0, -0.65, 0.12), (1.20, 0.75, 0.30), mat_gold, chassis)
+    # Gold Thermal MLI Avionics Bay (between hood and cockpit)
+    add_box("Avionics_GoldBay", (0, 0.65, 0.12), (1.20, 0.75, 0.30), mat_gold, chassis)
 
     # 4. Heavy-Duty Front Bullbar & High-Intensity LED Lightbars ---------------
-    bullbar = add_cyl(
-        "Bullbar_Bumper", (0, -1.74, 0.22), 0.032, 1.58, mat_titanium, chassis,
+    add_cyl(
+        "Bullbar_Bumper", (0, 1.74, 0.22), 0.032, 1.58, mat_titanium, chassis,
         rot=(0, math.radians(90), 0),
     )
-    # Lower bullbar cross-guard
     add_cyl(
-        "Bullbar_LowerGuard", (0, -1.74, -0.06), 0.024, 1.30, mat_titanium, chassis,
+        "Bullbar_LowerGuard", (0, 1.74, -0.06), 0.024, 1.30, mat_titanium, chassis,
         rot=(0, math.radians(90), 0),
     )
     for x in (-0.55, 0.55):
         add_cyl(
             f"Bullbar_Upright_{'L' if x < 0 else 'R'}",
-            (x, -1.72, 0.06), 0.028, 0.45, mat_titanium, chassis,
+            (x, 1.72, 0.06), 0.028, 0.45, mat_titanium, chassis,
         )
-    # Dual High-Intensity LED Headlight Pods (emissive)
     for x in (-0.48, 0.48):
         add_box(
             f"LED_Lightbar_{'L' if x < 0 else 'R'}",
-            (x, -1.68, 0.22), (0.32, 0.08, 0.09), mat_led, chassis,
+            (x, 1.68, 0.22), (0.32, 0.08, 0.09), mat_led, chassis,
         )
-    # Work lamps on the bullbar uprights
     for x in (-0.55, 0.55):
         add_cyl(
             f"Bullbar_WorkLamp_{'L' if x < 0 else 'R'}",
-            (x, -1.72, 0.26), 0.035, 0.05, mat_led, chassis,
+            (x, 1.72, 0.26), 0.035, 0.05, mat_led, chassis,
         )
 
-    # 5. Integrated Artemis Roll Cage (local to chassis, z +0.26 offset) -------
+    # 5. Integrated Artemis Roll Cage (local to chassis) ----------------------
     cage_tubes = [
-        ("Rollbar_Left", -0.68, 0.15, 0.79, 1.45, 0),
-        ("Rollbar_Right", 0.68, 0.15, 0.79, 1.45, 0),
-        ("Rollbar_Front_L", -0.68, -0.45, 0.59, 1.15, math.radians(18)),
-        ("Rollbar_Front_R", 0.68, -0.45, 0.59, 1.15, math.radians(18)),
-        ("Rollbar_Rear_L", -0.68, 0.85, 0.59, 1.15, math.radians(-18)),
-        ("Rollbar_Rear_R", 0.68, 0.85, 0.59, 1.15, math.radians(-18)),
+        ("Rollbar_Left", -0.68, -0.15, 0.79, 1.45, 0),
+        ("Rollbar_Right", 0.68, -0.15, 0.79, 1.45, 0),
+        ("Rollbar_Front_L", -0.68, 0.45, 0.59, 1.15, -math.radians(18)),
+        ("Rollbar_Front_R", 0.68, 0.45, 0.59, 1.15, -math.radians(18)),
+        ("Rollbar_Rear_L", -0.68, -0.85, 0.59, 1.15, math.radians(18)),
+        ("Rollbar_Rear_R", 0.68, -0.85, 0.59, 1.15, math.radians(18)),
     ]
     for name, x, y, z, depth, rot_x in cage_tubes:
-        bar = add_cyl(name, (x, y, z), 0.035, depth, mat_titanium, chassis, rot=(rot_x, 0, 0))
-    # Cross beams
-    add_cyl("Rollbar_Cross", (0, 0.15, 1.46), 0.032, 1.40, mat_titanium, chassis,
+        add_cyl(name, (x, y, z), 0.035, depth, mat_titanium, chassis, rot=(rot_x, 0, 0))
+    add_cyl("Rollbar_Cross", (0, -0.15, 1.46), 0.032, 1.40, mat_titanium, chassis,
             rot=(0, math.radians(90), 0))
-    add_cyl("Rollbar_Cross_Rear", (0, 0.85, 1.10), 0.028, 1.36, mat_titanium, chassis,
+    add_cyl("Rollbar_Cross_Rear", (0, -0.85, 1.10), 0.028, 1.36, mat_titanium, chassis,
             rot=(0, math.radians(90), 0))
 
     # 6. Autonomous Navigation Mast & High-Gain Dish ---------------------------
-    mast = add_cyl("SensorMast", (0.45, -0.92, 0.89), 0.03, 0.85, mat_carbon, chassis)
-    # LiDAR turret dome
+    mast = add_cyl("SensorMast", (0.45, 0.92, 0.89), 0.03, 0.85, mat_carbon, chassis)
     add_cyl("SensorMast_LiDAR", (0, 0, 0.48), 0.09, 0.12, mat_titanium, mast)
     add_cyl("SensorMast_LiDAR_Dome", (0, 0, 0.56), 0.06, 0.05, mat_glass, mast)
-    # Stereo nav-cam pods flanking the mast
     for side, sx in (("L", -0.12), ("R", 0.12)):
         cam = add_box(f"SensorMast_NavCam_{side}", (sx, 0.06, 0.36), (0.09, 0.10, 0.07),
                       mat_carbon, mast)
         add_cyl(f"SensorMast_NavCam_Lens_{side}", (sx, 0.12, 0.36), 0.025, 0.02,
                 mat_glass, cam, rot=(0, math.radians(90), 0))
-    # High-Gain Telemetry Dish (cone axis local +Z = dish axis; rest pose aims sky)
-    dish = add_cyl("HighGain_Dish", (-0.45, -0.92, 1.19), 0.06, 0.16, mat_gold, chassis,
-                   rot=(0, 0, 0), verts=32)
-    dish.data.materials.clear()
-    dish.data.materials.append(mat_gold)
-    # Rebuild as a real dish: cone with wide rim
-    bpy.ops.object.select_all(action="DESELECT")
-    dish.select_set(True)
-    bpy.context.view_layer.objects.active = dish
-    bpy.ops.object.delete(use_global=False)
+
     bpy.ops.mesh.primitive_cone_add(radius1=0.48, radius2=0.06, depth=0.16,
-                                    location=(-0.45, -0.92, 1.19),
-                                    rotation=(math.radians(-55), math.radians(15), 0))
+                                    location=(-0.45, 0.92, 1.19),
+                                    rotation=(math.radians(55), math.radians(15), 0))
     dish = bpy.context.active_object
     dish.name = "HighGain_Dish"
     dish.data.materials.append(mat_gold)
     dish.parent = chassis
-    # Feed horn at the focal point
-    feed = add_cyl("HighGain_Feed", (-0.20, -0.85, 1.30), 0.02, 0.22, mat_titanium, chassis,
-                   rot=(math.radians(35), 0, 0))
+    add_cyl("HighGain_Feed", (-0.20, 0.85, 1.30), 0.02, 0.22, mat_titanium, chassis,
+            rot=(-math.radians(35), 0, 0))
 
     # 7. Ergonomic Flight Seats & Cockpit Center Console -----------------------
-    console = add_box("Cockpit_Console", (0, 0.05, 0.32), (0.20, 0.45, 0.35), mat_carbon, chassis)
-    # Telemetry display screen (emissive dark-glass panel)
-    add_box("Cockpit_Screen", (0, -0.02, 0.48), (0.16, 0.02, 0.12), mat_led, console)
-    # Center control yoke
-    add_cyl("Cockpit_Yoke", (0, -0.12, 0.54), 0.02, 0.18, mat_titanium, console)
-    add_cyl("Cockpit_Yoke_Grip", (0, -0.12, 0.64), 0.05, 0.04, mat_carbon, console,
+    console = add_box("Cockpit_Console", (0, -0.05, 0.32), (0.20, 0.45, 0.35), mat_carbon, chassis)
+    add_box("Cockpit_Screen", (0, 0.02, 0.48), (0.16, 0.02, 0.12), mat_led, console)
+    add_cyl("Cockpit_Yoke", (0, 0.12, 0.54), 0.02, 0.18, mat_titanium, console)
+    add_cyl("Cockpit_Yoke_Grip", (0, 0.12, 0.64), 0.05, 0.04, mat_carbon, console,
             rot=(0, math.radians(90), 0))
 
     for name, x in (("Seat_Commander", -0.38), ("Seat_Pilot", 0.38)):
-        seat_pan = add_box(f"{name}_Pan", (x, 0.12, 0.22), (0.45, 0.48, 0.12), mat_seat, chassis)
+        seat_pan = add_box(f"{name}_Pan", (x, -0.12, 0.22), (0.45, 0.48, 0.12), mat_seat, chassis)
         seat_back = add_box(
-            f"{name}_Back", (x, 0.34, 0.56), (0.44, 0.10, 0.62), mat_seat, seat_pan,
-            rot=(math.radians(-14), 0, 0),
+            f"{name}_Back", (x, -0.34, 0.56), (0.44, 0.10, 0.62), mat_seat, seat_pan,
+            rot=(math.radians(14), 0, 0),
         )
-        # 5-point harness relief straps
-        harness = add_box(
-            f"{name}_Harness", (x, 0.32, 0.56), (0.34, 0.11, 0.48), mat_harness, seat_back,
-            rot=(math.radians(-14), 0, 0),
+        add_box(
+            f"{name}_Harness", (x, -0.32, 0.56), (0.34, 0.11, 0.48), mat_harness, seat_back,
+            rot=(math.radians(14), 0, 0),
         )
-        # Shoulder straps
         for dx in (-0.14, 0.14):
             add_box(
                 f"{name}_Harness_Shoulder_{'L' if dx < 0 else 'R'}",
-                (x + dx, 0.28, 0.80), (0.05, 0.10, 0.26), mat_harness, seat_back,
-                rot=(math.radians(-14), 0, 0),
+                (x + dx, -0.28, 0.80), (0.05, 0.10, 0.26), mat_harness, seat_back,
+                rot=(math.radians(14), 0, 0),
             )
 
     # 8. Rear Scientific Payload Bed & 8 Rock Canister Docks --------------------
-    cargo_bed = add_box("CargoBed", (0, 0.88, 0.20), (1.30, 0.95, 0.16), mat_titanium, chassis)
+    cargo_bed = add_box("CargoBed", (0, -0.88, 0.20), (1.30, 0.95, 0.16), mat_titanium, chassis)
     cargo_rock_coords = [
-        (-0.42, 0.58), (-0.14, 0.58), (0.14, 0.58), (0.42, 0.58),
-        (-0.42, 1.05), (-0.14, 1.05), (0.14, 1.05), (0.42, 1.05),
+        (-0.42, -0.58), (-0.14, -0.58), (0.14, -0.58), (0.42, -0.58),
+        (-0.42, -1.05), (-0.14, -1.05), (0.14, -1.05), (0.42, -1.05),
     ]
     for idx, (rx, ry) in enumerate(cargo_rock_coords):
-        # Specimen retention ring / collar (local to cargo bed)
-        collar = add_cyl(f"Cargo_Ring_{idx + 1}", (rx, ry, 0.09), 0.10, 0.06, mat_carbon,
-                         cargo_bed)
-        # Rock specimen: authored at REST local offset relative to CargoBed
-        # (world y = 0.46 bed + 0.16 = 0.62 top surface)
+        add_cyl(f"Cargo_Ring_{idx + 1}", (rx, ry, 0.09), 0.10, 0.06, mat_carbon, cargo_bed)
         add_rock(f"Cargo_Rock_{idx + 1}", (rx, ry, 0.16), 0.085, mat_rock, cargo_bed, idx)
 
     # 9. Next-Gen 4-DOF Articulated Robotic Arm & Gripper ----------------------
-    #
-    # CORRECT PIVOT HIERARCHY (local offsets, each node's origin at its joint):
-    #   RoboticArm_Base  (azimuth yaw, +Y)      @ chassis-local (0.78, -0.35, 0.55)
-    #     RoboticArm_Shoulder (visual yoke)     @ (0, 0, 0.13)
-    #     RoboticArm_Boom    (elbow pitch, +X)  @ (0, 0, 0.13)
-    #       RoboticArm_Elbow  (visual)          @ (0, 0.92, 0)
-    #       RoboticArm_Forearm (wrist pitch)    @ (0, 0.92, 0)
-    #         RoboticArm_Wrist (visual)         @ (0, 0.82, 0)
-    #         RoboticArm_Claw  (grip pitch)     @ (0, 0.82, 0)
-    #           RoboticArm_Finger_{1..3}
-    #           RoboticArm_LaserEmitter
-    #           RoboticArm_HeldRock
-    #
-    # Boom rest pose: -35 deg pitch (forward/down toward the front-right
-    # ground, matching the rest-pose world envelope of the previous rig).
-    arm_base = add_cyl("RoboticArm_Base", (0.78, -0.35, 0.29), 0.12, 0.22, mat_titanium, chassis)
-    # Turret housing cap
+    # Joint hierarchy:
+    #   RoboticArm_Base (turret yaw, Y) @ chassis (0.78, 0.35, 0.29)
+    #     -> RoboticArm_Boom (shoulder pitch, X) @ (0, 0, 0.13)
+    #       -> RoboticArm_Forearm (elbow pitch, X) @ (0, 0.92, 0)
+    #         -> RoboticArm_Claw (wrist pitch, X) @ (0, 0.82, 0)
+    #           -> RoboticArm_LaserEmitter @ (0, 0.17, 0)
+    #           -> RoboticArm_HeldRock @ (0, 0.10, 0)
+    # Every joint has origin at its pivot center and identity rest rotation.
+    # Spars extend forward along Blender +Y (glTF -Z).
+    arm_base = add_cyl("RoboticArm_Base", (0.78, 0.35, 0.29), 0.12, 0.22, mat_titanium, chassis)
     add_cyl("RoboticArm_TurretCap", (0, 0, 0.18), 0.09, 0.14, mat_carbon, arm_base)
-    # Shoulder yoke (visual, at the elbow axis)
     add_cyl("RoboticArm_Shoulder", (0, 0, 0.13), 0.06, 0.16, mat_titanium, arm_base,
             rot=(0, math.radians(90), 0))
-    # Elbow boom spar: X-axis spar, origin at elbow joint (rear end)
-    boom = add_cyl("RoboticArm_Boom", (0, 0, 0.13), 0.045, 0.92, mat_carbon, arm_base,
-                   rot=(0, 0, math.radians(90)))
-    _set_pivot(boom, (0, -0.46, 0))
-    boom.rotation_euler = (math.radians(-35), 0, 0)
-    # Elbow actuator (visual)
+
+    # Boom: origin at shoulder joint (0, 0, 0.13) on arm_base; extends along +Y by 0.92m
+    bpy.ops.mesh.primitive_cylinder_add(
+        radius=0.045, depth=0.92, location=(0, 0.46, 0), rotation=(math.radians(90), 0, 0)
+    )
+    boom = bpy.context.active_object
+    boom.name = "RoboticArm_Boom"
+    boom.data.materials.append(mat_carbon)
+    bpy.ops.object.transform_apply(location=True, rotation=True, scale=False)
+    boom.location = (0, 0, 0.13)
+    boom.parent = arm_base
+
+    # Elbow joint visual on boom
     add_cyl("RoboticArm_Elbow", (0, 0.92, 0), 0.05, 0.14, mat_titanium, boom,
-            rot=(0, 0, math.radians(90)))
-    # Forearm spar: origin at wrist end
-    forearm = add_cyl("RoboticArm_Forearm", (0, 0.92, 0), 0.038, 0.82, mat_titanium, boom,
-                      rot=(0, 0, math.radians(90)))
-    _set_pivot(forearm, (0, -0.41, 0))
-    # Wrist gimbal (visual)
+            rot=(0, math.radians(90), 0))
+
+    # Forearm: origin at elbow joint (0, 0.92, 0) on boom; extends along +Y by 0.82m
+    bpy.ops.mesh.primitive_cylinder_add(
+        radius=0.038, depth=0.82, location=(0, 0.41, 0), rotation=(math.radians(90), 0, 0)
+    )
+    forearm = bpy.context.active_object
+    forearm.name = "RoboticArm_Forearm"
+    forearm.data.materials.append(mat_titanium)
+    bpy.ops.object.transform_apply(location=True, rotation=True, scale=False)
+    forearm.location = (0, 0.92, 0)
+    forearm.parent = boom
+
+    # Wrist visual on forearm
     add_box("RoboticArm_Wrist", (0, 0.82, 0), (0.10, 0.10, 0.12), mat_carbon, forearm)
-    # 3-finger claw effector: origin at wrist joint
-    claw = add_box("RoboticArm_Claw", (0, 0.82, 0), (0.18, 0.22, 0.14), mat_titanium, forearm)
-    # 3 articulated gripper fingers (local to claw, fanned around the grip)
+
+    # Claw: origin at wrist joint (0, 0.82, 0) on forearm
+    bpy.ops.mesh.primitive_cube_add(size=1.0, location=(0, 0.10, 0))
+    claw = bpy.context.active_object
+    claw.name = "RoboticArm_Claw"
+    claw.scale = (0.18, 0.22, 0.14)
+    claw.data.materials.append(mat_titanium)
+    bpy.ops.object.transform_apply(location=True, rotation=False, scale=True)
+    claw.location = (0, 0.82, 0)
+    claw.parent = forearm
+
+    # 3 articulated gripper fingers (local to claw, fanned around grasp axis +Y)
     for f_idx, fa in enumerate((0, 120, 240)):
         rad = math.radians(fa)
         fx = math.cos(rad) * 0.07
         fz = math.sin(rad) * 0.07
         add_box(f"RoboticArm_Finger_{f_idx + 1}", (fx, 0.10, fz), (0.025, 0.15, 0.035),
-                mat_carbon, claw, rot=(math.radians(-15), 0, 0))
-    # Green alignment laser guide (local to claw, pointing along the grasp axis)
+                mat_carbon, claw, rot=(-math.radians(15), 0, 0))
+
+    # Alignment laser emitter along +Y
     add_cyl("RoboticArm_LaserEmitter", (0, 0.17, 0), 0.015, 0.06, mat_laser, claw,
             rot=(math.radians(90), 0, 0))
-    # Held sample node: authored at REST local offset (hidden at runtime)
+    # Held rock specimen node inside grip
     add_rock("RoboticArm_HeldRock", (0, 0.10, 0), 0.075, mat_rock, claw, 99)
 
     # 10. Next-Gen Airless Compliant Lattice Wheels & Suspension ----------------
     wheel_configs = [
-        ("FL", -1.02, -1.05),
-        ("FR", 1.02, -1.05),
-        ("RL", -1.02, 1.05),
-        ("RR", 1.02, 1.05),
+        ("FL", -1.02, 1.05),
+        ("FR", 1.02, 1.05),
+        ("RL", -1.02, -1.05),
+        ("RR", 1.02, -1.05),
     ]
-    axle_z = 0.12  # chassis-local axle height (world z = 0.38 = ground + 0.41 radius)
+    axle_z = 0.12  # chassis-local axle height
 
     for label, x, y in wheel_configs:
         is_left = x < 0
@@ -394,25 +394,41 @@ def build_apollo_lrv(out_path: str):
                         rot=(0, math.radians(25 if is_left else -25), 0))
         add_cyl(f"Shock_{label}_Reservoir", (x * 0.58, y, 0.30), 0.05, 0.10, mat_gold,
                 shock, rot=(0, 0, 0))
+
         # Steering knuckle pivot empty at the axle center
         knuckle = add_empty(f"SteeringKnuckle_{label}", (x, y, axle_z), chassis)
 
-        # Wheel assembly: origin at axle center, X axis along the axle so that
-        # Three.js rotation.x = forward roll, rotation.y = steer.
-        wheel = add_cyl(f"Wheel_{label}", (0, 0, 0), 0.42, 0.32, mat_tire, knuckle,
-                        rot=(0, 0, math.radians(90)), verts=28)
-        # Central titanium motor hub
-        add_cyl(f"WheelHub_{label}", (0, 0, 0), 0.18, 0.34, mat_titanium, wheel,
-                rot=(0, 0, math.radians(90)), verts=20)
-        # Radial compliant spring lattice blades (8 arching spokes)
+        # Wheel assembly: origin at (0, 0, 0) inside knuckle.
+        # Cylinder axis oriented along X axle so Three.js rotation.x = forward roll.
+        bpy.ops.mesh.primitive_cylinder_add(
+            radius=0.42, depth=0.32, vertices=28, location=(0, 0, 0), rotation=(0, math.radians(90), 0)
+        )
+        wheel = bpy.context.active_object
+        wheel.name = f"Wheel_{label}"
+        wheel.data.materials.append(mat_tire)
+        wheel.parent = knuckle
+        bpy.ops.object.transform_apply(location=False, rotation=True, scale=False)
+
+        # Central motor hub
+        bpy.ops.mesh.primitive_cylinder_add(
+            radius=0.18, depth=0.34, vertices=20, location=(0, 0, 0), rotation=(0, math.radians(90), 0)
+        )
+        hub = bpy.context.active_object
+        hub.name = f"WheelHub_{label}"
+        hub.data.materials.append(mat_titanium)
+        hub.parent = wheel
+        bpy.ops.object.transform_apply(location=False, rotation=True, scale=False)
+
+        # Radial compliant spring lattice blades (8 arching spokes in Y-Z plane around X)
         for blade_idx in range(8):
             blade_ang = blade_idx * (360.0 / 8.0)
             rad = math.radians(blade_ang)
             add_box(f"LatticeBlade_{label}_{blade_idx + 1}",
                     (0, math.cos(rad) * 0.28, math.sin(rad) * 0.28),
                     (0.26, 0.02, 0.14), mat_tire, wheel,
-                    rot=(math.radians(-blade_ang + 25), 0, 0))
-        # Titanium chevron traction cleats (12 grousers on the outer rims)
+                    rot=(-math.radians(blade_ang + 25), 0, 0))
+
+        # Titanium chevron traction cleats (12 grousers on outer rim)
         for cleat_idx in range(12):
             cleat_ang = cleat_idx * (360.0 / 12.0)
             rad = math.radians(cleat_ang)
@@ -420,13 +436,11 @@ def build_apollo_lrv(out_path: str):
             add_box(f"Cleat_{label}_{cleat_idx + 1}",
                     (cx, math.cos(rad) * 0.425, math.sin(rad) * 0.425),
                     (0.04, 0.08, 0.035), mat_cleat, wheel,
-                    rot=(math.radians(-cleat_ang), 0, 0))
+                    rot=(-math.radians(cleat_ang), 0, 0))
 
     # 11. Low-Poly Collision Proxy Box (wire display) ---------------------------
     col_box = add_box("LRV_Collision_Box", (0, 0, 0.35), (2.25, 3.45, 0.95), None, root)
     col_box.display_type = "WIRE"
-    # Collision proxy carries no material: strip it so it exports as an
-    # invisible helper node.
     if col_box.data.materials:
         col_box.data.materials.clear()
 
@@ -444,4 +458,5 @@ def build_apollo_lrv(out_path: str):
 if __name__ == "__main__":
     out_file = sys.argv[1] if len(sys.argv) > 1 else "/home/jagosan/repos/playground/public/models/apollo_lrv.glb"
     build_apollo_lrv(out_file)
+    sys.stdout.flush()
     os._exit(0)
