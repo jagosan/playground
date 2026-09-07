@@ -1,17 +1,17 @@
 {
-  "generated_at": "2026-09-06T23:42:34.103185+00:00",
-  "pipeline_duration_s": 3.0,
+  "generated_at": "2026-09-07T02:18:17.224552+00:00",
+  "pipeline_duration_s": 9.9,
   "blender_version": "4.2.0",
   "toolchain": ".",
   "assets": [
     {
       "file": "apollo_lrv.glb",
       "path": "public/models/apollo_lrv.glb",
-      "bytes": 523000,
-      "size_mb": 0.499,
+      "bytes": 569856,
+      "size_mb": 0.543,
       "size_target_mb": 4.0,
-      "objects": 155,
-      "total_vertices": 3786,
+      "objects": 185,
+      "total_vertices": 3962,
       "materials": [
         "ArtemisWhiteComposite",
         "AstronautSeatFabric",
@@ -21,12 +21,13 @@
         "LaserEmitter",
         "LunarBasaltCargo",
         "MatteCarbonFiber",
+        "NavCamGlass",
         "TitaniumCleat",
         "TitaniumDark",
         "WovenZincWireTire"
       ],
       "preview": "public/models/previews/apollo_lrv_preview.png",
-      "preview_bytes": 726305
+      "preview_bytes": 729283
     },
     {
       "file": "lunar_rocks.glb",
@@ -75,8 +76,8 @@
       "preview_bytes": 741439
     }
   ],
-  "total_payload_bytes": 1229424,
-  "total_payload_mb": 1.172,
+  "total_payload_bytes": 1276280,
+  "total_payload_mb": 1.217,
   "total_target_mb": 15.0,
   "within_total_target": true
 }
