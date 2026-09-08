@@ -6,6 +6,7 @@
 - `docs/architecture/03-moonbuggy2.md`: High-fidelity Apollo LRV simulation, Pacejka slip, PBR regolith, Win Max 2 gamepad.
 - `docs/architecture/08-artemis-ltv-and-robotic-arm.md`: Next-gen Artemis LTV skin, airless lattice wheels, directed robotic arm retrieval rig.
 - `docs/architecture/09-3d-assembly-and-kinematics-fix.md`: Artemis LTV 3D assembly and kinematics rectification, wheel X-axle alignment, 4-DOF joint hierarchy.
+- `docs/architecture/10-road-network-and-dynamics-overhaul.md`: Graded dirt road network with banked curves, chase camera perspective fix, volumetric shadow and contact shading, and boosted powertrain dynamics.
 - `specs/`:
   - `specs/00-system-overview.md`: Project vision, minigame architecture, rendering stack.
   - `specs/01-playground-lobby.md`: 3D retro playground hub, equipment-to-minigame selector.
