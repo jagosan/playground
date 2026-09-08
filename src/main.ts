@@ -176,6 +176,17 @@ function bootstrap(): void {
   });
 
   sceneManager.start();
+
+  // Auto-launch minigame if specified in URL query (e.g. ?game=moonbuggy2)
+  const urlParams = new URLSearchParams(window.location.search);
+  const targetGame = urlParams.get('game');
+  if (targetGame === 'moonbuggy2' || targetGame === 'moon-buggy') {
+    eventBus.emit('TRANSITION_TO_MINIGAME', {
+      minigameId: targetGame,
+      equipmentId: 'direct_url',
+      name: targetGame === 'moonbuggy2' ? 'Moonbuggy 2' : 'Moon Buggy',
+    });
+  }
 }
 
 bootstrap();

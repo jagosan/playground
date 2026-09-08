@@ -38,6 +38,8 @@ export class Moonbuggy2Scene {
   private activeTargetRock: LunarRock | null = null;
   private dockingMessage = '';
   private dockingMessageTimer = 0;
+  private sunLight!: THREE.DirectionalLight;
+  private contactShadow!: THREE.Mesh;
 
   // Dust puff particles on sample retrieval
   private dustContainer!: THREE.Group;
@@ -60,28 +62,45 @@ export class Moonbuggy2Scene {
     this.scene.background = new THREE.Color(0x020205);
     this.scene.fog = new THREE.FogExp2(0x020205, 0.0018);
 
-    // 2. Harsh Unfiltered Solar Directional Light
-    const sunLight = new THREE.DirectionalLight(0xfff7ed, 4.2);
-    sunLight.position.set(120, 85, 120);
-    sunLight.castShadow = true;
-    sunLight.shadow.mapSize.width = 2048;
-    sunLight.shadow.mapSize.height = 2048;
-    sunLight.shadow.camera.near = 10;
-    sunLight.shadow.camera.far = 400;
-    sunLight.shadow.camera.left = -60;
-    sunLight.shadow.camera.right = 60;
-    sunLight.shadow.camera.top = 60;
-    sunLight.shadow.camera.bottom = -60;
-    sunLight.shadow.bias = -0.0003;
-    this.scene.add(sunLight);
+    // 2. High-Fidelity Cinematic Tone Mapping & PCF Soft Shadows
+    const renderer = this.sceneManager.renderer;
+    if (renderer) {
+      renderer.toneMapping = THREE.ACESFilmicToneMapping;
+      renderer.toneMappingExposure = 1.15;
+      renderer.shadowMap.enabled = true;
+      renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    }
 
-    // 3. Earthshine Lunar Rim Lighting
-    const earthshine = new THREE.DirectionalLight(0x38bdf8, 0.45);
-    earthshine.position.set(-150, 40, -100);
+    // 3. Perspective Field of View Adjustment for 3D Depth
+    if (this.sceneManager.camera instanceof THREE.PerspectiveCamera) {
+      this.sceneManager.camera.fov = 55;
+      this.sceneManager.camera.updateProjectionMatrix();
+    }
+
+    // 4. Oblique High-Contrast Solar Key Light with Dynamic Rover Tracking
+    this.sunLight = new THREE.DirectionalLight(0xfff7ed, 4.4);
+    this.sunLight.position.set(-75, 60, -50);
+    this.sunLight.castShadow = true;
+    this.sunLight.shadow.mapSize.width = 2048;
+    this.sunLight.shadow.mapSize.height = 2048;
+    this.sunLight.shadow.camera.near = 5;
+    this.sunLight.shadow.camera.far = 250;
+    this.sunLight.shadow.camera.left = -35;
+    this.sunLight.shadow.camera.right = 35;
+    this.sunLight.shadow.camera.top = 35;
+    this.sunLight.shadow.camera.bottom = -35;
+    this.sunLight.shadow.bias = -0.0004;
+    this.sunLight.shadow.normalBias = 0.025;
+    this.scene.add(this.sunLight);
+    this.scene.add(this.sunLight.target);
+
+    // 5. Earthshine Lunar Rim Lighting
+    const earthshine = new THREE.DirectionalLight(0x38bdf8, 0.55);
+    earthshine.position.set(120, 35, 90);
     this.scene.add(earthshine);
 
-    // 4. Subtle Ambient Fill for Lunar Surface Shadows
-    const ambientLight = new THREE.AmbientLight(0x0c1322, 0.28);
+    // 6. Subtle Ambient Fill for Lunar Surface Shadows
+    const ambientLight = new THREE.AmbientLight(0x0a101d, 0.22);
     this.scene.add(ambientLight);
   }
 
@@ -93,6 +112,35 @@ export class Moonbuggy2Scene {
     // 3D Apollo LRV Master Model (loads apollo_lrv.glb asynchronously)
     this.model = new ApolloRoverModel();
     this.scene.add(this.model.group);
+
+    // Soft Ground Contact Shadow Plane
+    let shadowTexture: THREE.Texture | null = null;
+    if (typeof document !== 'undefined') {
+      const shadowCanvas = document.createElement('canvas');
+      shadowCanvas.width = 128;
+      shadowCanvas.height = 128;
+      const sCtx = shadowCanvas.getContext('2d');
+      if (sCtx) {
+        const grad = sCtx.createRadialGradient(64, 64, 10, 64, 64, 60);
+        grad.addColorStop(0, 'rgba(0, 0, 0, 0.65)');
+        grad.addColorStop(0.55, 'rgba(0, 0, 0, 0.35)');
+        grad.addColorStop(1, 'rgba(0, 0, 0, 0)');
+        sCtx.fillStyle = grad;
+        sCtx.fillRect(0, 0, 128, 128);
+      }
+      shadowTexture = new THREE.CanvasTexture(shadowCanvas);
+    }
+    const shadowGeom = new THREE.PlaneGeometry(2.6, 3.8);
+    shadowGeom.rotateX(-Math.PI / 2);
+    const shadowMat = new THREE.MeshBasicMaterial({
+      map: shadowTexture,
+      transparent: true,
+      depthWrite: false,
+      opacity: 0.85,
+    });
+    this.contactShadow = new THREE.Mesh(shadowGeom, shadowMat);
+    this.contactShadow.position.set(0, 0.02, 0);
+    this.model.group.add(this.contactShadow);
 
     // Dual Artemis LTV High-Intensity LED Headlights
     const leftHeadlight = new THREE.SpotLight(0xf8fafc, 45, 60, Math.PI / 4.5, 0.4, 1.2);
@@ -324,22 +372,33 @@ export class Moonbuggy2Scene {
       this.physics.steerAngle
     );
 
+    // 8b. Dynamically track high-res solar shadow camera with the rover
+    if (this.sunLight) {
+      this.sunLight.target.position.copy(this.physics.position);
+      this.sunLight.position.set(
+        this.physics.position.x - 70,
+        this.physics.position.y + 55,
+        this.physics.position.z - 45
+      );
+    }
+
     // 9. Update Camera Rig (Chase or Cockpit)
     const camera = this.sceneManager.camera;
     const heading = this.physics.heading;
 
     if (this.cameraMode === 'chase') {
+      // Moved back and up another buggy-length (~3.3m back, ~2.5m up) for true 3D perspective
       const backOffset = new THREE.Vector3(0, 0, 1)
         .applyAxisAngle(new THREE.Vector3(0, 1, 0), heading)
-        .multiplyScalar(7.5);
+        .multiplyScalar(10.8);
       const idealCamPos = this.physics.position.clone().add(backOffset);
-      idealCamPos.y += 3.2;
+      idealCamPos.y += 5.7;
 
       const forwardOffset = new THREE.Vector3(0, 0, -1)
         .applyAxisAngle(new THREE.Vector3(0, 1, 0), heading)
-        .multiplyScalar(4.5);
+        .multiplyScalar(5.5);
       const idealLook = this.physics.position.clone().add(forwardOffset);
-      idealLook.y += 1.2;
+      idealLook.y += 1.0;
 
       this.chaseCamPos.lerp(idealCamPos, Math.min(1.0, 7.0 * delta));
       this.chaseLookTarget.lerp(idealLook, Math.min(1.0, 10.0 * delta));

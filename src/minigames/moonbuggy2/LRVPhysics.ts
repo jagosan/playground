@@ -323,23 +323,23 @@ export class LRVPhysics {
       }
 
       // 6. Longitudinal Powertrain & Dynamic Mass Acceleration
-      // Apollo LRV motors tuned to reach 25 km/h within governor curve (Spec 04 §2.1)
-      const nominalTraction = 480.0 * powerAvailable;
+      // High-performance electric lunar drivetrain: dramatically faster acceleration and strong hill climbing
+      const nominalTraction = 920.0 * powerAvailable;
       let driveForce = 0;
 
       if (reverse) {
-        driveForce = -throttle * (nominalTraction * 0.6);
+        driveForce = -throttle * (nominalTraction * 0.65);
       } else {
         const speedRatio = Math.min(1.0, this.forwardSpeed / this.maxSpeed);
-        const torqueCurve = Math.max(0.5, 1.0 - Math.pow(speedRatio, 4));
+        const torqueCurve = Math.max(0.65, 1.0 - Math.pow(speedRatio, 3.0));
         driveForce = throttle * nominalTraction * torqueCurve;
       }
 
-      // Braking force
-      const brakeForce = (brake * 550.0) + (handbrake ? 900.0 : 0);
+      // High-authority hydraulic / regenerative braking force
+      const brakeForce = (brake * 2400.0) + (handbrake ? 4200.0 : 0);
       if (Math.abs(this.forwardSpeed) > 0.05) {
         const brakeDirection = -Math.sign(this.forwardSpeed);
-        driveForce += brakeDirection * Math.min(Math.abs(this.forwardSpeed) * 350.0, brakeForce);
+        driveForce += brakeDirection * brakeForce;
       }
 
       // Regolith rolling resistance

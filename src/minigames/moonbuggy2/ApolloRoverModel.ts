@@ -188,8 +188,13 @@ export class ApolloRoverModel {
 
       this.cargoRocks = [];
 
-      // Scan and bind named nodes
+      // Scan, bind named nodes, and enable PBR volumetric shadow casting
       this.gltfRoot.traverse((child) => {
+        if ((child as THREE.Mesh).isMesh) {
+          child.castShadow = true;
+          child.receiveShadow = true;
+        }
+
         const name = child.name;
         if (name === 'SteeringKnuckle_FL') this.gltfKnuckles[0] = child;
         else if (name === 'SteeringKnuckle_FR') this.gltfKnuckles[1] = child;
