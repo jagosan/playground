@@ -6,6 +6,8 @@ export class ScienceDropStation {
   public readonly group: THREE.Group;
   public readonly position = new THREE.Vector3(0, 0, 0);
   public readonly dockingRadius = 6.0;
+  public readonly outpostName: string;
+  public readonly beaconColor: number;
 
   private dockingRing: THREE.Mesh;
   private beaconLight: THREE.PointLight;
@@ -13,18 +15,26 @@ export class ScienceDropStation {
   private ringMaterial: THREE.MeshBasicMaterial;
   private pulseTime = 0;
 
-  constructor(terrain: PhotorealisticTerrain) {
+  constructor(
+    terrain: PhotorealisticTerrain,
+    x = 0,
+    z = 0,
+    outpostName = 'Apollo Drop Station Alpha',
+    beaconColor = 0x38bdf8
+  ) {
     this.group = new THREE.Group();
+    this.outpostName = outpostName;
+    this.beaconColor = beaconColor;
 
-    const spawnY = terrain.calculateHeight(0, 0);
-    this.position.set(0, spawnY, 0);
+    const spawnY = terrain.calculateHeight(x, z);
+    this.position.set(x, spawnY, z);
     this.group.position.copy(this.position);
 
     // Glowing Docking Beacon Ring at radius 6.0m
     const ringGeom = new THREE.RingGeometry(5.8, 6.2, 48);
     ringGeom.rotateX(-Math.PI / 2);
     this.ringMaterial = new THREE.MeshBasicMaterial({
-      color: 0x0284c7,
+      color: beaconColor,
       side: THREE.DoubleSide,
       transparent: true,
       opacity: 0.85,
@@ -33,8 +43,8 @@ export class ScienceDropStation {
     this.dockingRing.position.y = 0.08;
     this.group.add(this.dockingRing);
 
-    // Cyan Strobe Beacon Light
-    this.beaconLight = new THREE.PointLight(0x38bdf8, 3.5, 25);
+    // Strobe Beacon Light
+    this.beaconLight = new THREE.PointLight(beaconColor, 3.5, 25);
     this.beaconLight.position.set(0, 4.5, 0);
     this.group.add(this.beaconLight);
 
@@ -55,7 +65,7 @@ export class ScienceDropStation {
       });
 
       this.group.add(gltf);
-      console.log('[ScienceDropStation] Drop station GLB loaded at (0, 0)');
+      console.log(`[ScienceDropStation] Drop station GLB loaded for ${this.outpostName} at (${this.position.x}, ${this.position.z})`);
     } catch (err) {
       console.warn('[ScienceDropStation] Failed to load lunar_drop_station.glb, building fallback', err);
       // Fallback base structure

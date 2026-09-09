@@ -7,6 +7,8 @@ export interface HUDNotificationState {
   dockingText?: string;
   compassDegrees: number;
   distanceToBase: number;
+  hullDamage?: number;
+  waveInfo?: string;
 }
 
 export class Moonbuggy2HUD {
@@ -19,6 +21,8 @@ export class Moonbuggy2HUD {
   private batteryPctEl: HTMLElement;
   private cargoEl: HTMLElement;
   private compassEl: HTMLElement;
+  private damageEl!: HTMLElement;
+  private waveEl!: HTMLElement;
   private promptBannerEl: HTMLElement;
   private dockingBannerEl: HTMLElement;
   private onExitCallback: () => void;
@@ -66,6 +70,16 @@ export class Moonbuggy2HUD {
         <!-- Cargo Payload Mass -->
         <div style="font-size: 11px; color: #94a3b8; margin-top: 5px;">
           CARGO: <span id="lrv2-cargo" style="color: #38bdf8; font-weight: bold;">0/8 ROCKS (+0 kg)</span>
+        </div>
+
+        <!-- Hull Damage -->
+        <div style="font-size: 11px; color: #94a3b8; margin-top: 3px;">
+          HULL DAMAGE: <span id="lrv2-damage" style="color: #4ade80; font-weight: bold;">0%</span>
+        </div>
+
+        <!-- Wave / Rivals -->
+        <div style="font-size: 11px; color: #94a3b8; margin-top: 3px;">
+          RUN: <span id="lrv2-wave" style="color: #f59e0b; font-weight: bold;">WAVE 1 (2 RIVALS ACTIVE)</span>
         </div>
 
         <!-- Base Compass -->
@@ -118,6 +132,8 @@ export class Moonbuggy2HUD {
     this.batteryBarEl = this.container.querySelector('#lrv2-battery-bar') as HTMLElement;
     this.batteryPctEl = this.container.querySelector('#lrv2-battery-pct') as HTMLElement;
     this.cargoEl = this.container.querySelector('#lrv2-cargo') as HTMLElement;
+    this.damageEl = this.container.querySelector('#lrv2-damage') as HTMLElement;
+    this.waveEl = this.container.querySelector('#lrv2-wave') as HTMLElement;
     this.compassEl = this.container.querySelector('#lrv2-compass') as HTMLElement;
     this.promptBannerEl = this.container.querySelector('#lrv2-prompt-banner') as HTMLElement;
     this.dockingBannerEl = this.container.querySelector('#lrv2-docking-banner') as HTMLElement;
@@ -163,6 +179,24 @@ export class Moonbuggy2HUD {
     if (this.cargoEl) {
       const addedMass = physics.rockCount * physics.rockMass;
       this.cargoEl.textContent = `${physics.rockCount}/${physics.maxRocks} ROCKS (+${addedMass} kg)`;
+    }
+
+    // 3b. Hull Damage
+    if (this.damageEl && navState && navState.hullDamage !== undefined) {
+      const dmg = Math.round(navState.hullDamage);
+      this.damageEl.textContent = `${dmg}%`;
+      if (dmg < 25) {
+        this.damageEl.style.color = '#4ade80';
+      } else if (dmg < 65) {
+        this.damageEl.style.color = '#facc15';
+      } else {
+        this.damageEl.style.color = '#ef4444';
+      }
+    }
+
+    // 3c. Wave / Competitor status
+    if (this.waveEl && navState && navState.waveInfo) {
+      this.waveEl.textContent = navState.waveInfo;
     }
 
     // 4. Navigation Compass to Base (0, 0)
