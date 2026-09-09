@@ -9,6 +9,9 @@ import { Moonbuggy2HUD, HUDNotificationState } from './Moonbuggy2HUD';
 import { LunarRockField, LunarRock } from './LunarRockField';
 import { ScienceDropStation } from './ScienceDropStation';
 import { RoboticArmController } from './RoboticArmController';
+import { RoverCollisionSystem, RoverCollider } from './RoverCollisionSystem';
+import { NPCCompetitorController, NPCCompetitor } from './NPCCompetitorController';
+import { LunarWaveManager } from './LunarWaveManager';
 
 interface DustParticle {
   mesh: THREE.Mesh;
@@ -40,6 +43,12 @@ export class Moonbuggy2Scene {
   private dockingMessageTimer = 0;
   private sunLight!: THREE.DirectionalLight;
   private contactShadow!: THREE.Mesh;
+  private collisionSystem!: RoverCollisionSystem;
+  private npcController!: NPCCompetitorController;
+  private waveManager!: LunarWaveManager;
+  private rivalDropStations: ScienceDropStation[] = [];
+  private npcVisualGroups: { id: string; group: THREE.Group }[] = [];
+  private playerDamage = 0;
 
   // Dust puff particles on sample retrieval
   private dustContainer!: THREE.Group;
@@ -170,6 +179,25 @@ export class Moonbuggy2Scene {
     this.dropStation = new ScienceDropStation(this.terrain);
     this.scene.add(this.dropStation.group);
 
+    // Dedicated Rival Science Drop Stations per architecture blueprint
+    // Outpost Beta (Valkyrie Mining Drone Station) at (-75, 45) with Amber Beacon
+    const outpostBeta = new ScienceDropStation(this.terrain, -75, 45, 'Valkyrie Outpost Beta', 0xf59e0b);
+    this.scene.add(outpostBeta.group);
+    this.rivalDropStations.push(outpostBeta);
+
+    // Outpost Gamma (Kaguya Autonomous Station) at (80, -60) with Purple Beacon
+    const outpostGamma = new ScienceDropStation(this.terrain, 80, -60, 'Kaguya Outpost Gamma', 0xa855f7);
+    this.scene.add(outpostGamma.group);
+    this.rivalDropStations.push(outpostGamma);
+
+    // Collision physics & NPC controller & Wave manager
+    this.collisionSystem = new RoverCollisionSystem();
+    this.npcController = new NPCCompetitorController();
+    this.waveManager = new LunarWaveManager();
+
+    // Spawn initial rival competitors
+    this.spawnCompetitors();
+
     // Regolith Dust Particle Container
     this.dustContainer = new THREE.Group();
     this.scene.add(this.dustContainer);
@@ -222,6 +250,61 @@ export class Moonbuggy2Scene {
         life,
         maxLife: life,
       });
+    }
+  }
+
+  private spawnCompetitors(): void {
+    const factions = [
+      {
+        id: 'valkyrie-01',
+        name: 'Valkyrie Mining Drone',
+        color: 0xf59e0b,
+        basePos: new THREE.Vector3(-75, 0, 45),
+        startPos: new THREE.Vector3(-65, 0, 40),
+      },
+      {
+        id: 'kaguya-02',
+        name: 'Kaguya Prospector',
+        color: 0xa855f7,
+        basePos: new THREE.Vector3(80, 0, -60),
+        startPos: new THREE.Vector3(70, 0, -55),
+      },
+    ];
+
+    for (const f of factions) {
+      const groundY = this.terrain.calculateHeight(f.startPos.x, f.startPos.z) + 0.6;
+      f.startPos.y = groundY;
+
+      const competitor: NPCCompetitor = {
+        id: f.id,
+        name: f.name,
+        position: f.startPos.clone(),
+        velocity: new THREE.Vector3(0, 0, 0),
+        heading: Math.random() * Math.PI * 2,
+        mass: 700,
+        radius: 1.6,
+        isPlayer: false,
+        damage: 0,
+        totalDelivered: 0,
+      };
+      this.npcController.addCompetitor(competitor);
+
+      // Create distinctive visual rover model for competitor with colored beacon
+      const npcModel = new ApolloRoverModel();
+      const beaconLight = new THREE.PointLight(f.color, 4.0, 18);
+      beaconLight.position.set(0, 2.2, 0);
+      npcModel.group.add(beaconLight);
+
+      const beaconMesh = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.12, 0.12, 0.4, 8),
+        new THREE.MeshBasicMaterial({ color: f.color })
+      );
+      beaconMesh.position.set(0, 2.0, 0);
+      npcModel.group.add(beaconMesh);
+
+      npcModel.group.position.copy(f.startPos);
+      this.scene.add(npcModel.group);
+      this.npcVisualGroups.push({ id: f.id, group: npcModel.group });
     }
   }
 
@@ -283,7 +366,51 @@ export class Moonbuggy2Scene {
 
     // 4. Update Drop Station & Arm Controller
     this.dropStation.update(delta);
+    for (const st of this.rivalDropStations) {
+      st.update(delta);
+    }
     this.armController.update(delta);
+
+    // 4b. Update NPC Competitors & Visual Models
+    this.npcController.update(delta);
+    const competitors = this.npcController.getCompetitors();
+    for (const comp of competitors) {
+      const visual = this.npcVisualGroups.find((v) => v.id === comp.id);
+      if (visual) {
+        const groundY = this.terrain.calculateHeight(comp.position.x, comp.position.z) + 0.6;
+        visual.group.position.set(comp.position.x, groundY, comp.position.z);
+        visual.group.rotation.y = comp.heading;
+      }
+    }
+
+    // 4c. Vehicle-to-Vehicle Collision Detection & Impulse Physics
+    const playerCollider: RoverCollider = {
+      id: 'player',
+      position: this.physics.position,
+      velocity: this.physics.velocity,
+      heading: this.physics.heading,
+      mass: this.physics.currentMass,
+      radius: 1.6,
+      isPlayer: true,
+      damage: this.playerDamage,
+    };
+    const allColliders: RoverCollider[] = [playerCollider, ...competitors];
+    const impacts = this.collisionSystem.checkCollisions(allColliders);
+    for (const imp of impacts) {
+      if (imp.roverAId === 'player' || imp.roverBId === 'player') {
+        const isA = imp.roverAId === 'player';
+        const appliedDmg = isA ? imp.damageA : imp.damageB;
+        this.playerDamage = Math.min(100, this.playerDamage + appliedDmg);
+
+        // Apply physical bounce impulse to player velocity
+        const bounceDir = isA ? imp.normal.clone().negate() : imp.normal.clone();
+        const deltaV = Math.abs(imp.impulseMagnitude) / this.physics.currentMass;
+        this.physics.velocity.addScaledVector(bounceDir, deltaV * 0.45);
+
+        // Spawn regolith collision puff
+        this.spawnDustPuff(imp.impactPoint);
+      }
+    }
 
     // 5. Update Regolith Dust Particles (1/6th lunar gravity g=1.62 m/s^2)
     for (let i = this.dustParticles.length - 1; i >= 0; i--) {
@@ -439,6 +566,8 @@ export class Moonbuggy2Scene {
       dockingText: this.dockingMessageTimer > 0 ? this.dockingMessage : undefined,
       compassDegrees: bearingDeg,
       distanceToBase: distToBase,
+      hullDamage: this.playerDamage,
+      waveInfo: `RUN: ${this.waveManager.waveState} | RIVALS: VALKYRIE (${competitors[0]?.totalDelivered ?? 0}), KAGUYA (${competitors[1]?.totalDelivered ?? 0})`,
     };
 
     this.hud.update(this.physics, gp, this.cameraMode, navState);
