@@ -217,6 +217,8 @@ export class ApolloRoverModel {
         } else if (name.startsWith('Cargo_Rock_')) {
           this.cargoRocks.push(child);
           child.visible = false; // Hidden until collected into cargo
+        } else if (name.startsWith('Cargo_Ring_')) {
+          child.visible = false; // Eliminate flat unconvincing circular discs on rear cargo deck
         }
       });
 
