@@ -420,12 +420,12 @@ export class PhotorealisticTerrain {
       canvas.height = 256;
       const ctx = canvas.getContext('2d');
       if (ctx) {
-        // Base compacted gray-brown regolith
-        ctx.fillStyle = '#4a505c';
+        // Base excavated dark lunar mare basalt
+        ctx.fillStyle = '#181b20';
         ctx.fillRect(0, 0, 256, 256);
 
         // Grader blade longitudinal striations
-        ctx.strokeStyle = '#3e434e';
+        ctx.strokeStyle = '#252a32';
         ctx.lineWidth = 3;
         for (let y = 0; y < 256; y += 8) {
           ctx.beginPath();
@@ -434,15 +434,15 @@ export class PhotorealisticTerrain {
           ctx.stroke();
         }
 
-        // Two dark tire/tread ruts (left: ~65px, right: ~190px)
-        ctx.fillStyle = '#2f343d';
+        // Two deep dark tire/tread ruts (compacted crushed basalt)
+        ctx.fillStyle = '#0f1114';
         ctx.fillRect(45, 0, 40, 256);
         ctx.fillRect(170, 0, 40, 256);
 
-        // Surface gravel grain
+        // Surface basalt gravel grain
         const imgData = ctx.getImageData(0, 0, 256, 256);
         for (let i = 0; i < imgData.data.length; i += 4) {
-          const noise = (Math.random() - 0.5) * 20;
+          const noise = (Math.random() - 0.5) * 14;
           imgData.data[i] = Math.min(255, Math.max(0, imgData.data[i] + noise));
           imgData.data[i + 1] = Math.min(255, Math.max(0, imgData.data[i + 1] + noise));
           imgData.data[i + 2] = Math.min(255, Math.max(0, imgData.data[i + 2] + noise));
@@ -456,10 +456,10 @@ export class PhotorealisticTerrain {
     }
 
     const roadMat = new THREE.MeshStandardMaterial({
-      color: 0x5a606d, // Distinct darker compacted bulldozed dirt
+      color: 0x242830, // Deep dark lunar mare basalt under surface dust
       map: roadTexture,
-      roughness: 0.90,
-      metalness: 0.12,
+      roughness: 0.94,
+      metalness: 0.18,
       flatShading: false,
     });
 

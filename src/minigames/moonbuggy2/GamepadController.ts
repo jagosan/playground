@@ -61,34 +61,36 @@ export class GamepadController {
     const gamepads = navigator.getGamepads();
     if (!gamepads) return defaultState;
 
-    // Pick the most valid gamepad candidate (skipping virtual touchpads / motion sensors with 0 buttons)
+    // 1. Check all connected gamepads for active input
     let gp: Gamepad | null = null;
-
-    // 1. Prefer previously active gamepad if still connected
-    if (this.connectedGamepadIndex !== null && gamepads[this.connectedGamepadIndex]?.connected) {
-      gp = gamepads[this.connectedGamepadIndex];
-    }
-
-    // 2. Scan for gamepad with at least 6 buttons (standard controllers)
-    if (!gp) {
-      for (let i = 0; i < gamepads.length; i++) {
-        const candidate = gamepads[i];
-        if (candidate && candidate.connected && candidate.buttons && candidate.buttons.length >= 6) {
-          gp = candidate;
-          this.connectedGamepadIndex = i;
-          break;
-        }
+    for (let i = 0; i < gamepads.length; i++) {
+      const cand = gamepads[i];
+      if (!cand || !cand.connected) continue;
+      const isAnyBtnPressed = cand.buttons?.some((b) => b.pressed || (typeof b.value === 'number' && b.value > 0.15));
+      const isAnyAxisActive = cand.axes?.some((a, idx) => {
+        // Exclude trigger axes that may rest at -1 or 1
+        if (idx === 2 || idx === 4 || idx === 5) return false;
+        return Math.abs(a) > 0.25;
+      });
+      if (isAnyBtnPressed || isAnyAxisActive) {
+        gp = cand;
+        this.connectedGamepadIndex = i;
+        break;
       }
     }
 
-    // 3. Fallback to any connected gamepad with axes or buttons
+    // 2. If no active inputs right now, use previously active or first valid gamepad
     if (!gp) {
-      for (let i = 0; i < gamepads.length; i++) {
-        const candidate = gamepads[i];
-        if (candidate && candidate.connected && (candidate.buttons.length > 0 || candidate.axes.length > 0)) {
-          gp = candidate;
-          this.connectedGamepadIndex = i;
-          break;
+      if (this.connectedGamepadIndex !== null && gamepads[this.connectedGamepadIndex]?.connected) {
+        gp = gamepads[this.connectedGamepadIndex];
+      } else {
+        for (let i = 0; i < gamepads.length; i++) {
+          const cand = gamepads[i];
+          if (cand && cand.connected && cand.buttons && cand.buttons.length >= 4) {
+            gp = cand;
+            this.connectedGamepadIndex = i;
+            break;
+          }
         }
       }
     }
@@ -100,14 +102,6 @@ export class GamepadController {
       if (Math.abs(val) < threshold) return 0;
       const sign = Math.sign(val);
       return sign * ((Math.abs(val) - threshold) / (1 - threshold));
-    };
-
-    // Helper to get button value or pressed status
-    const getBtnVal = (index: number): number => {
-      const btn = gp.buttons[index];
-      if (!btn) return 0;
-      if (typeof btn.value === 'number' && btn.value > 0) return btn.value;
-      return btn.pressed ? 1.0 : 0;
     };
 
     const isBtnPressed = (index: number): boolean => {
@@ -126,48 +120,64 @@ export class GamepadController {
     // -------------------------------------------------------------------------
     // 2. THROTTLE (RT):
     //    - Button 7 (Standard RT trigger)
+    //    - Axis 5 (Linux XInput RT)
+    //    - Axis 2 (DirectInput / Alternative RT)
     //    - Button 5 (RB - Right Bumper fallback)
     //    - Button 12 (D-Pad Up fallback)
-    //    - Axis 5 (Standard Linux / joydev RT axis, resting at -1, max at +1)
-    //    - Axis 2 (Alternative raw RT trigger axis)
     // -------------------------------------------------------------------------
-    let throttle = getBtnVal(7); // RT
-
-    // Check RB or D-Pad Up
-    if (throttle < 0.1) {
-      if (isBtnPressed(5)) throttle = 1.0; // RB
-      else if (isBtnPressed(12)) throttle = 1.0; // D-Pad Up
+    let throttle = 0;
+    const btn7 = gp.buttons[7];
+    if (btn7) {
+      if (typeof btn7.value === 'number' && btn7.value > 0.05) {
+        throttle = btn7.value;
+      } else if (btn7.pressed) {
+        throttle = 1.0;
+      }
     }
 
-    // Check raw analog axis fallback for Linux / non-standard controllers
+    // Check Axis 5 (Linux XInput RT trigger: rests at -1.0, max at 1.0)
+    if (throttle < 0.05 && gp.axes[5] !== undefined && gp.axes[5] > -0.80) {
+      throttle = Math.max(throttle, (gp.axes[5] + 1) / 2);
+    }
+
+    // Check Axis 2 (Alternative RT axis)
+    if (throttle < 0.05 && gp.axes[2] !== undefined && gp.axes[2] > -0.80 && gp.axes.length >= 4) {
+      throttle = Math.max(throttle, (gp.axes[2] + 1) / 2);
+    }
+
+    // Bumpers & D-Pad Up
     if (throttle < 0.05) {
-      // Axis 5 on Linux XInput: -1.0 (unpressed) to 1.0 (fully pressed)
-      if (gp.axes[5] !== undefined && gp.axes[5] > -0.85) {
-        throttle = Math.max(0, (gp.axes[5] + 1) / 2);
-      } else if (gp.axes[2] !== undefined && gp.axes[2] > -0.85 && (gp.mapping === '' || !gp.buttons[7])) {
-        throttle = Math.max(0, (gp.axes[2] + 1) / 2);
-      }
+      if (isBtnPressed(5)) throttle = 1.0;       // RB
+      else if (isBtnPressed(12)) throttle = 1.0; // D-Pad Up
     }
     throttle = THREE_clamp01(throttle);
 
     // -------------------------------------------------------------------------
     // 3. BRAKE (LT):
     //    - Button 6 (Standard LT trigger)
+    //    - Axis 4 (Linux XInput LT)
     //    - Button 4 (LB - Left Bumper fallback)
     //    - Button 13 (D-Pad Down fallback)
-    //    - Axis 4 or Axis 2 (Standard Linux / joydev LT axis)
     // -------------------------------------------------------------------------
-    let brake = getBtnVal(6); // LT
-
-    if (brake < 0.1) {
-      if (isBtnPressed(4)) brake = 1.0; // LB
-      else if (isBtnPressed(13)) brake = 1.0; // D-Pad Down
+    let brake = 0;
+    const btn6 = gp.buttons[6];
+    if (btn6) {
+      if (typeof btn6.value === 'number' && btn6.value > 0.05) {
+        brake = btn6.value;
+      } else if (btn6.pressed) {
+        brake = 1.0;
+      }
     }
 
+    // Check Axis 4 (Linux XInput LT trigger: rests at -1.0, max at 1.0)
+    if (brake < 0.05 && gp.axes[4] !== undefined && gp.axes[4] > -0.80) {
+      brake = Math.max(brake, (gp.axes[4] + 1) / 2);
+    }
+
+    // Bumpers & D-Pad Down
     if (brake < 0.05) {
-      if (gp.axes[4] !== undefined && gp.axes[4] > -0.85) {
-        brake = Math.max(0, (gp.axes[4] + 1) / 2);
-      }
+      if (isBtnPressed(4)) brake = 1.0;       // LB
+      else if (isBtnPressed(13)) brake = 1.0; // D-Pad Down
     }
     brake = THREE_clamp01(brake);
 

@@ -95,14 +95,14 @@ export class LRVPhysics {
   public readonly wheelRadius = 0.41;   // 32-inch diameter
   public readonly restSuspension = 0.52;// Extension rest length
 
-  // Suspension & Damper Parameters (Spec 06 §2.2: k=7500 N/m, c=950 Ns/m)
-  private springK = 7500.0;             // N/m per wheel
-  private damperBump = 1350.0;          // Ns/m compression
-  private damperRebound = 1850.0;       // Ns/m extension
+  // Suspension & Damper Parameters (Spec 06 §2.2: tuned for high-speed lunar terrain adhesion)
+  private springK = 9200.0;             // N/m per wheel
+  private damperBump = 2400.0;          // Ns/m compression
+  private damperRebound = 3800.0;       // Ns/m extension - critical damping prevents trampoline bouncing
 
-  // Drive & Powertrain (Spec 06 §2.2: 4 x 1.2 kW motors, 25.0 km/h hard cap)
-  public readonly maxSpeed = 6.944;     // 25.0 km/h (6.944 m/s)
-  public maxTorque = 360.0;             // Total Nm traction force
+  // Drive & Powertrain (Upgraded for 80.0 km/h circuit racing)
+  public readonly maxSpeed = 22.222;    // 80.0 km/h (22.222 m/s)
+  public maxTorque = 900.0;             // Total Nm traction force
   public maxSteerAngle = 0.48;          // ~27.5 degrees
   private steerSpeed = 4.2;
 
@@ -309,7 +309,13 @@ export class LRVPhysics {
       }
     }
 
+    const wasAirborne = this.isAirborne;
     this.isAirborne = groundedCount === 0;
+
+    // Dampen vertical velocity sharply on touchdown to eliminate floaty lunar bouncing
+    if (wasAirborne && !this.isAirborne && this.velocity.y < 0) {
+      this.velocity.y *= 0.20;
+    }
 
     // 5. Vertical Acceleration & Lunar Gravity Integration
     this.velocity.y -= this.gravity * dt;
@@ -318,25 +324,32 @@ export class LRVPhysics {
       const upwardAccel = totalSuspensionForce / currentMass;
       this.velocity.y += upwardAccel * dt;
 
-      if (this.velocity.y < 0 && upwardAccel > this.gravity * 0.9) {
-        this.velocity.y *= 0.75; // Settle rebound cleanly
+      if (this.velocity.y < 0 && upwardAccel > this.gravity * 0.8) {
+        this.velocity.y *= 0.65; // Settle rebound cleanly
       }
 
+      // Surface adhesion downforce: keeps high-speed rover planted to the moon dust/track
+      const absSpeed = Math.abs(this.forwardSpeed);
+      const radiusDist = Math.sqrt(this.position.x * this.position.x + this.position.z * this.position.z);
+      const isOnBasaltTrack = radiusDist >= 48.0 && radiusDist <= 88.0;
+      const adhesionDownforce = (absSpeed * 2.8 + Math.pow(absSpeed, 1.45) * 1.1) * (isOnBasaltTrack ? 1.4 : 1.0);
+      this.velocity.y -= (adhesionDownforce / currentMass) * dt;
+
       // 6. Longitudinal Powertrain & Dynamic Mass Acceleration
-      // High-performance electric lunar drivetrain: dramatically faster acceleration and strong hill climbing
-      const nominalTraction = 920.0 * powerAvailable;
+      // High-performance electric lunar drivetrain: 80 km/h top speed with robust hill climbing
+      const nominalTraction = 2600.0 * powerAvailable;
       let driveForce = 0;
 
       if (reverse) {
         driveForce = -throttle * (nominalTraction * 0.65);
       } else {
         const speedRatio = Math.min(1.0, this.forwardSpeed / this.maxSpeed);
-        const torqueCurve = Math.max(0.65, 1.0 - Math.pow(speedRatio, 3.0));
+        const torqueCurve = Math.max(0.55, 1.0 - Math.pow(speedRatio, 2.5));
         driveForce = throttle * nominalTraction * torqueCurve;
       }
 
       // High-authority hydraulic / regenerative braking force
-      const brakeForce = (brake * 2400.0) + (handbrake ? 4200.0 : 0);
+      const brakeForce = (brake * 3600.0) + (handbrake ? 6000.0 : 0);
       if (Math.abs(this.forwardSpeed) > 0.05) {
         const brakeDirection = -Math.sign(this.forwardSpeed);
         driveForce += brakeDirection * brakeForce;
@@ -348,8 +361,8 @@ export class LRVPhysics {
       const acceleration = netForce / currentMass;
 
       this.forwardSpeed += acceleration * dt;
-      // Governed speed cap at 25 km/h (6.944 m/s)
-      this.forwardSpeed = THREE.MathUtils.clamp(this.forwardSpeed, -3.5, this.maxSpeed);
+      // Governed speed cap at 80 km/h (22.222 m/s)
+      this.forwardSpeed = THREE.MathUtils.clamp(this.forwardSpeed, -6.0, this.maxSpeed);
 
       // 7. Yaw Dynamics (Counter-steer Ackermann turning with dynamic yaw inertia)
       if (Math.abs(this.forwardSpeed) > 0.1) {
@@ -363,8 +376,33 @@ export class LRVPhysics {
         this.angularVelocity *= 0.85;
       }
     } else {
-      // Airborne damping
+      // Airborne dynamics & gyroscopic / RCS attitude recovery
       this.forwardSpeed *= 0.998;
+
+      // Active airborne attitude recovery: steer controls roll/yaw, throttle/brake controls pitch
+      if (Math.abs(steerInput) > 0.05) {
+        this.roll += -steerInput * 2.2 * dt;
+        this.heading += -steerInput * 1.5 * dt;
+      }
+      if (Math.abs(throttle) > 0.05) {
+        this.pitch += throttle * 1.8 * dt; // Pitch nose up
+      }
+      if (Math.abs(brake) > 0.05) {
+        this.pitch -= brake * 1.8 * dt;    // Pitch nose down
+      }
+
+      // Auto-leveling torque toward local terrain slope beneath the rover
+      const gAhead = this.terrain.getHeightAt(
+        this.position.x - Math.sin(this.heading) * 3.0,
+        this.position.z - Math.cos(this.heading) * 3.0
+      );
+      const gBehind = this.terrain.getHeightAt(
+        this.position.x + Math.sin(this.heading) * 3.0,
+        this.position.z + Math.cos(this.heading) * 3.0
+      );
+      const targetAirPitch = Math.atan2(gAhead - gBehind, 6.0);
+      this.pitch += (targetAirPitch - this.pitch) * Math.min(1.0, 4.0 * dt);
+      this.roll += (0 - this.roll) * Math.min(1.0, 4.0 * dt);
     }
 
     // 8. Velocity Vector & Position Integration
@@ -400,9 +438,6 @@ export class LRVPhysics {
       const rightGround = (g1 + g3) * 0.5;
       const targetRoll = Math.atan2(rightGround - leftGround, this.trackWidth);
       this.roll += (targetRoll - this.roll) * Math.min(1.0, 9.0 * dt);
-    } else {
-      this.pitch *= 0.98;
-      this.roll *= 0.98;
     }
   }
 }
