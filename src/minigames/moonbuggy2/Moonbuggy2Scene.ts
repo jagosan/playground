@@ -462,8 +462,8 @@ export class Moonbuggy2Scene {
       this.physics.batteryLevel > 0.02
     );
 
-    // Trigger Robotic Arm directed pickup on Button A or Space
-    if (canSample && (gp.handbrake || this.keyState['Space'])) {
+    // Trigger Robotic Arm directed pickup on Button A, KeyE, or Space
+    if (canSample && (gp.actionSample || this.keyState['KeyE'] || this.keyState['Space'])) {
       const target = this.activeTargetRock!;
       this.armController.triggerPickup({
         targetWorldPos: target.position,

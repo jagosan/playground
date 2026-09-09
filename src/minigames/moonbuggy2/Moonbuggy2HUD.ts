@@ -220,11 +220,11 @@ export class Moonbuggy2HUD {
     // 6. Gamepad tag
     if (this.gamepadIndicator) {
       if (gamepad.connected) {
-        this.gamepadIndicator.textContent = 'GAMEPAD (XINPUT)';
+        this.gamepadIndicator.textContent = `GAMEPAD: ${gamepad.rawDebug}`;
         this.gamepadIndicator.style.background = '#15803d';
         this.gamepadIndicator.style.color = '#ffffff';
       } else {
-        this.gamepadIndicator.textContent = 'KB/TOUCH';
+        this.gamepadIndicator.textContent = 'KB/TOUCH (PRESS ANY GP BTN)';
         this.gamepadIndicator.style.background = '#334155';
         this.gamepadIndicator.style.color = '#94a3b8';
       }

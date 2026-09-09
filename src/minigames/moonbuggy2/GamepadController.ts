@@ -1,34 +1,57 @@
 export interface GamepadState {
   connected: boolean;
-  steer: number;        // -1.0 to 1.0 (Left Stick X)
-  throttle: number;     // 0.0 to 1.0 (Right Trigger RT)
-  brake: number;        // 0.0 to 1.0 (Left Trigger LT)
-  handbrake: boolean;   // Button A / South
-  reverse: boolean;     // Button X / West
-  toggleCamera: boolean;// Button Y / North
+  gamepadName: string;
+  steer: number;        // -1.0 to 1.0 (Left Stick X or D-Pad Left/Right)
+  throttle: number;     // 0.0 to 1.0 (RT, RB, D-Pad Up, or Axis 5/2)
+  brake: number;        // 0.0 to 1.0 (LT, LB, D-Pad Down, or Axis 4/2)
+  handbrake: boolean;   // Button B (East)
+  reverse: boolean;     // Button X (West)
+  toggleCamera: boolean;// Button Y (North)
+  actionSample: boolean;// Button A (South) - Retrieve rock / interact
   lookX: number;        // Right Stick X
   lookY: number;        // Right Stick Y
+  rawDebug: string;     // Short telemetry string for HUD diagnostics
 }
 
 export class GamepadController {
   private lastCameraToggle = false;
   private onCameraToggleCallback?: () => void;
+  private connectedGamepadIndex: number | null = null;
 
   constructor(onCameraToggle?: () => void) {
     this.onCameraToggleCallback = onCameraToggle;
+
+    if (typeof window !== 'undefined') {
+      window.addEventListener('gamepadconnected', (e: GamepadEvent) => {
+        console.log(`[Gamepad] Connected: ${e.gamepad.id} (index ${e.gamepad.index}, ${e.gamepad.buttons.length} buttons, ${e.gamepad.axes.length} axes)`);
+        if (this.connectedGamepadIndex === null && (e.gamepad.buttons.length >= 4 || e.gamepad.axes.length >= 2)) {
+          this.connectedGamepadIndex = e.gamepad.index;
+        }
+      });
+
+      window.addEventListener('gamepaddisconnected', (e: GamepadEvent) => {
+        console.log(`[Gamepad] Disconnected: index ${e.gamepad.index}`);
+        if (this.connectedGamepadIndex === e.gamepad.index) {
+          this.connectedGamepadIndex = null;
+        }
+      });
+    }
   }
 
   public poll(): GamepadState {
     const defaultState: GamepadState = {
       connected: false,
+      gamepadName: '',
       steer: 0,
       throttle: 0,
       brake: 0,
       handbrake: false,
       reverse: false,
       toggleCamera: false,
+      actionSample: false,
       lookX: 0,
       lookY: 0,
+      rawDebug: 'NO CONTROLLER DETECTED',
     };
 
     if (typeof navigator === 'undefined' || !navigator.getGamepads) {
@@ -38,12 +61,35 @@ export class GamepadController {
     const gamepads = navigator.getGamepads();
     if (!gamepads) return defaultState;
 
-    // Look for connected gamepad (GPD Win Max 2 / Xbox 360 controller)
+    // Pick the most valid gamepad candidate (skipping virtual touchpads / motion sensors with 0 buttons)
     let gp: Gamepad | null = null;
-    for (let i = 0; i < gamepads.length; i++) {
-      if (gamepads[i] && gamepads[i]!.connected) {
-        gp = gamepads[i];
-        break;
+
+    // 1. Prefer previously active gamepad if still connected
+    if (this.connectedGamepadIndex !== null && gamepads[this.connectedGamepadIndex]?.connected) {
+      gp = gamepads[this.connectedGamepadIndex];
+    }
+
+    // 2. Scan for gamepad with at least 6 buttons (standard controllers)
+    if (!gp) {
+      for (let i = 0; i < gamepads.length; i++) {
+        const candidate = gamepads[i];
+        if (candidate && candidate.connected && candidate.buttons && candidate.buttons.length >= 6) {
+          gp = candidate;
+          this.connectedGamepadIndex = i;
+          break;
+        }
+      }
+    }
+
+    // 3. Fallback to any connected gamepad with axes or buttons
+    if (!gp) {
+      for (let i = 0; i < gamepads.length; i++) {
+        const candidate = gamepads[i];
+        if (candidate && candidate.connected && (candidate.buttons.length > 0 || candidate.axes.length > 0)) {
+          gp = candidate;
+          this.connectedGamepadIndex = i;
+          break;
+        }
       }
     }
 
@@ -56,48 +102,114 @@ export class GamepadController {
       return sign * ((Math.abs(val) - threshold) / (1 - threshold));
     };
 
-    // Standard W3C Gamepad Mapping:
-    // Axes: 0: Left Stick X, 1: Left Stick Y, 2: Right Stick X, 3: Right Stick Y
-    // Buttons: 0: A, 1: B, 2: X, 3: Y, 4: LB, 5: RB, 6: LT, 7: RT
-    const steer = applyDeadzone(gp.axes[0] || 0);
+    // Helper to get button value or pressed status
+    const getBtnVal = (index: number): number => {
+      const btn = gp.buttons[index];
+      if (!btn) return 0;
+      if (typeof btn.value === 'number' && btn.value > 0) return btn.value;
+      return btn.pressed ? 1.0 : 0;
+    };
+
+    const isBtnPressed = (index: number): boolean => {
+      const btn = gp.buttons[index];
+      if (!btn) return false;
+      return Boolean(btn.pressed || (typeof btn.value === 'number' && btn.value > 0.4));
+    };
+
+    // -------------------------------------------------------------------------
+    // 1. STEERING: Left Stick X (axes[0]) + D-Pad Left/Right (buttons 14/15)
+    // -------------------------------------------------------------------------
+    let steer = applyDeadzone(gp.axes[0] || 0);
+    if (isBtnPressed(14)) steer = -1.0; // D-Pad Left
+    if (isBtnPressed(15)) steer = 1.0;  // D-Pad Right
+
+    // -------------------------------------------------------------------------
+    // 2. THROTTLE (RT):
+    //    - Button 7 (Standard RT trigger)
+    //    - Button 5 (RB - Right Bumper fallback)
+    //    - Button 12 (D-Pad Up fallback)
+    //    - Axis 5 (Standard Linux / joydev RT axis, resting at -1, max at +1)
+    //    - Axis 2 (Alternative raw RT trigger axis)
+    // -------------------------------------------------------------------------
+    let throttle = getBtnVal(7); // RT
+
+    // Check RB or D-Pad Up
+    if (throttle < 0.1) {
+      if (isBtnPressed(5)) throttle = 1.0; // RB
+      else if (isBtnPressed(12)) throttle = 1.0; // D-Pad Up
+    }
+
+    // Check raw analog axis fallback for Linux / non-standard controllers
+    if (throttle < 0.05) {
+      // Axis 5 on Linux XInput: -1.0 (unpressed) to 1.0 (fully pressed)
+      if (gp.axes[5] !== undefined && gp.axes[5] > -0.85) {
+        throttle = Math.max(0, (gp.axes[5] + 1) / 2);
+      } else if (gp.axes[2] !== undefined && gp.axes[2] > -0.85 && (gp.mapping === '' || !gp.buttons[7])) {
+        throttle = Math.max(0, (gp.axes[2] + 1) / 2);
+      }
+    }
+    throttle = THREE_clamp01(throttle);
+
+    // -------------------------------------------------------------------------
+    // 3. BRAKE (LT):
+    //    - Button 6 (Standard LT trigger)
+    //    - Button 4 (LB - Left Bumper fallback)
+    //    - Button 13 (D-Pad Down fallback)
+    //    - Axis 4 or Axis 2 (Standard Linux / joydev LT axis)
+    // -------------------------------------------------------------------------
+    let brake = getBtnVal(6); // LT
+
+    if (brake < 0.1) {
+      if (isBtnPressed(4)) brake = 1.0; // LB
+      else if (isBtnPressed(13)) brake = 1.0; // D-Pad Down
+    }
+
+    if (brake < 0.05) {
+      if (gp.axes[4] !== undefined && gp.axes[4] > -0.85) {
+        brake = Math.max(0, (gp.axes[4] + 1) / 2);
+      }
+    }
+    brake = THREE_clamp01(brake);
+
+    // -------------------------------------------------------------------------
+    // 4. FACE BUTTONS:
+    //    - Button 0 (A / South): Primary Action / Sample Rock / Dock
+    //    - Button 1 (B / East): Handbrake / Drift
+    //    - Button 2 (X / West): Reverse Gear
+    //    - Button 3 (Y / North): Camera Toggle
+    // -------------------------------------------------------------------------
+    const actionSample = isBtnPressed(0); // Button A
+    const handbrake = isBtnPressed(1);    // Button B
+    const reverse = isBtnPressed(2);      // Button X
+    const toggleCamera = isBtnPressed(3); // Button Y
+
     const lookX = applyDeadzone(gp.axes[2] || 0);
     const lookY = applyDeadzone(gp.axes[3] || 0);
-
-    // Triggers (LT: axis or button 6, RT: axis or button 7)
-    let throttle = 0;
-    if (gp.buttons[7]) {
-      throttle = gp.buttons[7].value;
-    } else if (gp.axes[5] !== undefined) {
-      // Direct raw axis fallback
-      throttle = (gp.axes[5] + 1) / 2;
-    }
-
-    let brake = 0;
-    if (gp.buttons[6]) {
-      brake = gp.buttons[6].value;
-    } else if (gp.axes[4] !== undefined) {
-      brake = (gp.axes[4] + 1) / 2;
-    }
-
-    const handbrake = Boolean(gp.buttons[0]?.pressed);
-    const reverse = Boolean(gp.buttons[2]?.pressed);
-    const toggleCamera = Boolean(gp.buttons[3]?.pressed);
 
     if (toggleCamera && !this.lastCameraToggle) {
       this.onCameraToggleCallback?.();
     }
     this.lastCameraToggle = toggleCamera;
 
+    const rawDebug = `RT:${(throttle * 100).toFixed(0)}% LT:${(brake * 100).toFixed(0)}% ST:${(steer * 100).toFixed(0)}%`;
+
     return {
       connected: true,
+      gamepadName: gp.id || 'Standard Gamepad',
       steer,
       throttle,
       brake,
       handbrake,
       reverse,
       toggleCamera,
+      actionSample,
       lookX,
       lookY,
+      rawDebug,
     };
   }
+}
+
+function THREE_clamp01(v: number): number {
+  return Math.max(0, Math.min(1, v));
 }
