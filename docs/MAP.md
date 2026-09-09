@@ -8,6 +8,7 @@
 - `docs/architecture/09-3d-assembly-and-kinematics-fix.md`: Artemis LTV 3D assembly and kinematics rectification, wheel X-axle alignment, 4-DOF joint hierarchy.
 - `docs/architecture/10-road-network-and-dynamics-overhaul.md`: Graded dirt road network with banked curves, chase camera perspective fix, volumetric shadow and contact shading, and boosted powertrain dynamics.
 - `docs/architecture/11-npc-competitors-and-collision-physics.md`: NPC rover competitors, autonomous harvesting state machine, dedicated science stations, rover-to-rover collision impulses, hull damage models, and timed wave system.
+- `docs/architecture/12-lunar-frontier-economy-and-multiplayer.md`: Babylon.js 3D engine, Fastify WebSocket authoritative server, SQLite persistent moon economy, rail lines, mine tunnels, EVA suit and buggy.
 - `specs/`:
   - `specs/00-system-overview.md`: Project vision, minigame architecture, rendering stack.
   - `specs/01-playground-lobby.md`: 3D retro playground hub, equipment-to-minigame selector.
@@ -18,6 +19,14 @@
   - `specs/06-moonbuggy2-engine-m2.md`: Three.js GLTF loader integration, articulated kinematics, HUD telemetry.
   - `specs/07-asset-pipeline-handoff.md`: Multi-agent handoff, Blender 4.2 pipeline execution, verification.
   - `specs/08-artemis-ltv-and-robotic-arm.md`: Artemis LTV 3D model hierarchy, PBR materials, 4-DOF arm kinematics, sample collection.
+  - `specs/12-lunar-frontier.md`: Persistent multiplayer moon economy, Babylon.js client, SQLite state, rail lines, mine tunnels, suit and buggy.
+
+## Lunar Frontier Multiplayer & Economy Subsystem (Spec 12)
+- `games/lunar-frontier/server/`: Fastify + `ws` server, SQLite schema, market pricing, 20Hz tick (`LunarServer.ts`, `Database.ts`).
+- `games/lunar-frontier/src/engine/`: Babylon.js scene manager, lighting, vacuum shadows (`WorldScene.ts`, `CameraRig.ts`).
+- `games/lunar-frontier/src/entities/`: Astronaut suit EVA controller, open-top buggy, dock mechs (`AstronautSuit.ts`, `OpenBuggy.ts`, `LoadingDockMech.ts`).
+- `games/lunar-frontier/src/infrastructure/`: Procedural tunnel mesh builder, rail line spline renderer, ore cart runner (`TunnelNetwork.ts`, `RailSystem.ts`).
+- `games/lunar-frontier/src/network/`: WebSocket client, state delta interpolator, player manager (`NetworkClient.ts`).
 
 ## Blender Asset Pipeline (Spec 05)
 - `scripts/build_lunar_assets.py`: Standalone Blender 4.2 headless asset generator (`--all` / per-phase flags; previews + `manifest.json`).
