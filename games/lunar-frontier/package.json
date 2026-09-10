@@ -4,7 +4,9 @@
   "description": "Lunar Frontier Multiplayer Economy and Subterranean Simulation",
   "main": "index.ts",
   "scripts": {
-    "start": "node index.ts"
+    "start": "node index.ts",
+    "smoke:world": "node --no-warnings scripts/smoke-lunarworld.ts",
+    "typecheck:server": "tsc -p tsconfig.server.json"
   },
   "dependencies": {
     "express": "^4.21.0",
