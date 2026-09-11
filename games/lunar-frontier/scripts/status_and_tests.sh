@@ -43,6 +43,11 @@ cd "${ROOT_DIR}"
 npx tsx scripts/smoke-worldscene.ts
 
 echo ""
+echo "--- [6/6] Verifying AstronautSuit Avatar Entity (TASK-PLAY-049a) ---"
+cd "${ROOT_DIR}"
+npx tsx scripts/smoke-eva-suit.ts
+
+echo ""
 echo "=========================================================="
 echo "🎉 ALL VERIFIED CORE SYSTEMS ARE GREEN!"
 echo "=========================================================="
