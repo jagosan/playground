@@ -9,6 +9,9 @@
     "typecheck:server": "tsc -p tsconfig.server.json"
   },
   "dependencies": {
+    "@babylonjs/core": "^9.26.0",
+    "@babylonjs/gui": "^9.26.0",
+    "@babylonjs/materials": "^9.26.0",
     "express": "^4.21.0",
     "fastify": "^5.12.3",
     "sqlite3": "^5.1.0",
