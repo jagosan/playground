@@ -58,9 +58,14 @@ cd "${ROOT_DIR}"
 npx tsx scripts/smoke-tunnel-network.ts
 
 echo ""
-echo "--- [9/9] Verifying RailSystem Dual Rails, Ties & Ore Carts (TASK-PLAY-048b) ---"
+echo "--- [9/10] Verifying RailSystem Dual Rails, Ties & Ore Carts (TASK-PLAY-048b) ---"
 cd "${ROOT_DIR}"
 npx tsx scripts/smoke-rail-system.ts
+
+echo ""
+echo "--- [10/10] Verifying Faction Bases & Loading-Dock Mechs (TASK-PLAY-050) ---"
+cd "${ROOT_DIR}"
+npx tsx scripts/smoke-factions-and-mechs.ts
 
 echo ""
 echo "=========================================================="
