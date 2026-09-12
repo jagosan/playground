@@ -53,9 +53,14 @@ cd "${ROOT_DIR}"
 npx tsx scripts/smoke-open-buggy.ts
 
 echo ""
-echo "--- [8/8] Verifying TunnelNetwork Subterranean Mesh & Veins (TASK-PLAY-048a) ---"
+echo "--- [8/9] Verifying TunnelNetwork Subterranean Mesh & Veins (TASK-PLAY-048a) ---"
 cd "${ROOT_DIR}"
 npx tsx scripts/smoke-tunnel-network.ts
+
+echo ""
+echo "--- [9/9] Verifying RailSystem Dual Rails, Ties & Ore Carts (TASK-PLAY-048b) ---"
+cd "${ROOT_DIR}"
+npx tsx scripts/smoke-rail-system.ts
 
 echo ""
 echo "=========================================================="
