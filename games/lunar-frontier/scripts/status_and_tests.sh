@@ -43,9 +43,14 @@ cd "${ROOT_DIR}"
 npx tsx scripts/smoke-worldscene.ts
 
 echo ""
-echo "--- [6/6] Verifying AstronautSuit Avatar Entity (TASK-PLAY-049a) ---"
+echo "--- [6/7] Verifying AstronautSuit Avatar Entity (TASK-PLAY-049a) ---"
 cd "${ROOT_DIR}"
 npx tsx scripts/smoke-eva-suit.ts
+
+echo ""
+echo "--- [7/7] Verifying OpenBuggy Vehicle Entity (TASK-PLAY-049b) ---"
+cd "${ROOT_DIR}"
+npx tsx scripts/smoke-open-buggy.ts
 
 echo ""
 echo "=========================================================="
