@@ -48,9 +48,14 @@ cd "${ROOT_DIR}"
 npx tsx scripts/smoke-eva-suit.ts
 
 echo ""
-echo "--- [7/7] Verifying OpenBuggy Vehicle Entity (TASK-PLAY-049b) ---"
+echo "--- [7/8] Verifying OpenBuggy Vehicle Entity (TASK-PLAY-049b) ---"
 cd "${ROOT_DIR}"
 npx tsx scripts/smoke-open-buggy.ts
+
+echo ""
+echo "--- [8/8] Verifying TunnelNetwork Subterranean Mesh & Veins (TASK-PLAY-048a) ---"
+cd "${ROOT_DIR}"
+npx tsx scripts/smoke-tunnel-network.ts
 
 echo ""
 echo "=========================================================="
