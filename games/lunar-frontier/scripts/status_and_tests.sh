@@ -53,26 +53,26 @@ cd "${ROOT_DIR}"
 npx tsx scripts/smoke-open-buggy.ts
 
 echo ""
-echo "--- [8/9] Verifying TunnelNetwork Subterranean Mesh & Veins (TASK-PLAY-048a) ---"
+echo "--- [8/11] Verifying TunnelNetwork Subterranean Mesh & Veins (TASK-PLAY-048a) ---"
 cd "${ROOT_DIR}"
 npx tsx scripts/smoke-tunnel-network.ts
 
 echo ""
-echo "--- [9/10] Verifying RailSystem Dual Rails, Ties & Ore Carts (TASK-PLAY-048b) ---"
+echo "--- [9/11] Verifying RailSystem Dual Rails, Ties & Ore Carts (TASK-PLAY-048b) ---"
 cd "${ROOT_DIR}"
 npx tsx scripts/smoke-rail-system.ts
 
 echo ""
-echo "--- [10/10] Verifying Faction Bases & Loading-Dock Mechs (TASK-PLAY-050) ---"
+echo "--- [10/11] Verifying Faction Bases & Loading-Dock Mechs (TASK-PLAY-050) ---"
 cd "${ROOT_DIR}"
 npx tsx scripts/smoke-factions-and-mechs.ts
 
 echo ""
+echo "--- [11/11] Verifying Multi-Client E2E Shard Simulation & SQLite ACID (TASK-PLAY-051) ---"
+cd "${ROOT_DIR}"
+node --no-warnings tests/verify-lunar-frontier.ts
+
+echo ""
 echo "=========================================================="
-echo "🎉 ALL VERIFIED CORE SYSTEMS ARE GREEN!"
-echo "=========================================================="
-echo "Next tasks for incoming session:"
-echo "1. Procedural subterranean tunnels & rail line infrastructure (TunnelNetwork.ts, RailSystem.ts)"
-echo "2. Faction Outposts & Loading-Dock Mechs (Nation-State domes vs Scrappy Startup pads)"
-echo "3. Multi-client End-to-End WebSocket simulation integration test"
+echo "🎉 ALL 11 VERIFIED SUBSYSTEMS ARE GREEN (SPEC 12 COMPLETE)!"
 echo "=========================================================="
