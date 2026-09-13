@@ -1,27 +1,110 @@
 <!DOCTYPE html>
+<!--
+  Lunar Frontier — interactive web client entry (Spec 13 §1/§5, TASK-PLAY-054).
+
+  Served through Vite (`npx vite --root games/lunar-frontier`, then
+  /src/client/index.html) or statically after `vite build`. The Babylon
+  WebGL2 canvas fills the viewport; the glassmorphic HUD (ADR-013-1) is
+  built by src/ui/LunarHUD.ts on top of it, so this file stays thin: canvas,
+  loader chrome, and the module entry.
+-->
 <html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Lunar Frontier Traversal</title>
-    <link rel="stylesheet" href="styles.css">
-</head>
-<body>
-    <div id="app">
-        <header>
-            <h1>Lunar Frontier</h1>
-        </header>
-        <main>
-            <div id="node-display">
-                <h2 id="node-title"></h2>
-                <p id="node-description"></p>
-                <div id="node-choices"></div>
-            </div>
-        </main>
-        <footer>
-            <p>Traverse the lunar frontier</p>
-        </footer>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark" />
+    <title>Lunar Frontier — Second Lunar Rush</title>
+    <link rel="stylesheet" href="../ui/hud.css" />
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: #000;
+        color: #dfeefb;
+        font-family: ui-monospace, "SFMono-Regular", "JetBrains Mono", Menlo, Consolas, monospace;
+      }
+      #scene {
+        position: fixed;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        display: block;
+        outline: none;
+        touch-action: none;
+      }
+      #loading {
+        position: fixed;
+        inset: 0;
+        z-index: 90;
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+        align-items: center;
+        justify-content: center;
+        background: radial-gradient(ellipse at 50% 35%, #0a1418 0%, #000 75%);
+        transition: opacity 500ms ease;
+      }
+      #loading.is-hidden {
+        opacity: 0;
+        pointer-events: none;
+      }
+      #loading h1 {
+        margin: 0;
+        font-size: clamp(18px, 4vw, 30px);
+        letter-spacing: 0.42em;
+        text-transform: uppercase;
+        color: #56e0ff;
+        text-shadow: 0 0 24px rgba(86, 224, 255, 0.35);
+      }
+      #loading .sub {
+        font-size: 11px;
+        letter-spacing: 0.22em;
+        color: rgba(223, 238, 251, 0.5);
+      }
+      #loading .spinner {
+        width: 42px;
+        height: 42px;
+        border-radius: 50%;
+        border: 2px solid rgba(86, 224, 255, 0.18);
+        border-top-color: #56e0ff;
+        animation: lf-spin 1.1s linear infinite;
+      }
+      #loading .boot-error {
+        max-width: 80vw;
+        white-space: pre-wrap;
+        color: #ff5d5c;
+        font-size: 12px;
+        text-align: center;
+      }
+      @keyframes lf-spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <!-- Babylon render target: ClientApp boots WorldScene into this canvas. -->
+    <canvas id="scene" tabindex="0" aria-label="Lunar Frontier 3D view"></canvas>
+
+    <!-- Boot chrome; LunarHUD (#lunar-hud) + trade terminal mount on <body>. -->
+    <div id="loading">
+      <h1>Lunar Frontier</h1>
+      <div class="spinner" role="progressbar" aria-label="Booting"></div>
+      <div class="sub">pressurising suit · pinging station exchange</div>
     </div>
-    <script src="app.js"></script>
-</body>
+
+    <!-- Optional identity overrides: { username, faction, role, wsUrl, seed } -->
+    <script>
+      window.LF_CONFIG = window.LF_CONFIG || {};
+    </script>
+    <script type="module" src="./main.ts"></script>
+  </body>
 </html>
