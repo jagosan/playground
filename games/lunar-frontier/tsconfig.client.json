@@ -1,0 +1,25 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "types": ["node"],
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "allowImportingTsExtensions": true,
+    "noUnusedLocals": false,
+    "noUnusedParameters": false,
+    "noEmit": true
+  },
+  "include": [
+    "src/client/ClientApp.ts",
+    "src/client/main.ts",
+    "src/client/TraversalController.ts",
+    "src/ui/LunarHUD.ts",
+    "src/engine/index.ts",
+    "src/engine/WorldScene.ts",
+    "src/engine/CameraRig.ts",
+    "src/entities/AstronautSuit.ts",
+    "src/entities/OpenBuggy.ts",
+    "src/physics/TraversalPhysics.ts",
+    "src/network/NetworkClient.ts",
+    "src/world/LunarWorldGenerator.ts"
+  ]
+}
