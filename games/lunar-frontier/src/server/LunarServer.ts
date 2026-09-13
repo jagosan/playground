@@ -31,10 +31,16 @@ import WebSocket from 'ws';
 import { WebSocketServer } from 'ws';
 
 import DatabaseManager, {
+  TradeError,
   type ClaimRow,
   type PlayerRow,
+  type RailTrackRow,
   type ResourceRow,
 } from '../database';
+import {
+  MarketEngine,
+  MAX_TRADE_AMOUNT,
+} from '../economy/MarketEngine';
 
 // ---------------------------------------------------------------------------
 // Domain types
@@ -70,6 +76,10 @@ export interface LunarServerOptions {
   dbPath?: string;
   /** Inject a prepared DatabaseManager (tests / shared pools). Takes over its lifecycle. */
   database?: DatabaseManager;
+  /** Inject a prepared MarketEngine (tests / shared books). Initialized against the DB on start. */
+  market?: MarketEngine;
+  /** Seconds between periodic `market_sync` broadcasts (default MARKET_SYNC_INTERVAL_SECONDS; 0 disables). */
+  marketSyncIntervalSeconds?: number;
   /** Enable Fastify's pino logger (default: false). */
   logger?: boolean;
 }
@@ -102,6 +112,15 @@ export const BUGGY_MAX_SPEED = 12;
 export const MAX_MINE_AMOUNT = 1000;
 export const MIN_CLAIM_RADIUS = 1;
 export const MAX_CLAIM_RADIUS = 500;
+
+/** A player-laid rail segment must be at least this long (metres). */
+export const MIN_RAIL_SEGMENT_M = 1;
+/** …and no longer than this (metres). */
+export const MAX_RAIL_SEGMENT_M = 100;
+/** Narrow-gauge track the frontier standardises on for player-laid rail. */
+export const PLAYER_RAIL_GAUGE_M = 0.75;
+/** How often (seconds) a full `market_sync` goes out to every client. 0 = off. */
+export const MARKET_SYNC_INTERVAL_SECONDS = 15;
 
 const RESOURCE_TYPES: readonly ResourceType[] = [
   'regolith',
@@ -144,6 +163,47 @@ function asResourceType(value: unknown): ResourceType | undefined {
     : undefined;
 }
 
+/**
+ * A wire-space `[x, y, z]` triple: a 3-element array of finite numbers, or
+ * `undefined`. Rejects holes, strings, NaN, Infinity and wrong lengths — a
+ * malformed rail endpoint must never reach the database.
+ */
+function asVec3(value: unknown): [number, number, number] | undefined {
+  if (!Array.isArray(value) || value.length !== 3) return undefined;
+  const out: number[] = [];
+  for (const part of value) {
+    if (typeof part !== 'number' || !Number.isFinite(part)) return undefined;
+    if (Math.abs(part) > MAX_POSITION) return undefined;
+    out.push(part);
+  }
+  return [out[0], out[1], out[2]];
+}
+
+/** Map a `TradeError.code` onto the wire-level error code clients switch on. */
+function tradeErrorCode(err: unknown): string {
+  if (err instanceof TradeError) {
+    switch (err.code) {
+      case 'insufficient_credits':
+        return 'insufficient_credits';
+      case 'insufficient_inventory':
+        return 'insufficient_inventory';
+      case 'bad_amount':
+        return 'bad_amount';
+      case 'unknown_commodity':
+        return 'unknown_commodity';
+      case 'unknown_player':
+        return 'unknown_player';
+      case 'reserve_changed':
+        // The pool moved mid-fill and bounded retries were exhausted: the
+        // client should refresh quotes and retry, not treat it as fatal.
+        return 'market_busy';
+      default:
+        return 'trade_failed';
+    }
+  }
+  return 'trade_failed';
+}
+
 // ---------------------------------------------------------------------------
 // LunarServer
 // ---------------------------------------------------------------------------
@@ -160,6 +220,9 @@ export class LunarServer {
 
   private readonly db: DatabaseManager;
   private readonly ownsDatabase: boolean;
+  private readonly market: MarketEngine;
+  private readonly marketSyncSeconds: number;
+  private marketSyncTimer: ReturnType<typeof setInterval> | null = null;
   private readonly port: number;
   private readonly host: string;
   private readonly wsPath: string;
@@ -198,6 +261,12 @@ export class LunarServer {
       options.database ??
       new DatabaseManager(options.dbPath ?? './lunarfrontier.db');
 
+    // Same ownership rule for the market engine: an injected one is neither
+    // initialized nor disposed by us beyond `initialize` (which is idempotent).
+    this.market = options.market ?? new MarketEngine();
+    this.marketSyncSeconds =
+      options.marketSyncIntervalSeconds ?? MARKET_SYNC_INTERVAL_SECONDS;
+
     this.app = Fastify({ logger: options.logger ?? false });
     this.registerRoutes();
   }
@@ -216,12 +285,16 @@ export class LunarServer {
 
     try {
       if (this.ownsDatabase) await this.db.initialize();
+      // Seed/refresh liquidity pools before any client can TRADE. Idempotent,
+      // so an injected-but-uninitialized engine and a fresh one both work.
+      await this.market.initialize(this.db);
       await this.app.ready();
       this.attachWebSocketServer();
 
       const address = await this.app.listen({ port: this.port, host: this.host });
       this.startedAt = Date.now();
       this.startTick();
+      this.startMarketSync();
       return address;
     } catch (err) {
       // Never leave a half-open server behind.
@@ -240,6 +313,10 @@ export class LunarServer {
     if (this.tickTimer !== null) {
       clearInterval(this.tickTimer);
       this.tickTimer = null;
+    }
+    if (this.marketSyncTimer !== null) {
+      clearInterval(this.marketSyncTimer);
+      this.marketSyncTimer = null;
     }
     this.running = false;
 
@@ -273,6 +350,10 @@ export class LunarServer {
     if (this.ownsDatabase) {
       await this.db.close().catch(() => undefined);
     }
+    // A market engine we own is deliberately NOT disposed here: stop() then
+    // start() on the same instance must keep working, and the engine's only
+    // state is a DB reference plus a reserve mirror that `initialize()`
+    // re-reads from disk anyway.
     this.startedAt = 0;
   }
 
@@ -292,12 +373,16 @@ export class LunarServer {
     }));
 
     this.app.get('/api/world', async () => {
-      const [claims, infrastructure] = await Promise.all([
+      const [claims, infrastructure, rail_tracks] = await Promise.all([
         this.db.listClaims(),
         this.db.listInfrastructure(),
+        this.db.listRailTracks('active'),
       ]);
-      return { claims, infrastructure };
+      return { claims, infrastructure, rail_tracks };
     });
+
+    /** Read-only market terminal feed (prices, reserves, base references). */
+    this.app.get('/api/market', async () => this.market.getMarketSnapshot());
   }
 
   // -- WebSocket plumbing --------------------------------------------------------
@@ -406,6 +491,16 @@ export class LunarServer {
         case 'CLAIM':
           await this.handleClaim(ws, payload);
           break;
+        case 'TRADE':
+          await this.handleTrade(ws, payload);
+          break;
+        case 'LAY_RAIL':
+          await this.handleLayRail(ws, payload);
+          break;
+        case 'MARKET_QUERY':
+          // Client-initiated re-sync (market terminal "refresh" button).
+          await this.broadcastMarketSync();
+          break;
         case 'PING':
           this.send(ws, { type: 'PONG', t: Date.now() });
           break;
@@ -497,10 +592,12 @@ export class LunarServer {
     this.states.set(player.id, state);
     this.lastSent.delete(player.id); // force a full snapshot on the first tick
 
-    const [claims, infrastructure, resources] = await Promise.all([
+    const [claims, infrastructure, resources, inventory, rail_tracks] = await Promise.all([
       this.db.listClaims(),
       this.db.listInfrastructure(),
       this.db.getResources(player.id),
+      this.db.getInventory(player.id),
+      this.db.listRailTracks('active'),
     ]);
     const ownClaims = claims.filter((c) => c.player_id === player.id);
 
@@ -522,8 +619,13 @@ export class LunarServer {
           helium3: 0,
           rare_earths: 0,
         },
-      world: { claims, infrastructure },
+      // Tradable wallet (Phase 8a) — separate from the in-situ `resources`
+      // ledger because commodities like BASALT/ILMENITE have no legacy column.
+      inventory,
+      world: { claims, infrastructure, rail_tracks },
       own_claims: ownClaims,
+      // Spec 13 §3.2: a joining client's market terminal opens pre-populated.
+      market: this.market.getMarketSnapshot(),
       uptime: this.uptimeSeconds(),
     });
 
@@ -617,11 +719,18 @@ export class LunarServer {
     }
 
     const earned = Math.round(amount * RESOURCE_PRICES[resource]);
-    // Sequential on purpose: adjustResources and adjustCredits each open a
-    // transaction on the shared sqlite handle and must not interleave.
-    const updated = await this.db.adjustResources(playerId, { [resource]: amount });
-    const balance = await this.db.adjustCredits(playerId, earned);
-    if (balance !== null) state.credits = balance;
+    // One atomic unit of work: physical stock, its tradable mirror, and the
+    // extraction bounty all land or none do. (Two separate calls here used to
+    // leave a window where credits paid without the ore being banked.)
+    const commodity = MarketEngine.commodityForLegacyResource(resource);
+    const updated = await this.db.creditExtraction(
+      playerId,
+      { [resource]: amount },
+      earned,
+      commodity === undefined ? {} : { [commodity]: amount },
+    );
+    const player = await this.db.getPlayer(playerId);
+    if (player !== undefined) state.credits = player.credits;
 
     this.send(ws, {
       type: 'mine_result',
@@ -629,6 +738,7 @@ export class LunarServer {
       amount,
       earned,
       resources: updated,
+      inventory: await this.db.getInventory(playerId),
       credits: state.credits,
     });
   }
@@ -720,6 +830,244 @@ export class LunarServer {
     state.credits = debited;
     this.send(ws, { type: 'claim_result', ok: true, claim, credits: debited });
     this.broadcast({ type: 'claim_staked', claim }, playerId);
+  }
+
+  // -- TRADE ------------------------------------------------------------------------
+
+  /**
+   * Station market order (spec 13 §3.1 / §4).
+   *
+   * `{ commodity, amount, is_buy }` — a marketable-against-the-station fill at
+   * the curve's integrated price, not at the quoted spot. Validation happens
+   * twice on purpose: cheaply here (so a dumb frame gets a precise error code)
+   * and again inside `MarketEngine`/`recordTrade`, which are the only places
+   * holding the atomic lock on credits + inventory + reserve.
+   *
+   * On success: a `trade_confirmed` receipt to the trader, plus a
+   * `market_sync` broadcast so every open terminal reprices immediately.
+   */
+  private async handleTrade(ws: WebSocket, payload: Record<string, unknown>): Promise<void> {
+    const playerId = this.requirePlayerId(ws);
+    if (playerId === null) return;
+    const state = this.states.get(playerId);
+    if (state === undefined) return;
+
+    const commodity = MarketEngine.normalizeCommodity(payload.commodity);
+    if (commodity === undefined) {
+      this.sendError(
+        ws,
+        'unknown_commodity',
+        `commodity must name a tradable resource (${String(payload.commodity)})`,
+      );
+      return;
+    }
+
+    // `is_buy` must be a real boolean — defaulting it would silently turn a
+    // malformed frame into an unintended sale of the player's stock.
+    if (typeof payload.is_buy !== 'boolean') {
+      this.sendError(ws, 'bad_trade', 'is_buy must be a boolean');
+      return;
+    }
+    const isBuy = payload.is_buy;
+
+    const amount = num(payload.amount);
+    if (amount === undefined || amount <= 0) {
+      this.sendError(ws, 'bad_amount', 'amount must be a finite number greater than 0');
+      return;
+    }
+    if (amount > MAX_TRADE_AMOUNT) {
+      this.sendError(
+        ws,
+        'bad_amount',
+        `order size ${amount} exceeds the per-order cap of ${MAX_TRADE_AMOUNT} kg`,
+      );
+      return;
+    }
+
+    // Cheap pre-checks so the common rejections get specific, actionable codes
+    // without touching the trade path at all.
+    if (isBuy) {
+      const quote = this.market.quoteOrder(commodity, amount, true);
+      if (state.credits < quote.totalCredits) {
+        this.sendError(
+          ws,
+          'insufficient_credits',
+          `buying ${amount} ${commodity} costs ${quote.totalCredits} credits (balance ${state.credits})`,
+        );
+        return;
+      }
+    } else {
+      const inventory = await this.db.getInventory(playerId);
+      const held = inventory[commodity] ?? 0;
+      if (held < amount) {
+        this.sendError(
+          ws,
+          'insufficient_inventory',
+          `selling ${amount} ${commodity} but inventory holds ${held}`,
+        );
+        return;
+      }
+    }
+
+    let fill;
+    try {
+      fill = await this.market.executeTrade(playerId, commodity, amount, isBuy, this.db);
+    } catch (err) {
+      this.sendError(ws, tradeErrorCode(err), (err as Error).message);
+      return;
+    }
+
+    // Trust the DB's committed balance — it is the authority, and a concurrent
+    // CLAIM/MINE may have moved it while this trade was in flight.
+    const committed = await this.db.getPlayer(playerId);
+    if (committed !== undefined) state.credits = committed.credits;
+    const inventory = await this.db.getInventory(playerId);
+
+    this.send(ws, {
+      type: 'trade_confirmed',
+      trade_id: fill.tradeId,
+      commodity: fill.commodity,
+      amount: fill.amount,
+      is_buy: isBuy,
+      unit_price: fill.unitPrice,
+      total_credits: fill.totalCredits,
+      new_balance: fill.newBalance,
+      credits: fill.newBalance, // legacy alias — the tick also carries `credits`
+      inventory,
+      quote: {
+        spot: fill.quote.spotPrice,
+        average: fill.quote.averagePrice,
+        last_unit: fill.quote.lastUnitPrice,
+        price_impact: fill.quote.priceImpact,
+        reserve_before: fill.quote.reserveBefore,
+        reserve_after: fill.quote.reserveAfter,
+      },
+    });
+
+    await this.broadcastMarketSync();
+  }
+
+  // -- LAY_RAIL ---------------------------------------------------------------------
+
+  /**
+   * Lay a rail segment between two world points (spec 13 §3.1).
+   *
+   * `{ p0: [x,y,z], p1: [x,y,z] }` — endpoints are validated as finite
+   * 3-tuples and the segment length must fall inside
+   * `[MIN_RAIL_SEGMENT_M, MAX_RAIL_SEGMENT_M]`. Free to build in Phase 8a
+   * (economy hook lands in 8b); the row persists in `rail_tracks` and every
+   * peer is told via `rail_placed`.
+   *
+   * Rail laid below the surface line (z < 0) is legal — that is how a tunnel
+   * descent gets tracked — but it must not straddle the surface, since a
+   * segment half in vacuum and half in regolith has no consistent gauge bed.
+   */
+  private async handleLayRail(ws: WebSocket, payload: Record<string, unknown>): Promise<void> {
+    const playerId = this.requirePlayerId(ws);
+    if (playerId === null) return;
+
+    const p0 = asVec3(payload.p0);
+    const p1 = asVec3(payload.p1);
+    if (p0 === undefined || p1 === undefined) {
+      this.sendError(ws, 'bad_rail', 'p0 and p1 must each be [x, y, z] finite numbers');
+      return;
+    }
+
+    const length = Math.hypot(p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]);
+    if (!Number.isFinite(length) || length < MIN_RAIL_SEGMENT_M) {
+      this.sendError(
+        ws,
+        'bad_rail',
+        `rail segment must be at least ${MIN_RAIL_SEGMENT_M} m (got ${length.toFixed(3)} m)`,
+      );
+      return;
+    }
+    if (length > MAX_RAIL_SEGMENT_M) {
+      this.sendError(
+        ws,
+        'bad_rail',
+        `rail segment must be at most ${MAX_RAIL_SEGMENT_M} m (got ${length.toFixed(3)} m)`,
+      );
+      return;
+    }
+
+    // No surface-straddling segments: both endpoints on the same side of z = 0.
+    if ((p0[2] < 0) !== (p1[2] < 0)) {
+      this.sendError(
+        ws,
+        'bad_rail',
+        'a rail segment may not cross the surface line — lay two segments with a shaft collar',
+      );
+      return;
+    }
+
+    const track: RailTrackRow = {
+      id: randomUUID(),
+      built_by: playerId,
+      x0: p0[0], y0: p0[1], z0: p0[2],
+      x1: p1[0], y1: p1[1], z1: p1[2],
+      length,
+      gauge: PLAYER_RAIL_GAUGE_M,
+      status: 'active',
+      built_at: new Date().toISOString(),
+    };
+
+    try {
+      await this.db.addRailTrack(track);
+    } catch (err) {
+      this.sendError(ws, 'rail_failed', (err as Error).message);
+      return;
+    }
+
+    this.send(ws, {
+      type: 'rail_laid',
+      ok: true,
+      rail_id: track.id,
+      p0,
+      p1,
+      length,
+      gauge: track.gauge,
+      built_by: playerId,
+    });
+    this.broadcast({
+      type: 'rail_placed',
+      rail_id: track.id,
+      p0,
+      p1,
+      length,
+      gauge: track.gauge,
+      built_by: playerId,
+    });
+  }
+
+  // -- market sync ---------------------------------------------------------------------------
+
+  /** Periodic `market_sync` broadcast so idle terminals stay current. */
+  private startMarketSync(): void {
+    if (this.marketSyncTimer !== null || !(this.marketSyncSeconds > 0)) return;
+    const intervalMs = this.marketSyncSeconds * 1000;
+    this.marketSyncTimer = setInterval(() => {
+      // Fire-and-forget: a failed sync must never kill the interval or the process.
+      void this.broadcastMarketSync().catch(() => undefined);
+    }, intervalMs);
+  }
+
+  /**
+   * Pushes the current book to every connected client. `prices` carries the
+   * station's ask and `sellPrices` its bid; `reserves` is the raw pool depth so
+   * a terminal can render curve headroom.
+   */
+  async broadcastMarketSync(): Promise<void> {
+    await this.market.syncReserves();
+    const snapshot = this.market.getMarketSnapshot();
+    this.broadcast({
+      type: 'market_sync',
+      timestamp: snapshot.timestamp,
+      prices: snapshot.prices,
+      sell_prices: snapshot.sellPrices,
+      base_prices: snapshot.basePrices,
+      reserves: snapshot.reserves,
+    });
   }
 
   // -- 20 Hz delta tick ---------------------------------------------------------------------

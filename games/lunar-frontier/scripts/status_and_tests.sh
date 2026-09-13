@@ -68,11 +68,16 @@ cd "${ROOT_DIR}"
 npx tsx scripts/smoke-factions-and-mechs.ts
 
 echo ""
-echo "--- [11/11] Verifying Multi-Client E2E Shard Simulation & SQLite ACID (TASK-PLAY-051) ---"
+echo "--- [11/12] Verifying Multi-Client E2E Shard Simulation & SQLite ACID (TASK-PLAY-051) ---"
 cd "${ROOT_DIR}"
 node --no-warnings tests/verify-lunar-frontier.ts
 
 echo ""
+echo "--- [12/12] Verifying MarketEngine, TRADE & LAY_RAIL Handlers (Phase 8a) ---"
+cd "${ROOT_DIR}"
+npx tsx scripts/smoke-market-and-rails.ts
+
+echo ""
 echo "=========================================================="
-echo "🎉 ALL 11 VERIFIED SUBSYSTEMS ARE GREEN (SPEC 12 COMPLETE)!"
+echo "🎉 ALL 12 VERIFIED SUBSYSTEMS ARE GREEN (SPEC 12 + PHASE 8a)!"
 echo "=========================================================="
