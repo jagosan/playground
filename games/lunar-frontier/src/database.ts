@@ -74,6 +74,115 @@ export interface TransactionRow {
   created_at: string;
 }
 
+/** Tradable stock held by one player (Phase 8a market ledger). */
+export interface InventoryRow {
+  player_id: string;
+  /** Commodity id, e.g. 'HELIUM3'. */
+  commodity: string;
+  units: number;
+  updated_at: string;
+}
+
+/** One commodity's liquidity pool: baseline + current reserve (market state). */
+export interface MarketReserveRow {
+  commodity: string;
+  /** Reserve the pool was seeded with — the bonding-curve denominator. */
+  baseline_reserve: number;
+  /** Live reserve; may go negative (a bookkeeping net-position signal). */
+  reserve: number;
+  updated_at: string;
+}
+
+/** A laid rail segment between two world-space endpoints (metres). */
+export interface RailTrackRow {
+  id: string;
+  built_by: string;
+  x0: number;
+  y0: number;
+  z0: number;
+  x1: number;
+  y1: number;
+  z1: number;
+  /** Euclidean segment length in metres. */
+  length: number;
+  /** Track gauge in metres (narrow gauge, spec 12). */
+  gauge: number;
+  status: string;
+  built_at: string;
+}
+
+export type RailTrackUpdate = Partial<Omit<RailTrackRow, 'id' | 'built_by'>>;
+
+/** Why `recordTrade` refused a commit. */
+export type TradeErrorCode =
+  | 'bad_trade'
+  | 'bad_amount'
+  | 'unknown_commodity'
+  | 'unknown_player'
+  | 'insufficient_credits'
+  | 'insufficient_inventory'
+  | 'reserve_changed';
+
+/**
+ * Thrown by {@link DatabaseManager.recordTrade}. Exported so callers can
+ * branch on `code` (notably `reserve_changed`, the optimistic-concurrency
+ * retry signal) without string-matching messages.
+ */
+export class TradeError extends Error {
+  readonly code: TradeErrorCode;
+  constructor(code: TradeErrorCode, message: string) {
+    super(message);
+    this.name = 'TradeError';
+    this.code = code;
+  }
+}
+
+/**
+ * Virtual counterparty id for every station-side (AMM) trade. The exchange is
+ * not a player, so it deliberately has no `players` row; `recordTrade` moves
+ * only the human leg of the credits and never touches a station balance.
+ */
+export const STATION_ID = 'STATION_EXCHANGE';
+
+/** Everything needed to commit one station trade atomically. */
+export interface MarketTradeCommit {
+  tradeId: string;
+  playerId: string;
+  commodity: string;
+  amount: number;
+  isBuy: boolean;
+  /** Total credits for the fill (unit price x amount, rounded). */
+  totalCredits: number;
+  /** Average unit price actually paid/received, for the receipt. */
+  unitPrice: number;
+  /** Reserve the pool must still hold for this fill to be valid (CAS). */
+  expectedReserve: number;
+  /** Reserve after the fill. */
+  newReserve: number;
+  /** Legacy `resources` column to mirror, when the commodity has one. */
+  legacyColumn?: keyof ResourceUpdate;
+}
+
+/** Committed fill, echoed back to the trader. */
+export interface MarketTradeResult {
+  tradeId: string;
+  commodity: string;
+  amount: number;
+  isBuy: boolean;
+  unitPrice: number;
+  totalCredits: number;
+  newBalance: number;
+  inventory: number;
+  reserveBefore: number;
+  reserveAfter: number;
+}
+
+/** Payload for `addRailTrack` (built_at/status are filled in automatically). */
+export type NewRailTrack = Omit<RailTrackRow, 'built_at' | 'status'> & {
+  built_at?: string;
+  status?: string;
+};
+
 /** Payload for createPlayer (created_at is filled in automatically). */
 export type NewPlayer = Omit<PlayerRow, 'created_at'> & { created_at?: string };
 
@@ -104,10 +213,16 @@ const COLUMNS: Record<string, readonly string[]> = {
   resources: ['player_id', 'regolith', 'water_ice', 'helium3', 'rare_earths'],
   infrastructure: ['id', 'claim_id', 'type', 'level', 'x', 'y', 'health'],
   transactions: ['id', 'buyer_id', 'seller_id', 'item_type', 'quantity', 'total_credits', 'created_at'],
+  inventory: ['player_id', 'commodity', 'units', 'updated_at'],
+  market_reserves: ['commodity', 'baseline_reserve', 'reserve', 'updated_at'],
+  rail_tracks: ['id', 'built_by', 'x0', 'y0', 'z0', 'x1', 'y1', 'z1', 'length', 'gauge', 'status', 'built_at'],
 };
 
 /** SQLite comparison operators whitelisted for generic queries. */
 const OPERATORS = ['=', '!=', '<>', '<', '<=', '>', '>=', 'LIKE', 'NOT LIKE', 'IS', 'IS NOT'] as const;
+
+/** Name prefix for nested-transaction savepoints (see `withTransaction`). */
+const SAVEPOINT_NAME = 'lf_tx';
 export type Operator = (typeof OPERATORS)[number];
 
 export type QueryCondition = Record<string, { op: Operator; value: unknown } | unknown>;
@@ -179,6 +294,8 @@ export class DatabaseManager {
   private db: sqlite3.Database | null = null;
   private readonly path: string;
   private initialized = false;
+  /** Nesting depth of {@link withTransaction}; 0 when no frame is open. */
+  private txDepth = 0;
 
   constructor(dbPath: string = './lunarfrontier.db') {
     this.path = dbPath;
@@ -257,6 +374,36 @@ export class DatabaseManager {
           total_credits REAL,
           created_at TEXT
         );
+
+        /* Phase 8a — tradable stock per player (commodities have no column in
+           the legacy fixed-column resources ledger). */
+        CREATE TABLE IF NOT EXISTS inventory (
+          player_id TEXT NOT NULL,
+          commodity TEXT NOT NULL,
+          units REAL NOT NULL DEFAULT 0,
+          updated_at TEXT,
+          PRIMARY KEY (player_id, commodity)
+        );
+
+        /* Phase 8a — one liquidity pool per commodity (market state). */
+        CREATE TABLE IF NOT EXISTS market_reserves (
+          commodity TEXT PRIMARY KEY,
+          baseline_reserve REAL NOT NULL,
+          reserve REAL NOT NULL,
+          updated_at TEXT
+        );
+
+        /* Phase 8a — player-laid rail segments between two world points. */
+        CREATE TABLE IF NOT EXISTS rail_tracks (
+          id TEXT PRIMARY KEY,
+          built_by TEXT,
+          x0 REAL, y0 REAL, z0 REAL,
+          x1 REAL, y1 REAL, z1 REAL,
+          length REAL,
+          gauge REAL,
+          status TEXT,
+          built_at TEXT
+        );
       `);
 
       // Hot paths: per-player lookups, ownership joins, market history.
@@ -266,6 +413,9 @@ export class DatabaseManager {
         CREATE INDEX IF NOT EXISTS idx_tx_buyer ON transactions (buyer_id);
         CREATE INDEX IF NOT EXISTS idx_tx_seller ON transactions (seller_id);
         CREATE INDEX IF NOT EXISTS idx_tx_created ON transactions (created_at);
+        CREATE INDEX IF NOT EXISTS idx_inventory_player ON inventory (player_id);
+        CREATE INDEX IF NOT EXISTS idx_rail_built_by ON rail_tracks (built_by);
+        CREATE INDEX IF NOT EXISTS idx_rail_status ON rail_tracks (status);
       `);
 
       this.initialized = true;
@@ -332,18 +482,49 @@ export class DatabaseManager {
     });
   }
 
-  /** Runs `fn` inside BEGIN/COMMIT with a rollback on any throw. */
+  /**
+   * Runs `fn` inside a transaction with rollback on any throw.
+   *
+   * Re-entrancy safe: every public helper below opens its own transaction, so
+   * composing them (e.g. `recordTrade` → `adjustInventory` → `getPlayer`) used
+   * to die with `cannot start a transaction within a transaction`. Nested calls
+   * now ride SAVEPOINTs, and only the outermost frame issues the real
+   * BEGIN/COMMIT/ROLLBACK — so an inner failure still unwinds the whole unit
+   * of work, which is exactly the all-or-nothing semantics a trade needs.
+   */
   async withTransaction<T>(fn: () => Promise<T>): Promise<T> {
     const db = this.requireDb();
-    await this.exec('BEGIN');
+    const depth = ++this.txDepth;
+    if (depth === 1) await this.exec('BEGIN IMMEDIATE');
+    else await this.exec(`SAVEPOINT ${SAVEPOINT_NAME}_${depth}`);
     try {
       const result = await fn();
-      await this.exec('COMMIT');
+      if (depth === 1) await this.exec('COMMIT');
+      else await this.exec(`RELEASE ${SAVEPOINT_NAME}_${depth}`);
       return result;
     } catch (err) {
-      await new Promise<void>((resolve) => db.run('ROLLBACK', () => resolve()));
+      // Unwind to this frame's mark. At depth 1 that is a full ROLLBACK; if the
+      // unwind itself fails we surface the ORIGINAL error, never the cleanup
+      // one. A COMMIT that threw (e.g. SQLITE_BUSY) may already have ended the
+      // transaction, leaving this ROLLBACK a harmless no-op error.
+      await new Promise<void>((resolve) => {
+        const sql = depth === 1 ? 'ROLLBACK' : `ROLLBACK TO ${SAVEPOINT_NAME}_${depth}`;
+        db.run(sql, () => resolve());
+      });
+      if (depth > 1) {
+        await new Promise<void>((resolve) => {
+          db.run(`RELEASE ${SAVEPOINT_NAME}_${depth}`, () => resolve());
+        });
+      }
       throw err;
+    } finally {
+      this.txDepth--;
     }
+  }
+
+  /** True while a transaction frame owned by this manager is open. */
+  inTransaction(): boolean {
+    return this.txDepth > 0;
   }
 
   // -- players ----------------------------------------------------------------
@@ -408,6 +589,8 @@ export class DatabaseManager {
       void infra;
       await this.run('DELETE FROM claims WHERE player_id = ?', [id]);
       await this.run('DELETE FROM resources WHERE player_id = ?', [id]);
+      await this.run('DELETE FROM inventory WHERE player_id = ?', [id]);
+      await this.run('DELETE FROM rail_tracks WHERE built_by = ?', [id]);
       await this.run('DELETE FROM transactions WHERE buyer_id = ? OR seller_id = ?', [id, id]);
       const { changes } = await this.run('DELETE FROM players WHERE id = ?', [id]);
       return changes;
@@ -537,8 +720,16 @@ export class DatabaseManager {
   /**
    * Atomic per-player resource deltas (negatives allowed, clamped at 0).
    * Creates the ledger row on first use.
+   *
+   * `opts.requireNonNegative` makes a shortfall a hard rejection instead of a
+   * silent clamp — used by anything spending physical stock, so a lost race
+   * can never mint resources out of thin air.
    */
-  async adjustResources(playerId: string, deltas: ResourceUpdate): Promise<ResourceRow | null> {
+  async adjustResources(
+    playerId: string,
+    deltas: ResourceUpdate,
+    opts: { requireNonNegative?: boolean } = {},
+  ): Promise<ResourceRow | null> {
     const allowed: (keyof ResourceUpdate)[] = ['regolith', 'water_ice', 'helium3', 'rare_earths'];
     for (const key of Object.keys(deltas)) {
       if (!allowed.includes(key as keyof ResourceUpdate)) {
@@ -556,11 +747,22 @@ export class DatabaseManager {
         };
       const next: ResourceRow = {
         player_id: playerId,
-        regolith: Math.max(0, current.regolith + (deltas.regolith ?? 0)),
-        water_ice: Math.max(0, current.water_ice + (deltas.water_ice ?? 0)),
-        helium3: Math.max(0, current.helium3 + (deltas.helium3 ?? 0)),
-        rare_earths: Math.max(0, current.rare_earths + (deltas.rare_earths ?? 0)),
+        regolith: current.regolith + (deltas.regolith ?? 0),
+        water_ice: current.water_ice + (deltas.water_ice ?? 0),
+        helium3: current.helium3 + (deltas.helium3 ?? 0),
+        rare_earths: current.rare_earths + (deltas.rare_earths ?? 0),
       };
+      if (opts.requireNonNegative) {
+        for (const key of allowed) {
+          if (next[key] < 0) {
+            throw new TradeError(
+              'insufficient_inventory',
+              `DatabaseManager: player "${playerId}" has insufficient ${key} (${current[key]} < ${-(deltas[key] ?? 0)})`,
+            );
+          }
+        }
+      }
+      for (const key of allowed) next[key] = Math.max(0, next[key]);
       await this.run(
         `INSERT INTO resources (player_id, regolith, water_ice, helium3, rare_earths)
          VALUES (?, ?, ?, ?, ?)
@@ -574,6 +776,48 @@ export class DatabaseManager {
       return next;
     });
   }
+
+  /**
+   * Atomic "extraction credit": pays `credits`, grants `deltas` to the legacy
+   * resource ledger, and (when `inventory` is supplied) credits the tradable
+   * wallet — all in one transaction, so a haul is always both physical stock
+   * and sellable stock, never one without the other.
+   *
+   * Currency guard: both ledgers are physical holdings, so this entry point
+   * accepts GAINS only. Every SPEND must go through `adjustResources` /
+   * `adjustInventory` with `requireNonNegative`, otherwise a concurrent spend
+   * and a concurrent gain could each read the same pre-image and silently lose
+   * one update.
+   */
+  creditExtraction(
+    playerId: string,
+    deltas: ResourceUpdate,
+    credits: number,
+    inventory: Record<string, number> = {},
+  ): Promise<ResourceRow | null> {
+    for (const [key, value] of Object.entries(deltas)) {
+      if ((value as number) < 0) {
+        throw new Error(`DatabaseManager: creditExtraction accepts gains only (bad delta ${key}=${value})`);
+      }
+    }
+    for (const [commodity, units] of Object.entries(inventory)) {
+      if (!(units >= 0)) {
+        throw new Error(`DatabaseManager: creditExtraction accepts gains only (bad inventory ${commodity}=${units})`);
+      }
+    }
+    if (credits < 0) throw new Error('DatabaseManager: creditExtraction accepts a non-negative credit amount');
+    return this.withTransaction(async () => {
+      const player = await this.getPlayer(playerId);
+      if (!player) return null;
+      const granted = await this.adjustResources(playerId, deltas);
+      for (const [commodity, units] of Object.entries(inventory)) {
+        await this.applyInventoryDelta(playerId, commodity, units, {});
+      }
+      await this.run('UPDATE players SET credits = credits + ? WHERE id = ?', [credits, playerId]);
+      return granted;
+    });
+  }
+
 
   // -- infrastructure --------------------------------------------------------------
 
@@ -703,6 +947,261 @@ export class DatabaseManager {
         );
   }
 
+  // -- market: reserves / inventory / atomic trades -----------------------------------
+
+  /** Idempotently seed liquidity pools. Existing commodities are untouched. */
+  async seedMarketReserves(
+    seeds: ReadonlyArray<{ commodity: string; baseline: number }>,
+  ): Promise<void> {
+    const ts = nowIso();
+    await this.withTransaction(async () => {
+      for (const seed of seeds) {
+        if (!Number.isFinite(seed.baseline) || seed.baseline <= 0) {
+          throw new TradeError('bad_trade', `baseline reserve for "${seed.commodity}" must be > 0`);
+        }
+        await this.run(
+          `INSERT INTO market_reserves (commodity, baseline_reserve, reserve, updated_at)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(commodity) DO NOTHING`,
+          [seed.commodity, seed.baseline, seed.baseline, ts],
+        );
+      }
+    });
+  }
+
+  /** All liquidity pools (baseline + live reserve), ordered by commodity. */
+  listMarketReserves(): Promise<MarketReserveRow[]> {
+    return this.all<MarketReserveRow>('SELECT * FROM market_reserves ORDER BY commodity');
+  }
+
+  getMarketReserve(commodity: string): Promise<MarketReserveRow | undefined> {
+    return this.get<MarketReserveRow>('SELECT * FROM market_reserves WHERE commodity = ?', [commodity]);
+  }
+
+  /** Tradable stock per commodity for one player (missing rows mean zero). */
+  async getInventory(playerId: string): Promise<Record<string, number>> {
+    const rows = await this.all<InventoryRow>(
+      'SELECT * FROM inventory WHERE player_id = ? AND units > 0 ORDER BY commodity',
+      [playerId],
+    );
+    const out: Record<string, number> = {};
+    for (const row of rows) out[row.commodity] = row.units;
+    return out;
+  }
+
+  /**
+   * One-time, idempotent migration: mirrors pre-market holdings from the legacy
+   * fixed-column `resources` ledger into `inventory` for commodities that have a
+   * legacy column. Only creates rows that do not exist yet, so it can never
+   * double-count — and without it, ore mined before the market tables landed
+   * would be permanently unsellable.
+   *
+   * `mapping` maps commodity id -> legacy column. Returns units backfilled.
+   */
+  async backfillInventoryFromResources(
+    mapping: Record<string, keyof ResourceUpdate>,
+  ): Promise<Record<string, number>> {
+    const backfilled: Record<string, number> = {};
+    const ts = nowIso();
+    await this.withTransaction(async () => {
+      const rows = await this.all<ResourceRow>('SELECT * FROM resources');
+      for (const [commodity, column] of Object.entries(mapping)) {
+        let total = 0;
+        for (const row of rows) {
+          const units = row[column] ?? 0;
+          if (!(units > 0)) continue;
+          const inserted = await this.run(
+            `INSERT INTO inventory (player_id, commodity, units, updated_at)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(player_id, commodity) DO NOTHING`,
+            [row.player_id, commodity, units, ts],
+          );
+          if (inserted.changes === 1) total += units;
+        }
+        backfilled[commodity] = total;
+      }
+    });
+    return backfilled;
+  }
+
+  /** Atomic per-commodity stock delta (creates the row; clamped at 0). */
+  async adjustInventory(
+    playerId: string,
+    commodity: string,
+    delta: number,
+    opts: { requireNonNegative?: boolean } = {},
+  ): Promise<number> {
+    return this.withTransaction(async () => this.applyInventoryDelta(playerId, commodity, delta, opts));
+  }
+
+  /** Bare delta writer — call ONLY inside an open withTransaction frame. */
+  private async applyInventoryDelta(
+    playerId: string,
+    commodity: string,
+    delta: number,
+    opts: { requireNonNegative?: boolean },
+  ): Promise<number> {
+    const current = await this.get<InventoryRow>(
+      'SELECT * FROM inventory WHERE player_id = ? AND commodity = ?',
+      [playerId, commodity],
+    );
+    const next = (current?.units ?? 0) + delta;
+    if (opts.requireNonNegative && next < 0) {
+      throw new TradeError(
+        'insufficient_inventory',
+        `DatabaseManager: player "${playerId}" holds ${current?.units ?? 0} ${commodity}, needs ${delta}`,
+      );
+    }
+    const clamped = Math.max(0, next);
+    await this.run(
+      `INSERT INTO inventory (player_id, commodity, units, updated_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(player_id, commodity) DO UPDATE SET
+         units = excluded.units,
+         updated_at = excluded.updated_at`,
+      [playerId, commodity, clamped, nowIso()],
+    );
+    return clamped;
+  }
+
+  /**
+   * The single atomic unit of a market trade, mirroring `recordTransaction`
+   * for station-side (AMM) counterparties. In one transaction:
+   *
+   *  1. validates the player, balance (buy) and stock (sell);
+   *  2. CAS-updates the liquidity pool: the write only lands if `reserve`
+   *     still equals `expectedReserve` — a lost race throws `reserve_changed`
+   *     so the caller can reprice, never fill at a stale curve;
+   *  3. moves credits, inventory, and (when the commodity maps to a legacy
+   *     `resources` column) the physical ledger together;
+   *  4. appends the immutable `transactions` row.
+   *
+   * The station ("STATION_EXCHANGE") is a virtual counterparty: it needs no
+   * players row and its own balance is not tracked here.
+   */
+  async recordTrade(trade: MarketTradeCommit): Promise<MarketTradeResult> {
+    const {
+      tradeId, playerId, commodity, amount, isBuy,
+      totalCredits, unitPrice, expectedReserve, newReserve, legacyColumn,
+    } = trade;
+    if (!Number.isFinite(amount) || amount <= 0) throw new TradeError('bad_amount', 'trade amount must be > 0');
+    if (!Number.isFinite(totalCredits) || totalCredits < 0) {
+      throw new TradeError('bad_trade', 'trade total must be >= 0');
+    }
+    const ts = nowIso();
+    return this.withTransaction(async () => {
+      const player = await this.getPlayer(playerId);
+      if (!player) throw new TradeError('unknown_player', `player "${playerId}" not found`);
+      if (isBuy && (player.credits ?? 0) < totalCredits) {
+        throw new TradeError(
+          'insufficient_credits',
+          `balance ${player.credits} < trade total ${totalCredits}`,
+        );
+      }
+
+      // CAS on the pool: stale repricers lose and retry against fresh state.
+      const pool = await this.run(
+        'UPDATE market_reserves SET reserve = ?, updated_at = ? WHERE commodity = ? AND reserve = ?',
+        [newReserve, ts, commodity, expectedReserve],
+      );
+      if (pool.changes !== 1) {
+        throw new TradeError(
+          'reserve_changed',
+          `liquidity pool "${commodity}" moved under this trade (expected reserve ${expectedReserve})`,
+        );
+      }
+
+      // Credits: buy debits the player, sell credits them (station is virtual).
+      const balanceRow = isBuy
+        ? await this.run('UPDATE players SET credits = credits - ? WHERE id = ? AND credits >= ?', [totalCredits, playerId, totalCredits])
+        : await this.run('UPDATE players SET credits = credits + ? WHERE id = ?', [totalCredits, playerId]);
+      if (isBuy && balanceRow.changes !== 1) {
+        throw new TradeError('insufficient_credits', `could not debit ${totalCredits} from "${playerId}"`);
+      }
+      const newBalance = isBuy ? (player.credits ?? 0) - totalCredits : (player.credits ?? 0) + totalCredits;
+
+      // Tradable wallet, then the physical mirror where one exists.
+      const inventory = await this.applyInventoryDelta(playerId, commodity, isBuy ? amount : -amount, {
+        requireNonNegative: true,
+      });
+      if (legacyColumn !== undefined) {
+        await this.adjustResources(playerId, { [legacyColumn]: isBuy ? amount : -amount }, {
+          requireNonNegative: true,
+        });
+      }
+
+      await this.run(
+        `INSERT INTO transactions (id, buyer_id, seller_id, item_type, quantity, total_credits, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [
+          tradeId,
+          isBuy ? playerId : STATION_ID,
+          isBuy ? STATION_ID : playerId,
+          commodity,
+          amount,
+          totalCredits,
+          ts,
+        ],
+      );
+
+      return {
+        tradeId,
+        commodity,
+        amount,
+        isBuy,
+        unitPrice,
+        totalCredits,
+        newBalance,
+        inventory,
+        reserveBefore: expectedReserve,
+        reserveAfter: newReserve,
+      };
+    });
+  }
+
+  // -- rail tracks ------------------------------------------------------------------------
+
+  async addRailTrack(track: NewRailTrack): Promise<RailTrackRow> {
+    const row: RailTrackRow = {
+      id: track.id,
+      built_by: track.built_by,
+      x0: track.x0, y0: track.y0, z0: track.z0,
+      x1: track.x1, y1: track.y1, z1: track.z1,
+      length: track.length,
+      gauge: track.gauge,
+      status: track.status ?? 'active',
+      built_at: track.built_at ?? nowIso(),
+    };
+    await this.run(
+      `INSERT INTO rail_tracks (id, built_by, x0, y0, z0, x1, y1, z1, length, gauge, status, built_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [row.id, row.built_by, row.x0, row.y0, row.z0, row.x1, row.y1, row.z1, row.length, row.gauge, row.status, row.built_at],
+    );
+    return row;
+  }
+
+  getRailTrack(id: string): Promise<RailTrackRow | undefined> {
+    return this.get<RailTrackRow>('SELECT * FROM rail_tracks WHERE id = ?', [id]);
+  }
+
+  listRailTracks(status?: string): Promise<RailTrackRow[]> {
+    return status
+      ? this.all<RailTrackRow>('SELECT * FROM rail_tracks WHERE status = ? ORDER BY built_at', [status])
+      : this.all<RailTrackRow>('SELECT * FROM rail_tracks ORDER BY built_at');
+  }
+
+  async updateRailTrack(id: string, updates: RailTrackUpdate): Promise<number> {
+    const { cols, values } = sanitize('rail_tracks', updates as Record<string, unknown>);
+    const setClause = cols.map((c) => `${c} = ?`).join(', ');
+    const { changes } = await this.run(`UPDATE rail_tracks SET ${setClause} WHERE id = ?`, [...values, id]);
+    return changes;
+  }
+
+  async deleteRailTrack(id: string): Promise<number> {
+    const { changes } = await this.run('DELETE FROM rail_tracks WHERE id = ?', [id]);
+    return changes;
+  }
+
   // -- generic query / delete ----------------------------------------------------------
 
   /** Small typed query helper: `query('claims', { status: 'active', radius: { op: '>=', value: 10 } })` */
@@ -733,6 +1232,9 @@ export class DatabaseManager {
     await this.withTransaction(async () => {
       await this.exec(`
         DROP TABLE IF EXISTS transactions;
+        DROP TABLE IF EXISTS rail_tracks;
+        DROP TABLE IF EXISTS inventory;
+        DROP TABLE IF EXISTS market_reserves;
         DROP TABLE IF EXISTS infrastructure;
         DROP TABLE IF EXISTS claims;
         DROP TABLE IF EXISTS resources;

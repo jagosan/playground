@@ -9,6 +9,7 @@
 - `docs/architecture/10-road-network-and-dynamics-overhaul.md`: Graded dirt road network with banked curves, chase camera perspective fix, volumetric shadow and contact shading, and boosted powertrain dynamics.
 - `docs/architecture/11-npc-competitors-and-collision-physics.md`: NPC rover competitors, autonomous harvesting state machine, dedicated science stations, rover-to-rover collision impulses, hull damage models, and timed wave system.
 - `docs/architecture/12-lunar-frontier-economy-and-multiplayer.md`: Babylon.js 3D engine, Fastify WebSocket authoritative server, SQLite persistent moon economy, rail lines, mine tunnels, EVA suit and buggy.
+- `docs/architecture/13-lunar-frontier-interactive-client-and-market.md`: Interactive Babylon.js web client, WebSocket replication, life-support HUD, dynamic market economy and commodity trading.
 - `specs/`:
   - `specs/00-system-overview.md`: Project vision, minigame architecture, rendering stack.
   - `specs/01-playground-lobby.md`: 3D retro playground hub, equipment-to-minigame selector.
@@ -23,10 +24,13 @@
 
 ## Lunar Frontier Multiplayer & Economy Subsystem (Spec 12)
 - `games/lunar-frontier/server/`: Fastify + `ws` server, SQLite schema, market pricing, 20Hz tick (`LunarServer.ts`, `Database.ts`).
+- `games/lunar-frontier/src/economy/`: Automated market pricing, commodity liquidity pools (`MarketEngine.ts`).
 - `games/lunar-frontier/src/engine/`: Babylon.js scene manager, lighting, vacuum shadows (`WorldScene.ts`, `CameraRig.ts`).
 - `games/lunar-frontier/src/entities/`: Astronaut suit EVA controller, open-top buggy, dock mechs (`AstronautSuit.ts`, `OpenBuggy.ts`, `LoadingDockMech.ts`).
 - `games/lunar-frontier/src/infrastructure/`: Procedural tunnel mesh builder, rail line spline renderer, ore cart runner (`TunnelNetwork.ts`, `RailSystem.ts`).
 - `games/lunar-frontier/src/network/`: WebSocket client, state delta interpolator, player manager (`NetworkClient.ts`).
+- `games/lunar-frontier/src/ui/`: Glassmorphic telemetry HUD, life support meters, commodity trade modal (`LunarHUD.ts`, `hud.css`).
+- `games/lunar-frontier/src/client/`: Interactive Babylon.js client game loop and Vite web entry (`ClientApp.ts`, `main.ts`).
 
 ## Blender Asset Pipeline (Spec 05)
 - `scripts/build_lunar_assets.py`: Standalone Blender 4.2 headless asset generator (`--all` / per-phase flags; previews + `manifest.json`).
