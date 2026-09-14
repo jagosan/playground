@@ -34,6 +34,15 @@ export default defineConfig({
     open: false,
     // Dev server must also serve src/ui/hud.css (outside the client root).
     fs: { allow: [PACKAGE_ROOT] },
+    proxy: {
+      '/ws': {
+        target: 'ws://127.0.0.1:3030',
+        ws: true,
+      },
+      '/api': {
+        target: 'http://127.0.0.1:3030',
+      },
+    },
   },
   build: {
     target: 'es2022',

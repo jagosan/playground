@@ -1126,9 +1126,11 @@ export class ClientApp {
       });
     }
     // Server-authoritative spawn (state carries x/y/z once the session exists).
+    // If the server sent (0, 0) (uninitialized origin), preserve the world's
+    // resolved spawn point (512, 512) where the base and buggy are parked.
     const sx = finite(ev.state['x']);
     const sy = finite(ev.state['y']);
-    if (sx !== null && sy !== null && this.mode === 'suit') {
+    if (sx !== null && sy !== null && (sx !== 0 || sy !== 0) && this.mode === 'suit') {
       this.suit?.teleport(sx, sy);
     }
     this.hudSay(`welcome to the frontier, ${ev.player.username}`);
