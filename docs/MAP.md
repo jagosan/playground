@@ -10,6 +10,8 @@
 - `docs/architecture/11-npc-competitors-and-collision-physics.md`: NPC rover competitors, autonomous harvesting state machine, dedicated science stations, rover-to-rover collision impulses, hull damage models, and timed wave system.
 - `docs/architecture/12-lunar-frontier-economy-and-multiplayer.md`: Babylon.js 3D engine, Fastify WebSocket authoritative server, SQLite persistent moon economy, rail lines, mine tunnels, EVA suit and buggy.
 - `docs/architecture/13-lunar-frontier-interactive-client-and-market.md`: Interactive Babylon.js web client, WebSocket replication, life-support HUD, dynamic market economy and commodity trading.
+- `docs/architecture/14-lunar-frontier-ux-infrastructure-and-visual-overhaul.md`: Controls inversion fix, micro-relief normal tiling, 3D waypoint compass, infrastructure mounting (bases, tunnels, rails), tutorial onboarding, and articulated walking.
+- `docs/architecture/15-subagent-context-pruning-and-turn-budgeting.md`: Subagent context pruning, N-3 turn-budget circuit breaker, AST extraction, and Beehive Neo4j symbol discovery.
 - `specs/`:
   - `specs/00-system-overview.md`: Project vision, minigame architecture, rendering stack.
   - `specs/01-playground-lobby.md`: 3D retro playground hub, equipment-to-minigame selector.
