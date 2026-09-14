@@ -196,7 +196,7 @@ export class WorldScene {
       microRelief: options.microRelief ?? 1.1,
       shadowMapSize: options.shadowMapSize ?? 1024,
       sunIntensity: options.sunIntensity ?? 3.1,
-      earthshineIntensity: options.earthshineIntensity ?? 0.08,
+      earthshineIntensity: options.earthshineIntensity ?? 0.28,
       starDomeRadius: options.starDomeRadius ?? 6000,
       starCount: options.starCount ?? 900,
       spawnClearance: options.spawnClearance ?? 1.7,
@@ -232,7 +232,7 @@ export class WorldScene {
     this.buildTerrain();
 
     this.rig = new CameraRig(this.scene, {
-      initialMode: this.options.cameraMode ?? 'eva_first_person',
+      initialMode: this.options.cameraMode ?? 'eva_third_person',
       groundHeightAt: (x, y) => this.getGroundHeightAt(x, y),
       ...(this.options.silent !== undefined ? { silent: this.options.silent } : {}),
     });
@@ -696,7 +696,8 @@ export class WorldScene {
   private buildRegolithMaterial(): PBRMaterial {
     const scene = this.requireScene();
     const mat = new PBRMaterial('regolith', scene);
-    mat.albedoColor = new Color3(0.121, 0.118, 0.114); // low-albedo grey-tan
+    mat.albedoColor = new Color3(0.24, 0.23, 0.22); // low-albedo grey-tan regolith
+    mat.emissiveColor = new Color3(0.12, 0.12, 0.13); // ambient earthshine bounce for shadow visibility
     mat.metallic = 0.0;
     mat.roughness = 0.96;
     mat.environmentIntensity = 0.02; // vacuum: nothing to reflect

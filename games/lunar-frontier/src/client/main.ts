@@ -15,6 +15,7 @@
  * Build:       npx vite build --root games/lunar-frontier
  */
 
+import '../ui/hud.css';
 import { ClientApp } from './ClientApp.ts';
 
 interface LunarFrontierConfig {
@@ -34,7 +35,7 @@ function readConfig(): LunarFrontierConfig {
     username: injected.username ?? params?.get('user') ?? undefined,
     faction: injected.faction ?? params?.get('faction') ?? undefined,
     role: injected.role ?? params?.get('role') ?? undefined,
-    wsUrl: injected.wsUrl ?? undefined,
+    wsUrl: injected.wsUrl ?? params?.get('ws') ?? undefined,
     seed: injected.seed ?? params?.get('seed') ?? undefined,
   };
 }
