@@ -357,7 +357,12 @@ export class ClientApp {
     this.stepEntities(dt);
     this.syncCamera(dt);
     this.pumpMoveStream(dt);
-    this.network?.update(timestamp);
+    // Clock-domain rule (ADR-013-2): NetworkClient interpolates against the
+    // SAME clock it stamps snapshots with (its own `options.clock`, default
+    // Date.now). Passing this frame's timestamp here would mix domains —
+    // `nowMs()` is performance.now()-based in browsers — and the resulting
+    // negative `since` extrapolates remote avatars to astronomical positions.
+    this.network?.update();
     this.syncRemoteAvatars();
     this.refreshScanner(timestamp);
     this.refreshHud();

@@ -5,6 +5,7 @@
   "main": "index.ts",
   "scripts": {
     "start": "node index.ts",
+    "build": "vite build",
     "smoke:world": "node --no-warnings scripts/smoke-lunarworld.ts",
     "smoke:market": "npx tsx scripts/smoke-market-and-rails.ts",
     "typecheck:server": "tsc -p tsconfig.server.json"
