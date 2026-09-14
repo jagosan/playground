@@ -426,16 +426,14 @@ async function main(): Promise<void> {
     const deltasSeen = countFrames(bobNet, 'world_delta') - deltasAtStart;
     check('world_delta replicated to peer at ~20 Hz', deltasSeen >= 15, `${deltasSeen} in the same window`);
 
-    // Puppet convergence on the authoritative target.
+    // Puppet convergence on the authoritative target. The MOVE frame that
+    // carries the new position can only flow while alice's frames are being
+    // stepped, so pump both clients while waiting on it.
     alice.getSuit().teleport(540, 512);
-    alice.update();
-    alice.handleKeyInput('KeyW', 'down');
-    alice.update();
-    check('remote target converges on authoritative x=540', await until(() => {
+    check('remote target converges on authoritative x=540', await pumpUntil(() => {
       const p = bobNet.getRemote(aliceNet.playerId ?? '');
       return p !== undefined && Math.abs(p.x - 540) < 0.5;
     }, 4000), `bob's target: ${JSON.stringify(bobNet.getRemote(aliceNet.playerId ?? '')?.x)}`);
-    alice.handleKeyInput('KeyW', 'up');
 
     await pumpUntil(() => {
       const puppetNow = bob.getRemoteAvatar(aliceNet.playerId ?? '');
