@@ -53,6 +53,21 @@ export const HEADLIGHT_RANGE_M = 45;
 /** Fraction of look-pitch the stiff torso copies. */
 export const PITCH_LEAN_SCALE = 0.4;
 
+// -- Walking articulation (TASK-PLAY-060, spec §3.6) --------------------------
+/** Minimum ground speed that drives the walk cycle (m/s). */
+export const WALK_MIN_SPEED = 0.08;
+/** Speed above which the cycle quickens to the lope/sprint cadence (m/s). */
+export const SPRINT_MIN_SPEED = 2.5;
+/** Walk-cycle clock advance per 1/60 s reference frame (rad), walk / sprint. */
+export const WALK_CYCLE_RATE = 7.5;
+export const SPRINT_CYCLE_RATE = 12;
+/** Reference frame time the cycle rates are tuned for (s). */
+export const WALK_CYCLE_FRAME_S = 0.016;
+/** Peak leg swing amplitude (rad); arms/torso counter-move at half rate. */
+export const LEG_SWING_RAD = 0.42;
+/** Torso counter-bob amplitude (m). */
+export const TORSO_BOB_M = 0.025;
+
 export interface EvaSuitAvatarOptions {
   /** Seed for the owned `LunarEvaSuit` (spawn position, reserves…). */
   initial?: Partial<SuitState>;
@@ -115,6 +130,11 @@ export class EvaSuitAvatar {
   private root: TransformNode | null = null;
   private parts: Mesh[] = [];
   private visor: Mesh | null = null;
+  private torso: Mesh | null = null;
+  private legL: Mesh | null = null;
+  private legR: Mesh | null = null;
+  /** Locomotion walk-cycle clock (radians of phase), advanced in syncTransform. */
+  private walkCycleTime = 0;
   private lamp: SpotLight | null = null;
   private materials: PBRMaterial[] = [];
 
@@ -361,8 +381,10 @@ export class EvaSuitAvatar {
     hardware.environmentIntensity = 0.05;
 
     const gold = new PBRMaterial(`${p}-visor-gold`, scene);
-    gold.albedoColor = new Color3(0.12, 0.08, 0.02);
-    gold.metallic = 0.9;
+    // Apollo EVA gold-sputtered sun visor: bright reflective amber, near-mirror
+    // metalness (TASK-PLAY-060, spec §3.6 visual definition).
+    gold.albedoColor = new Color3(0.92, 0.76, 0.22);
+    gold.metallic = 0.95;
     gold.roughness = 0.12;
     gold.emissiveColor = new Color3(0.62, 0.4, 0.08); // classic gold EVA glow
     gold.environmentIntensity = 0.05;
@@ -432,6 +454,10 @@ export class EvaSuitAvatar {
     legR.position.set(GEO.leg.dx, GEO.leg.y, 0);
     legR.material = fabric;
 
+    this.torso = torso;
+    this.legL = legL;
+    this.legR = legR;
+
     this.parts = [torso, helmet, visor, backpack, consoleBox, legL, legR];
     for (const mesh of this.parts) {
       mesh.parent = this.root;
@@ -472,11 +498,43 @@ export class EvaSuitAvatar {
     // look pitch leans the torso a fraction inside that yawed frame.
     root.rotation.set(PITCH_LEAN_SCALE * state.pitch, Math.PI / 2 + state.heading, 0);
 
+    this.applyWalkCycle(state);
     this.applyLamp(state);
 
     // Force a matrix rebuild so headless consumers read a truthful
     // globalPosition without an intervening render().
     root.computeWorldMatrix(true);
+  }
+
+  /**
+   * Procedural walking articulation (TASK-PLAY-060, spec §3.6): counter-phase
+   * leg swing and torso counter-bob driven by a locomotion clock. Visual only
+   * — physics stays in `LunarEvaSuit`. Stopped or airborne the pose snaps back
+   * to neutral standing.
+   */
+  private applyWalkCycle(state: SuitState): void {
+    const torso = this.torso;
+    const legL = this.legL;
+    const legR = this.legR;
+    if (torso === null || legL === null || legR === null) return;
+
+    const speed = Math.hypot(state.vx, state.vy);
+    if (speed > WALK_MIN_SPEED && state.isGrounded) {
+      // Sprint cadence above SPRINT_MIN_SPEED, brisk lunar walk below.
+      const rate = speed > SPRINT_MIN_SPEED ? SPRINT_CYCLE_RATE : WALK_CYCLE_RATE;
+      this.walkCycleTime += rate * WALK_CYCLE_FRAME_S;
+      const swing = Math.sin(this.walkCycleTime) * LEG_SWING_RAD;
+      legL.rotation.x = swing;
+      legR.rotation.x = -swing;
+      // Torso counter-bob at twice the leg frequency (heel-strike impacts).
+      torso.position.y = GEO.torso.y + Math.abs(Math.sin(this.walkCycleTime * 2)) * TORSO_BOB_M;
+    } else {
+      // Stopped or airborne: neutral standing pose, clock parked for next start.
+      this.walkCycleTime = 0;
+      legL.rotation.x = 0;
+      legR.rotation.x = 0;
+      torso.position.y = GEO.torso.y;
+    }
   }
 
   /** Push lamp on/off and battery fade into the SpotLight. */

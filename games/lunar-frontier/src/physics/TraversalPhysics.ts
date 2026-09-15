@@ -112,6 +112,19 @@ export const SUIT_MAX_RCS_FUEL = 100;
 export const SUIT_O2_BASE = 0.05;
 export const SUIT_O2_EXERTION = 0.12;
 export const SUIT_O2_RCS = 0.04;
+/**
+ * Dynamic metabolic respiration (TASK-PLAY-060, spec §3.7): gait-gated
+ * multipliers on the baseline O₂ draw. Idle breathes at 1×, a brisk lunar
+ * walk at ~1.8×, the full sprint-lope at ~4.5×, and a suit plugged into
+ * vehicle life support (umbilical) drops to 0.35×.
+ */
+export const SUIT_METABOLIC_IDLE = 1.0;
+export const SUIT_METABOLIC_WALK = 1.8;
+export const SUIT_METABOLIC_SPRINT = 4.5;
+export const SUIT_METABOLIC_MOUNTED = 0.35;
+/** Speed gates for the metabolic gait bands (m/s). */
+export const SUIT_METABOLIC_WALK_V = 0.5;
+export const SUIT_METABOLIC_SPRINT_V = 2.5;
 /** Suit battery draw (units/s): PLSS heaters, lamps, comms, exertion, RCS. */
 export const SUIT_BAT_LIFE_SUPPORT = 0.035;
 export const SUIT_BAT_EXERTION = 0.08;
@@ -188,6 +201,34 @@ export interface SuitExertion {
   exertion: number;
 }
 
+/** Optional per-frame context for `LunarEvaSuit.step`. */
+export interface SuitStepOptions {
+  /**
+   * Umbilical support (TASK-PLAY-060, spec §3.7): the suit is plugged into
+   * vehicle life support, so metabolic O₂ draw scales to
+   * `SUIT_METABOLIC_MOUNTED` (0.35×) regardless of gait.
+   */
+  mounted?: boolean;
+}
+
+/**
+ * Gait-gated metabolic respiration multiplier (TASK-PLAY-060, spec §3.7).
+ * Mounted on vehicle life support beats everything (0.35×); otherwise the
+ * breath follows the gait: idle 1×, walk (>0.5 m/s) 1.8×, sprint (>2.5 m/s)
+ * 4.5×. Airborne coasting is not exertion — the hop already paid for itself.
+ */
+export function metabolicMultiplier(
+  speed: number,
+  isGrounded: boolean,
+  mounted = false,
+): number {
+  if (mounted) return SUIT_METABOLIC_MOUNTED;
+  if (!isGrounded) return SUIT_METABOLIC_IDLE;
+  if (speed > SUIT_METABOLIC_SPRINT_V) return SUIT_METABOLIC_SPRINT;
+  if (speed > SUIT_METABOLIC_WALK_V) return SUIT_METABOLIC_WALK;
+  return SUIT_METABOLIC_IDLE;
+}
+
 /**
  * Astronaut EVA suit physics: grounded locomotion with regolith friction and
  * slip, ballistic low-g arcs, RCS micro-maneuvering / descent softening, and
@@ -230,7 +271,12 @@ export class LunarEvaSuit {
   }
 
   /** Advance the suit one timestep. `ground` is surface elevation underfoot. */
-  public step(dt: number, input: SuitInput = IDLE_SUIT_INPUT, ground: GroundElevationFn = FLAT_GROUND): SuitState {
+  public step(
+    dt: number,
+    input: SuitInput = IDLE_SUIT_INPUT,
+    ground: GroundElevationFn = FLAT_GROUND,
+    options: SuitStepOptions = {},
+  ): SuitState {
     const s = this.state;
     const step = clamp(dt, 0, 0.25);
 
@@ -350,8 +396,12 @@ export class LunarEvaSuit {
       0,
       1.5,
     );
+    // Dynamic metabolic respiration (TASK-PLAY-060, spec §3.7): the breath
+    // follows the gait — idle baseline, ~1.8× walking, ~4.5× sprinting — and
+    // drops to 0.35× on the vehicle umbilical.
+    const metabolic = metabolicMultiplier(speed, s.isGrounded, options.mounted === true);
     s.oxygen = clamp(
-      s.oxygen - (SUIT_O2_BASE + SUIT_O2_EXERTION * exertion + SUIT_O2_RCS * rcsUsage) * step,
+      s.oxygen - (SUIT_O2_BASE * metabolic + SUIT_O2_EXERTION * exertion + SUIT_O2_RCS * rcsUsage) * step,
       0,
       SUIT_MAX_OXYGEN,
     );
@@ -1181,6 +1231,12 @@ export interface TraversalCommands {
   mount?: boolean;
   /** Attempt to leave the current vehicle. */
   dismount?: boolean;
+  /**
+   * Umbilical support for the suit this frame (TASK-PLAY-060, spec §3.7):
+   * plugged into vehicle life support, metabolic O₂ draw scales to 0.35×.
+   * Forwarded to `LunarEvaSuit.step` while the suit mode is active.
+   */
+  mounted?: boolean;
 }
 
 export interface TraversalSnapshot {
@@ -1424,7 +1480,7 @@ export class TraversalPhysics {
     // Suit steps while on foot (and during mount animation, frozen-ish).
     const suitInput: SuitInput = { ...IDLE_SUIT_INPUT, ...(commands.suit ?? {}) };
     if (this.mode === 'suit') {
-      this.suit.step(step, suitInput, this.ground);
+      this.suit.step(step, suitInput, this.ground, { mounted: commands.mounted === true });
     } else if (this.mode === 'mounting' || this.mode === 'dismounting') {
       this.suit.step(step, IDLE_SUIT_INPUT, this.ground);
     }
