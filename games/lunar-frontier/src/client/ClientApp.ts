@@ -380,6 +380,14 @@ export class ClientApp {
     }).init(scene);
 
     const snapshot = this.world.getSnapshot();
+    if (snapshot !== null) {
+      // Infrastructure layer (spec 14 §3.3): faction bases, tunnel network,
+      // and rail system are built from the generated world snapshot — never
+      // invented client-side.
+      this.factionBases = new FactionBases(snapshot).init(scene);
+      this.tunnelNetwork = new TunnelNetwork(snapshot).init(scene);
+      this.railSystem = new RailSystem(snapshot).init(scene);
+    }
     this.traversal =
       snapshot !== null
         ? TraversalController.fromSnapshot(snapshot, { startAt: { x: spawn.x, y: spawn.y } })
@@ -390,6 +398,15 @@ export class ClientApp {
             position: { x: spawn.x, y: spawn.y, z: 0 },
             links: [],
           });
+
+    // Shadow casters (spec 14 §3.3): local entities and base furniture drop
+    // crisp vacuum shadows; registration is idempotent and a no-op when the
+    // shadow generator is disabled.
+    this.world.registerShadowCasters(this.suit.getMeshes());
+    this.world.registerShadowCasters(this.buggy.getMeshes());
+    if (this.factionBases !== null) {
+      this.world.registerShadowCasters(this.factionBases.getMeshes());
+    }
 
     if (this.hud === null && this.options.createHud !== false) {
       // Browser (or harness with an injected global document) gets the DOM
@@ -511,6 +528,14 @@ export class ClientApp {
     this.buggy?.dispose();
     this.suit = null;
     this.buggy = null;
+    // Infrastructure teardown before the world itself goes away (their meshes
+    // live in the world scene; dispose() unparents and releases materials).
+    this.factionBases?.dispose();
+    this.tunnelNetwork?.dispose();
+    this.railSystem?.dispose();
+    this.factionBases = null;
+    this.tunnelNetwork = null;
+    this.railSystem = null;
     this.world.dispose();
     this.hud?.dispose();
     this.hud = null;
@@ -536,6 +561,21 @@ export class ClientApp {
 
   getTraversal(): TraversalController | null {
     return this.traversal;
+  }
+
+  /** Faction base assemblies, or null before `init()`/without a snapshot. */
+  getFactionBases(): FactionBases | null {
+    return this.factionBases;
+  }
+
+  /** Tunnel network assembly, or null before `init()`/without a snapshot. */
+  getTunnelNetwork(): TunnelNetwork | null {
+    return this.tunnelNetwork;
+  }
+
+  /** Rail system assembly, or null before `init()`/without a snapshot. */
+  getRailSystem(): RailSystem | null {
+    return this.railSystem;
   }
 
   isMounted(): boolean {
