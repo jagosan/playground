@@ -175,9 +175,15 @@ export class OpenBuggy {
   private ownedEngine: AbstractEngine | null = null;
 
   private root: TransformNode | null = null;
+  private chassisBody: TransformNode | null = null;
   private chassis: Mesh | null = null;
   private parts: Mesh[] = [];
   private wheels: Mesh[] = [];
+  private cornerPivots: TransformNode[] = [];
+  private steeringKnuckles: (TransformNode | Mesh)[] = [];
+  private cargoCrates: Mesh | null = null;
+  private taillights: Mesh | null = null;
+  private taillightMaterial: PBRMaterial | null = null;
   private lamps: SpotLight[] = [];
   private materials: PBRMaterial[] = [];
 
@@ -276,6 +282,15 @@ export class OpenBuggy {
     this.parts = [];
     this.wheels = [];
     this.chassis = null;
+    this.cargoCrates = null;
+    this.taillights = null;
+    this.taillightMaterial = null;
+    for (const knuckle of this.steeringKnuckles) OpenBuggy.disposeQuietly(knuckle);
+    this.steeringKnuckles = [];
+    for (const pivot of this.cornerPivots) OpenBuggy.disposeQuietly(pivot);
+    this.cornerPivots = [];
+    OpenBuggy.disposeQuietly(this.chassisBody);
+    this.chassisBody = null;
     for (const material of this.materials) OpenBuggy.disposeQuietly(material);
     this.materials = [];
     OpenBuggy.disposeQuietly(this.root);
@@ -526,118 +541,259 @@ export class OpenBuggy {
 
   // -- internals --------------------------------------------------------------
 
-  /** Procedural rover: chassis, flatbed, seat, roll bar, 4 wheels, 2 lamps. */
+  /** Procedural rover: cohesive chassis hierarchy, wishbones, knuckles, wheels, and lighting. */
   private buildRover(scene: Scene): void {
     const p = this.prefix;
 
-    const paint = new PBRMaterial(`${p}-paint`, scene);
-    paint.albedoColor = new Color3(0.78, 0.55, 0.18); // hazard yellow, dusted
-    paint.metallic = 0.2;
-    paint.roughness = 0.62;
-    paint.environmentIntensity = 0.05; // vacuum: almost nothing to reflect
+    // Spec 15 §2.3 PBR Materials Palette
+    const gold = new PBRMaterial(`${p}-gold`, scene);
+    gold.albedoColor = new Color3(0.92, 0.76, 0.20); // Kapton foil
+    gold.metallic = 0.85;
+    gold.roughness = 0.25;
+    gold.environmentIntensity = 0.05;
 
-    const hardware = new PBRMaterial(`${p}-hardware`, scene);
-    hardware.albedoColor = new Color3(0.55, 0.53, 0.52); // dusted gear grey
-    hardware.metallic = 0.5;
-    hardware.roughness = 0.5;
-    hardware.environmentIntensity = 0.05;
+    const hazard = new PBRMaterial(`${p}-hazard`, scene);
+    hazard.albedoColor = new Color3(0.82, 0.62, 0.12); // Hazard matte yellow
+    hazard.metallic = 0.10;
+    hazard.roughness = 0.55;
+    hazard.environmentIntensity = 0.05;
 
-    const rubber = new PBRMaterial(`${p}-rubber`, scene);
-    rubber.albedoColor = new Color3(0.09, 0.09, 0.1); // wire-mesh tyre dark
-    rubber.metallic = 0.1;
-    rubber.roughness = 0.95;
-    rubber.environmentIntensity = 0.05;
+    const aluminum = new PBRMaterial(`${p}-aluminum`, scene);
+    aluminum.albedoColor = new Color3(0.75, 0.77, 0.80); // Anodized aluminum
+    aluminum.metallic = 0.90;
+    aluminum.roughness = 0.35;
+    aluminum.environmentIntensity = 0.05;
 
-    this.materials = [paint, hardware, rubber];
+    const tire = new PBRMaterial(`${p}-tire`, scene);
+    tire.albedoColor = new Color3(0.18, 0.18, 0.20); // Titanium chevron tread
+    tire.metallic = 0.40;
+    tire.roughness = 0.85;
+    tire.environmentIntensity = 0.05;
+
+    const taillightMat = new PBRMaterial(`${p}-taillight-mat`, scene);
+    taillightMat.albedoColor = new Color3(0.8, 0.05, 0.05);
+    taillightMat.emissiveColor = new Color3(0.3, 0.0, 0.0);
+    taillightMat.metallic = 0.1;
+    taillightMat.roughness = 0.5;
+    this.taillightMaterial = taillightMat;
+
+    const dashMat = new PBRMaterial(`${p}-dash-mat`, scene);
+    dashMat.albedoColor = new Color3(0.05, 0.1, 0.2);
+    dashMat.emissiveColor = new Color3(0.15, 0.4, 0.8);
+    dashMat.metallic = 0.1;
+    dashMat.roughness = 0.5;
+
+    this.materials = [gold, hazard, aluminum, tire, taillightMat, dashMat];
     this.root = new TransformNode(`${p}-rover`, scene);
 
-    const chassis = MeshBuilder.CreateBox(
-      `${p}-chassis`,
-      { width: GEO.chassis.width, height: GEO.chassis.height, depth: GEO.chassis.depth },
-      scene,
-    );
-    chassis.material = hardware;
-    this.chassis = chassis;
+    // Unified rigid chassis body node: all chassis elements share this transform
+    const chassisBody = new TransformNode(`${p}-chassis-body`, scene);
+    chassisBody.parent = this.root;
+    this.chassisBody = chassisBody;
 
-    const bed = MeshBuilder.CreateBox(
-      `${p}-bed`,
-      { width: GEO.bed.width, height: GEO.bed.height, depth: GEO.bed.depth },
+    // 1. Structural chassis tub with underside skid plate
+    const tub = MeshBuilder.CreateBox(
+      `${p}-tub-chassis`,
+      { width: 1.42, height: 0.25, depth: 2.9 },
       scene,
     );
-    bed.position.set(0, GEO.bed.y, GEO.bed.z);
-    bed.material = paint;
+    tub.position.set(0, 0.12, 0);
+    tub.material = aluminum;
+    tub.parent = chassisBody;
+    this.chassis = tub;
 
-    const seat = MeshBuilder.CreateBox(
-      `${p}-seat`,
-      { width: GEO.seat.width, height: GEO.seat.height, depth: GEO.seat.depth },
+    // 2. Tubular roll cage & perimeter space frame
+    const frame = MeshBuilder.CreateBox(
+      `${p}-tubular-frame`,
+      { width: 1.46, height: 0.95, depth: 1.8 },
       scene,
     );
-    seat.position.set(GEO.seat.x, GEO.seat.y, GEO.seat.z);
-    seat.material = rubber;
+    frame.position.set(0, 0.72, -0.3);
+    frame.material = hazard;
+    frame.parent = chassisBody;
+
+    // 3. Sloped front cowl & sensor pod
+    const cowl = MeshBuilder.CreateBox(
+      `${p}-front-cowl`,
+      { width: 1.25, height: 0.28, depth: 0.8 },
+      scene,
+    );
+    cowl.position.set(0, 0.35, 1.15);
+    cowl.material = gold;
+    cowl.parent = chassisBody;
+
+    // 4. Cockpit: seat base, seat back, T-bar joystick, dash display
+    const seatBase = MeshBuilder.CreateBox(
+      `${p}-seat-base`,
+      { width: 0.55, height: 0.14, depth: 0.55 },
+      scene,
+    );
+    seatBase.position.set(-0.28, 0.32, 0.3);
+    seatBase.material = tire;
+    seatBase.parent = chassisBody;
 
     const seatBack = MeshBuilder.CreateBox(
       `${p}-seat-back`,
-      { width: GEO.seatBack.width, height: GEO.seatBack.height, depth: GEO.seatBack.depth },
+      { width: 0.55, height: 0.55, depth: 0.12 },
       scene,
     );
-    seatBack.position.set(GEO.seatBack.x, GEO.seatBack.y, GEO.seatBack.z);
-    seatBack.material = rubber;
+    seatBack.position.set(-0.28, 0.62, 0.02);
+    seatBack.material = tire;
+    seatBack.parent = chassisBody;
 
-    const postL = MeshBuilder.CreateCylinder(
-      `${p}-roll-post-l`,
-      { diameter: GEO.rollPost.diameter, height: GEO.rollPost.height },
+    const tBar = MeshBuilder.CreateCylinder(
+      `${p}-steering-t-bar`,
+      { diameter: 0.05, height: 0.45 },
       scene,
     );
-    postL.position.set(GEO.rollPost.dx, GEO.rollPost.y, GEO.rollPost.z);
-    postL.material = hardware;
+    tBar.position.set(-0.28, 0.52, 0.62);
+    tBar.material = aluminum;
+    tBar.parent = chassisBody;
 
-    const postR = MeshBuilder.CreateCylinder(
-      `${p}-roll-post-r`,
-      { diameter: GEO.rollPost.diameter, height: GEO.rollPost.height },
+    const dash = MeshBuilder.CreateBox(
+      `${p}-dash-display`,
+      { width: 0.45, height: 0.2, depth: 0.1 },
       scene,
     );
-    postR.position.set(-GEO.rollPost.dx, GEO.rollPost.y, GEO.rollPost.z);
-    postR.material = hardware;
+    dash.position.set(-0.28, 0.48, 0.75);
+    dash.material = dashMat;
+    dash.parent = chassisBody;
 
-    // Crossbar + axle stub run across the rover (model x): lay the cylinders
-    // on their sides with a 90° roll about the nose axis.
-    const crossbar = MeshBuilder.CreateCylinder(
-      `${p}-roll-bar`,
-      { diameter: GEO.rollBar.diameter, height: GEO.rollBar.length },
+    // 5. Cargo bay: cargo bed & dynamic mineral crates
+    const bed = MeshBuilder.CreateBox(
+      `${p}-cargo-bed`,
+      { width: 1.5, height: 0.18, depth: 1.6 },
       scene,
     );
-    crossbar.position.set(0, GEO.rollBar.y, GEO.rollBar.z);
-    crossbar.rotation.set(0, 0, -Math.PI / 2);
-    crossbar.material = hardware;
+    bed.position.set(0, 0.25, -0.65);
+    bed.material = aluminum;
+    bed.parent = chassisBody;
 
-    const hub = MeshBuilder.CreateCylinder(
-      `${p}-axle`,
-      { diameter: GEO.hub.diameter, height: GEO.hub.length },
+    const crates = MeshBuilder.CreateBox(
+      `${p}-cargo-crates`,
+      { width: 1.3, height: 0.45, depth: 1.4 },
       scene,
     );
-    hub.rotation.set(0, 0, -Math.PI / 2);
-    hub.position.set(0, BUGGY_WHEEL_RADIUS * 0.6, 0);
-    hub.material = hardware;
+    crates.position.set(0, 0.55, -0.65);
+    crates.material = gold;
+    crates.parent = chassisBody;
+    this.cargoCrates = crates;
 
-    // Wheels: radius BUGGY_WHEEL_RADIUS, hubs at ±BUGGY_TRACK/2 (model x) on
-    // two axles (model z). Side +1 = physics left = model +x. Cylinder axis
-    // starts vertical (+y); LAY_DOWN tips it onto the axle axis and the spin
-    // quaternion turns the tyre in its own plane (order verified headless).
+    // 6. Lighting: lightbar & reactive taillights
+    const lightbar = MeshBuilder.CreateBox(
+      `${p}-lightbar`,
+      { width: 1.35, height: 0.08, depth: 0.08 },
+      scene,
+    );
+    lightbar.position.set(0, 0.42, 1.45);
+    lightbar.material = aluminum;
+    lightbar.parent = chassisBody;
+
+    const taillights = MeshBuilder.CreateBox(
+      `${p}-taillights`,
+      { width: 1.35, height: 0.08, depth: 0.06 },
+      scene,
+    );
+    taillights.position.set(0, 0.28, -1.45);
+    taillights.material = taillightMat;
+    taillights.parent = chassisBody;
+    this.taillights = taillights;
+
+    // 7. Suspension corners (FL, FR, RL, RR)
+    const cornerPivots: TransformNode[] = [];
+    const steeringKnuckles: (TransformNode | Mesh)[] = [];
+    const aArmsList: Mesh[] = [];
+    const hubList: Mesh[] = [];
+    const wheelsList: Mesh[] = [];
+    const mudFlapsList: Mesh[] = [];
+
     const wheelDiameter = BUGGY_WHEEL_RADIUS * 2;
-    this.wheels = WHEEL_SLOTS.map((slot, index) => {
+
+    for (let i = 0; i < WHEEL_SLOTS.length; i++) {
+      const slot = WHEEL_SLOTS[i];
+      const isFront = i < 2;
+      const cornerPivot = new TransformNode(`${p}-corner-pivot-${i}`, scene);
+      cornerPivot.parent = this.root;
+      cornerPivot.position.set(slot.side * (BUGGY_TRACK / 2), BUGGY_WHEEL_RADIUS, slot.z);
+      cornerPivots.push(cornerPivot);
+
+      // A-arms (double wishbone)
+      const aArms = MeshBuilder.CreateBox(
+        `${p}-a-arms-${i}`,
+        { width: 0.35, height: 0.06, depth: 0.2 },
+        scene,
+      );
+      aArms.position.set(-slot.side * 0.15, 0, 0);
+      aArms.material = aluminum;
+      aArms.parent = cornerPivot;
+      aArmsList.push(aArms);
+
+      // Steering knuckle (front wheels articulate steering yaw)
+      let knuckleParent: TransformNode | Mesh = cornerPivot;
+      if (isFront) {
+        const knuckle = new TransformNode(`${p}-steering-knuckle-${i}`, scene);
+        knuckle.parent = cornerPivot;
+        steeringKnuckles.push(knuckle);
+        knuckleParent = knuckle;
+      }
+
+      // Wheel hub
+      const hub = MeshBuilder.CreateCylinder(
+        `${p}-hub-${i}`,
+        { diameter: 0.18, height: 0.12 },
+        scene,
+      );
+      hub.rotation.set(0, 0, -Math.PI / 2);
+      hub.material = aluminum;
+      hub.parent = knuckleParent;
+      hubList.push(hub);
+
+      // Road wheel: cylinder starts with axis along +y; rotated to lay down along axle
       const wheel = MeshBuilder.CreateCylinder(
-        `${p}-wheel-${index}`,
-        { diameter: wheelDiameter, height: GEO.wheel.depth, tessellation: GEO.wheel.tessellation },
+        `${p}-wheel-${i}`,
+        { diameter: wheelDiameter, height: 0.34, tessellation: 24 },
         scene,
       );
       wheel.position.set(slot.side * (BUGGY_TRACK / 2), BUGGY_WHEEL_RADIUS, slot.z);
-      wheel.material = rubber;
-      return wheel;
-    });
+      wheel.material = tire;
+      wheel.parent = this.root;
+      wheelsList.push(wheel);
 
-    this.parts = [chassis, bed, seat, seatBack, postL, postR, crossbar, hub, ...this.wheels];
+      // Mud flap / regolith dust fender
+      const flap = MeshBuilder.CreateBox(
+        `${p}-mud-flap-${i}`,
+        { width: 0.38, height: 0.08, depth: 0.55 },
+        scene,
+      );
+      flap.position.set(0, BUGGY_WHEEL_RADIUS * 0.52, 0);
+      flap.material = hazard;
+      flap.parent = cornerPivot;
+      mudFlapsList.push(flap);
+    }
+
+    this.cornerPivots = cornerPivots;
+    this.steeringKnuckles = steeringKnuckles;
+    this.wheels = wheelsList;
+
+    this.parts = [
+      tub,
+      frame,
+      cowl,
+      seatBase,
+      seatBack,
+      tBar,
+      dash,
+      bed,
+      crates,
+      lightbar,
+      taillights,
+      ...aArmsList,
+      ...hubList,
+      ...wheelsList,
+      ...mudFlapsList,
+    ];
+
     for (const mesh of this.parts) {
-      mesh.parent = this.root;
       mesh.isPickable = true;
       mesh.receiveShadows = false;
     }
@@ -684,14 +840,47 @@ export class OpenBuggy {
     );
     root.computeWorldMatrix(true);
 
-    // Heave + suspension articulation: chassis rides the physics datum, wheel
-    // centres sit at wheel radius minus travel around the static mid stroke.
-    if (this.chassis !== null) {
-      this.chassis.position.y = state.bodyHeight;
+    // Rigid chassis body translation (heave): all chassis children move together
+    if (this.chassisBody !== null) {
+      this.chassisBody.position.y = state.bodyHeight;
     }
+
+    // Suspension articulation: corner pivots and wheel meshes track spring travel
     for (let i = 0; i < this.wheels.length; i++) {
-      this.wheels[i].position.y =
-        BUGGY_WHEEL_RADIUS - (state.wheels[i].compression - 0.5) * BUGGY_SPRING_TRAVEL;
+      const springOffset = -(state.wheels[i].compression - 0.5) * BUGGY_SPRING_TRAVEL;
+      this.wheels[i].position.y = BUGGY_WHEEL_RADIUS + springOffset;
+      if (this.cornerPivots[i]) {
+        this.cornerPivots[i].position.y = BUGGY_WHEEL_RADIUS + springOffset;
+      }
+    }
+
+    // Steering knuckles yaw articulation (front wheels)
+    if (state.steerAngle !== undefined) {
+      const tanSteer = Math.tan(state.steerAngle);
+      for (let i = 0; i < 2; i++) {
+        if (Math.abs(state.steerAngle) < 1e-4) {
+          this.steeringKnuckles[i]?.rotation.set(0, 0, 0);
+        } else {
+          const r = 2.7 / tanSteer;
+          const fy = i === 0 ? 0.85 : -0.85;
+          const effRadius = fy < 0 ? r - 0.85 : r + 0.85;
+          const ackermannAngle = Math.atan(2.7 / effRadius);
+          this.steeringKnuckles[i]?.rotation.set(0, ackermannAngle, 0);
+        }
+      }
+    }
+
+    // Reactive taillights brightening on braking/reversing
+    if (this.taillightMaterial !== null) {
+      const isBraking = state.vLong < 0 || (state.driveMode === 'FORWARD' && state.vLong > 0.2 && state.vLong < this.last.vLong);
+      this.taillightMaterial.emissiveColor.set(isBraking ? 1.0 : 0.25, 0.02, 0.02);
+    }
+
+    // Dynamic cargo crates scaling
+    if (this.cargoCrates !== null) {
+      const cargoFrac = clamp(state.cargoMass / BUGGY_MAX_CARGO, 0, 1);
+      this.cargoCrates.setEnabled(cargoFrac > 0.001);
+      this.cargoCrates.scaling.y = Math.max(0.1, cargoFrac);
     }
 
     this.applyWheelSpin(state, dt);
@@ -707,10 +896,22 @@ export class OpenBuggy {
     for (const wheel of state.wheels) spin += wheel.spin;
     this.wheelPhase = (this.wheelPhase + (spin / state.wheels.length) * dt) % (Math.PI * 2);
 
-    for (const wheel of this.wheels) {
+    for (let i = 0; i < this.wheels.length; i++) {
+      const wheel = this.wheels[i];
       if (wheel.rotationQuaternion === null) wheel.rotationQuaternion = new Quaternion();
       Quaternion.RotationAxisToRef(AXIS_X, this.wheelPhase, this.scratchSpin);
       this.scratchSpin.multiplyToRef(LAY_DOWN, wheel.rotationQuaternion);
+
+      // Articulate front wheels steering yaw with spin: WheelRotation = R_steer(delta) * R_spin(theta)
+      if (i < 2 && state.steerAngle !== undefined && Math.abs(state.steerAngle) >= 1e-4) {
+        const tanSteer = Math.tan(state.steerAngle);
+        const r = 2.7 / tanSteer;
+        const fy = i === 0 ? 0.85 : -0.85;
+        const effRadius = fy < 0 ? r - 0.85 : r + 0.85;
+        const ackermannAngle = Math.atan(2.7 / effRadius);
+        const steerQuat = Quaternion.RotationAxis(new Vector3(0, 1, 0), ackermannAngle);
+        steerQuat.multiplyToRef(wheel.rotationQuaternion, wheel.rotationQuaternion);
+      }
     }
   }
 

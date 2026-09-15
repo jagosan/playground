@@ -11,6 +11,7 @@
 - `docs/architecture/12-lunar-frontier-economy-and-multiplayer.md`: Babylon.js 3D engine, Fastify WebSocket authoritative server, SQLite persistent moon economy, rail lines, mine tunnels, EVA suit and buggy.
 - `docs/architecture/13-lunar-frontier-interactive-client-and-market.md`: Interactive Babylon.js web client, WebSocket replication, life-support HUD, dynamic market economy and commodity trading.
 - `docs/architecture/14-lunar-frontier-ux-infrastructure-and-visual-overhaul.md`: Controls inversion fix, micro-relief normal tiling, 3D waypoint compass, infrastructure mounting (bases, tunnels, rails), tutorial onboarding, and articulated walking.
+- `docs/architecture/15-lunar-buggy-overhaul.md`: Lunar rover visual overhaul, cohesive chassis assembly, straight-line stability, progressive acceleration/braking & keyboard/gamepad controller calibration.
 - `docs/architecture/15-subagent-context-pruning-and-turn-budgeting.md`: Subagent context pruning, N-3 turn-budget circuit breaker, AST extraction, and Beehive Neo4j symbol discovery.
 - `specs/`:
   - `specs/00-system-overview.md`: Project vision, minigame architecture, rendering stack.
@@ -23,6 +24,7 @@
   - `specs/07-asset-pipeline-handoff.md`: Multi-agent handoff, Blender 4.2 pipeline execution, verification.
   - `specs/08-artemis-ltv-and-robotic-arm.md`: Artemis LTV 3D model hierarchy, PBR materials, 4-DOF arm kinematics, sample collection.
   - `specs/12-lunar-frontier.md`: Persistent multiplayer moon economy, Babylon.js client, SQLite state, rail lines, mine tunnels, suit and buggy.
+  - `specs/15-lunar-buggy-overhaul.md`: Lunar rover visual overhaul, unified kinematics, straight-line stability & keyboard/gamepad controller tuning.
 
 ## Lunar Frontier Multiplayer & Economy Subsystem (Spec 12)
 - `games/lunar-frontier/server/`: Fastify + `ws` server, SQLite schema, market pricing, 20Hz tick (`LunarServer.ts`, `Database.ts`).
@@ -33,6 +35,7 @@
 - `games/lunar-frontier/src/network/`: WebSocket client, state delta interpolator, player manager (`NetworkClient.ts`).
 - `games/lunar-frontier/src/ui/`: Glassmorphic telemetry HUD, life support meters, commodity trade modal (`LunarHUD.ts`, `hud.css`).
 - `games/lunar-frontier/src/client/`: Interactive Babylon.js client game loop and Vite web entry (`ClientApp.ts`, `main.ts`).
+- `docs/runbooks/lunar-frontier-operations.md`: Operational runbook, controller layouts, test commands, and production build deployment.
 
 ## Blender Asset Pipeline (Spec 05)
 - `scripts/build_lunar_assets.py`: Standalone Blender 4.2 headless asset generator (`--all` / per-phase flags; previews + `manifest.json`).

@@ -441,8 +441,8 @@ export const BUGGY_WHEEL_RADIUS = 0.45;
 export const BUGGY_TRACK = 1.7;
 /** Per-corner suspension spring rate (N/m). */
 export const BUGGY_SPRING_RATE = 4_200;
-/** Per-corner damper coefficient (N·s/m). */
-export const BUGGY_DAMPER = 650;
+/** Per-corner damper coefficient (N·s/m) — tuned for critical damping (zeta ~ 0.707) under lunar gravity. */
+export const BUGGY_DAMPER = 1360;
 /** Suspension travel from static ride (m). */
 export const BUGGY_SPRING_TRAVEL = 0.2;
 /** Peak tyre force per unit normal load (regolith, simplified Pacejka peak). */
@@ -457,12 +457,14 @@ export const BUGGY_MOTOR_POWER = 9_000;
 export const BUGGY_REGEN_FORCE = 4_500;
 /** Regenerator round-trip efficiency. */
 export const BUGGY_REGEN_EFFICIENCY = 0.62;
-/** Rolling resistance coefficient into loose regolith. */
-export const BUGGY_ROLLING_RESISTANCE = 0.05;
+/** Rolling resistance coefficient into loose regolith (Spec 15: 0.04). */
+export const BUGGY_ROLLING_RESISTANCE = 0.04;
 /** Regolith plume drag coefficient (∝ v², no atmosphere but saltating grit). */
 export const BUGGY_DRAG = 0.25;
 /** Electronic speed limiter (m/s). */
 export const BUGGY_SPEED_LIMIT = 22;
+/** Reverse speed limiter (m/s, Spec 15: 5.0 m/s). */
+export const BUGGY_REVERSE_SPEED_LIMIT = 5.0;
 /** Onboard traction battery (kWh). */
 export const BUGGY_BATTERY_KWH = 2.2;
 /** Max road-wheel steering angle (rad). */
@@ -541,6 +543,10 @@ export interface BuggyState {
   /** True when the buggy tipped onto its roll bar — needs a winch. */
   rolled: boolean;
   airborne: boolean;
+  /** Active drive mode (FORWARD, STOPPED, REVERSE). */
+  driveMode?: 'FORWARD' | 'STOPPED' | 'REVERSE';
+  /** Mean front road-wheel steering angle (rad). */
+  steerAngle?: number;
 }
 
 export interface BuggyOptions {
@@ -563,6 +569,9 @@ export class LunarBuggy {
   private readonly chassisMass: number;
   private readonly ground: GroundElevationFn;
   private readonly state: BuggyState;
+  private motorTorque = 0;
+  private driveMode: 'FORWARD' | 'STOPPED' | 'REVERSE' = 'STOPPED';
+  private steerAngle = 0;
 
   constructor(options: BuggyOptions = {}, initial: Partial<BuggyState> = {}) {
     this.chassisMass = options.chassisMass ?? BUGGY_CHASSIS_MASS;
@@ -591,7 +600,12 @@ export class LunarBuggy {
   }
 
   public getState(): BuggyState {
-    return { ...this.state, wheels: this.state.wheels.map((w) => ({ ...w })) as [WheelState, WheelState, WheelState, WheelState] };
+    return {
+      ...this.state,
+      driveMode: this.driveMode,
+      steerAngle: this.steerAngle,
+      wheels: this.state.wheels.map((w) => ({ ...w })) as [WheelState, WheelState, WheelState, WheelState],
+    };
   }
 
   public get totalMass(): number {
@@ -664,28 +678,86 @@ export class LunarBuggy {
     const slopePitch = Math.atan2(ahead - behind, 4);
     const slopeRoll = Math.atan2(here - right, 2);
 
-    // -- Drive / brake demand -------------------------------------------------
+    // -- Drive mode state machine & smooth powertrain ------------------------
     const speedRef = Math.hypot(s.vLong, s.vLat);
-    let throttle = clamp(input.throttle, -1, 1);
-    if (this.state.rolled) throttle = 0;
-    if (s.vLong > BUGGY_SPEED_LIMIT) throttle = Math.min(throttle, 0);
-    if (s.vLong < -BUGGY_SPEED_LIMIT * 0.4) throttle = Math.max(throttle, 0);
-    const reversing = throttle < 0 && s.vLong < 0.4;
-    const driveDir = reversing ? -1 : 1;
-    let driveForce = Math.abs(throttle) * BUGGY_WHEEL_FORCE * 4 * driveDir;
-    // Continuous-power derating above base speed.
-    const powerCap = (BUGGY_MOTOR_POWER * 4) / Math.max(Math.abs(s.vLong), 0.8);
-    driveForce = clamp(driveForce, -powerCap, powerCap);
+    const rawThrottle = clamp(input.throttle, -1, 1);
+    const rawBrake = clamp(input.brake, 0, 1);
+
+    if (this.driveMode === 'FORWARD') {
+      if (s.vLong <= 0.2 && rawThrottle < -0.05) {
+        this.driveMode = 'REVERSE';
+      } else if (Math.abs(s.vLong) < 0.2 && Math.abs(rawThrottle) <= 0.05) {
+        this.driveMode = 'STOPPED';
+      }
+    } else if (this.driveMode === 'STOPPED') {
+      if (rawThrottle > 0.05) {
+        this.driveMode = 'FORWARD';
+      } else if (rawThrottle < -0.05) {
+        this.driveMode = 'REVERSE';
+      }
+    } else if (this.driveMode === 'REVERSE') {
+      if (s.vLong >= -0.2 && rawThrottle > 0.05) {
+        this.driveMode = 'FORWARD';
+      } else if (Math.abs(s.vLong) < 0.2 && Math.abs(rawThrottle) <= 0.05) {
+        this.driveMode = 'STOPPED';
+      }
+    }
+
+    let targetTorqueDemand = 0;
+    let serviceBrakeDemand = rawBrake;
+
+    if (this.driveMode === 'FORWARD') {
+      if (rawThrottle > 0) {
+        targetTorqueDemand = rawThrottle;
+      } else if (rawThrottle < 0) {
+        serviceBrakeDemand = Math.max(serviceBrakeDemand, -rawThrottle);
+      }
+    } else if (this.driveMode === 'REVERSE') {
+      if (rawThrottle < 0) {
+        targetTorqueDemand = rawThrottle;
+      } else if (rawThrottle > 0) {
+        serviceBrakeDemand = Math.max(serviceBrakeDemand, rawThrottle);
+      }
+    } else {
+      if (rawThrottle > 0) {
+        this.driveMode = 'FORWARD';
+        targetTorqueDemand = rawThrottle;
+      } else if (rawThrottle < 0) {
+        this.driveMode = 'REVERSE';
+        targetTorqueDemand = rawThrottle;
+      }
+    }
+
+    if (this.state.rolled) targetTorqueDemand = 0;
+    if (s.vLong > BUGGY_SPEED_LIMIT && targetTorqueDemand > 0) targetTorqueDemand = 0;
+    if (s.vLong < -BUGGY_REVERSE_SPEED_LIMIT && targetTorqueDemand < 0) targetTorqueDemand = 0;
+
+    // Smooth motor torque rise: approach(tau_current, tau_target, 4.0, dt)
+    this.motorTorque = approach(this.motorTorque, targetTorqueDemand, 4.0, dt);
+    if (Math.abs(this.motorTorque) < 1e-4) this.motorTorque = 0;
+
+    const powerCap = (BUGGY_MOTOR_POWER * 4) / Math.max(Math.abs(s.vLong), 1.0);
+    const maxTractive = Math.min(BUGGY_WHEEL_FORCE * 4, powerCap);
+    let driveForce = this.motorTorque * maxTractive;
     if (this.state.batteryKwh <= 0) driveForce = 0;
 
-    // Regen: opposes motion, capped by adhesion and charger acceptance.
+    // Regen + friction brake
     const regenDemand = clamp(input.regen, 0, 1) * BUGGY_REGEN_FORCE
-      + clamp(input.brake, 0, 1) * BUGGY_REGEN_FORCE * 0.7;
-    let regenForce = speedRef > 0.4 ? -Math.sign(s.vLong) * Math.min(regenDemand, BUGGY_REGEN_FORCE) : 0;
+      + serviceBrakeDemand * BUGGY_REGEN_FORCE * 0.7;
+    let regenForce = speedRef > 0.1 ? -Math.sign(s.vLong) * Math.min(regenDemand, BUGGY_REGEN_FORCE) : 0;
     if (this.state.rolled || this.state.batteryKwh >= BUGGY_BATTERY_KWH) regenForce = 0;
 
-    const steerAngle = clamp(input.steer, -1, 1) * BUGGY_MAX_STEER / (1 + 0.06 * speedRef);
-    const parkSlipLock = input.parkBrake;
+    const frictionBrakeForce = speedRef > 0.05 ? -Math.sign(s.vLong) * serviceBrakeDemand * 6000 : 0;
+
+    // Steer angle & speed-sensitive derating
+    const rawSteer = clamp(input.steer, -1, 1);
+    const isZeroSteer = Math.abs(rawSteer) < 1e-3;
+    const maxSteer = BUGGY_MAX_STEER / (1 + 0.08 * Math.abs(s.vLong));
+    const steerAngle = isZeroSteer ? 0 : rawSteer * maxSteer;
+    this.steerAngle = steerAngle;
+
+    const isHillHold = this.driveMode === 'STOPPED' && Math.abs(rawThrottle) < 0.05;
+    const parkSlipLock = input.parkBrake || isHillHold;
 
     // -- Per-corner suspension & tyres ----------------------------------------
     let sumZ = 0;
@@ -728,16 +800,26 @@ export class LunarBuggy {
       const loadFrac = loadN / Math.max(m * LUNAR_GRAVITY / 4, 1);
       const mu = BUGGY_MU_PEAK * (1.12 - 0.12 * loadFrac);
 
-      // Wheel kinematics.
-      const wheelSteer = isFront ? steerAngle : 0;
+      // Wheel kinematics with Ackermann steering geometry for front wheels.
+      let wheelSteer = 0;
+      if (isFront) {
+        if (isZeroSteer || Math.abs(steerAngle) < 1e-4) {
+          wheelSteer = 0;
+        } else {
+          const tanSteer = Math.tan(steerAngle);
+          const r = 2.7 / tanSteer;
+          const effRadius = fy < 0 ? r - 0.85 : r + 0.85;
+          wheelSteer = Math.atan(2.7 / effRadius);
+        }
+      }
       const wx = Math.cos(wheelSteer) * s.vLong + Math.sin(wheelSteer) * s.vLat;
       const wy = -Math.sin(wheelSteer) * s.vLong + Math.cos(wheelSteer) * s.vLat;
 
       const wheel = s.wheels[i];
       if (parkSlipLock) wheel.spin = 0;
 
-      // Drive force shared equally; regen applied at all four corners.
-      let forceAlong = driveForce / 4 + (fx > 0 ? regenForce / 4 : regenForce / 4);
+      // Drive force shared equally; regen and service brake applied at all four corners.
+      let forceAlong = driveForce / 4 + (regenForce + frictionBrakeForce) / 4;
 
       // Slip ratio (motion-based, simplified).
       const refSpeed = Math.max(Math.abs(wx), 0.8);
@@ -775,11 +857,10 @@ export class LunarBuggy {
 
       // Park-brake holding force against creep.
       if (parkSlipLock) {
-        const hold = Math.min(fMax, 900);
-        fxOut -= clamp(fxOut + s.vLong * 400, -hold, hold) * 0;
-        if (Math.abs(s.vLong) < 0.15 && Math.abs(s.vLat) < 0.15) {
-          fxOut = -s.vLong * 800;
-          fyOut = -s.vLat * 800;
+        const hold = Math.min(fMax, 1800);
+        if (Math.abs(s.vLong) < 0.25 && Math.abs(s.vLat) < 0.25) {
+          fxOut = -s.vLong * 1200;
+          fyOut = -s.vLat * 1200;
           fxOut = clamp(fxOut, -hold, hold);
           fyOut = clamp(fyOut, -hold, hold);
         }
@@ -806,6 +887,11 @@ export class LunarBuggy {
       wheel.force = fxOut;
     }
 
+    // Active straight-line yaw stabilizer to eliminate numerical yaw drift
+    if (isZeroSteer) {
+      yawMoment -= 8.0 * inertia * s.yawRate;
+    }
+
     // -- Body accelerations -----------------------------------------------------
     const n = sumZ;
     const aDrive = (FxBody - (FxBody >= 0 ? 0 : 0)) / m;
@@ -815,8 +901,15 @@ export class LunarBuggy {
     const gravLat = LUNAR_GRAVITY * Math.sin(slopeRoll);
 
     s.vLong += (aDrive - (rolling + plume) / m + gravLong) * dt;
-    s.vLat += (FyBody / m - gravLat * 0) * dt + (-gravLat) * 0 * dt;
-    s.vLat -= gravLat * dt;
+    s.vLat += (FyBody / m - gravLat) * dt;
+
+    if (isZeroSteer && Math.abs(s.vLat) < 0.015) {
+      s.vLat *= Math.exp(-12.0 * dt);
+    }
+    if (isHillHold && Math.abs(s.vLong) < 0.1) {
+      s.vLong = 0;
+      s.vLat = 0;
+    }
 
     s.yawRate = approach(
       s.yawRate + (yawMoment / inertia) * dt,
@@ -824,6 +917,9 @@ export class LunarBuggy {
       0,
       dt,
     ) - s.yawRate * 0.35 * dt;
+    if (isZeroSteer && Math.abs(s.yawRate) < 0.005) {
+      s.yawRate = 0;
+    }
     if (this.state.rolled) s.yawRate *= Math.exp(-3 * dt);
 
     // -- Heave & attitude dynamics ----------------------------------------------
