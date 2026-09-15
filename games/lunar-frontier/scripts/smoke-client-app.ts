@@ -557,8 +557,8 @@ section('D. input routing & hotkeys');
   app.handleKeyInput('ShiftLeft', 'down');
   const sampled = app.sampleInput();
   check(
-    'WASD + Shift latch into the input frame',
-    sampled.forward === 1 && sampled.strafe === -1 && sampled.sprint === true,
+    'WASD + Shift latch into the input frame (TASK-PLAY-056: D = strafe right, +1)',
+    sampled.forward === 1 && sampled.strafe === 1 && sampled.sprint === true && sampled.brake === 0,
   );
   app.handleKeyInput('KeyW', 'up');
   app.handleKeyInput('KeyD', 'up');
@@ -568,6 +568,17 @@ section('D. input routing & hotkeys');
     app.sampleInput().forward === 0 && app.sampleInput().sprint === false,
   );
   check('unknown codes report unhandled', app.handleKeyInput('KeyQ', 'down') === false);
+
+  // TASK-PLAY-056 — sign rectification: right/Right is +1 on both axes.
+  app.handleKeyInput('KeyA', 'down');
+  check('A strafe is -1 (left)', app.sampleInput().strafe === -1);
+  app.handleKeyInput('KeyA', 'up');
+  app.handleKeyInput('ArrowRight', 'down');
+  check('ArrowRight yaw is +1 (clockwise)', app.sampleInput().yaw === 1);
+  app.handleKeyInput('ArrowRight', 'up');
+  app.handleKeyInput('ArrowLeft', 'down');
+  check('ArrowLeft yaw is -1 (counter-clockwise)', app.sampleInput().yaw === -1);
+  app.handleKeyInput('ArrowLeft', 'up');
 
   // [E] out of range → refused; walk over to the buggy → accepted.
   check('[E] refuses to mount a distant buggy', app.toggleMount() === false && app.getMode() === 'suit');
@@ -630,6 +641,154 @@ section('D. input routing & hotkeys');
     app.handleKeyInput('Escape', 'down') === true && !app.getHud()!.isTradeDialogOpen(),
   );
   app.handleKeyInput('KeyW', 'up');
+
+  // ---------------------------------------------------------------------
+  // TASK-PLAY-056 — Gamepad API polling (spec 14 §3.1). The harness swaps
+  // in a fake navigator (Node's own is a getter-only global without
+  // getGamepads) exposing one standard-mapping pad, then drives axes and
+  // buttons directly.
+  // ---------------------------------------------------------------------
+  const realNavigator = (globalThis as { navigator?: unknown }).navigator;
+  const fakePad = {
+    axes: [0, 0, 0, 0],
+    buttons: Array.from({ length: 12 }, () => ({ value: 0, pressed: false })),
+  };
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    writable: true,
+    value: { getGamepads: () => [null, fakePad] },
+  });
+  const pressPad = (index: number, pressed = true, value = pressed ? 1 : 0): void => {
+    fakePad.buttons[index]!.pressed = pressed;
+    fakePad.buttons[index]!.value = value;
+  };
+  const releasePad = (): void => {
+    fakePad.axes.fill(0);
+    for (const b of fakePad.buttons) {
+      b.pressed = false;
+      b.value = 0;
+    }
+  };
+
+  fakePad.axes[0] = 1;
+  check('left stick X → strafe (right = +1)', app.sampleInput().strafe === 1);
+  fakePad.axes[0] = 0.15;
+  check('deadzone: axis at 0.15 reads centred', app.sampleInput().strafe === 0);
+  fakePad.axes[0] = 0;
+
+  fakePad.axes[1] = -0.8; // raw stick-up is negative
+  check('left stick Y → forward (up = +0.8)', app.sampleInput().forward === 0.8);
+  fakePad.axes[1] = 0.8;
+  check('left stick Y down → reverse', app.sampleInput().forward === -0.8);
+  fakePad.axes[1] = 0;
+
+  fakePad.axes[2] = 0.6;
+  check('right stick X → yaw (+right)', app.sampleInput().yaw === 0.6);
+  fakePad.axes[2] = 0;
+
+  pressPad(7, true, 0.4);
+  check('right trigger → forward throttle', app.sampleInput().forward === 0.4);
+  pressPad(7, false, 0);
+  pressPad(6, true, 0.9);
+  check('left trigger → analog brake', app.sampleInput().brake === 0.9);
+  pressPad(6, false, 0);
+  pressPad(0);
+  check('A button → jump', app.sampleInput().jump === true);
+  pressPad(0, false);
+  pressPad(4);
+  check('LB → sprint', app.sampleInput().sprint === true);
+  pressPad(4, false);
+  pressPad(10);
+  check('L3 → sprint', app.sampleInput().sprint === true);
+  pressPad(10, false);
+  check(
+    'released pad idles neutral',
+    (() => {
+      const f = app.sampleInput();
+      return (
+        f.forward === 0 &&
+        f.strafe === 0 &&
+        f.yaw === 0 &&
+        f.brake === 0 &&
+        !f.jump &&
+        !f.sprint
+      );
+    })(),
+  );
+
+  // Edge triggers: X mounts/dismounts, once per press (two frames: sample,
+  // then fire — pumpGamepadActions compares against the previous frame).
+  const padBuggyPos = app.getBuggy().getPosition();
+  app.getSuit().teleport(padBuggyPos.x, padBuggyPos.y);
+  pressPad(2);
+  nowMs += 16;
+  app.update(nowMs); // frame 1: snapshot only
+  const modeAfterSample = app.getMode();
+  nowMs += 16;
+  app.update(nowMs); // frame 2: rising edge fires
+  check(
+    'X edge mounts the buggy (one press, one toggle)',
+    modeAfterSample === 'suit' && app.getMode() === 'buggy',
+  );
+  nowMs += 16;
+  app.update(nowMs);
+  nowMs += 16;
+  app.update(nowMs);
+  check('held X does not re-toggle', app.getMode() === 'buggy');
+  pressPad(2, false, 0);
+  nowMs += 16;
+  app.update(nowMs);
+  pressPad(2, true);
+  nowMs += 16;
+  app.update(nowMs);
+  nowMs += 16;
+  app.update(nowMs);
+  check('second X press dismounts', app.getMode() === 'suit');
+
+  // Y toggles the lamps on the ridden entity (on foot → suit headlight).
+  const padLampBefore = app.getSuit().isHeadlightOn();
+  pressPad(3);
+  nowMs += 16;
+  app.update(nowMs);
+  nowMs += 16;
+  app.update(nowMs);
+  check('Y edge toggles headlight', app.getSuit().isHeadlightOn() !== padLampBefore);
+  releasePad();
+  nowMs += 16;
+  app.update(nowMs);
+
+  // B opens the terminal; analog axes sleep while it is open; B closes.
+  pressPad(1);
+  nowMs += 16;
+  app.update(nowMs);
+  nowMs += 16;
+  app.update(nowMs);
+  check('B edge opens trade terminal', app.getHud()!.isTradeDialogOpen());
+  fakePad.axes[0] = 1;
+  check('analog strafe parked while terminal open', app.sampleInput().strafe === 0);
+  fakePad.axes[0] = 0;
+  pressPad(1, false, 0);
+  nowMs += 16;
+  app.update(nowMs);
+  pressPad(1, true);
+  nowMs += 16;
+  app.update(nowMs);
+  nowMs += 16;
+  app.update(nowMs);
+  check('second B press closes terminal', !app.getHud()!.isTradeDialogOpen());
+  releasePad();
+
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    writable: true,
+    value: realNavigator,
+  });
+  nowMs += 16;
+  app.update(nowMs);
+  check(
+    'no pad after teardown → keyboard-only frame stays safe',
+    app.sampleInput().forward === 0 && app.sampleInput().brake === 0,
+  );
 }
 
 // ===========================================================================
