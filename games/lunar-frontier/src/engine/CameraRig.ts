@@ -110,10 +110,10 @@ export const DEFAULT_MODE_CONFIGS: Record<CameraMode, CameraModeConfig> = {
   },
   vehicle_chase: {
     fovDegrees: 55,
-    distance: 11.5,
-    heightOffset: 3.8,
-    positionSmoothing: 4.5,
-    rotationSmoothing: 4.0,
+    distance: 7.5,
+    heightOffset: 2.8,
+    positionSmoothing: 5.5,
+    rotationSmoothing: 4.5,
     groundClearance: 1.1,
   },
 };
@@ -286,12 +286,14 @@ export class CameraRig {
    *                  `SuitState.heading`.
    * @param dt        seconds since last update.
    * @param targetPitch optional look pitch (radians, + = up).
+   * @param speedFraction optional normalized speed (0..1) for dynamic chase FOV.
    */
   update(
     targetPos: { x: number; y: number; z: number },
     targetYaw: number,
     dt: number,
     targetPitch = 0,
+    speedFraction = 0,
   ): void {
     if (this.disposed) return;
     const cfg = this.configs[this.mode];
@@ -334,9 +336,22 @@ export class CameraRig {
       // Orbit azimuth places the camera behind the moving target: offset dir
       // (−cos yaw, 0, sin yaw) ⇒ α = π − yaw (Babylon: pos ∝ (cos α, ·, sin α)).
       const goalAzimuth = Math.PI - this.wrapTargetYaw(targetYaw);
-      this.currentOrbitAzimuth = approachAngle(this.currentOrbitAzimuth, goalAzimuth, rotT);
+      // At very low speeds, stabilize camera rotation to prevent wild swinging
+      const effRotT = this.mode === 'vehicle_chase' && speedFraction < 0.05
+        ? smoothFactor(cfg.rotationSmoothing * 0.4, dt)
+        : rotT;
+      this.currentOrbitAzimuth = approachAngle(this.currentOrbitAzimuth, goalAzimuth, effRotT);
       arc.alpha = this.currentOrbitAzimuth;
-      arc.beta = clamp(Math.PI / 2 - 0.32 - this.currentPitch * 0.35, 0.35, 1.5);
+
+      // Spec 15 §4.2: Pitch tilt -12 deg (-0.21 rad)
+      const tiltOffset = this.mode === 'vehicle_chase' ? 0.209 : 0.32;
+      arc.beta = clamp(Math.PI / 2 - tiltOffset - this.currentPitch * 0.35, 0.35, 1.5);
+
+      // Spec 15 §4.2: Dynamic FOV expansion with speed (55 deg to 68 deg at top speed)
+      if (this.mode === 'vehicle_chase') {
+        const targetFov = 55 + (68 - 55) * clamp(speedFraction, 0, 1);
+        this.setFovDegrees(approach(this.getFovDegrees(), targetFov, smoothFactor(3.0, dt)));
+      }
 
       const pivotX = approach(arc.target.x, bx, posT);
       const pivotY = approach(arc.target.y, by + cfg.heightOffset * 0.6, posT);

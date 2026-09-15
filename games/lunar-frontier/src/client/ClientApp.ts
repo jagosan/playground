@@ -772,8 +772,13 @@ export class ClientApp {
     // Right = +1, left = -1: physics `strafe` drives body-frame +y, which the
     // render mapping (worldToBabylon + rotation.y = PI/2 + heading) shows on
     // the right (spec 14 §3.1 — rectifies the old inverted A/D).
-    const keyForward = (p.has('KeyW') ? 1 : 0) - (p.has('KeyS') ? 1 : 0);
-    const keyStrafe = (p.has('KeyD') ? 1 : 0) - (p.has('KeyA') ? 1 : 0);
+    // In buggy mode, ArrowUp/ArrowDown drive forward/reverse and ArrowLeft/ArrowRight steer.
+    const keyForward = this.mode === 'buggy'
+      ? (p.has('KeyW') || p.has('ArrowUp') ? 1 : 0) - (p.has('KeyS') || p.has('ArrowDown') ? 1 : 0)
+      : (p.has('KeyW') ? 1 : 0) - (p.has('KeyS') ? 1 : 0);
+    const keyStrafe = this.mode === 'buggy'
+      ? (p.has('KeyD') || p.has('ArrowRight') ? 1 : 0) - (p.has('KeyA') || p.has('ArrowLeft') ? 1 : 0)
+      : (p.has('KeyD') ? 1 : 0) - (p.has('KeyA') ? 1 : 0);
     // Right/ArrowRight increases heading = clockwise turn (spec 14 §3.1).
     const keyYaw = (p.has('ArrowRight') ? 1 : 0) - (p.has('ArrowLeft') ? 1 : 0);
     const pitch = (p.has('ArrowUp') ? 1 : 0) - (p.has('ArrowDown') ? 1 : 0);
@@ -800,6 +805,14 @@ export class ClientApp {
       if (typeof v !== 'number' || !Number.isFinite(v) || Math.abs(v) <= GAMEPAD_DEADZONE) return 0;
       return clamp(v, -1, 1);
     };
+    // Spec 15 §4.1: Proportional steering with 15% deadzone and polynomial response (x^1.4)
+    const steerCurve = (v: number): number => {
+      const sign = Math.sign(v);
+      const abs = Math.abs(v);
+      if (abs <= GAMEPAD_DEADZONE) return 0;
+      const norm = (abs - GAMEPAD_DEADZONE) / (1 - GAMEPAD_DEADZONE);
+      return sign * Math.pow(norm, 1.4);
+    };
     const trigger = (index: number): number => {
       const v = pad.buttons[index]?.value;
       if (typeof v !== 'number' || !Number.isFinite(v)) return 0;
@@ -811,7 +824,7 @@ export class ClientApp {
       -1,
       1,
     );
-    frame.strafe = clamp(frame.strafe + axis(GAMEPAD_AXES.strafe), -1, 1);
+    frame.strafe = clamp(frame.strafe + steerCurve(axis(GAMEPAD_AXES.strafe)), -1, 1);
     frame.yaw = clamp(frame.yaw + axis(GAMEPAD_AXES.yaw), -1, 1);
     frame.brake = trigger(GAMEPAD_BUTTONS.brake);
     frame.sprint =
@@ -1080,17 +1093,14 @@ export class ClientApp {
     const frame = this.sampleInput();
     if (this.mode === 'buggy') {
       const buggy = this.requireBuggy();
+      const steerInput = frame.strafe !== 0 ? frame.strafe : frame.yaw;
+      const handbrake = frame.jump; // Space on keyboard, Button A on pad
       const input: BuggyInput = {
         throttle: clamp(frame.forward, -1, 1),
-        brake:
-          frame.brake > 0
-            ? clamp(frame.brake, 0, 1)
-            : frame.forward < 0 && buggy.getSpeed() > 0.5
-              ? 1
-              : 0,
-        regen: frame.forward < 0 ? 1 : 0,
-        steer: clamp(frame.strafe, -1, 1),
-        parkBrake: false,
+        brake: clamp(frame.brake, 0, 1),
+        regen: frame.forward < 0 && buggy.getSpeed() > 0.5 ? 1 : 0,
+        steer: clamp(steerInput, -1, 1),
+        parkBrake: handbrake,
       };
       buggy.update(dt, input);
       if (buggy.getState().rolled) buggy.getPhysics().right();
@@ -1118,10 +1128,11 @@ export class ClientApp {
     const rig = this.world.getCameraRig();
     if (this.mode === 'buggy') {
       const buggy = this.requireBuggy();
-      rig.update(buggy.getPosition(), buggy.getHeading(), dt, buggy.getPitch());
+      const speedFrac = buggy.getSpeed() / 22;
+      rig.update(buggy.getPosition(), buggy.getHeading(), dt, buggy.getPitch(), speedFrac);
     } else {
       const suit = this.requireSuit();
-      rig.update(suit.getPosition(), suit.getHeading(), dt, suit.getPitch());
+      rig.update(suit.getPosition(), suit.getHeading(), dt, suit.getPitch(), 0);
     }
   }
 

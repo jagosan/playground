@@ -84,14 +84,14 @@ check('no headlights before init', rover.getHeadlights().length === 0);
 rover.init(); // no args → self-owned NullEngine fallback
 check('init() builds under NullEngine', rover.isBuilt() === true);
 check('init() is idempotent', rover.init().isBuilt() === true);
-check('12 procedural meshes', rover.getMeshes().length === 12, `got ${rover.getMeshes().length}`);
+check('27 procedural meshes (cohesive hierarchy)', rover.getMeshes().length === 27, `got ${rover.getMeshes().length}`);
 check('all meshes named buggy-*', rover.getMeshes().every((m) => m.name.startsWith('buggy-')));
 check('root transform node present', rover.getRootNode() !== null);
 check('2 spotlight headlights', rover.getHeadlights().length === 2);
 check('headlights lit at spawn by default', rover.isHeadlightsOn() === true);
 
 const materials = new Set(rover.getMeshes().map((m) => m.material));
-check('meshes carry materials (3 shared PBR)', materials.size === 3 && [...materials].every((mm) => mm !== null));
+check('meshes carry materials (6 PBR materials)', materials.size === 6 && [...materials].every((mm) => mm !== null));
 
 const wheelMeshes = rover.getMeshes().filter((m) => m.name.includes('wheel'));
 const expectedDia = BUGGY_WHEEL_RADIUS * 2;
@@ -112,18 +112,42 @@ check(
   `x=${wheelXs.map((v) => v.toFixed(2)).join(',')}`,
 );
 
+// Verify rigid chassis hierarchy (Spec 15 §2.2):
+// Chassis body components share unified parent and maintain zero relative offset.
+const chassisParts = rover.getMeshes().filter((m) =>
+  m.name.includes('tub') || m.name.includes('frame') || m.name.includes('cowl') ||
+  m.name.includes('seat') || m.name.includes('cargo') || m.name.includes('lightbar') ||
+  m.name.includes('taillights'),
+);
+const sharedParent = chassisParts[0]?.parent;
+check(
+  'rigid chassis hierarchy (components share unified chassis parent)',
+  chassisParts.length >= 8 && chassisParts.every((m) => m.parent === sharedParent && m.parent !== null),
+);
+
 // ---------------------------------------------------------------------------
-// 2. Driving — zero duplicated physics (bit-identical oracle)
+// 2. Driving — zero duplicated physics & straight-line stability
 // ---------------------------------------------------------------------------
 section('2. driving verification (bit-identical to standalone LunarBuggy)');
 
 const driver = new OpenBuggy().init();
 const throttleInput = drive();
 let last = driver.getState();
-for (let i = 0; i < 300; i++) last = driver.update(DT, throttleInput);
+const vHistory: number[] = [];
+for (let i = 0; i < 300; i++) {
+  last = driver.update(DT, throttleInput);
+  vHistory.push(last.vLong);
+}
 
 check('throttle moves the vehicle forward', last.x > 5 && last.vLong > 1, `x=${last.x.toFixed(2)} vLong=${last.vLong.toFixed(2)}`);
 check('speed getter matches |vLong|', Math.abs(driver.getSpeed() - Math.abs(last.vLong)) < 1e-12);
+
+// Spec 15 §5: Progressive acceleration: smooth monotonic velocity increase without jerk or spikes.
+let monotonicAccel = true;
+for (let i = 1; i < 60; i++) {
+  if (vHistory[i] < vHistory[i - 1] - 1e-5) monotonicAccel = false;
+}
+check('progressive acceleration (monotonic velocity rise without spikes)', monotonicAccel);
 
 const oracle = referenceRun(300, throttleInput);
 for (const key of ['x', 'y', 'z', 'heading', 'vLong', 'vLat', 'yawRate', 'batteryKwh', 'motorEnergyJ'] as const) {
@@ -135,6 +159,24 @@ for (const key of ['x', 'y', 'z', 'heading', 'vLong', 'vLat', 'yawRate', 'batter
 }
 check('getPhysics() returns the owned buggy', driver.getPhysics().getState().x === last.x);
 check('getState() is a fresh copy', driver.getState() !== driver.getState());
+
+// Straight-line driving test (Spec 15 §5 & §6): 10 seconds of full throttle with zero steering
+// must maintain heading within ±0.5° (0.0087 rad) and |Δy| < 0.05 m across >40m travel.
+const straightBuggy = new OpenBuggy().init();
+let straightState = straightBuggy.getState();
+for (let i = 0; i < 600; i++) {
+  straightState = straightBuggy.update(DT, drive({ steer: 0 }));
+}
+check(
+  'straight-line test: |Δy| < 0.05m over 10 seconds',
+  Math.abs(straightState.y) < 0.05,
+  `Δy=${straightState.y.toFixed(5)}m at x=${straightState.x.toFixed(2)}m`,
+);
+check(
+  'straight-line test: heading within ±0.5° (0.0087 rad)',
+  Math.abs(straightState.heading) < 0.0087,
+  `heading=${straightState.heading.toFixed(6)} rad`,
+);
 
 // Frame sync: root follows worldToBabylon; azimuth PI/2 + heading encoded in
 // the quaternion (verified by transforming the model nose +z into world).
@@ -154,7 +196,7 @@ check('chassis visibly tilts under acceleration (pitch/roll applied)', Math.abs(
 check('getBabylonYaw() = PI/2 + heading', Math.abs(driver.getBabylonYaw() - (Math.PI / 2 + last.heading)) < 1e-12);
 
 // ---------------------------------------------------------------------------
-// 3. Steering
+// 3. Steering & Ackermann Geometry
 // ---------------------------------------------------------------------------
 section('3. steering verification');
 
@@ -171,6 +213,47 @@ for (let i = 0; i < 300; i++) rightState = rightBuggy.update(DT, drive({ steer: 
 check('opposite steer yaws the opposite way', Math.sign(steerState.heading) === -Math.sign(rightState.heading) && rightState.heading !== 0);
 check('lateral velocity developed in the turn', Math.abs(steerState.vLat) > 0.5, `vLat=${steerState.vLat.toFixed(3)}`);
 check('pitch/roll getters finite during maneuver', Number.isFinite(steerLeft.getPitch()) && Number.isFinite(steerLeft.getRoll()));
+
+// Spec 15 §3.1 & §5: High-speed steering derating verification: delta_max(v) = delta_0 / (1 + 0.08 * |vLong|)
+const slowRover = new OpenBuggy().init();
+slowRover.update(DT, drive({ throttle: 0.1, steer: 1 }));
+const slowSteerAngle = slowRover.getState().steerAngle ?? 0;
+const fastRover = new OpenBuggy().init();
+for (let i = 0; i < 300; i++) fastRover.update(DT, drive({ throttle: 1, steer: 0 }));
+fastRover.update(DT, drive({ throttle: 1, steer: 1 }));
+const fastSteerAngle = fastRover.getState().steerAngle ?? 0;
+check(
+  'speed-sensitive steering derating (high-speed steer angle < low-speed steer angle)',
+  fastSteerAngle > 0 && fastSteerAngle < slowSteerAngle * 0.85,
+  `slow=${slowSteerAngle.toFixed(3)} fast=${fastSteerAngle.toFixed(3)}`,
+);
+
+// ---------------------------------------------------------------------------
+// 3b. Stop & Reverse Transitions (Spec 15 §3.2 & §5)
+// ---------------------------------------------------------------------------
+section('3b. stop and reverse transitions');
+
+const cycleRover = new OpenBuggy().init();
+// 1. Accelerate forward
+for (let i = 0; i < 180; i++) cycleRover.update(DT, drive({ throttle: 1 }));
+const forwardSpeed = cycleRover.getSpeed();
+check('forward drive accelerates (> 2 m/s)', forwardSpeed > 2.0, `speed=${forwardSpeed.toFixed(2)}`);
+
+// 2. Brake to complete standstill
+for (let i = 0; i < 180; i++) cycleRover.update(DT, drive({ throttle: -1, brake: 1 }));
+const stoppedSpeed = cycleRover.getSpeed();
+check('braking brings rover to standstill (< 0.2 m/s)', stoppedSpeed < 0.2, `speed=${stoppedSpeed.toFixed(3)}`);
+
+// 3. Reverse throttle drives backward
+for (let i = 0; i < 180; i++) cycleRover.update(DT, drive({ throttle: -1, brake: 0 }));
+const revState = cycleRover.getState();
+check('reverse throttle drives backward (vLong < 0)', revState.vLong < -1.0, `vLong=${revState.vLong.toFixed(2)}`);
+check('reverse speed capped at BUGGY_REVERSE_SPEED_LIMIT (5.0 m/s)', revState.vLong >= -5.05, `vLong=${revState.vLong.toFixed(2)}`);
+
+// 4. Return to forward drive
+for (let i = 0; i < 180; i++) cycleRover.update(DT, drive({ throttle: 1, brake: 1 }));
+for (let i = 0; i < 180; i++) cycleRover.update(DT, drive({ throttle: 1, brake: 0 }));
+check('recovers from reverse to forward drive (vLong > 0)', cycleRover.getState().vLong > 1.0);
 
 // ---------------------------------------------------------------------------
 // 4. Battery draw under motor acceleration
@@ -314,7 +397,7 @@ injected.dispose();
 check('caller-owned engine survives rover dispose', sharedEngine.isDisposed === false);
 sharedEngine.dispose();
 
-for (const r of [driver, steerLeft, rightBuggy, rig, hauler, empty, loaded, dock, spin90]) r.dispose();
+for (const r of [driver, steerLeft, rightBuggy, straightBuggy, slowRover, fastRover, cycleRover, rig, hauler, empty, loaded, dock, spin90]) r.dispose();
 suit.dispose();
 
 // ---------------------------------------------------------------------------
