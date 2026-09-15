@@ -95,10 +95,35 @@ const terrain = world.getTerrainMesh();
 check('terrain mesh built', terrain !== null && terrain.getTotalVertices() === 129 * 129);
 const regolith = terrain?.material;
 check('regolith PBR material bound', regolith !== null && regolith !== undefined && regolith.getClassName() === 'PBRMaterial');
-check('regolith albedo ~0.12 low', (() => {
+check('regolith albedo per spec 14 §3.2 (0.20/0.19/0.18)', (() => {
   if (regolith === undefined || regolith === null) return false;
   const c = (regolith as { albedoColor?: { r: number; g: number; b: number } }).albedoColor;
-  return c !== undefined && c.r < 0.16 && c.g < 0.16 && c.b < 0.16;
+  return c !== undefined
+    && Math.abs(c.r - 0.20) < 1e-6 && Math.abs(c.g - 0.19) < 1e-6 && Math.abs(c.b - 0.18) < 1e-6;
+})());
+check('regolith roughness 0.94', (() => {
+  if (regolith === undefined || regolith === null) return false;
+  return Math.abs((regolith as { roughness?: number }).roughness! - 0.94) < 1e-6;
+})());
+check('regolith emissive is minimal shadow lift (no flat ambient)', (() => {
+  if (regolith === undefined || regolith === null) return false;
+  const e = (regolith as { emissiveColor?: { r: number; g: number; b: number } }).emissiveColor;
+  return e !== undefined
+    && Math.abs(e.r - 0.015) < 1e-6 && Math.abs(e.g - 0.015) < 1e-6 && Math.abs(e.b - 0.018) < 1e-6
+    && e.r < 0.05;
+})());
+check('normal map UV-tiled 64× with level 2.4', (() => {
+  if (regolith === undefined || regolith === null) return false;
+  const b = (regolith as { bumpTexture?: { uScale: number; vScale: number; level: number } }).bumpTexture;
+  return b !== undefined && b.uScale === 64 && b.vScale === 64 && Math.abs(b.level - 2.4) < 1e-6;
+})());
+check('terrain receives shadows', terrain?.receiveShadows === true);
+check('terrain is a shadow caster of the sun', (() => {
+  if (sun === undefined || terrain === null || terrain === undefined) return false;
+  const maps = sun.getShadowGenerators();
+  if (maps === null || maps.size === 0) return false;
+  const sg = maps.entries().next().value?.[1] as { getShadowMap?: () => { renderList?: unknown[] } } | undefined;
+  return sg?.getShadowMap?.()?.renderList?.includes(terrain) === true;
 })());
 check('shadow casters registered', (() => {
   if (sun === undefined) return false;
@@ -270,6 +295,30 @@ check('entity unregistered', !world.getEntities().includes(crate));
 check('orphan remove returns false', world.removeEntity(crate) === false);
 check('entity unparented after remove', crate.parent === null);
 crate.dispose();
+
+// registerShadowCasters(): casts without becoming a tracked entity.
+const preRegisterCount = world.getEntities().length;
+const baseRoot = MeshBuilder.CreateBox('base-root', { size: 4 }, scene);
+const domeChild = MeshBuilder.CreateSphere('base-dome', { diameter: 3 }, scene);
+domeChild.parent = baseRoot;
+world.registerShadowCasters([baseRoot]);
+const renderList = (() => {
+  if (sun === undefined) return [] as unknown[];
+  const maps = sun.getShadowGenerators();
+  if (maps === null || maps.size === 0) return [] as unknown[];
+  const sg = maps.entries().next().value?.[1] as { getShadowMap?: () => { renderList?: unknown[] } };
+  return sg.getShadowMap?.()?.renderList ?? [];
+})();
+check('registerShadowCasters adds the mesh', renderList.includes(baseRoot));
+check('registerShadowCasters includes descendants', renderList.includes(domeChild));
+check('registerShadowCasters does not create entities', world.getEntities().length === preRegisterCount);
+world.registerShadowCasters([baseRoot]); // idempotent
+check('double register does not duplicate render list entries',
+  renderList.filter((m) => m === baseRoot).length === 1);
+world.registerShadowCasters([]); // empty array is a no-op
+check('empty registerShadowCasters array is a no-op', renderList.includes(baseRoot));
+domeChild.dispose();
+baseRoot.dispose();
 
 // ---------------------------------------------------------------------------
 // 5. Render loop & lifecycle

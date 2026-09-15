@@ -13,7 +13,10 @@
  *  - **Regolith terrain** — a heightmap mesh whose macro relief comes from
  *    `LunarWorldGenerator.elevationAt()` (datum plain, crater bowls, rim
  *    bumps) with deterministic fbm micro-texturing on top, wearing a
- *    low-albedo (~0.12), near-dielectric, Hapke-ish rough PBR material.
+ *    low-albedo (0.20, 0.19, 0.18), near-dielectric, Hapke-ish rough PBR
+ *    material. The procedural micro-grit normal map is UV-tiled 64× across
+ *    the patch (spec 14 §3.2) so texels stay ~12 cm instead of stretching to
+ *    8 m and reading as uniform smoothness.
  *  - **Camera rig** — the EVA/vehicle `CameraRig` (first person, third
  *    person, vehicle chase) wired to the scene.
  *
@@ -196,7 +199,7 @@ export class WorldScene {
       microRelief: options.microRelief ?? 1.1,
       shadowMapSize: options.shadowMapSize ?? 1024,
       sunIntensity: options.sunIntensity ?? 3.1,
-      earthshineIntensity: options.earthshineIntensity ?? 0.28,
+      earthshineIntensity: options.earthshineIntensity ?? 0.08,
       starDomeRadius: options.starDomeRadius ?? 6000,
       starCount: options.starCount ?? 900,
       spawnClearance: options.spawnClearance ?? 1.7,
@@ -232,7 +235,7 @@ export class WorldScene {
     this.buildTerrain();
 
     this.rig = new CameraRig(this.scene, {
-      initialMode: this.options.cameraMode ?? 'eva_third_person',
+      initialMode: this.options.cameraMode ?? 'eva_first_person',
       groundHeightAt: (x, y) => this.getGroundHeightAt(x, y),
       ...(this.options.silent !== undefined ? { silent: this.options.silent } : {}),
     });
@@ -300,6 +303,24 @@ export class WorldScene {
   /** Registered entity meshes. */
   getEntities(): AbstractMesh[] {
     return Array.from(this.entities);
+  }
+
+  /**
+   * Add meshes to the sun's shadow-map render list **without** registering them
+   * as world entities (spec 14 §3.3). For static or externally-owned scene
+   * furniture — faction base assemblies, rail splines, ore carts — that must
+   * cast crisp vacuum shadows but is parented/built elsewhere.
+   *
+   * Descendants are included (Babylon's `includeDescendants`), so a base root
+   * node registers its whole mesh tree. Idempotent (Babylon de-dupes the render
+   * list) and a no-op before `init()` or when shadows are disabled
+   * (`shadowMapSize: 0`).
+   */
+  registerShadowCasters(meshes: ReadonlyArray<AbstractMesh>): void {
+    if (this.shadowGen === null) return;
+    for (const m of meshes) {
+      this.shadowGen.addShadowCaster(m, true);
+    }
   }
 
   /**
@@ -653,14 +674,16 @@ export class WorldScene {
       }
     }
 
-    // UVs tile the patch so the bump texture reads as centimetre-scale grit.
+    // UVs span the patch exactly once (0..1); all tiling lives on the bump
+    // texture's own uScale/vScale (spec 14 §3.2 = 64× across `terrainSize`),
+    // so the grit density is independent of patch size and stays at
+    // 1024 m / 64 tiles / 128 texels ≈ 12.5 cm per normal texel.
     const uvs = new Float32Array(vertexCount * 2);
-    const uvTiles = size / 32;
     for (let iy = 0; iy < res; iy++) {
       for (let ix = 0; ix < res; ix++) {
         const o = (iy * res + ix) * 2;
-        uvs[o] = (ix / (res - 1)) * uvTiles;
-        uvs[o + 1] = (iy / (res - 1)) * uvTiles;
+        uvs[o] = ix / (res - 1);
+        uvs[o + 1] = iy / (res - 1);
       }
     }
 
@@ -696,10 +719,13 @@ export class WorldScene {
   private buildRegolithMaterial(): PBRMaterial {
     const scene = this.requireScene();
     const mat = new PBRMaterial('regolith', scene);
-    mat.albedoColor = new Color3(0.24, 0.23, 0.22); // low-albedo grey-tan regolith
-    mat.emissiveColor = new Color3(0.12, 0.12, 0.13); // ambient earthshine bounce for shadow visibility
+    mat.albedoColor = new Color3(0.20, 0.19, 0.18); // low-albedo grey-tan regolith (spec 14 §3.2)
+    // Bare-minimum non-zero lift so pure-vacuum shadowed texels don't crush to
+    // 0/NaN — the sun/earthshine contrast does the real work (spec 14 §3.2
+    // removes the old flat 0.12 ambient emissive).
+    mat.emissiveColor = new Color3(0.015, 0.015, 0.018);
     mat.metallic = 0.0;
-    mat.roughness = 0.96;
+    mat.roughness = 0.94;
     mat.environmentIntensity = 0.02; // vacuum: nothing to reflect
     mat.directIntensity = 1.0;
 
@@ -739,9 +765,14 @@ export class WorldScene {
     );
     bump.wrapU = Constants.WRAP_ADDRESSMODE;
     bump.wrapV = Constants.WRAP_ADDRESSMODE;
+    // Spec 14 §3.2 — tile the 128² grit map 64× across the patch. With mesh UVs
+    // spanning 0..1 this lands one tile on every 1024/64 = 16 m of ground
+    // (~12.5 cm per normal texel) instead of stretching the map to 8 m/texel.
+    bump.uScale = 64;
+    bump.vScale = 64;
     this.bumpTexture = bump;
     mat.bumpTexture = bump;
-    bump.level = 3.2; // coarse, airless grit catches the sun harshly
+    bump.level = 2.4; // coarse, airless grit catches the sun harshly
     return mat;
   }
 
