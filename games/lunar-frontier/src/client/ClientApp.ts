@@ -66,6 +66,7 @@ import NetworkClient, {
   type WorldDeltaEvent,
 } from '../network/NetworkClient.ts';
 import LunarHUD, {
+  type HudCompassTargets,
   type HudPrompt,
   type HudScannerReadout,
   type HudTradeRequest,
@@ -140,6 +141,30 @@ export const GAMEPAD_BUTTONS: Readonly<{
 
 /** Buggy parks this far from the spawn collar, metres. */
 export const BUGGY_PARK_OFFSET: readonly [number, number] = [9, 4];
+
+/** Waypoint beacon column height (m) — tall enough to spot over crater rims. */
+export const BEACON_HEIGHT_M = 18;
+
+/** Beacon alpha pulse period (ms) — the "pulsing" in pulsing beacon. */
+export const BEACON_PULSE_MS = 1400;
+
+/**
+ * Ordered onboarding progression (spec 14 §3.5). The HUD checklist row at
+ * index *i* tracks `TUTORIAL_ORDER[i]`; `complete` is the terminal state
+ * once every entry has fired.
+ */
+export const TUTORIAL_ORDER = ['move', 'scan', 'mine', 'buggy', 'trade'] as const;
+export type TutorialProgressStep = (typeof TUTORIAL_ORDER)[number];
+export type TutorialStep = TutorialProgressStep | 'complete';
+
+/** Ground distance (m) that satisfies the locomotion step. */
+export const TUTORIAL_MOVE_DISTANCE_M = 8;
+
+/**
+ * Single-frame displacements above this are teleports (server-authoritative
+ * welcome spawn), not footsteps — they never count toward the move step.
+ */
+export const TUTORIAL_TELEPORT_GUARD_M = 25;
 
 /** Key-sheet actions that fire once per key-down (spec 13 §1). */
 export const ACTION_KEYS: Readonly<Record<string, string>> = {
@@ -261,6 +286,26 @@ function finite(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
+/** Wrap degrees to [0, 360). */
+function wrap360(deg: number): number {
+  if (!Number.isFinite(deg)) return 0;
+  return ((deg % 360) + 360) % 360;
+}
+
+/**
+ * Compass bearing (degrees, 0 = North, clockwise) from one world-frame point
+ * to another. World +y is North and physics heading θ runs counter-clockwise
+ * from +x, so bearing = 90° − θ (planar delta only — the z component is
+ * irrelevant to a bearing tape).
+ */
+function compassBearingDeg(
+  from: { x: number; y: number },
+  to: { x: number; y: number },
+): number {
+  const theta = (Math.atan2(to.y - from.y, to.x - from.x) * 180) / Math.PI;
+  return wrap360(90 - theta);
+}
+
 // ---------------------------------------------------------------------------
 // ClientApp
 // ---------------------------------------------------------------------------
@@ -307,6 +352,19 @@ export class ClientApp {
   private railSystem: RailSystem | null = null;
   private buggyBeacon: Mesh | null = null;
   private baseBeacon: Mesh | null = null;
+  private veinBeacon: Mesh | null = null;
+  /** Beacon materials, pulsed every frame (alpha sine — spec 14 §3.4). */
+  private readonly beaconMaterials = new Map<string, StandardMaterial>();
+
+  /**
+   * Onboarding state machine (spec 14 §3.5): a step is done once its trigger
+   * has fired; `firstIncomplete()` is the active step shown by the HUD.
+   */
+  private readonly tutorialDone = new Set<TutorialProgressStep>();
+  private tutorialWasAirborne = false;
+  private tutorialHopped = false;
+  private tutorialTravelM = 0;
+  private tutorialPrevPos: { x: number; y: number } = { x: 0, y: 0 };
 
   private scannerReadout: HudScannerReadout = { found: false, message: 'SCANNING…' };
   private nearestVein: ResourceVein | null = null;
@@ -361,6 +419,7 @@ export class ClientApp {
     const ground: GroundElevationFn = (x, y) => this.world.getGroundHeightAt(x, y);
     const scene = this.world.getScene();
     const spawn = this.resolveSpawn();
+    this.tutorialPrevPos = { x: spawn.x, y: spawn.y };
 
     this.suit = new EvaSuitAvatar({
       groundElevation: ground,
@@ -408,6 +467,17 @@ export class ClientApp {
       this.world.registerShadowCasters(this.factionBases.getMeshes());
     }
 
+    // Waypoint beacons (spec 14 §3.4): translucent pulsing columns over the
+    // three navigation targets. The vein beacon starts disabled — it lights
+    // only while the scanner holds a lock.
+    this.buggyBeacon = this.buildBeacon('buggy', 0x56 / 255, 0xe0 / 255, 1, this.buggy.getPosition());
+    const homeBase = this.nearestBaseTo({ x: spawn.x, y: spawn.y });
+    if (homeBase !== null) {
+      this.baseBeacon = this.buildBeacon('base', 1, 0xcc / 255, 0x55 / 255, homeBase.position);
+    }
+    this.veinBeacon = this.buildBeacon('vein', 0x5c / 255, 0xe6 / 255, 0xa4 / 255, { x: spawn.x, y: spawn.y, z: 0 });
+    this.veinBeacon.setEnabled(false);
+
     if (this.hud === null && this.options.createHud !== false) {
       // Browser (or harness with an injected global document) gets the DOM
       // overlay; a headless run without any document simply runs bare.
@@ -432,6 +502,7 @@ export class ClientApp {
     this.initialized = true;
     this.hudSay('surface suit');
     this.hud?.setConnection(this.network?.state ?? 'offline');
+    this.refreshTutorialHud();
     if (this.network === null && !this.ownsNetwork) {
       this.log('no NetworkClient injected or owned — running single-player');
     }
@@ -464,6 +535,8 @@ export class ClientApp {
     this.network?.update();
     this.syncRemoteAvatars();
     this.refreshScanner(timestamp);
+    this.updateTutorialSensors();
+    this.refreshWaypoints(timestamp);
     this.refreshHud();
     this.world.render();
   }
@@ -523,6 +596,19 @@ export class ClientApp {
       }
     }
     this.claimMarkers.clear();
+
+    for (const beacon of [this.buggyBeacon, this.baseBeacon, this.veinBeacon]) {
+      try {
+        beacon?.material?.dispose();
+        beacon?.dispose();
+      } catch {
+        /* world already gone */
+      }
+    }
+    this.buggyBeacon = null;
+    this.baseBeacon = null;
+    this.veinBeacon = null;
+    this.beaconMaterials.clear();
 
     this.suit?.dispose();
     this.buggy?.dispose();
@@ -836,6 +922,8 @@ export class ClientApp {
       for (const mesh of suit.getMeshes()) mesh.setEnabled(false);
       this.hud?.setBuggyPanelVisible(true);
       this.world.getCameraRig().setMode('vehicle_chase');
+      // Onboarding: boarding the rover completes the vehicle step.
+      this.tutorialTrigger('buggy');
       this.hudSay('buggy engaged');
       return true;
     }
@@ -899,6 +987,9 @@ export class ClientApp {
     }
     this.lastMineAt = now;
 
+    // Onboarding: a fired drill frame completes the extraction step.
+    this.tutorialTrigger('mine');
+
     // Local survey bookkeeping only — the server remains authoritative and
     // the next `mine_result` replaces inventory/credits wholesale.
     try {
@@ -941,6 +1032,8 @@ export class ClientApp {
     if (this.hud === null) return false;
     const open = this.hud.toggleTradeDialog();
     if (open) {
+      // Onboarding: cracking the terminal open completes the commerce step.
+      this.tutorialTrigger('trade');
       this.network?.marketQuery();
       const market = this.network?.marketView as
         | { prices?: Record<string, number>; sellPrices?: Record<string, number>; basePrices?: Record<string, number>; reserves?: Record<string, number> }
@@ -1175,6 +1268,8 @@ export class ClientApp {
         remaining: best.remaining,
         rangeM: Math.max(0, bestRange),
       };
+      // Onboarding: scanner lock on a deposit completes the recon step.
+      this.tutorialTrigger('scan');
     } else {
       this.nearestVein = null;
       this.nearestVeinRangeM = null;
@@ -1227,6 +1322,9 @@ export class ClientApp {
     }
     hud.setPrompts(prompts);
 
+    // Bearing tape last — it reads the freshest scanner lock + entity poses.
+    this.refreshCompass();
+
     const node = this.traversal?.nearestNode(this.activePosition());
     if (node !== undefined) {
       this.hudSay(`${node.name} · ${Math.round(node.distance)} m`);
@@ -1237,6 +1335,192 @@ export class ClientApp {
     const a = this.requireSuit().getPosition();
     const b = this.requireBuggy().getPosition();
     return Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
+  }
+
+  // -- waypoint beacons & compass (spec 14 §3.4) -----------------------------------
+
+  /**
+   * Build one translucent pulsing waypoint column at a world-frame site.
+   * Columns are emissive/emissive-only, never shadow casters (they're light,
+   * not furniture), and ride above the terrain by half their height.
+   */
+  private buildBeacon(
+    kind: string,
+    r: number,
+    g: number,
+    b: number,
+    at: { x: number; y: number; z?: number },
+  ): Mesh {
+    const scene = this.world.getScene();
+    const mesh = MeshBuilder.CreateCylinder(
+      `beacon-${kind}`,
+      { diameter: 1.4, height: BEACON_HEIGHT_M, tessellation: 12 },
+      scene,
+    );
+    const material = new StandardMaterial(`beacon-mat-${kind}`, scene);
+    material.diffuseColor = new Color3(r, g, b);
+    material.emissiveColor = new Color3(r, g, b);
+    material.alpha = 0.4;
+    material.disableLighting = true;
+    mesh.material = material;
+    mesh.isPickable = false;
+    mesh.receiveShadows = false;
+    this.beaconMaterials.set(kind, material);
+    const groundZ = at.z ?? this.world.getGroundHeightAt(at.x, at.y);
+    mesh.position.copyFrom(worldToBabylon({ x: at.x, y: at.y, z: groundZ + BEACON_HEIGHT_M / 2 }));
+    this.world.addEntity(mesh);
+    return mesh;
+  }
+
+  /** Reposition an existing beacon column (base of the column on the terrain). */
+  private placeBeacon(mesh: Mesh, x: number, y: number): void {
+    const groundZ = this.world.getGroundHeightAt(x, y);
+    mesh.position.copyFrom(worldToBabylon({ x, y, z: groundZ + BEACON_HEIGHT_M / 2 }));
+  }
+
+  /** Nearest faction base to a world-frame point, or null without bases. */
+  private nearestBaseTo(p: { x: number; y: number }) {
+    const bases = this.factionBases?.getBases() ?? [];
+    let best: (typeof bases)[number] | null = null;
+    let bestD = Number.POSITIVE_INFINITY;
+    for (const base of bases) {
+      const d = Math.hypot(base.position.x - p.x, base.position.y - p.y);
+      if (d < bestD) {
+        bestD = d;
+        best = base;
+      }
+    }
+    return best;
+  }
+
+  /**
+   * Per-frame beacon book: the green vein beacon snaps to (and hides with)
+   * the scanner lock, the cyan rover beacon trails the parked/driven buggy,
+   * and every beacon material breathes on the shared pulse clock.
+   */
+  private refreshWaypoints(now: number): void {
+    if (this.disposed) return;
+    const vein = this.getNearestVein();
+    if (this.veinBeacon !== null) {
+      if (vein !== null) {
+        this.placeBeacon(this.veinBeacon, vein.vein.center.x, vein.vein.center.y);
+        this.veinBeacon.setEnabled(true);
+      } else {
+        this.veinBeacon.setEnabled(false);
+      }
+    }
+    if (this.buggyBeacon !== null) {
+      const b = this.requireBuggy().getPosition();
+      this.placeBeacon(this.buggyBeacon, b.x, b.y);
+    }
+    // Alpha sine, phase-offset per beacon so triple-pulses never sync flat.
+    let phaseIndex = 0;
+    for (const material of this.beaconMaterials.values()) {
+      const phase = (phaseIndex++ * Math.PI) / 3;
+      material.alpha =
+        0.42 + 0.28 * Math.sin((2 * Math.PI * now) / BEACON_PULSE_MS + phase);
+    }
+  }
+
+  /**
+   * Feed the HUD compass tape: heading of the ridden entity (physics θ runs
+   * counter-clockwise from +x; compass bearing = 90° − θ) plus relative pins
+   * for the rover (on foot only), nearest faction base, and scanner-locked
+   * vein.
+   */
+  private refreshCompass(): void {
+    const hud = this.hud;
+    if (hud === null || this.disposed) return;
+
+    const headingRad =
+      this.mode === 'buggy' ? this.requireBuggy().getHeading() : this.requireSuit().getHeading();
+    const headingDeg = wrap360(90 - (headingRad * 180) / Math.PI);
+
+    const p = this.activePosition();
+    const targets: HudCompassTargets = {};
+
+    if (this.mode !== 'buggy') {
+      const b = this.requireBuggy().getPosition();
+      targets.buggy = { bearing: compassBearingDeg(p, b), dist: this.suitBuggyDistance() };
+    }
+
+    const base = this.nearestBaseTo(p);
+    if (base !== null) {
+      targets.base = {
+        name: base.factionName,
+        bearing: compassBearingDeg(p, base.position),
+        dist: Math.hypot(base.position.x - p.x, base.position.y - p.y),
+      };
+    }
+
+    const vein = this.getNearestVein();
+    if (vein !== null) {
+      targets.vein = {
+        kind: vein.vein.kind,
+        bearing: compassBearingDeg(p, vein.vein.center),
+        dist: vein.rangeM,
+      };
+    }
+
+    hud.updateCompass(headingDeg, targets);
+  }
+
+  // -- onboarding state machine (spec 14 §3.5) --------------------------------------
+
+  /** Current onboarding state: first incomplete step, or `'complete'`. */
+  getTutorialStep(): TutorialStep {
+    for (const step of TUTORIAL_ORDER) {
+      if (!this.tutorialDone.has(step)) return step;
+    }
+    return 'complete';
+  }
+
+  /** Authoritative per-step flags + first-incomplete index (0-based). */
+  getTutorialProgress(): { step: TutorialStep; index: number; completed: boolean[] } {
+    const completed = TUTORIAL_ORDER.map((step) => this.tutorialDone.has(step));
+    const firstOpen = completed.indexOf(false);
+    const index = firstOpen < 0 ? TUTORIAL_ORDER.length : firstOpen;
+    return { step: this.getTutorialStep(), index, completed };
+  }
+
+  /** Fire a step trigger (idempotent) and repaint the checklist when it lands. */
+  private tutorialTrigger(step: TutorialProgressStep): void {
+    if (this.tutorialDone.has(step)) return;
+    this.tutorialDone.add(step);
+    this.refreshTutorialHud();
+  }
+
+  /** Push the state machine into the HUD checklist. */
+  private refreshTutorialHud(): void {
+    const { index, completed } = this.getTutorialProgress();
+    this.hud?.updateTutorial(index, completed);
+  }
+
+  /**
+   * Passive triggers polled every frame: enough ground distance walked AND
+   * at least one low-g hop complete the locomotion step. The remaining
+   * triggers (scan lock, mine, mount, trade-open) fire from their action
+   * sites directly.
+   */
+  private updateTutorialSensors(): void {
+    if (this.disposed || this.mode !== 'suit') return;
+    const suit = this.requireSuit();
+    if (this.tutorialDone.has('move')) return;
+
+    const p = suit.getPosition();
+    const step = Math.hypot(p.x - this.tutorialPrevPos.x, p.y - this.tutorialPrevPos.y);
+    // Guard the teleport teleport-jump (welcome spawn) from counting as foot
+    // travel: displacements over a render frame can only be a teleport.
+    if (step < TUTORIAL_TELEPORT_GUARD_M) this.tutorialTravelM += step;
+    this.tutorialPrevPos = { x: p.x, y: p.y };
+
+    const airborne = !suit.getState().isGrounded;
+    if (airborne && !this.tutorialWasAirborne) this.tutorialHopped = true;
+    this.tutorialWasAirborne = airborne;
+
+    if (this.tutorialTravelM >= TUTORIAL_MOVE_DISTANCE_M && this.tutorialHopped) {
+      this.tutorialTrigger('move');
+    }
   }
 
   // -- network wiring -----------------------------------------------------------------------

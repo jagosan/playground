@@ -46,6 +46,7 @@
 
 #lunar-hud .hud-panel,
 #lunar-hud .hud-strip,
+#lunar-hud .hud-compass,
 #lunar-hud .hud-prompts {
   position: absolute;
   background: var(--lf-glass);
@@ -100,6 +101,180 @@
   backdrop-filter: none;
   -webkit-backdrop-filter: none;
   padding: 0;
+}
+
+/* --- compass band (spec 14 §3.4) -------------------------------------------------- */
+
+#lunar-hud-compass {
+  top: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(440px, 62vw);
+  padding: 8px 16px 10px;
+  text-align: center;
+  overflow: hidden;
+}
+
+.compass-heading-value {
+  position: absolute;
+  /* Heading is mirrored into a visually-hidden slot; the big readout below
+     carries the text the eye actually reads. */
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  opacity: 0;
+}
+
+.compass-readout {
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  color: var(--lf-cyan);
+  line-height: 1.2;
+}
+
+.compass-tape {
+  position: relative;
+  height: 30px;
+  margin-top: 4px;
+  border-top: 1px solid var(--lf-rule);
+  /* fade the tape into the glass at both ends */
+  mask-image: linear-gradient(90deg, transparent, #000 12%, #000 88%, transparent);
+  -webkit-mask-image: linear-gradient(90deg, transparent, #000 12%, #000 88%, transparent);
+}
+
+.compass-tick {
+  position: absolute;
+  top: 0;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  color: var(--lf-dim);
+  transition: opacity 90ms linear;
+}
+
+.compass-tick-mark {
+  font-size: 11px;
+  line-height: 8px;
+  color: var(--lf-rule);
+}
+
+.compass-tick-label {
+  font-size: 10px;
+  letter-spacing: 0.12em;
+}
+
+/* Cardinal ticks (N/E/S/W) read brighter than the intercardinals. */
+.compass-tick[data-deg="0"] .compass-tick-label,
+.compass-tick[data-deg="90"] .compass-tick-label,
+.compass-tick[data-deg="180"] .compass-tick-label,
+.compass-tick[data-deg="270"] .compass-tick-label {
+  color: var(--lf-text);
+  font-weight: 700;
+}
+
+#lunar-hud-compass-caret {
+  position: absolute;
+  top: 30px;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 10px;
+  line-height: 10px;
+  color: var(--lf-cyan);
+  pointer-events: none;
+}
+
+.compass-pin {
+  position: absolute;
+  bottom: -26px;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 8px;
+  border: 1px solid var(--lf-rule);
+  border-radius: 999px;
+  background: var(--lf-glass-solid);
+  font-size: 11px;
+  white-space: nowrap;
+  transition: left 90ms linear;
+}
+
+.compass-pin.is-edge {
+  opacity: 0.45;
+  filter: saturate(60%);
+}
+
+.compass-pin-icon {
+  font-size: 12px;
+}
+
+.compass-pin-readout {
+  color: var(--lf-text);
+  letter-spacing: 0.06em;
+}
+
+/* --- onboarding checklist (spec 14 §3.5) ------------------------------------------- */
+
+#lunar-hud-tutorial {
+  top: 72px;
+  right: 16px;
+  width: 268px;
+}
+
+.tutorial-progress {
+  float: right;
+  margin-top: -18px;
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  color: var(--lf-dim);
+}
+
+.tutorial-step {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  line-height: 1.7;
+  font-size: 12px;
+  color: var(--lf-dim);
+  transition: color 160ms ease;
+}
+
+.tutorial-mark {
+  width: 14px;
+  text-align: center;
+  color: var(--lf-dim);
+}
+
+.tutorial-step.is-active {
+  color: var(--lf-text);
+  animation: lf-pulse 2.4s ease-in-out infinite;
+}
+
+.tutorial-step.is-active .tutorial-mark {
+  color: var(--lf-warn);
+}
+
+.tutorial-step.is-done {
+  color: var(--lf-dim);
+  text-decoration: line-through;
+  text-decoration-color: rgba(223, 238, 251, 0.25);
+}
+
+.tutorial-step.is-done .tutorial-mark {
+  color: var(--lf-good);
+  text-decoration: none;
+}
+
+#lunar-hud-tutorial.tutorial-complete {
+  border-color: rgba(92, 230, 164, 0.45);
+}
+
+#lunar-hud-tutorial.tutorial-complete .hud-heading {
+  color: var(--lf-good);
 }
 
 /* --- generic atoms -------------------------------------------------------- */
@@ -536,6 +711,15 @@
   #lunar-hud-buggy {
     width: 210px;
   }
+  #lunar-hud-compass {
+    width: min(320px, 70vw);
+  }
+  #lunar-hud-tutorial {
+    width: 200px;
+  }
+  .compass-pin-readout {
+    display: none;
+  }
   .hud-speed-big {
     font-size: 22px;
   }
@@ -550,7 +734,8 @@
 
 @media (prefers-reduced-motion: reduce) {
   .hud-alarm,
-  #lunar-hud.life-critical {
+  #lunar-hud.life-critical,
+  .tutorial-step.is-active {
     animation: none;
   }
   .hud-bar-fill {

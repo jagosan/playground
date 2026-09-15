@@ -9,7 +9,10 @@
  * equally inspectable by a headless harness that injects a minimal
  * `Document`-shaped object.
  *
- * Panels (spec 13 §3):
+ * Panels (spec 13 §3, spec 14 §3.4/§3.5):
+ *   • Compass        — top-centre bearing tape (0°–360° + cardinals) with
+ *                      tracking pins for 🚗 rover, 🏛️ faction base, 💎 vein.
+ *   • Tutorial       — top-right `MISSION ONBOARDING` checklist (5 steps).
  *   • Life support   — Oxygen % bar, EVA battery % bar, suit headlight lamp,
  *                      RCS fuel, altitude / ground-contact readouts.
  *   • Buggy dashboard— speedometer (m/s AND km/h), cargo bar (0–500 kg),
@@ -32,6 +35,22 @@
 
 export const HUD_ROOT_ID = 'lunar-hud';
 export const HUD_TRADE_ID = 'lunar-hud-trade';
+export const HUD_COMPASS_ID = 'lunar-hud-compass';
+export const HUD_TUTORIAL_ID = 'lunar-hud-tutorial';
+
+/** Compass tape: 8 major ticks (every 45° = 360/8), window ±90° of heading. */
+export const HUD_COMPASS_TAPE_TICKS = 8;
+export const HUD_COMPASS_TAPE_SPAN_DEG = 45;
+export const HUD_COMPASS_WINDOW_DEG = 90;
+
+/** The five guided-onboarding steps, in canonical order (spec 14 §3.5). */
+export const HUD_TUTORIAL_STEPS: readonly string[] = [
+  'Move & Low-g Hop (WASD / Space)',
+  'Locate Mineral Deposit (follow compass 💎)',
+  'Extract Mineral Ore (Press [M])',
+  'Rover Operations (Approach 🚗 & press [E])',
+  'Station Exchange (Press [T] to trade)',
+];
 
 /** Fallback book when the terminal opens before the first `market_sync`. */
 export const HUD_DEFAULT_COMMODITIES: readonly string[] = [
@@ -118,6 +137,31 @@ export interface HudTradeRequest {
 
 export type HudFeedbackKind = 'info' | 'success' | 'error';
 
+/** A tracked landmark pin on the compass tape (spec 14 §3.4). */
+export interface HudCompassBearing {
+  /** Bearing from the local player to the landmark, degrees (0 = N, clockwise). */
+  bearing: number;
+  /** Slant distance in metres. */
+  dist: number;
+}
+
+export interface HudCompassBaseBearing extends HudCompassBearing {
+  /** Faction / base name shown beside the 🏛️ pin. */
+  name: string;
+}
+
+export interface HudCompassVeinBearing extends HudCompassBearing {
+  /** Vein resource kind shown beside the 💎 pin (e.g. `ilmenite`). */
+  kind: string;
+}
+
+/** Everything `updateCompass()` can pin at once — any subset may be absent. */
+export interface HudCompassTargets {
+  buggy?: HudCompassBearing;
+  base?: HudCompassBaseBearing;
+  vein?: HudCompassVeinBearing;
+}
+
 export interface LunarHUDOptions {
   /** Document to build into (injected by headless harnesses). */
   document?: Document;
@@ -144,7 +188,8 @@ interface Elementish {
   id: string;
   className: string;
   textContent: string | null;
-  style: { width: string };
+  /** Width plus free-form CSS custom props (`left`, `transform`, `opacity`). */
+  style: { width: string; [key: string]: string };
   classList: {
     add(name: string): void;
     remove(name: string): void;
@@ -198,6 +243,24 @@ function severityBar(percent: number): '' | 'is-low' | 'is-critical' {
   return percent <= 15 ? 'is-critical' : percent <= 35 ? 'is-low' : '';
 }
 
+/** Wrap any angle to [0, 360). */
+function wrap360(deg: number): number {
+  if (!Number.isFinite(deg)) return 0;
+  return ((deg % 360) + 360) % 360;
+}
+
+/** Signed shortest signed offset of `deg` from `from`, in [-180, 180). */
+function angleDelta(deg: number, from: number): number {
+  return ((wrap360(deg) - wrap360(from) + 540) % 360) - 180;
+}
+
+const COMPASS_CARDINALS: readonly string[] = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
+
+/** 8-wind cardinal label for a bearing (0° → N, 45° → NE, …). */
+function cardinal(bearingDeg: number): string {
+  return COMPASS_CARDINALS[Math.round(wrap360(bearingDeg) / 45) % 8];
+}
+
 // ---------------------------------------------------------------------------
 // LunarHUD
 // ---------------------------------------------------------------------------
@@ -216,6 +279,13 @@ export class LunarHUD {
   private readonly els = new Map<string, Elementish>();
 
   private promptEls: Elementish[] = [];
+  /** Compass tape tick marks (fixed count, repositioned every frame). */
+  private compassTicks: Elementish[] = [];
+  /** Per-pin readout spans (built once; `updateCompass` only rewrites text). */
+  private readonly compassPinReadouts = new Map<string, Elementish>();
+  /** Tutorial checklist rows + their ✔/□ glyph cells. */
+  private tutorialSteps: Elementish[] = [];
+  private tutorialMarks: Elementish[] = [];
   private marketTable: Elementish | null = null;
   private readonly tradeRows = new Map<
     string,
@@ -255,10 +325,12 @@ export class LunarHUD {
     }
 
     this.buildStatusStrip();
+    this.buildCompass();
     this.buildLifeSupport();
     this.buildBuggyPanel();
     this.buildScanner();
     this.buildPrompts();
+    this.buildTutorial();
     this.buildTradeTerminal(options.commodities ?? HUD_DEFAULT_COMMODITIES);
 
     // Escape closes the terminal even if ClientApp's own listener is absent.
@@ -284,6 +356,10 @@ export class LunarHUD {
     this.tradeRows.clear();
     this.tradeOptions.clear();
     this.promptEls = [];
+    this.compassTicks = [];
+    this.compassPinReadouts.clear();
+    this.tutorialSteps = [];
+    this.tutorialMarks = [];
     this.els.clear();
     this.tradeRoot.remove();
     this.root.remove();
@@ -448,6 +524,103 @@ export class LunarHUD {
   private orderOf(prompt: HudPrompt): number {
     if (prompt.order !== undefined) return prompt.order;
     return HUD_PROMPT_KINDS[(prompt.kind ?? 'trade') as HudPromptKind]?.order ?? 50;
+  }
+
+  // -- compass (spec 14 §3.4) --------------------------------------------------------
+
+  /**
+   * Paint the top-centre bearing tape: the current heading readout
+   * (`123° NE`), eight sliding tape ticks (N/NE/E/… every 45°, each at
+   * `(bearing − heading + 180) / 360` of the tape width so the heading you
+   * face sits dead centre), and the landmark tracking pins 🚗 / 🏛️ / 💎
+   * with bearing + distance. Absent targets hide their pin; targets outside
+   * the ±90° window clamp to the tape edge and gain an `is-edge` class so
+   * CSS can dim them behind the frame gradient.
+   */
+  updateCompass(
+    headingDeg: number,
+    targets: HudCompassTargets = {},
+  ): void {
+    if (this.disposed) return;
+    const heading = wrap360(headingDeg);
+
+    this.setText('compass-value', `${Math.round(heading)}° ${cardinal(heading)}`);
+    this.setText('compass-heading', `${Math.round(heading)}°`);
+
+    // Tape ticks slide so the faced bearing is always centred.
+    for (const tick of this.compassTicks) {
+      const tickDeg = Number(tick.getAttribute('data-deg') ?? 0);
+      const delta = angleDelta(tickDeg, heading);
+      const inside = Math.abs(delta) <= HUD_COMPASS_WINDOW_DEG;
+      const leftPct = ((delta / HUD_COMPASS_WINDOW_DEG) * 0.5 + 0.5) * 100;
+      tick.style['left'] = `${leftPct.toFixed(2)}%`;
+      tick.style['opacity'] = inside ? '1' : '0';
+    }
+
+    this.setCompassPin('compass-pin-buggy', heading, targets.buggy);
+    this.setCompassPin('compass-pin-base', heading, targets.base, targets.base?.name);
+    this.setCompassPin('compass-pin-vein', heading, targets.vein, targets.vein?.kind);
+  }
+
+  private setCompassPin(
+    key: string,
+    heading: number,
+    target: HudCompassBearing | undefined,
+    name?: string,
+  ): void {
+    const pin = this.els.get(key);
+    if (pin === undefined) return;
+    if (target === undefined || !Number.isFinite(target.bearing)) {
+      this.setClassEl(pin, 'is-hidden', true);
+      return;
+    }
+    const delta = angleDelta(target.bearing, heading);
+    const clamped = clamp(delta, -HUD_COMPASS_WINDOW_DEG, HUD_COMPASS_WINDOW_DEG);
+    const leftPct = ((clamped / HUD_COMPASS_WINDOW_DEG) * 0.5 + 0.5) * 100;
+    pin.style['left'] = `${leftPct.toFixed(2)}%`;
+    const label = name !== undefined && name.length > 0 ? String(name).toUpperCase() : '';
+    const readout = this.compassPinReadouts.get(key);
+    if (readout !== undefined) {
+      readout.textContent =
+        `${label.length > 0 ? `${label} ` : ''}${Math.round(wrap360(target.bearing))}° · ${num(target.dist, 0)} m`;
+    }
+    this.setClassEl(pin, 'is-hidden', false);
+    this.setClassEl(pin, 'is-edge', Math.abs(delta) > HUD_COMPASS_WINDOW_DEG);
+  }
+
+  // -- onboarding tutorial (spec 14 §3.5) ---------------------------------------------
+
+  /**
+   * Paint the top-right `MISSION ONBOARDING` checklist. `stepIndex` is the
+   * first *incomplete* step (0-based); every step before it renders done,
+   * the step itself renders active/pulsing, later steps render pending.
+   * `completed` is the authoritative per-step flag array from ClientApp's
+   * state machine (it wins over `stepIndex` when the two disagree). Passing
+   * `stepIndex >= 5` or an all-true `completed` marks the whole run done and
+   * adds `tutorial-complete` to the widget.
+   */
+  updateTutorial(stepIndex: number, completed: boolean[]): void {
+    if (this.disposed) return;
+    for (let i = 0; i < this.tutorialSteps.length; i++) {
+      const row = this.tutorialSteps[i];
+      const mark = this.tutorialMarks[i];
+      const done = completed[i] === true || i < stepIndex;
+      const active = !done && i === stepIndex;
+      mark.textContent = done ? '✔' : '□';
+      this.setClassEl(row, 'is-done', done);
+      this.setClassEl(row, 'is-active', active);
+      this.setClassEl(row, 'is-pending', !done && !active);
+    }
+    const allDone = stepIndex >= this.tutorialSteps.length ||
+      this.tutorialSteps.every((_row, i) => completed[i] === true);
+    this.setClass('tutorial-panel', 'tutorial-complete', allDone);
+    this.setText('tutorial-progress', allDone ? 'COMPLETE' : `${stepIndex + 1} / ${this.tutorialSteps.length}`);
+  }
+
+  /** Hide / show the whole onboarding widget (e.g. after completion + delay). */
+  setTutorialVisible(visible: boolean): void {
+    if (this.disposed) return;
+    this.setClass('tutorial-panel', 'is-hidden', !visible);
   }
 
   // -- status strip --------------------------------------------------------------------------
@@ -625,6 +798,62 @@ export class LunarHUD {
     strip.appendChild(this.labeledField('status', 'STATUS', 'booting'));
   }
 
+  /**
+   * Top-centre bearing tape (spec 14 §3.4): heading readout, a sliding tick
+   * strip (one tick per 45° of bearing, cardinal-labelled), and three
+   * landmark pins repositioned by `updateCompass()`.
+   */
+  private buildCompass(): void {
+    const band = this.make('div', HUD_COMPASS_ID, 'hud-compass', 'compass-panel');
+    this.root.appendChild(band);
+
+    const heading = this.make('div', 'lunar-hud-compass-heading', 'compass-heading-value', 'compass-heading');
+    heading.textContent = '0°';
+    band.appendChild(heading);
+    const readout = this.make('div', 'lunar-hud-compass-value', 'compass-readout', 'compass-value');
+    readout.textContent = '0° N';
+    band.appendChild(readout);
+
+    const tape = this.make('div', 'lunar-hud-compass-tape', 'compass-tape', 'compass-tape');
+    this.compassTicks = [];
+    for (let i = 0; i < HUD_COMPASS_TAPE_TICKS; i++) {
+      const deg = i * HUD_COMPASS_TAPE_SPAN_DEG;
+      const tick = this.make('div', `hud-compass-tick-${deg}`, 'compass-tick');
+      tick.setAttribute('data-deg', String(deg));
+      const mark = this.make('span', undefined, 'compass-tick-mark');
+      mark.textContent = '|';
+      const label = this.make('span', undefined, 'compass-tick-label');
+      label.textContent = COMPASS_CARDINALS[i % COMPASS_CARDINALS.length];
+      tick.appendChild(mark);
+      tick.appendChild(label);
+      tape.appendChild(tick);
+      this.compassTicks.push(tick);
+    }
+    band.appendChild(tape);
+
+    // Centre caret over the tape — the "you are facing here" hairline.
+    const caret = this.make('div', 'lunar-hud-compass-caret', 'compass-caret');
+    caret.textContent = '▼';
+    band.appendChild(caret);
+
+    for (const [key, icon] of [
+      ['compass-pin-buggy', '🚗'],
+      ['compass-pin-base', '🏛️'],
+      ['compass-pin-vein', '💎'],
+    ] as const) {
+      const pin = this.make('div', `lunar-hud-${key}`, 'compass-pin is-hidden', key);
+      pin.setAttribute('data-target', key.replace('compass-pin-', ''));
+      const glyphEl = this.make('span', undefined, 'compass-pin-icon');
+      glyphEl.textContent = icon;
+      const readoutEl = this.make('span', undefined, 'compass-pin-readout');
+      readoutEl.textContent = '';
+      pin.appendChild(glyphEl);
+      pin.appendChild(readoutEl);
+      this.compassPinReadouts.set(key, readoutEl);
+      band.appendChild(pin);
+    }
+  }
+
   private buildLifeSupport(): void {
     const panel = this.make('section', 'lunar-hud-life', 'hud-panel life-support', 'life-panel');
     this.root.appendChild(panel);
@@ -709,6 +938,36 @@ export class LunarHUD {
       '[WASD] move · [Space] hop · [Shift] sprint · [E] buggy · [F] lamps · ' +
       '[V] camera · [M] mine · [C] claim · [T] trade · [Esc] close UI';
     strip.appendChild(legend);
+  }
+
+  /**
+   * Top-right `MISSION ONBOARDING` checklist (spec 14 §3.5): five rows driven
+   * by `updateTutorial()`, each rendered as a ✔/□ glyph + step text.
+   */
+  private buildTutorial(): void {
+    const panel = this.make('section', HUD_TUTORIAL_ID, 'hud-panel tutorial-panel', 'tutorial-panel');
+    this.root.appendChild(panel);
+    panel.appendChild(this.heading('MISSION ONBOARDING'));
+
+    const progress = this.make('div', 'lunar-hud-tutorial-progress', 'tutorial-progress', 'tutorial-progress');
+    progress.textContent = `1 / ${HUD_TUTORIAL_STEPS.length}`;
+    panel.appendChild(progress);
+
+    this.tutorialSteps = [];
+    this.tutorialMarks = [];
+    for (let i = 0; i < HUD_TUTORIAL_STEPS.length; i++) {
+      const row = this.make('div', `lunar-hud-tutorial-step-${i + 1}`, 'tutorial-step is-pending', `tutorial-step-${i}`);
+      row.setAttribute('data-step', String(i));
+      const mark = this.make('span', undefined, 'tutorial-mark', `tutorial-mark-${i}`);
+      mark.textContent = '□';
+      const label = this.make('span', undefined, 'tutorial-label');
+      label.textContent = HUD_TUTORIAL_STEPS[i];
+      row.appendChild(mark);
+      row.appendChild(label);
+      panel.appendChild(row);
+      this.tutorialSteps.push(row);
+      this.tutorialMarks.push(mark);
+    }
   }
 
   private buildTradeTerminal(commodities: readonly string[]): void {
