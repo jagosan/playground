@@ -45,6 +45,9 @@ import { WorldScene, worldToBabylon, type CameraMode } from '../engine/index.ts'
 import { EvaSuitAvatar } from '../entities/AstronautSuit.ts';
 import { OpenBuggy, MOUNT_RADIUS_M } from '../entities/OpenBuggy.ts';
 import { TraversalController } from './TraversalController.ts';
+import { FactionBases } from '../infrastructure/Factions.ts';
+import { TunnelNetwork } from '../infrastructure/TunnelNetwork.ts';
+import { RailSystem } from '../infrastructure/RailSystem.ts';
 import {
   IDLE_BUGGY_INPUT,
   type BuggyInput,
@@ -93,6 +96,47 @@ export const SCAN_INTERVAL_MS = 250;
 
 /** Claim radius staked by the [C] hotkey, metres. */
 export const CLAIM_RADIUS_M = 20;
+
+/**
+ * Analog stick deadzone (spec 14 §3.1). Axis magnitudes at or below this read
+ * as centred, so a pad with drift/wander never creeps the suit or the buggy.
+ */
+export const GAMEPAD_DEADZONE = 0.15;
+
+/**
+ * Standard-mapping axis slots (spec 14 §3.1): left stick X → strafe/steer,
+ * left stick Y → throttle (inverted: raw up is negative), right stick X → yaw.
+ */
+export const GAMEPAD_AXES: Readonly<{ strafe: number; throttle: number; yaw: number }> = {
+  strafe: 0,
+  throttle: 1,
+  yaw: 2,
+};
+
+/**
+ * Standard-mapping button slots. `sprintLeft`/`sprintRight` are LB and L3 —
+ * either thumb-spare button runs, since handhelds (GPD Win Max 2, Steam Deck)
+ * differ on which is most reachable.
+ */
+export const GAMEPAD_BUTTONS: Readonly<{
+  jump: number;
+  trade: number;
+  mount: number;
+  headlight: number;
+  brake: number;
+  throttle: number;
+  sprintLeft: number;
+  sprintLeftAlt: number;
+}> = {
+  jump: 0, // A
+  trade: 1, // B
+  mount: 2, // X
+  headlight: 3, // Y
+  brake: 6, // LT (analog value)
+  throttle: 7, // RT (analog value)
+  sprintLeft: 4, // LB
+  sprintLeftAlt: 10, // L3
+};
 
 /** Buggy parks this far from the spawn collar, metres. */
 export const BUGGY_PARK_OFFSET: readonly [number, number] = [9, 4];
@@ -161,11 +205,19 @@ export interface ClientAppOptions {
 }
 
 export interface ClientInputFrame {
-  /** -1..1 forward (W/S). */
+  /** -1..1 forward (W/S, gamepad left-stick Y, or right trigger). */
   forward: number;
-  /** -1..1 strafe (A/D; + = left, matching `SuitInput.strafe`). */
+  /**
+   * -1..1 strafe (A/D, gamepad left stick X). `+` is the ridden entity's
+   * **right** — physics `strafe` drives the body-frame +y axis, which the
+   * `worldToBabylon` + `rotation.y = PI/2 + heading` mapping puts on the
+   * right side of the screen.
+   */
   strafe: number;
-  /** -1..1 yaw steer (Arrow keys). */
+  /**
+   * -1..1 yaw steer (Arrow keys, gamepad right stick X). `+` increases
+   * `heading`, i.e. turns clockwise / to the right as rendered.
+   */
   yaw: number;
   /** -1..1 look pitch (Arrow up/down). */
   pitch: number;
@@ -173,6 +225,19 @@ export interface ClientInputFrame {
   sprint: boolean;
   /** Space held — hop (physics tracks its own rising edge). */
   jump: boolean;
+  /** 0..1 analog service brake (gamepad left trigger); 0 from the keyboard. */
+  brake: number;
+}
+
+/**
+ * The structural slice of the Gamepad API this client consumes. Declaring it
+ * locally (rather than leaning on lib.dom's `Gamepad`) keeps the headless
+ * harness honest: `scripts/smoke-client-app.ts` hands in a plain object of
+ * axes + buttons and the code below never touches a browser-only member.
+ */
+export interface GamepadLike {
+  readonly axes: readonly number[];
+  readonly buttons: readonly { readonly value: number; readonly pressed: boolean }[];
 }
 
 /** Live remote puppet: physics is network-driven, meshes follow the render pos. */
@@ -221,6 +286,14 @@ export class ClientApp {
 
   private readonly pressed = new Set<string>();
 
+  /**
+   * Gamepad rising-edge bookkeeping (spec 14 §3.1): `sampleInput()` stashes
+   * the raw frame snapshot, `pumpGamepadActions()` compares it against the
+   * previous frame and fires X/Y/B once per press.
+   */
+  private prevGamepadButtons: boolean[] = [];
+  private lastGamepadButtons: boolean[] = [];
+
   private lastFrameAt: number | null = null;
   private moveAccumulatorMs = 0;
   private lastScanAt: number | null = null;
@@ -229,6 +302,11 @@ export class ClientApp {
 
   private readonly remotes = new Map<string, RemoteAvatar>();
   private readonly claimMarkers = new Map<string, Mesh>();
+  private factionBases: FactionBases | null = null;
+  private tunnelNetwork: TunnelNetwork | null = null;
+  private railSystem: RailSystem | null = null;
+  private buggyBeacon: Mesh | null = null;
+  private baseBeacon: Mesh | null = null;
 
   private scannerReadout: HudScannerReadout = { found: false, message: 'SCANNING…' };
   private nearestVein: ResourceVein | null = null;
@@ -354,6 +432,10 @@ export class ClientApp {
     const dt = clamp((timestamp - this.lastFrameAt) / 1000, 0, 0.25);
     this.lastFrameAt = timestamp;
 
+    // Gamepad hotkey edges run before the physics step so an X-press mounts
+    // this frame rather than the next (stepEntities → sampleInput refreshes
+    // the button snapshot for the following frame).
+    this.pumpGamepadActions();
     this.stepEntities(dt);
     this.syncCamera(dt);
     this.pumpMoveStream(dt);
@@ -551,22 +633,120 @@ export class ClientApp {
     }
   }
 
-  /** Poll the held-key set into a movement frame (public for tests). */
+  /**
+   * Poll held keys + gamepad into one movement frame (public for tests).
+   * Keyboard is digital; the gamepad adds analog axes on top (a stick inside
+   * {@link GAMEPAD_DEADZONE} reads as centred, so the two never fight). The
+   * pad's raw button snapshot is stashed for {@link pumpGamepadActions},
+   * which owns rising-edge detection — `sampleInput()` itself stays a pure
+   * query the harness can call twice a frame.
+   */
   sampleInput(): ClientInputFrame {
     const p = this.pressed;
-    const forward = (p.has('KeyW') ? 1 : 0) - (p.has('KeyS') ? 1 : 0);
-    const strafe = (p.has('KeyA') ? 1 : 0) - (p.has('KeyD') ? 1 : 0);
-    const yaw = (p.has('ArrowLeft') ? 1 : 0) - (p.has('ArrowRight') ? 1 : 0);
+    // Right = +1, left = -1: physics `strafe` drives body-frame +y, which the
+    // render mapping (worldToBabylon + rotation.y = PI/2 + heading) shows on
+    // the right (spec 14 §3.1 — rectifies the old inverted A/D).
+    const keyForward = (p.has('KeyW') ? 1 : 0) - (p.has('KeyS') ? 1 : 0);
+    const keyStrafe = (p.has('KeyD') ? 1 : 0) - (p.has('KeyA') ? 1 : 0);
+    // Right/ArrowRight increases heading = clockwise turn (spec 14 §3.1).
+    const keyYaw = (p.has('ArrowRight') ? 1 : 0) - (p.has('ArrowLeft') ? 1 : 0);
     const pitch = (p.has('ArrowUp') ? 1 : 0) - (p.has('ArrowDown') ? 1 : 0);
+
     const frame: ClientInputFrame = {
-      forward,
-      strafe,
-      yaw,
+      forward: keyForward,
+      strafe: keyStrafe,
+      yaw: keyYaw,
       pitch,
       sprint: p.has('ShiftLeft') || p.has('ShiftRight'),
       jump: p.has('Space'),
+      brake: 0,
     };
+
+    // Poll the pad unconditionally so `pumpGamepadActions()` always has this
+    // frame's button snapshot; while the trade terminal is parked the analog
+    // axes sleep with the page keys (B still closes via the edge pump).
+    const pad = this.pollGamepad();
+    this.lastGamepadButtons = pad === null ? [] : pad.buttons.map((b) => b.pressed);
+    if (pad === null || (this.hud?.isTradeDialogOpen() ?? false)) return frame;
+
+    const axis = (index: number): number => {
+      const v = pad.axes[index];
+      if (typeof v !== 'number' || !Number.isFinite(v) || Math.abs(v) <= GAMEPAD_DEADZONE) return 0;
+      return clamp(v, -1, 1);
+    };
+    const trigger = (index: number): number => {
+      const v = pad.buttons[index]?.value;
+      if (typeof v !== 'number' || !Number.isFinite(v)) return 0;
+      return clamp(v, 0, 1);
+    };
+
+    frame.forward = clamp(
+      frame.forward + axis(GAMEPAD_AXES.throttle) * -1 + trigger(GAMEPAD_BUTTONS.throttle),
+      -1,
+      1,
+    );
+    frame.strafe = clamp(frame.strafe + axis(GAMEPAD_AXES.strafe), -1, 1);
+    frame.yaw = clamp(frame.yaw + axis(GAMEPAD_AXES.yaw), -1, 1);
+    frame.brake = trigger(GAMEPAD_BUTTONS.brake);
+    frame.sprint =
+      frame.sprint ||
+      (pad.buttons[GAMEPAD_BUTTONS.sprintLeft]?.pressed ?? false) ||
+      (pad.buttons[GAMEPAD_BUTTONS.sprintLeftAlt]?.pressed ?? false);
+    frame.jump = frame.jump || (pad.buttons[GAMEPAD_BUTTONS.jump]?.pressed ?? false);
     return frame;
+  }
+
+  /**
+   * First connected standard pad, or null. Defensive against Node (navigator
+   * without `getGamepads`), locked-down browsers (getter throws), and null
+   * holes in the pads array.
+   */
+  private pollGamepad(): GamepadLike | null {
+    const nav = (globalThis as {
+      navigator?: { getGamepads?: () => (GamepadLike | null)[] | undefined };
+    }).navigator;
+    if (nav === undefined || typeof nav.getGamepads !== 'function') return null;
+    let pads: (GamepadLike | null)[] | undefined;
+    try {
+      pads = nav.getGamepads();
+    } catch {
+      return null;
+    }
+    if (!Array.isArray(pads)) return null;
+    for (const pad of pads) {
+      if (pad !== null && pad !== undefined && Array.isArray(pad.axes) && Array.isArray(pad.buttons)) {
+        return pad;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Rising-edge gamepad actions (spec 14 §3.1): X mounts, Y toggles lamps,
+   * B toggles the trade terminal. Runs once per `update()` frame against the
+   * snapshot stashed by `sampleInput()`. While the terminal is open only B
+   * responds (it closes) — the console "back" convention, mirroring how the
+   * keyboard parks every key except Escape.
+   */
+  private pumpGamepadActions(): void {
+    const now = this.lastGamepadButtons;
+    const prev = this.prevGamepadButtons;
+    const rising = (index: number): boolean =>
+      now[index] === true && prev[index] !== true;
+    const tradeOpen = this.hud?.isTradeDialogOpen() ?? false;
+    try {
+      if (tradeOpen) {
+        if (rising(GAMEPAD_BUTTONS.trade)) this.toggleTradeTerminal();
+      } else if (rising(GAMEPAD_BUTTONS.mount)) {
+        this.toggleMount();
+      } else if (rising(GAMEPAD_BUTTONS.headlight)) {
+        this.toggleHeadlights();
+      } else if (rising(GAMEPAD_BUTTONS.trade)) {
+        this.toggleTradeTerminal();
+      }
+    } finally {
+      this.prevGamepadButtons = now.slice();
+    }
   }
 
   private runAction(action: string): void {
@@ -769,7 +949,12 @@ export class ClientApp {
       const buggy = this.requireBuggy();
       const input: BuggyInput = {
         throttle: clamp(frame.forward, -1, 1),
-        brake: frame.forward < 0 && buggy.getSpeed() > 0.5 ? 1 : 0,
+        brake:
+          frame.brake > 0
+            ? clamp(frame.brake, 0, 1)
+            : frame.forward < 0 && buggy.getSpeed() > 0.5
+              ? 1
+              : 0,
         regen: frame.forward < 0 ? 1 : 0,
         steer: clamp(frame.strafe, -1, 1),
         parkBrake: false,
