@@ -572,6 +572,9 @@ export class LunarBuggy {
   private motorTorque = 0;
   private driveMode: 'FORWARD' | 'STOPPED' | 'REVERSE' = 'STOPPED';
   private steerAngle = 0;
+  /** Attitude rates (rad/s) realised last substep — feed suspension corner v_z. */
+  private pitchRate = 0;
+  private rollRate = 0;
 
   constructor(options: BuggyOptions = {}, initial: Partial<BuggyState> = {}) {
     this.chassisMass = options.chassisMass ?? BUGGY_CHASSIS_MASS;
@@ -772,23 +775,46 @@ export class LunarBuggy {
     const cornerForceY: number[] = [0, 0, 0, 0];
     const cornerLoad: number[] = [0, 0, 0, 0];
 
+    // Corner contact heights for slope-aligned attitude (spec 16 §2.2).
+    let frontZ = 0;
+    let rearZ = 0;
+    let leftZ = 0;
+    let rightZ = 0;
+
     for (let i = 0; i < 4; i++) {
       const fx = CORNERS[i].fx;
       const fy = CORNERS[i].fy;
       const isFront = fx > 0;
 
-      // Chassis mount height above ground at this corner.
+      // Per-corner ground contact height z_ground,i (spec 16 §2.2).
+      const zg = this.ground(s.x + fx * ch - fy * sh, s.y + fx * sh + fy * ch);
+
+      // Chassis spring-seat height above the local ground datum.
       const mountZ = s.bodyHeight - 0.25 + fx * cp * s.pitch - fy * cr * s.roll;
-      const desired = BUGGY_WHEEL_RADIUS; // wheel keeps the ground contact patch
-      const x0 = desired - mountZ; // positive = compressed
+
+      // Suspension deflection x_i = z_contact + R_wheel - z_mount, positive =
+      // compressed, measured against THIS corner's own ground so each wheel
+      // follows terrain independently of the chassis datum.
+      const x0 = zg - here + BUGGY_WHEEL_RADIUS - mountZ;
       const travel = BUGGY_SPRING_TRAVEL * 2; // droop..bump total
       const compression = clamp((x0 + BUGGY_SPRING_TRAVEL) / travel, 0, 1);
       const x = clamp(x0, -BUGGY_SPRING_TRAVEL, BUGGY_SPRING_TRAVEL);
 
-      // Corner vertical velocity (heave + roll/pitch rates), small-angle.
-      const vCorner = s.vBody + fx * s.pitch * 0 - fy * this.rollRateProxy() * 0;
-      let fz = BUGGY_SPRING_RATE * x + BUGGY_DAMPER * (vCorner - s.vBody);
+      // True corner vertical velocity: heave plus the pitch/roll rates
+      // realised last substep (small-angle). The pre-Spec-16 code evaluated
+      // BUGGY_DAMPER * (vCorner - s.vBody) with vCorner === s.vBody, so the
+      // damper was identically zero and heave rang like an unweighted pogo.
+      const vzCorner = s.vBody + fx * this.pitchRate - fy * this.rollRate;
+
+      // Critically damped spring-seat force with hard bump/droop stops
+      // (spec 16 §2.2): F_z = max(0, k·x - c·vz), c = 1360 = 2·ζ·√(k·m/4).
+      let fz = BUGGY_SPRING_RATE * x - BUGGY_DAMPER * vzCorner;
       fz = clamp(fz, 0, BUGGY_SPRING_RATE * BUGGY_SPRING_TRAVEL * 2.5);
+
+      if (fx > 0) frontZ += zg;
+      else rearZ += zg;
+      if (fy > 0) leftZ += zg;
+      else rightZ += zg;
 
       cornerLoad[i] = fz;
       sumZ += fz;
@@ -927,27 +953,33 @@ export class LunarBuggy {
     s.vBody += ((n - weight) / m) * dt;
     s.bodyHeight += s.vBody * dt;
 
-    const rollStiffness = rollInertia * (3.5 * 2 * Math.PI) ** 2;
-    const rollDamping = rollInertia * 2 * 0.3 * (3.5 * 2 * Math.PI);
-    const rollTorque =
-      rollMoment - m * LUNAR_GRAVITY * cog * Math.sin(s.roll) * 0 + 0 - (rollMoment - m * LUNAR_GRAVITY * cog * Math.sin(s.roll)) * 0;
-    // Roll: suspension moment minus gravity restoring, plus lateral force at CoG.
-    const netRoll = -(rollStiffness * 0) - (0) + (rollMoment - m * LUNAR_GRAVITY * cog * Math.sin(s.roll)) * 0;
-    void netRoll;
-    const lateralAtCog = m * (s.vLat * 0 + (FyBody / m) * 0);
-    void lateralAtCog;
-    const rollAcc = ((rollMoment - m * LUNAR_GRAVITY * Math.sin(s.roll) * cog) - rollDamping * this.rollRateProxy()) / rollInertia;
-    s.roll = clamp(s.roll + 0 * dt + rollAcc * dt * 0, -0.8, 0.8);
-    // The quasi-static roll attitude follows load transfer with lag; full rigid
-    // body roll is handled through the roll bar trip below.
-    const targetRoll = clamp(
-      Math.atan2((FyBody / m - gravLat) + s.vLong * s.yawRate, LUNAR_GRAVITY) * 0.35,
-      -0.5,
-      0.5,
-    );
-    s.roll = approach(s.roll, targetRoll, 6, dt);
-    const targetPitch = clamp(-Math.atan2(FxBody / m + gravLong, LUNAR_GRAVITY) * 0.4, -0.35, 0.35);
-    s.pitch = approach(s.pitch, targetPitch, 5, dt);
+    // Terrain attitude from the per-corner contact heights (spec 16 §2.2):
+    // θ = atan((z_front − z_rear)/L), φ = atan((z_left − z_right)/W). The
+    // chassis settles onto the slope its wheels are standing on instead of
+    // planing across it.
+    const slopePitchTarget = Math.atan((frontZ - rearZ) / 2 / 2.7);
+    const slopeRollTarget = Math.atan((leftZ - rightZ) / 2 / BUGGY_TRACK);
+
+    // Dynamic load transfer from drive/brake/brake yaw only (terrain grade is
+    // already carried by the slope targets — no double counting). Positive Fx
+    // transfers load REARWARD (nose-up squat), positive leftward a_lat rolls
+    // the left side up. Gains are the kinematic analogue of Σk_s deflection
+    // (θ ≈ m·a·h_cg / (k·L²)); steeper values would command more pitch than
+    // the springs can hold and lift a corner off the ground under throttle.
+    const accelPitch = Math.atan(FxBody / m / LUNAR_GRAVITY) * 0.1;
+    const accelRoll = Math.atan((FyBody / m + s.vLong * s.yawRate) / LUNAR_GRAVITY) * 0.15;
+
+    const targetPitch = clamp(slopePitchTarget + accelPitch, -0.35, 0.35);
+    const targetRoll = clamp(slopeRollTarget + accelRoll, -0.5, 0.5);
+
+    // Smooth first-order attitude tracking; the REALISED rates feed the
+    // suspension corner velocities next substep (critically damped heave).
+    const prevPitch = s.pitch;
+    const prevRoll = s.roll;
+    s.pitch = clamp(approach(s.pitch, targetPitch, 5, dt), -0.8, 0.8);
+    s.roll = clamp(approach(s.roll, targetRoll, 6, dt), -0.8, 0.8);
+    this.pitchRate = (s.pitch - prevPitch) / dt;
+    this.rollRate = (s.roll - prevRoll) / dt;
 
     // -- Rollover trip ------------------------------------------------------------
     let minLoadFrac = 1;

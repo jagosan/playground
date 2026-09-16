@@ -932,6 +932,9 @@ export class ClientApp {
       if (!buggy.mount(suit)) return false;
       this.mode = 'buggy';
       this.lastEvaCamera = this.world.getCameraRig().getMode();
+      // Spec 16 §2.1: the rover beacon guides the EVA astronaut on foot — it
+      // must never shine up into the driver's field of view from the roof.
+      this.buggyBeacon?.setEnabled(false);
       for (const mesh of suit.getMeshes()) mesh.setEnabled(false);
       this.hud?.setBuggyPanelVisible(true);
       this.world.getCameraRig().setMode('vehicle_chase');
@@ -943,6 +946,9 @@ export class ClientApp {
 
     if (!buggy.dismount(suit)) return false;
     this.mode = 'suit';
+    // Spec 16 §2.1: back on foot, the beacon re-arms to guide the astronaut
+    // home to the rover (placement/refresh happens in refreshWaypoints).
+    this.buggyBeacon?.setEnabled(true);
     for (const mesh of suit.getMeshes()) mesh.setEnabled(true);
     this.hud?.setBuggyPanelVisible(false);
     const rig = this.world.getCameraRig();
@@ -1421,8 +1427,15 @@ export class ClientApp {
       }
     }
     if (this.buggyBeacon !== null) {
-      const b = this.requireBuggy().getPosition();
-      this.placeBeacon(this.buggyBeacon, b.x, b.y);
+      if (this.mode === 'buggy') {
+        // Spec 16 §2.1: never light the beacon while mounted — the column sits
+        // at the vehicle origin, straight into the driver's field of view.
+        this.buggyBeacon.setEnabled(false);
+      } else {
+        const b = this.requireBuggy().getPosition();
+        this.placeBeacon(this.buggyBeacon, b.x, b.y);
+        this.buggyBeacon.setEnabled(true);
+      }
     }
     // Alpha sine, phase-offset per beacon so triple-pulses never sync flat.
     let phaseIndex = 0;
