@@ -87,6 +87,13 @@ export interface CameraRigOptions {
   maxZ?: number;
   /** Height sampler used to keep the camera above regolith; optional. */
   groundHeightAt?: (x: number, y: number) => number;
+  /**
+   * Called once per `update()` with the physics-frame position of the subject
+   * being filmed (spec 16 §2.3). `WorldScene` uses it to slide the sun's tight
+   * 120 m shadow box along with the rover/suit; any consumer that needs to
+   * track the rig (dynamic shadows, LOD) can hook here instead of polling.
+   */
+  onUpdate?: (pos: { x: number; y: number; z: number }) => void;
   /** Suppress console warnings when DOM input cannot attach (CI/headless). */
   silent?: boolean;
 }
@@ -297,6 +304,13 @@ export class CameraRig {
   ): void {
     if (this.disposed) return;
     const cfg = this.configs[this.mode];
+
+    // Spec 16 §2.3: hand the tracked subject's physics-frame position to any
+    // consumer that follows the rig (WorldScene slides the sun's shadow box).
+    // Emitted before the early-return branch so every mode reports every frame.
+    if (this.options.onUpdate !== undefined) {
+      this.options.onUpdate(targetPos);
+    }
 
     // Physics frame → Babylon frame: (x, y, z↑) → (x, z↑, -y).
     const bx = targetPos.x;

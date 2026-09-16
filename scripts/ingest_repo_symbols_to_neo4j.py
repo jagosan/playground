@@ -2,8 +2,8 @@
 """
 ingest_repo_symbols_to_neo4j.py - Knowledge Graph Symbol Ingestion for Homelab & Repositories.
 
-Parses docs/MAP.md and TypeScript/JavaScript/Python source trees and ingests structural
-symbols (Modules, Interfaces, Classes, Functions, Types) into the Beehive Neo4j instance.
+Parses docs/MAP.md (macro architecture, modules, REST endpoints) and source trees (TypeScript, Python)
+and ingests structural relationships into the Beehive Neo4j instance.
 
 Part of SPEC-HL-014 / TASK-HL-123c.
 """
@@ -12,6 +12,7 @@ import os
 import sys
 import re
 import json
+import ast
 import argparse
 import urllib.request
 from typing import List, Dict, Any, Tuple, Optional
@@ -62,7 +63,6 @@ def extract_ts_symbols(file_path: str, repo_name: str) -> Dict[str, List[Dict[st
     for m in if_pattern.finditer(content):
         name = m.group(2)
         extends = (m.group(5) or "").strip()
-        # Find brace bounds
         brace_count = 0
         end_pos = -1
         for i in range(m.end() - 1, len(content)):
@@ -74,7 +74,6 @@ def extract_ts_symbols(file_path: str, repo_name: str) -> Dict[str, List[Dict[st
                     end_pos = i + 1
                     break
         body = content[m.end():end_pos - 1] if end_pos != -1 else ""
-        # Extract property names and types
         props = []
         for line in body.splitlines():
             line = line.strip()
@@ -96,7 +95,6 @@ def extract_ts_symbols(file_path: str, repo_name: str) -> Dict[str, List[Dict[st
         name = m.group(3)
         extends = (m.group(6) or "").strip()
         implements = (m.group(8) or "").strip()
-        # Find brace bounds
         brace_count = 0
         end_pos = -1
         for i in range(m.end() - 1, len(content)):
@@ -156,39 +154,122 @@ def extract_ts_symbols(file_path: str, repo_name: str) -> Dict[str, List[Dict[st
     return symbols
 
 
-def parse_map_md(map_path: str, repo_name: str) -> List[Dict[str, str]]:
-    """Parse structural symbols from docs/MAP.md."""
+def extract_py_symbols(file_path: str, repo_name: str) -> Dict[str, List[Dict[str, Any]]]:
+    """Extract classes and functions from Python files using standard library ast."""
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+        tree = ast.parse(content)
+    except Exception:
+        return {}
+
+    rel_path = os.path.relpath(file_path, os.getcwd())
+    symbols: Dict[str, List[Dict[str, Any]]] = {
+        "classes": [],
+        "functions": [],
+    }
+
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef):
+            methods = []
+            for item in node.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    methods.append(f"{item.name}()")
+            bases = [ast.unparse(b) for b in node.bases] if node.bases else []
+            doc = ast.get_docstring(node)
+            summary = doc.strip().split("\n")[0] if doc else ""
+            symbols["classes"].append({
+                "name": node.name,
+                "extends": ", ".join(bases),
+                "implements": "",
+                "methods": ", ".join(methods[:8]) + ("..." if len(methods) > 8 else ""),
+                "description": summary,
+                "file": rel_path,
+                "repo": repo_name,
+            })
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            doc = ast.get_docstring(node)
+            summary = doc.strip().split("\n")[0] if doc else ""
+            args_list = [a.arg for a in node.args.args if a.arg != "self"]
+            sig = f"{node.name}({', '.join(args_list)})"
+            symbols["functions"].append({
+                "name": node.name,
+                "signature": sig[:150],
+                "description": summary,
+                "file": rel_path,
+                "repo": repo_name,
+            })
+
+    return symbols
+
+
+def parse_map_md(map_path: str, repo_name: str) -> Dict[str, List[Dict[str, str]]]:
+    """Parse structural symbols and endpoints from docs/MAP.md."""
     if not os.path.exists(map_path):
-        return []
+        return {"modules": [], "endpoints": []}
+
     modules = []
+    endpoints = []
+    seen_mod_paths = set()
+
     try:
         with open(map_path, "r", encoding="utf-8") as f:
             lines = f.readlines()
-        
-        # Regex matching - `path`: description
-        item_regex = re.compile(r'^\s*-\s+`([^`]+)`:\s*(.+)$')
+
         for line in lines:
-            m = item_regex.match(line.strip())
-            if m:
-                path = m.group(1).strip()
-                desc = m.group(2).strip()
-                modules.append({
-                    "name": os.path.basename(path),
-                    "path": path,
-                    "description": desc,
+            line_s = line.strip()
+            # Endpoint: - `GET /api/path`: description OR - GET /api/path: description
+            m_ep = re.match(r'^\s*-\s+`?(GET|POST|PUT|DELETE|PATCH)\s+([^:`]+)`?:\s*(.+)$', line_s)
+            if m_ep:
+                endpoints.append({
+                    "method": m_ep.group(1).upper(),
+                    "path": m_ep.group(2).strip(),
+                    "description": m_ep.group(3).strip(),
                     "repo": repo_name,
                 })
+                continue
+
+            # Module pattern 1: - `path`: description
+            m_mod1 = re.match(r'^\s*-\s+`([^`]+)`:\s*(.+)$', line_s)
+            if m_mod1:
+                p = m_mod1.group(1).strip()
+                if p not in seen_mod_paths:
+                    seen_mod_paths.add(p)
+                    modules.append({
+                        "name": os.path.basename(p),
+                        "path": p,
+                        "description": m_mod1.group(2).strip(),
+                        "repo": repo_name,
+                    })
+                continue
+
+            # Module pattern 2: ### `path` — description
+            m_mod2 = re.match(r'^###?\s+`([^`]+)`\s*([—-]\s*(.+))?$', line_s)
+            if m_mod2:
+                p = m_mod2.group(1).strip()
+                if p not in seen_mod_paths:
+                    seen_mod_paths.add(p)
+                    desc = (m_mod2.group(3) or "").strip()
+                    modules.append({
+                        "name": os.path.basename(p),
+                        "path": p,
+                        "description": desc,
+                        "repo": repo_name,
+                    })
+
     except Exception as e:
-        print(f"Warning parsing MAP.md: {e}")
-    return modules
+        print(f"Warning parsing MAP.md in {repo_name}: {e}")
+
+    return {"modules": modules, "endpoints": endpoints}
 
 
 # ── Ingestion Pipeline ────────────────────────────────────────────────────────
 
-def ingest_repository(repo_dir: str, neo4j_url: str = DEFAULT_NEO4J_URL) -> bool:
+def ingest_repository(repo_dir: str, neo4j_url: str = DEFAULT_NEO4J_URL, macro_only: bool = False) -> bool:
     """Ingest a repository's MAP.md and symbols into Neo4j."""
     repo_name = os.path.basename(os.path.abspath(repo_dir))
-    print(f"=== Ingesting Symbols for Repository: '{repo_name}' into Neo4j ===")
+    mode_str = "Macro Architecture Only (MAP.md & Endpoints)" if macro_only else "Full Symbol Tree (MAP.md + AST)"
+    print(f"=== Ingesting '{repo_name}' into Neo4j [{mode_str}] ===")
     print(f"Target Directory: {os.path.abspath(repo_dir)}")
     print(f"Neo4j Endpoint:   {neo4j_url}")
 
@@ -210,11 +291,14 @@ def ingest_repository(repo_dir: str, neo4j_url: str = DEFAULT_NEO4J_URL) -> bool
         "parameters": {"repo": repo_name, "path": os.path.abspath(repo_dir)}
     })
 
-    # 2. Ingest MAP.md entries
+    # 2. Ingest MAP.md entries (Modules & Endpoints)
     map_file = os.path.join(repo_dir, "docs", "MAP.md")
-    map_modules = parse_map_md(map_file, repo_name)
-    print(f"-> Parsed {len(map_modules)} modules/docs from docs/MAP.md")
-    for mod in map_modules:
+    parsed_map = parse_map_md(map_file, repo_name)
+    modules = parsed_map["modules"]
+    endpoints = parsed_map["endpoints"]
+    print(f"-> Parsed {len(modules)} modules and {len(endpoints)} endpoints from docs/MAP.md")
+
+    for mod in modules:
         statements.append({
             "statement": """
                 MERGE (m:Module {path: $path, repo: $repo})
@@ -232,109 +316,172 @@ def ingest_repository(repo_dir: str, neo4j_url: str = DEFAULT_NEO4J_URL) -> bool
             }
         })
 
-    # 3. Scan TypeScript source files
-    ts_files = []
-    for root, dirs, files in os.walk(repo_dir):
-        # Ignore build / node_modules / dot directories
-        dirs[:] = [d for d in dirs if d not in ("node_modules", "dist", ".git", ".hermes", "venv", ".venv")]
-        for file in files:
-            if file.endswith((".ts", ".tsx")) and not file.endswith(".d.ts"):
-                ts_files.append(os.path.join(root, file))
+    for ep in endpoints:
+        statements.append({
+            "statement": """
+                MERGE (e:Endpoint {method: $method, path: $path, repo: $repo})
+                ON CREATE SET e.description = $desc, e.updated_at = timestamp()
+                ON MATCH SET e.description = $desc, e.updated_at = timestamp()
+                WITH e
+                MATCH (r:Repository {name: $repo})
+                MERGE (r)-[:EXPOSES]->(e)
+            """,
+            "parameters": {
+                "method": ep["method"],
+                "path": ep["path"],
+                "desc": ep["description"],
+                "repo": repo_name,
+            }
+        })
 
-    print(f"-> Discovered {len(ts_files)} TypeScript source files to inspect")
-    total_interfaces = 0
-    total_classes = 0
-    total_types = 0
-    total_functions = 0
+    # If macro_only, skip scanning individual source files
+    if not macro_only:
+        ts_files = []
+        py_files = []
+        skip_dirs = {"node_modules", "dist", ".git", ".hermes", "venv", ".venv", "__pycache__", "build", ".next"}
 
-    for ts_path in ts_files:
-        symbols = extract_ts_symbols(ts_path, repo_name)
-        rel_file = os.path.relpath(ts_path, repo_dir)
+        for root, dirs, files in os.walk(repo_dir):
+            dirs[:] = [d for d in dirs if d not in skip_dirs]
+            for file in files:
+                if file.endswith((".ts", ".tsx")) and not file.endswith(".d.ts"):
+                    ts_files.append(os.path.join(root, file))
+                elif file.endswith(".py"):
+                    py_files.append(os.path.join(root, file))
 
-        # Interfaces
-        for iface in symbols.get("interfaces", []):
-            total_interfaces += 1
-            statements.append({
-                "statement": """
-                    MERGE (i:Interface {name: $name, file: $file, repo: $repo})
-                    ON CREATE SET i.exported_fields = $fields, i.extends = $extends, i.updated_at = timestamp()
-                    ON MATCH SET i.exported_fields = $fields, i.extends = $extends, i.updated_at = timestamp()
-                    WITH i
-                    MATCH (r:Repository {name: $repo})
-                    MERGE (r)-[:DECLARES]->(i)
-                """,
-                "parameters": {
-                    "name": iface["name"],
-                    "file": iface["file"],
-                    "fields": iface["fields"],
-                    "extends": iface["extends"],
-                    "repo": repo_name,
-                }
-            })
+        print(f"-> Discovered {len(ts_files)} TypeScript and {len(py_files)} Python source files to inspect")
+        total_interfaces = 0
+        total_classes = 0
+        total_types = 0
+        total_functions = 0
 
-        # Classes
-        for cls in symbols.get("classes", []):
-            total_classes += 1
-            statements.append({
-                "statement": """
-                    MERGE (c:Class {name: $name, file: $file, repo: $repo})
-                    ON CREATE SET c.methods = $methods, c.extends = $extends, c.implements = $implements, c.updated_at = timestamp()
-                    ON MATCH SET c.methods = $methods, c.extends = $extends, c.implements = $implements, c.updated_at = timestamp()
-                    WITH c
-                    MATCH (r:Repository {name: $repo})
-                    MERGE (r)-[:DECLARES]->(c)
-                """,
-                "parameters": {
-                    "name": cls["name"],
-                    "file": cls["file"],
-                    "methods": cls["methods"],
-                    "extends": cls["extends"],
-                    "implements": cls["implements"],
-                    "repo": repo_name,
-                }
-            })
+        # Scan TypeScript
+        for ts_path in ts_files:
+            symbols = extract_ts_symbols(ts_path, repo_name)
+            for iface in symbols.get("interfaces", []):
+                total_interfaces += 1
+                statements.append({
+                    "statement": """
+                        MERGE (i:Interface {name: $name, file: $file, repo: $repo})
+                        ON CREATE SET i.exported_fields = $fields, i.extends = $extends, i.updated_at = timestamp()
+                        ON MATCH SET i.exported_fields = $fields, i.extends = $extends, i.updated_at = timestamp()
+                        WITH i
+                        MATCH (r:Repository {name: $repo})
+                        MERGE (r)-[:DECLARES]->(i)
+                    """,
+                    "parameters": {
+                        "name": iface["name"],
+                        "file": iface["file"],
+                        "fields": iface["fields"],
+                        "extends": iface["extends"],
+                        "repo": repo_name,
+                    }
+                })
 
-        # Types
-        for tp in symbols.get("types", []):
-            total_types += 1
-            statements.append({
-                "statement": """
-                    MERGE (t:Type {name: $name, file: $file, repo: $repo})
-                    ON CREATE SET t.definition = $defn, t.updated_at = timestamp()
-                    ON MATCH SET t.definition = $defn, t.updated_at = timestamp()
-                    WITH t
-                    MATCH (r:Repository {name: $repo})
-                    MERGE (r)-[:DECLARES]->(t)
-                """,
-                "parameters": {
-                    "name": tp["name"],
-                    "file": tp["file"],
-                    "defn": tp["definition"],
-                    "repo": repo_name,
-                }
-            })
+            for cls in symbols.get("classes", []):
+                total_classes += 1
+                statements.append({
+                    "statement": """
+                        MERGE (c:Class {name: $name, file: $file, repo: $repo})
+                        ON CREATE SET c.methods = $methods, c.extends = $extends, c.implements = $implements, c.updated_at = timestamp()
+                        ON MATCH SET c.methods = $methods, c.extends = $extends, c.implements = $implements, c.updated_at = timestamp()
+                        WITH c
+                        MATCH (r:Repository {name: $repo})
+                        MERGE (r)-[:DECLARES]->(c)
+                    """,
+                    "parameters": {
+                        "name": cls["name"],
+                        "file": cls["file"],
+                        "methods": cls["methods"],
+                        "extends": cls["extends"],
+                        "implements": cls["implements"],
+                        "repo": repo_name,
+                    }
+                })
 
-        # Functions
-        for fn in symbols.get("functions", []):
-            total_functions += 1
-            statements.append({
-                "statement": """
-                    MERGE (f:Function {name: $name, file: $file, repo: $repo})
-                    ON CREATE SET f.signature = $sig, f.updated_at = timestamp()
-                    ON MATCH SET f.signature = $sig, f.updated_at = timestamp()
-                    WITH f
-                    MATCH (r:Repository {name: $repo})
-                    MERGE (r)-[:DECLARES]->(f)
-                """,
-                "parameters": {
-                    "name": fn["name"],
-                    "file": fn["file"],
-                    "sig": fn["signature"],
-                    "repo": repo_name,
-                }
-            })
+            for tp in symbols.get("types", []):
+                total_types += 1
+                statements.append({
+                    "statement": """
+                        MERGE (t:Type {name: $name, file: $file, repo: $repo})
+                        ON CREATE SET t.definition = $defn, t.updated_at = timestamp()
+                        ON MATCH SET t.definition = $defn, t.updated_at = timestamp()
+                        WITH t
+                        MATCH (r:Repository {name: $repo})
+                        MERGE (r)-[:DECLARES]->(t)
+                    """,
+                    "parameters": {
+                        "name": tp["name"],
+                        "file": tp["file"],
+                        "defn": tp["definition"],
+                        "repo": repo_name,
+                    }
+                })
 
-    print(f"-> Extracted: {total_interfaces} interfaces, {total_classes} classes, {total_types} types, {total_functions} functions.")
+            for fn in symbols.get("functions", []):
+                total_functions += 1
+                statements.append({
+                    "statement": """
+                        MERGE (f:Function {name: $name, file: $file, repo: $repo})
+                        ON CREATE SET f.signature = $sig, f.updated_at = timestamp()
+                        ON MATCH SET f.signature = $sig, f.updated_at = timestamp()
+                        WITH f
+                        MATCH (r:Repository {name: $repo})
+                        MERGE (r)-[:DECLARES]->(f)
+                    """,
+                    "parameters": {
+                        "name": fn["name"],
+                        "file": fn["file"],
+                        "sig": fn["signature"],
+                        "repo": repo_name,
+                    }
+                })
+
+        # Scan Python
+        for py_path in py_files:
+            py_symbols = extract_py_symbols(py_path, repo_name)
+            for cls in py_symbols.get("classes", []):
+                total_classes += 1
+                statements.append({
+                    "statement": """
+                        MERGE (c:Class {name: $name, file: $file, repo: $repo})
+                        ON CREATE SET c.methods = $methods, c.extends = $extends, c.description = $desc, c.updated_at = timestamp()
+                        ON MATCH SET c.methods = $methods, c.extends = $extends, c.description = $desc, c.updated_at = timestamp()
+                        WITH c
+                        MATCH (r:Repository {name: $repo})
+                        MERGE (r)-[:DECLARES]->(c)
+                    """,
+                    "parameters": {
+                        "name": cls["name"],
+                        "file": cls["file"],
+                        "methods": cls["methods"],
+                        "extends": cls["extends"],
+                        "desc": cls["description"],
+                        "repo": repo_name,
+                    }
+                })
+
+            for fn in py_symbols.get("functions", []):
+                total_functions += 1
+                statements.append({
+                    "statement": """
+                        MERGE (f:Function {name: $name, file: $file, repo: $repo})
+                        ON CREATE SET f.signature = $sig, f.description = $desc, f.updated_at = timestamp()
+                        ON MATCH SET f.signature = $sig, f.description = $desc, f.updated_at = timestamp()
+                        WITH f
+                        MATCH (r:Repository {name: $repo})
+                        MERGE (r)-[:DECLARES]->(f)
+                    """,
+                    "parameters": {
+                        "name": fn["name"],
+                        "file": fn["file"],
+                        "sig": fn["signature"],
+                        "desc": fn["description"],
+                        "repo": repo_name,
+                    }
+                })
+
+        print(f"-> Extracted: {total_interfaces} interfaces, {total_classes} classes, {total_types} types, {total_functions} functions.")
+
     print(f"-> Total Cypher operations queued: {len(statements)}")
 
     # Execute statements in batches of 50
@@ -347,20 +494,46 @@ def ingest_repository(repo_dir: str, neo4j_url: str = DEFAULT_NEO4J_URL) -> bool
             print(f"Error in batch {i // batch_size + 1}: {err}")
             return False
         committed += len(batch)
-        print(f"   Committed {committed}/{len(statements)} statements...")
+        if len(statements) > 50:
+            print(f"   Committed {committed}/{len(statements)} statements...")
 
-    print(f"✅ Successfully ingested symbols for '{repo_name}' into Neo4j Knowledge Graph!")
+    print(f"✅ Successfully synchronized '{repo_name}' with Neo4j Knowledge Graph!")
     return True
+
+
+def ingest_all_homelab_repos(repos_dir: str = "/home/jagosan/repos", neo4j_url: str = DEFAULT_NEO4J_URL, macro_only: bool = True) -> Dict[str, bool]:
+    """Discover and ingest all repositories containing docs/MAP.md."""
+    results = {}
+    if not os.path.exists(repos_dir):
+        print(f"Repos directory not found: {repos_dir}")
+        return results
+
+    for entry in sorted(os.listdir(repos_dir)):
+        entry_path = os.path.join(repos_dir, entry)
+        if os.path.isdir(entry_path):
+            map_p = os.path.join(entry_path, "docs", "MAP.md")
+            if os.path.exists(map_p):
+                ok = ingest_repository(entry_path, neo4j_url=neo4j_url, macro_only=macro_only)
+                results[entry] = ok
+
+    return results
 
 
 def main():
     parser = argparse.ArgumentParser(description="Ingest repository symbols into Neo4j.")
     parser.add_argument("repo_dir", nargs="?", default=".", help="Target repository directory (default: .)")
     parser.add_argument("--neo4j", default=DEFAULT_NEO4J_URL, help="Neo4j TX HTTP endpoint")
+    parser.add_argument("--macro-only", "-m", action="store_true", help="Ingest only macro architecture (MAP.md & endpoints), skipping full AST file scans")
+    parser.add_argument("--all", "-a", action="store_true", help="Ingest all repositories under /home/jagosan/repos with docs/MAP.md")
     args = parser.parse_args()
 
-    success = ingest_repository(args.repo_dir, args.neo4j)
-    sys.exit(0 if success else 1)
+    if args.all:
+        results = ingest_all_homelab_repos(neo4j_url=args.neo4j, macro_only=args.macro_only)
+        all_ok = all(results.values())
+        sys.exit(0 if all_ok else 1)
+    else:
+        success = ingest_repository(args.repo_dir, neo4j_url=args.neo4j, macro_only=args.macro_only)
+        sys.exit(0 if success else 1)
 
 
 if __name__ == "__main__":

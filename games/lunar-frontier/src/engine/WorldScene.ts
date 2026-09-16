@@ -79,7 +79,11 @@ export interface WorldSceneOptions {
   terrainResolution?: number;
   /** Terrain patch origin (world x, y) — generator coords (default 0, 0). */
   terrainOrigin?: { x: number; y: number };
-  /** Amplitude of the fbm micro-relief in metres (default 1.1). */
+  /**
+   * Amplitude of the fbm micro-relief in metres (default 0.22). Spec 16 §2.3
+   * tames the old 1.1 m amplitude: at 1.1 m the high-frequency fbm turned open
+   * plains into a dense mogul field that shook the buggy continuously.
+   */
   microRelief?: number;
   /** Sun shadow map size (default 1024; 0 disables shadows entirely). */
   shadowMapSize?: number;
@@ -101,6 +105,17 @@ export interface WorldSceneOptions {
 
 /** Sun azimuth/elevation of the frontier site, radians (low, harsh light). */
 const SUN_DIRECTION = { azimuth: -2.4, elevation: 0.42 };
+
+/**
+ * Spec 16 §2.3 / ADR-016-3: metres the sun's shadow origin is pulled *back*
+ * along −d̂ from the focus target, keeping the tight 120 m ortho box centred
+ * on the player (≈ 5.9 cm shadow texels at a 2048 map — razor vacuum shadows
+ * instead of the old 4000 m box's ~2 m blur blobs).
+ */
+const SUN_FOCUS_DISTANCE = 80;
+
+/** Spec 16 §2.3: tight shadow box around the focus target, metres. */
+const SUN_SHADOW_FRUSTUM_SIZE = 120;
 
 // ---------------------------------------------------------------------------
 // Deterministic value noise (same seed family as the world generator)
@@ -196,7 +211,7 @@ export class WorldScene {
       ...options,
       terrainSize: options.terrainSize ?? 1024,
       terrainResolution: Math.max(9, Math.min(1025, options.terrainResolution ?? 193)),
-      microRelief: options.microRelief ?? 1.1,
+      microRelief: options.microRelief ?? 0.22,
       shadowMapSize: options.shadowMapSize ?? 1024,
       sunIntensity: options.sunIntensity ?? 3.1,
       earthshineIntensity: options.earthshineIntensity ?? 0.08,
@@ -237,6 +252,9 @@ export class WorldScene {
     this.rig = new CameraRig(this.scene, {
       initialMode: this.options.cameraMode ?? 'eva_first_person',
       groundHeightAt: (x, y) => this.getGroundHeightAt(x, y),
+      // Spec 16 §2.3 / ADR-016-3: the shadow box chases whatever the rig is
+      // filming (suit on foot, rover in chase mode) every frame.
+      onUpdate: (pos) => this.updateShadowFocus(pos),
       ...(this.options.silent !== undefined ? { silent: this.options.silent } : {}),
     });
     const canvas = this.canvasFromInput(canvasOrEngine);
@@ -483,6 +501,29 @@ export class WorldScene {
     return { x: cx, y: cy, z: this.getGroundHeightAt(cx, cy) + this.options.spawnClearance };
   }
 
+  // -- dynamic shadow tracking (spec 16 §2.3 / ADR-016-3) ----------------------
+
+  /**
+   * Re-centre the sun's tight 120 m shadow box on a world-frame target (the
+   * rover / active camera subject). The light *direction* is untouched — only
+   * its position slides, dragging the ortho projection box with it:
+   *
+   *   p_sun = worldToBabylon(target) − 80 · d̂_sun
+   *
+   * so the target always sits `SUN_FOCUS_DISTANCE` metres down-range of the
+   * light origin, inside the frustum. Idempotent per target and safe before
+   * `init()` / after `dispose()` (no-op).
+   */
+  updateShadowFocus(target: { x: number; y: number; z: number }): void {
+    if (this.sun === null || this.disposed) return;
+    const dir = this.sun.direction;
+    const len = dir.length();
+    // A zero-length direction would NaN the light matrix; guard and bail.
+    if (len < 1e-9) return;
+    const back = dir.scale(-SUN_FOCUS_DISTANCE / len);
+    this.sun.position = worldToBabylon(target).add(back);
+  }
+
   // -- build stages ---------------------------------------------------------------
 
   private resolveEngine(input?: AbstractEngine | HTMLCanvasElement | null): AbstractEngine {
@@ -537,7 +578,11 @@ export class WorldScene {
       const sg = new ShadowGenerator(this.options.shadowMapSize, sun, undefined);
       sg.usePercentageCloserFiltering = true;
       sg.filteringQuality = ShadowGenerator.QUALITY_HIGH;
-      sun.shadowFrustumSize = 4000; // fixed ortho box; no per-frame refit
+      // Spec 16 §2.3 / ADR-016-3: tight 120 m ortho box re-centred on the
+      // player by `updateShadowFocus()` (driven from `CameraRig.onUpdate`),
+      // with `autoUpdateExtends` off so nothing but our explicit focus moves
+      // it. Replaces the static 4000 m box that smeared shadow texels to ~2 m.
+      sun.shadowFrustumSize = SUN_SHADOW_FRUSTUM_SIZE;
       sun.autoUpdateExtends = false;
       sg.bias = 0.0006;
       sg.normalBias = 0.02;
@@ -787,6 +832,10 @@ export class WorldScene {
   private spawnAtDefault(): void {
     if (this.rig === null) return;
     const spawn = this.getSpawnPoint();
+    // Spec 16 §2.3: shadow box starts locked on the spawn point (the rig loop
+    // below re-fires it via onUpdate every seeded frame; this makes the intent
+    // explicit and survives changes to the seeding loop).
+    this.updateShadowFocus(spawn);
     // Seed the rig with a few frames so the first render is already settled.
     for (let i = 0; i < 20; i++) {
       this.rig.update(spawn, 0, 1 / 30);
