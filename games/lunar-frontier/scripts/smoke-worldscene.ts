@@ -22,12 +22,15 @@
 import { NullEngine } from '@babylonjs/core/Engines/nullEngine.js';
 import '@babylonjs/core/Culling/ray.js'; // side-effect: Ray for getForwardRay
 import { MeshBuilder } from '@babylonjs/core/Meshes/meshBuilder.js';
+import { Vector3 } from '@babylonjs/core/Maths/math.vector.js';
 import type { ArcRotateCamera } from '@babylonjs/core/Cameras/arcRotateCamera.js';
+import type { DirectionalLight } from '@babylonjs/core/Lights/directionalLight.js';
 
 import {
   WorldScene,
   CameraRig,
   CAMERA_MODES,
+  worldToBabylon,
   type CameraMode,
 } from '../src/engine/index.ts';
 import { LunarWorldGenerator } from '../src/world/LunarWorldGenerator.ts';
@@ -131,6 +134,18 @@ check('shadow casters registered', (() => {
   return maps !== null && maps.size > 0;
 })());
 
+// Spec 16 §2.3 / ADR-016-3: tight 120 m shadow box, manual refit only.
+check('sun shadowFrustumSize == 120 (spec 16 §2.3)', (() => {
+  if (sun === undefined) return false;
+  return Math.abs((sun as DirectionalLight).shadowFrustumSize - 120) < 1e-9;
+})());
+check('sun autoUpdateExtends disabled (focus-driven only)', (() => {
+  if (sun === undefined) return false;
+  return (sun as DirectionalLight).autoUpdateExtends === false;
+})());
+check('plain micro-relief tamed to 0.22 m (spec 16 §2.3)',
+  Math.abs(world.options.microRelief - 0.22) < 1e-9);
+
 const starfield = scene.meshes.find((m) => m.name === 'starfield');
 check('procedural starfield dome present', starfield !== undefined && starfield.getTotalVertices() > 1000);
 
@@ -161,6 +176,48 @@ check(
   `sampled floor tracks analytic elevation ${analytic.toFixed(2)} within 2.5 m`,
   Math.abs(sampled - analytic) < 2.5,
 );
+
+// Spec 16 §2.3 smooth crater profile: z = -D·(1-(d/R)²)² inside, Gaussian
+// ejecta rim 0.12·D·exp(-((d-R)/(0.2R))²) outside. Assert the contract.
+{
+  const D = deepest.depth;
+  const R = deepest.radius;
+  const at = (d: number) =>
+    gen.elevationAt(deepest.center.x + d, deepest.center.y, [deepest]);
+  check(`crater centre sits at -D (${at(0).toFixed(2)} m)`,
+    Math.abs(at(0) + D) < 1e-9);
+  check('bowl matches -D·(1-(d/R)²)² at d=0.5R', (() => {
+    const t = 0.25; // (0.5)²
+    return Math.abs(at(R * 0.5) + D * (1 - t) * (1 - t)) < 1e-9;
+  })());
+  check('bowl flattens to ~0 approaching the lip from inside', (() => {
+    const d = R * (1 - 1e-3);
+    const t = (d / R) * (d / R);
+    const expected = -D * (1 - t) * (1 - t);
+    return Math.abs(at(d) - expected) < 1e-9 && Math.abs(at(d)) < 1e-3 * D;
+  })());
+  check('rim crest is 0.12·D immediately outside the lip', (() => {
+    const d = R * (1 + 1e-4);
+    const s = (d - R) / (0.2 * R);
+    return Math.abs(at(d) - 0.12 * D * Math.exp(-s * s)) < 1e-9
+      && Math.abs(at(d) - 0.12 * D) < 1e-4 * D && at(d) > 0;
+  })());
+  // The old cone met the rim with a dz/dd = ±D/R knife discontinuity on BOTH
+  // flanks; the new profile is a smooth bowl inside and a Gaussian ejecta
+  // bank outside — assert monotone decay and a flat interior gradient.
+  check('bowl interior gradient is sub-critical at lip (|dz/dd| < D/R)', (() => {
+    const eps = R * 1e-3;
+    const slope = (at(R - eps) - at(R - 2 * eps)) / eps;
+    return Math.abs(slope) < D / R;
+  })());
+  check('rim ejecta decays monotonically outward', (() => {
+    const a = at(R * 1.2);
+    const b = at(R * 1.6);
+    const c = at(R * 2.0);
+    return a > b && b > c && c >= 0;
+  })());
+  check('rim ejecta decays to ~0 by d = 3R', Math.abs(at(R * 3)) < 1e-4 * D);
+}
 
 // Determinism: query twice, and query a fresh WorldScene instance.
 const again = world.getGroundHeightAt(deepest.center.x, deepest.center.y);
@@ -251,7 +308,14 @@ const toCamWorld = { x: cp.x - rover.x, y: -cp.z - -rover.y, z: cp.y - rover.z }
 const behindDot = toCamWorld.x * Math.cos(roverYaw) + toCamWorld.y * Math.sin(roverYaw);
 check(`chase camera behind rover heading (dot=${behindDot.toFixed(2)})`, behindDot < -3);
 const chaseDist = distWB(rover, cp);
-check(`chase distance ≈ configured 11.5–13 m (${chaseDist.toFixed(2)})`, chaseDist > 9 && chaseDist < 16);
+// Spec 15 §4.2 re-cut the chase orbit from 11.5 m to 7.5 m; assert the live
+// radius against the rig's own config, then bound the eye-to-rover range
+// (orbit radius + pivot lift) so a stale constant can never creep back.
+const chaseCfg = rig.getConfig('vehicle_chase');
+check(`chase orbit radius == configured ${chaseCfg.distance} m (${chaseCam.radius.toFixed(2)})`,
+  Math.abs(chaseCam.radius - chaseCfg.distance) < 0.01);
+check(`chase distance consistent with orbit (${chaseDist.toFixed(2)} m)`,
+  chaseDist > chaseCfg.distance - 0.5 && chaseDist < chaseCfg.distance + 2.5);
 const chaseHeight = cp.y - rover.z;
 check(`chase camera airborne above rover (${chaseHeight.toFixed(2)} m)`, chaseHeight > 1.5);
 
@@ -278,6 +342,66 @@ for (const mode of CAMERA_MODES) {
   scene.render();
 }
 check('all 3 modes cycle without error', seenModes.size === 3);
+
+// ---------------------------------------------------------------------------
+// 3b. Dynamic shadow tracking (spec 16 §2.3 / ADR-016-3)
+// ---------------------------------------------------------------------------
+section('3b. dynamic shadow focus tracking');
+
+{
+  const sunDir = sun as DirectionalLight;
+  const dirN = sunDir.direction.clone().normalize();
+  const expectedFor = (t: { x: number; y: number; z: number }) =>
+    worldToBabylon(t).subtract(dirN.scale(80));
+
+  // Direct call: sun slides to 80 m up-datum of the target along −d̂.
+  const focusA = { x: 120, y: -240, z: 5.5 };
+  world.updateShadowFocus(focusA);
+  const eA = expectedFor(focusA);
+  const errA = Vector3.Distance(sunDir.position, eA);
+  check(`updateShadowFocus repositions sun (Δ=${errA.toFixed(4)} m)`, errA < 1e-6);
+  check('updateShadowFocus leaves light direction untouched', (() => {
+    const d2 = sunDir.direction.clone().normalize();
+    return Vector3.Distance(d2, dirN) < 1e-9;
+  })());
+  check('updateShadowFocus is idempotent', (() => {
+    world.updateShadowFocus(focusA);
+    return Vector3.Distance(sunDir.position, eA) < 1e-6;
+  })());
+
+  // Rig-driven: every `rig.update(pos, …)` must re-fire the focus hook, so
+  // driving the chase cam across the map drags the shadow box with it.
+  const far1 = { x: 900, y: 130, z: 2 };
+  rig.setMode('vehicle_chase');
+  rig.update(far1, 0.3, 1 / 60);
+  const eFar = expectedFor(far1);
+  check(`rig.update drags shadow focus to the rover (Δ=${Vector3.Distance(sunDir.position, eFar).toFixed(4)} m)`,
+    Vector3.Distance(sunDir.position, eFar) < 1e-6);
+
+  const near = { x: 12.5, y: 511.25, z: world.getGroundHeightAt(12.5, 511.25) };
+  rig.update(near, 1.1, 1 / 60);
+  check('focus tracks a second rig position',
+    Vector3.Distance(sunDir.position, expectedFor(near)) < 1e-6);
+
+  // Spawn boot already focused the sun before any manual steering happened —
+  // verify on a pristine instance whose sun sits at the spawn-derived pose.
+  const w4 = new WorldScene({ seed: SEED, terrainSize: 1024, terrainResolution: 65 });
+  w4.init(new NullEngine({ renderWidth: 320, renderHeight: 240 }));
+  const sun4 = w4.getScene().lights.find((l) => l.name === 'sun') as DirectionalLight;
+  const spawn4 = w4.getSpawnPoint();
+  check('sun is focused on the spawn point at boot',
+    Vector3.Distance(sun4.position, worldToBabylon(spawn4).subtract(sun4.direction.clone().normalize().scale(80))) < 1e-6);
+  // Un-inited / disposed scenes must not throw on focus calls.
+  check('updateShadowFocus on disposed scene is a no-op', (() => {
+    w4.dispose();
+    try {
+      w4.updateShadowFocus({ x: 0, y: 0, z: 0 });
+      return true;
+    } catch {
+      return false;
+    }
+  })());
+}
 
 // ---------------------------------------------------------------------------
 // 4. Entity bookkeeping

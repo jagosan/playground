@@ -888,7 +888,20 @@ export class LunarWorldGenerator {
 
   // -- static terrain queries ------------------------------------------------
 
-  /** Open-sky terrain height at (x, y): 0 on the datum plain, negative inside craters, small rim bumps. */
+  /**
+   * Open-sky terrain height at (x, y): 0 on the datum plain, negative inside
+   * craters, smooth ejecta rims outside (spec 16 §2.3).
+   *
+   * Smooth polynomial bowl + Gaussian ejecta lip — replaces the old linear
+   * cone (a sharp 15 % cliff at the rim that read as a depth-perfect knife
+   * edge and shook the buggy):
+   *
+   *   z_crater(d) = -D · (1 - (d/R)²)²            for d <  R   (smooth floor→floor slope, dz/dd → 0 at d = R)
+   *   z_rim(d)    =  0.12·D · exp(-((d - R)/(0.2·R))²)  for d ≥ R   (ejecta bank humped over the lip)
+   *
+   * Bowls lower the terrain (`min`), rims raise it (`max`); evaluation order
+   * is the generator's crater-list order, so the surface stays deterministic.
+   */
   elevationAt(x: number, y: number, craters?: Crater[]): number {
     const list = craters ?? Array.from(this.craterIndex.values());
     let z = 0;
@@ -896,10 +909,15 @@ export class LunarWorldGenerator {
       const dx = x - c.center.x;
       const dy = y - c.center.y;
       const d = Math.sqrt(dx * dx + dy * dy);
-      if (d < c.radius) {
-        z = Math.min(z, -c.depth * (1 - d / c.radius));
-      } else if (d < c.radius * 1.15) {
-        z = Math.max(z, c.depth * 0.15 * (1 - (d - c.radius) / (c.radius * 0.15)));
+      const R = c.radius;
+      const D = c.depth;
+      if (d < R) {
+        const t = (d / R) * (d / R);
+        z = Math.min(z, -D * (1 - t) * (1 - t));
+      } else {
+        const s = (d - R) / (0.2 * R);
+        // Gaussian tail is ~1e-10 m beyond 3R — skip for query cost.
+        if (d < R * 3) z = Math.max(z, 0.12 * D * Math.exp(-s * s));
       }
     }
     return z;

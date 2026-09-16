@@ -19,6 +19,8 @@ dist/
 
 # Database & Storage
 *.db
+*.db-shm
+*.db-wal
 *.sqlite
 *.sqlite3
 
