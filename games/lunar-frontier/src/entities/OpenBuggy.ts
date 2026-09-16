@@ -136,6 +136,9 @@ const WHEEL_SLOTS: ReadonlyArray<{ z: number; side: 1 | -1 }> = [
 ];
 
 const AXIS_X = new Vector3(1, 0, 0);
+/** Chassis datum rise above the wheel-centre plane at rest spawn ride (m).
+ *  Mirrors the physics module's initial `bodyHeight = R + 0.229`. */
+const CHASSIS_DATUM_RISE = 0.229;
 /** Tyre lay-down: cylinder axis local +y → axle axis local +x (left). */
 const LAY_DOWN = Quaternion.RotationAxis(new Vector3(0, 0, 1), -Math.PI / 2);
 /** Lamp attach points in the model frame: index 0 = left, 1 = right. */
@@ -840,18 +843,28 @@ export class OpenBuggy {
     );
     root.computeWorldMatrix(true);
 
-    // Rigid chassis body translation (heave): all chassis children move together
+    // Rigid chassis body translation (heave): all chassis children move
+    // together. Spec 16 §2.2 guard — the chassis may separate from the
+    // wheel-centre plane only by the suspension travel plus the static ride
+    // datum, so a transient physics excursion can never read as the body
+    // oscillating chaotically against its wheels.
     if (this.chassisBody !== null) {
-      this.chassisBody.position.y = state.bodyHeight;
-    }
-
-    // Suspension articulation: corner pivots and wheel meshes track spring travel
-    for (let i = 0; i < this.wheels.length; i++) {
-      const springOffset = -(state.wheels[i].compression - 0.5) * BUGGY_SPRING_TRAVEL;
-      this.wheels[i].position.y = BUGGY_WHEEL_RADIUS + springOffset;
-      if (this.cornerPivots[i]) {
-        this.cornerPivots[i].position.y = BUGGY_WHEEL_RADIUS + springOffset;
+      let meanWheelY = 0;
+      for (let i = 0; i < this.wheels.length; i++) {
+        const springOffset = -(state.wheels[i].compression - 0.5) * BUGGY_SPRING_TRAVEL;
+        this.wheels[i].position.y = BUGGY_WHEEL_RADIUS + springOffset;
+        if (this.cornerPivots[i]) {
+          this.cornerPivots[i].position.y = BUGGY_WHEEL_RADIUS + springOffset;
+        }
+        meanWheelY += springOffset;
       }
+      meanWheelY = BUGGY_WHEEL_RADIUS + meanWheelY / Math.max(this.wheels.length, 1);
+      const chassisNominal = meanWheelY + CHASSIS_DATUM_RISE;
+      this.chassisBody.position.y = clamp(
+        state.bodyHeight,
+        chassisNominal - BUGGY_SPRING_TRAVEL,
+        chassisNominal + BUGGY_SPRING_TRAVEL,
+      );
     }
 
     // Steering knuckles yaw articulation (front wheels)

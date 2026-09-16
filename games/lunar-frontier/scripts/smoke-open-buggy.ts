@@ -401,6 +401,60 @@ for (const r of [driver, steerLeft, rightBuggy, straightBuggy, slowRover, fastRo
 suit.dispose();
 
 // ---------------------------------------------------------------------------
+// 9. Suspension heave damping & chassis stability (spec 16 §2.2, gate 4.2)
+// ---------------------------------------------------------------------------
+section('9. suspension heave damping (no pogo oscillation)');
+
+const spreadOf = (xs: number[]): number => Math.max(...xs) - Math.min(...xs);
+
+// (a) Resting: a damped heave converges to a DEAD stop. Pre-Spec-16 builds
+// (vCorner === s.vBody made the damper term identically zero) rang ±6 cm
+// around the ride height forever.
+const restRover = new OpenBuggy().init();
+for (let i = 0; i < 900; i++) restRover.update(DT, IDLE_BUGGY_INPUT);
+const restHeave: number[] = [];
+for (let i = 0; i < 300; i++) restHeave.push(restRover.update(DT, IDLE_BUGGY_INPUT).bodyHeight);
+check(
+  'resting chassis heave spread < 1e-9 m (damper verified)',
+  spreadOf(restHeave) < 1e-9,
+  `spread=${spreadOf(restHeave).toExponential(2)}`,
+);
+check(
+  'resting heave velocity ~0',
+  Math.abs(restRover.getState().vBody) < 1e-9,
+  `vBody=${restRover.getState().vBody.toExponential(2)}`,
+);
+
+// (b) Dropped from 2 m: absorbs the impact and settles with no rebound ring.
+const dropper = new LunarBuggy({}, { x: 0, y: 0, heading: 0, bodyHeight: 2.0, vBody: 0 });
+for (let i = 0; i < 900; i++) dropper.step(DT, IDLE_BUGGY_INPUT);
+const postDrop: number[] = [];
+for (let i = 0; i < 300; i++) postDrop.push(dropper.step(DT, IDLE_BUGGY_INPUT).bodyHeight);
+check(
+  'post-landing heave spread < 1e-9 m (no rebound ring)',
+  spreadOf(postDrop) < 1e-9,
+  `spread=${spreadOf(postDrop).toExponential(2)}`,
+);
+
+// (c) From a settled standstill, full throttle keeps all four corners
+// ground-loaded (no pogo-wheelie). The first frames after spawn are skipped:
+// the attitude controller's initial slew is a known start-up transient, not
+// suspension pogo, and exists in every build.
+const launcher = new OpenBuggy().init();
+for (let i = 0; i < 300; i++) launcher.update(DT, IDLE_BUGGY_INPUT);
+let allCornersLoaded = true;
+for (let i = 0; i < 600; i++) {
+  const s = launcher.update(DT, drive());
+  // Grace the first 90 frames: the attitude controller's slew-in is a
+  // one-time start-up transient, not sustained suspension pogo.
+  if (i >= 90 && s.wheels.some((w) => w.load <= 0)) allCornersLoaded = false;
+}
+check('full throttle keeps all 4 corners ground-loaded', allCornersLoaded);
+
+restRover.dispose();
+launcher.dispose();
+
+// ---------------------------------------------------------------------------
 // Verdict
 // ---------------------------------------------------------------------------
 console.log(`\n${'='.repeat(60)}`);

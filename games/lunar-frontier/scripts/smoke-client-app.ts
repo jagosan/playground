@@ -587,6 +587,18 @@ section('D. input routing & hotkeys');
   app.getSuit().teleport(buggyPos.x - 1, buggyPos.y);
   check('suit is within mount radius', app.getBuggy().canMount(app.getSuit()));
   check('[E] mounts the buggy', app.toggleMount() === true && app.getMode() === 'buggy');
+  // Spec 16 §2.1 / acceptance 4.1: the rover beacon must be strictly off in
+  // the driver's seat (it stands at the vehicle origin, in the cockpit FOV).
+  check(
+    'buggy beacon strictly disabled while mounted',
+    app.world.getScene().getMeshByName('beacon-buggy')?.isEnabled() === false,
+  );
+  nowMs += 16;
+  app.update(nowMs); // refreshWaypoints must NOT re-arm it while mounted
+  check(
+    'refreshWaypoints keeps beacon disabled while mounted',
+    app.world.getScene().getMeshByName('beacon-buggy')?.isEnabled() === false,
+  );
   check('suit meshes hidden while driving', app.getSuit().getMeshes().every((m) => !m.isEnabled()));
   check('chase camera engaged on mount', app.world.getCameraRig().getMode() === 'vehicle_chase');
   check('buggy HUD panel visible while mounted', !app.getHud()!.hasClass('buggy-panel', 'is-hidden'));
@@ -602,6 +614,11 @@ section('D. input routing & hotkeys');
   check('throttle accelerates the buggy (>0.3 m/s)', speedWhileDriving > 0.3, `speed=${speedWhileDriving.toFixed(2)}`);
 
   check('[E] dismounts', app.toggleMount() === true && app.getMode() === 'suit');
+  // Spec 16 acceptance 4.1: back on foot, the beacon is enabled again.
+  check(
+    'buggy beacon re-enabled on dismount',
+    app.world.getScene().getMeshByName('beacon-buggy')?.isEnabled() === true,
+  );
   check('suit meshes restored after dismount', app.getSuit().getMeshes().every((m) => m.isEnabled()));
   check(
     'dismount steps the suit beside the buggy',
