@@ -1402,8 +1402,18 @@ export class ClientApp {
     const rig = this.world.getCameraRig();
     if (this.mode === 'buggy') {
       const buggy = this.requireBuggy();
+      // Spec 17 §2.4: v/22 drives the 60°→78° FOV band; the body-frame
+      // velocity pair engages the chase camera's velocity-vector lookahead so
+      // the view swings into drifts instead of locking to chassis yaw.
       const speedFrac = buggy.getSpeed() / 22;
-      rig.update(buggy.getPosition(), buggy.getHeading(), dt, buggy.getPitch(), speedFrac);
+      rig.update(
+        buggy.getPosition(),
+        buggy.getHeading(),
+        dt,
+        buggy.getPitch(),
+        speedFrac,
+        buggy.getVelocity(),
+      );
     } else {
       const suit = this.requireSuit();
       rig.update(suit.getPosition(), suit.getHeading(), dt, suit.getPitch(), 0);

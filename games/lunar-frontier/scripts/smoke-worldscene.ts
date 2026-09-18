@@ -10,8 +10,10 @@
  *      non-degenerate geometry, height queries agree with the generator's
  *      analytic `elevationAt` on datum & inside a real crater.
  *   3. Camera rig: all three modes switch, active camera identity/type
- *      changes, FOV lands in the 55–65° band, `update()` lerps positions
- *      smoothly (never teleports), chase camera sits behind the rover.
+ *      changes, EVA FOV lands in the 55–65° band, `update()` lerps positions
+ *      smoothly (never teleports), and the Spec 17 chase camera sits on its
+ *      elevated 8.5 m / 3.8 m −18° orbit with the 60–78° speed-varying FOV
+ *      and velocity-vector lookahead (drift tracking).
  *   4. Entities: add/remove bookkeeping, parenting, double-add idempotence.
  *   5. Render loop & lifecycle: frames advance, dispose is clean and
  *      idempotent, post-dispose calls no-op instead of throwing.
@@ -31,6 +33,11 @@ import {
   CameraRig,
   CAMERA_MODES,
   worldToBabylon,
+  CHASE_PITCH_TILT_RAD,
+  CHASE_FOV_BASE_DEG,
+  CHASE_FOV_MAX_DEG,
+  CHASE_LOOKAHEAD_BETA,
+  velocityLookaheadTheta,
   type CameraMode,
 } from '../src/engine/index.ts';
 import { LunarWorldGenerator } from '../src/world/LunarWorldGenerator.ts';
@@ -293,12 +300,21 @@ const step = Math.hypot(afterOne.x - beforeMove.x, afterOne.z - beforeMove.z);
 check(`single-frame follow lags the 50 m jump (moved ${step.toFixed(2)} m)`, step > 0.1 && step < 20);
 check('camera never teleports to target in one frame', step < 50);
 
-// Vehicle chase: switch, settle, then confirm it sits BEHIND the rover.
+// Vehicle chase (Spec 17 §2.4 "Above and Behind"): switch, settle, then
+// confirm the elevated orbit, −18° hood tilt, and behind-rover framing.
 check('setMode(vehicle_chase) accepted', rig.setMode('vehicle_chase') === true);
 const chaseCam = scene.activeCamera as ArcRotateCamera;
 check('chase active camera is ArcRotate rig cam', chaseCam.name === 'rig_vehicle_chase');
+// Spec 17 §2.4 re-cut the chase pose: base FOV 60° (dynamic band 60–78°),
+// orbit 8.5 m (was 7.5), height offset 3.8 m (was 2.8). Assert the LIVE
+// config carries the spec constants, then the derived geometry, so a stale
+// constant can never creep back.
+const chaseCfg = rig.getConfig('vehicle_chase');
+check(`chase config: distance ${chaseCfg.distance} m, heightOffset ${chaseCfg.heightOffset} m`,
+  Math.abs(chaseCfg.distance - 8.5) < 1e-9 && Math.abs(chaseCfg.heightOffset - 3.8) < 1e-9);
+check(`chase base FOV == ${CHASE_FOV_BASE_DEG}° configured`, chaseCfg.fovDegrees === CHASE_FOV_BASE_DEG);
 const chaseFov = rig.getFovDegrees();
-check(`chase FOV in 55–65° band (${chaseFov.toFixed(1)}°)`, chaseFov >= 55 && chaseFov <= 65);
+check(`chase FOV at base (${chaseFov.toFixed(1)}°)`, Math.abs(chaseFov - CHASE_FOV_BASE_DEG) < 0.01);
 
 const rover = { x: 500, y: 512, z: world.getGroundHeightAt(500, 512) };
 const roverYaw = 0; // facing +x
@@ -308,16 +324,62 @@ const toCamWorld = { x: cp.x - rover.x, y: -cp.z - -rover.y, z: cp.y - rover.z }
 const behindDot = toCamWorld.x * Math.cos(roverYaw) + toCamWorld.y * Math.sin(roverYaw);
 check(`chase camera behind rover heading (dot=${behindDot.toFixed(2)})`, behindDot < -3);
 const chaseDist = distWB(rover, cp);
-// Spec 15 §4.2 re-cut the chase orbit from 11.5 m to 7.5 m; assert the live
-// radius against the rig's own config, then bound the eye-to-rover range
-// (orbit radius + pivot lift) so a stale constant can never creep back.
-const chaseCfg = rig.getConfig('vehicle_chase');
 check(`chase orbit radius == configured ${chaseCfg.distance} m (${chaseCam.radius.toFixed(2)})`,
   Math.abs(chaseCam.radius - chaseCfg.distance) < 0.01);
 check(`chase distance consistent with orbit (${chaseDist.toFixed(2)} m)`,
-  chaseDist > chaseCfg.distance - 0.5 && chaseDist < chaseCfg.distance + 2.5);
+  chaseDist > chaseCfg.distance - 0.5 && chaseDist < chaseCfg.distance + 3.5);
+// Pivot sits at heightOffset·0.6 above the datum and the eye at
+// radius·cos(β) above the pivot: total ≈ 2.28 + 8.5·cos(π/2−0.3142) ≈ 4.9 m.
+const expectedEyeHeight =
+  chaseCfg.heightOffset * 0.6 + chaseCam.radius * Math.cos(chaseCam.beta);
 const chaseHeight = cp.y - rover.z;
-check(`chase camera airborne above rover (${chaseHeight.toFixed(2)} m)`, chaseHeight > 1.5);
+check(`chase camera high-attitude above rover (${chaseHeight.toFixed(2)} m)`,
+  chaseHeight > 3.0 && Math.abs(chaseHeight - expectedEyeHeight) < 0.05);
+// Spec 17 §2.4.1: −18° (0.3142 rad) downward incline toward the hood.
+const expectedBeta = Math.PI / 2 - CHASE_PITCH_TILT_RAD;
+check(`chase pitch tilt −18° (β=${chaseCam.beta.toFixed(4)} vs ${expectedBeta.toFixed(4)})`,
+  Math.abs(chaseCam.beta - expectedBeta) < 1e-3);
+
+// Spec 17 §2.4: dynamic speed FOV — 60° at rest, 78° at top speed (v/22).
+for (let i = 0; i < 180; i++) rig.update(rover, roverYaw, 1 / 60, 0, 0);
+const fovAtRest = rig.getFovDegrees();
+check(`chase FOV settles to ${CHASE_FOV_BASE_DEG}° at rest (${fovAtRest.toFixed(2)}°)`,
+  Math.abs(fovAtRest - CHASE_FOV_BASE_DEG) < 0.1);
+for (let i = 0; i < 180; i++) rig.update(rover, roverYaw, 1 / 60, 0, 1);
+const fovAtTop = rig.getFovDegrees();
+check(`chase FOV widens to ${CHASE_FOV_MAX_DEG}° at top speed (${fovAtTop.toFixed(2)}°)`,
+  Math.abs(fovAtTop - CHASE_FOV_MAX_DEG) < 0.1);
+check(`FOV stays inside the ${CHASE_FOV_BASE_DEG}–${CHASE_FOV_MAX_DEG}° band`,
+  fovAtRest >= CHASE_FOV_BASE_DEG - 0.1 && fovAtTop <= CHASE_FOV_MAX_DEG + 0.1);
+
+// Spec 17 §2.4.2: velocity vector lookahead (drift tracking).
+// θ_look = θ_body + β·atan2(vLat, vLong), β = 0.35 above 2 m/s, 0 below.
+const driftTheta = velocityLookaheadTheta(0, 12, 6);
+check(`θ_look formula: ${driftTheta.toFixed(4)} == 0.35·atan2(6,12)`,
+  Math.abs(driftTheta - CHASE_LOOKAHEAD_BETA * Math.atan2(6, 12)) < 1e-12);
+check('lookahead gated off below 2 m/s',
+  velocityLookaheadTheta(0.5, 1.4, 1.4) === 0.5 && velocityLookaheadTheta(0.5, 0, 0) === 0.5);
+check('lookahead gated on above 2 m/s',
+  velocityLookaheadTheta(0, 2.0 * Math.SQRT1_2, 2.0 * Math.SQRT1_2) > 0);
+// Drift right (vLat < 0) biases θ_look negative.
+check('right-drift biases θ_look negative',
+  velocityLookaheadTheta(0, 12, -6) < 0);
+// Rig integration: with a drifting velocity vector supplied, the orbit
+// azimuth must settle at π − θ_look (camera swung into the drift), NOT at
+// the pure body-yaw azimuth π.
+const driftVel = { vLong: 12, vLat: 6 };
+for (let i = 0; i < 240; i++) rig.update(rover, roverYaw, 1 / 60, 0, 0.55, driftVel);
+const driftAlpha = chaseCam.alpha;
+const expectedDriftAlpha = Math.PI - velocityLookaheadTheta(roverYaw, driftVel.vLong, driftVel.vLat);
+check(`drift lookahead swings azimuth (α=${driftAlpha.toFixed(4)} vs ${expectedDriftAlpha.toFixed(4)})`,
+  Math.abs(driftAlpha - expectedDriftAlpha) < 1e-3 && Math.abs(driftAlpha - Math.PI) > 0.1);
+// Without velocity info the legacy body-yaw lock resumes (α → π).
+for (let i = 0; i < 240; i++) rig.update(rover, roverYaw, 1 / 60);
+check('azimuth returns to body-yaw lock without velocity info',
+  Math.abs(chaseCam.alpha - Math.PI) < 1e-3);
+// FOV drains back toward base once speedFraction drops.
+check(`FOV drains toward base after speed drop (${rig.getFovDegrees().toFixed(1)}°)`,
+  rig.getFovDegrees() < CHASE_FOV_MAX_DEG - 5);
 
 // Invalid mode must be rejected, current mode retained.
 check('invalid mode rejected', rig.setMode('cockpit_view' as CameraMode) === false);
