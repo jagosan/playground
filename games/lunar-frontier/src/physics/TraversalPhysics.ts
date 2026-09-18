@@ -75,6 +75,49 @@ function approach(current: number, target: number, rate: number, dt: number): nu
 /** Ground elevation sampler: height of the local surface at (x, y), metres. */
 export type GroundElevationFn = (x: number, y: number) => number;
 
+// ---------------------------------------------------------------------------
+// Two-tier physics environments (Spec 17 §2.1)
+// ---------------------------------------------------------------------------
+
+/**
+ * A complete gravity + surface-material preset the buggy's physics runs in
+ * (Spec 17 §2.1). `ENV_LUNAR_FRONTIER` reproduces the legacy hard-coded
+ * lunar numbers; `ENV_EARTH_PROVING_GROUNDS` re-tunes the same chassis for
+ * the terrestrial test track (asphalt, 1 g, real aerodynamic drag).
+ */
+export interface EnvironmentProfile {
+  name: 'earth_proving_grounds' | 'lunar_frontier';
+  /** Local gravitational acceleration (m/s²). Earth: 9.81, Moon: 1.62. */
+  gravity: number;
+  /** Peak tyre–surface friction coefficient (Asphalt 1.05, Regolith 0.68). */
+  surfaceFrictionMu: number;
+  /** Aerodynamic drag area CdA (m²). 0.45 Earth air, 0.0 Moon vacuum. */
+  airResistanceCdA: number;
+  /** Tyre rolling resistance coefficient (0.015 asphalt, 0.035 regolith). */
+  tireRollingResistance: number;
+}
+
+/** Terrestrial proving grounds: asphalt, 1 g, real air (Spec 17 §2.1). */
+export const ENV_EARTH_PROVING_GROUNDS: EnvironmentProfile = {
+  name: 'earth_proving_grounds',
+  gravity: 9.81,
+  surfaceFrictionMu: 1.05,
+  airResistanceCdA: 0.45,
+  tireRollingResistance: 0.015,
+};
+
+/** Lunar frontier surface: regolith, 1/6 g, vacuum (Spec 17 §2.1). */
+export const ENV_LUNAR_FRONTIER: EnvironmentProfile = {
+  name: 'lunar_frontier',
+  gravity: 1.62,
+  surfaceFrictionMu: 0.68,
+  airResistanceCdA: 0.0,
+  tireRollingResistance: 0.035,
+};
+
+/** Standard sea-level air density for the CdA drag law ρ (kg/m³, Spec 17 §2.1). */
+export const DRAG_RHO_AIR = 1.225;
+
 const FLAT_GROUND: GroundElevationFn = () => 0;
 
 // ---------------------------------------------------------------------------
@@ -463,10 +506,67 @@ export const BUGGY_MOTOR_POWER = 18_000;
 export const BUGGY_REGEN_FORCE = 8_000;
 /** Peak friction (service) brake force at the road wheels (N, total, spec 16 §2.6). */
 export const BUGGY_BRAKE_FORCE = 14_000;
+/**
+ * Front-axle share of total service-brake force (Spec 17 §2.3.2):
+ * F_front = 0.62·F_total, F_rear = 0.38·F_total.
+ */
+export const BUGGY_BRAKE_BIAS_FRONT = 0.62;
+/** Rear-axle share of total service-brake force (Spec 17 §2.3.2). */
+export const BUGGY_BRAKE_BIAS_REAR = 0.38;
+/** Wheel slip ratio below which ABS pulse-modulates that corner's brake (Spec 17 §2.3.2, s_i < −0.25). */
+export const BUGGY_ABS_SLIP_THRESHOLD = -0.25;
+/** Below this ground speed ABS stands down — pulse-braking a crawl is pointless (Spec 17 §2.3.2, 1.0 m/s). */
+export const BUGGY_ABS_MIN_SPEED = 1.0;
+/** ABS release/re-apply cadence (Hz) (Spec 17 §2.3.2). */
+export const BUGGY_ABS_PULSE_HZ = 15;
+/** Fraction of the ABS pulse period the brake valve stays applied while a wheel is locked. */
+export const BUGGY_ABS_DUTY = 0.5;
+/**
+ * Release-phase brake-torque scale while a wheel is ABS-modulated (Spec 17
+ * §2.3.2). Below the traction cap by design, so the sliding patch re-rotates
+ * the wheel to rolling inside the release window; the re-apply phase hands
+ * full demand back and the 15 Hz cadence repeats.
+ */
+export const BUGGY_ABS_RELEASE_SCALE = 0.6;
+/** Effective lumped wheel+hub polar inertia for brake lock-up spin-down (kg·m²). */
+export const BUGGY_WHEEL_INERTIA = 0.9;
+/**
+ * Front-axle lateral cornering stiffness multiplier (Spec 17 §2.2.3).
+ * The rear runs HIGHER stiffness (1.15×) so the front saturates first and
+ * the buggy exhibits progressive understeer instead of snap-oversteer.
+ */
+export const BUGGY_LATERAL_STIFFNESS_FRONT = 1.0;
+/** Rear-axle lateral cornering stiffness multiplier — higher than front (Spec 17 §2.2.3). */
+export const BUGGY_LATERAL_STIFFNESS_REAR = 1.15;
 /** Throttle torque rise approach rate (1/s) — spec 16 §2.5 (was 4.0). */
 export const BUGGY_THROTTLE_RISE = 12.0;
-/** Speed (m/s) below which full steering lock holds; derating applies above (spec 16 §2.6). */
+/**
+ * @deprecated Spec-15/16 band law superseded by Spec 17 §2.2.1
+ * (`speedSensitiveSteerLock`). Kept exported for API compatibility; the
+ * steering model no longer reads it.
+ */
 export const BUGGY_STEER_FULL_LOCK_V = 3.0;
+/**
+ * Low-speed steering lock δ_low (rad) — 45° (Spec 17 §2.2.1). The mechanical
+ * maximum road-wheel angle at standstill for tight turnaround maneuvers.
+ */
+export const BUGGY_STEER_LOCK_LOW = (45 * Math.PI) / 180; // 0.785398 rad
+/**
+ * High-speed steering lock δ_high (rad) — 14° (Spec 17 §2.2.1). The lock the
+ * law asymptotes toward at speed to prevent spinouts.
+ */
+export const BUGGY_STEER_LOCK_HIGH = (14 * Math.PI) / 180; // 0.244346 rad
+/** Half-lock speed (m/s) (Spec 17 §2.2.1): δmax sits midway between the two locks here. */
+export const BUGGY_STEER_HALF_SPEED = 10.0;
+/**
+ * Speed-sensitive maximum road-wheel steering angle (rad) (Spec 17 §2.2.1):
+ * δmax(v) = δ_high + (δ_low − δ_high) / (1 + (v / v_steer_half)²).
+ */
+export function speedSensitiveSteerLock(v: number): number {
+  const speed = Math.abs(v);
+  const ratio = 1 / (1 + (speed / BUGGY_STEER_HALF_SPEED) * (speed / BUGGY_STEER_HALF_SPEED));
+  return BUGGY_STEER_LOCK_HIGH + (BUGGY_STEER_LOCK_LOW - BUGGY_STEER_LOCK_HIGH) * ratio;
+}
 /** Low-speed torque-vectoring / skid-steer assist moment (N·m, spec 16 §2.6). */
 export const BUGGY_YAW_ASSIST_TORQUE = 5_200;
 /** Assist cut-off speed (m/s): M = sign(δ)·τ·(1 − |v|/4.0), zero at/above this (spec 16 §2.6). */
@@ -574,6 +674,12 @@ export interface BuggyOptions {
   groundElevation?: GroundElevationFn;
   initialCargo?: number;
   batteryKwh?: number;
+  /**
+   * Active physics environment (Spec 17 §2.1). Defaults to
+   * `ENV_LUNAR_FRONTIER` — the legacy hard-coded lunar constants — so
+   * existing callers and tests step in exactly the same gravity well.
+   */
+  environment?: EnvironmentProfile;
 }
 
 function zeroWheel(): WheelState {
@@ -589,6 +695,14 @@ export class LunarBuggy {
   private readonly chassisMass: number;
   private readonly ground: GroundElevationFn;
   private readonly state: BuggyState;
+  /** Active gravity/surface environment (Spec 17 §2.1); never null. */
+  private env: EnvironmentProfile;
+  /**
+   * ABS wheel-lock state (Spec 17 §2.3.2): per-corner true while that wheel
+   * is being pulse-modulated, plus a substep clock driving the 15 Hz pulse.
+   */
+  private readonly absLocked: boolean[] = [false, false, false, false];
+  private absClock = 0;
   private motorTorque = 0;
   private driveMode: 'FORWARD' | 'STOPPED' | 'REVERSE' = 'STOPPED';
   private steerAngle = 0;
@@ -599,6 +713,10 @@ export class LunarBuggy {
   constructor(options: BuggyOptions = {}, initial: Partial<BuggyState> = {}) {
     this.chassisMass = options.chassisMass ?? BUGGY_CHASSIS_MASS;
     this.ground = options.groundElevation ?? FLAT_GROUND;
+    // Spec 17 §2.1: the lunar preset reproduces the legacy hard-coded lunar
+    // constants exactly, so an unset environment keeps every existing caller
+    // (and the lunar smoke suite) bit-compatible.
+    this.env = options.environment ?? ENV_LUNAR_FRONTIER;
     const cargo = clamp(initial.cargoMass ?? options.initialCargo ?? 0, 0, BUGGY_MAX_CARGO);
     this.state = {
       x: initial.x ?? 0,
@@ -629,6 +747,32 @@ export class LunarBuggy {
       steerAngle: this.steerAngle,
       wheels: this.state.wheels.map((w) => ({ ...w })) as [WheelState, WheelState, WheelState, WheelState],
     };
+  }
+
+  /**
+   * Swap the active physics environment mid-run (Spec 17 §2.1 / §5): gravity,
+   * surface friction μ, aerodynamic drag CdA and tyre rolling resistance all
+   * follow the new profile from the next substep. Returns the profile now
+   * active. Pass `ENV_EARTH_PROVING_GROUNDS` or `ENV_LUNAR_FRONTIER` (or a
+   * derived clone with tuned fields).
+   */
+  public setEnvironment(profile: EnvironmentProfile): EnvironmentProfile {
+    this.env = profile;
+    return this.env;
+  }
+
+  /** The physics environment this buggy is currently simulating in. */
+  public getEnvironment(): EnvironmentProfile {
+    return this.env;
+  }
+
+  /**
+   * True while any corner's wheel is wheel-locking and the ABS is pulse-
+   * modulating its brake valve (Spec 17 §2.3.2) — drives the controller
+   * brake-pulsing haptic and a dashboard ABS lamp.
+   */
+  public get absActive(): boolean {
+    return this.absLocked.some((locked) => locked);
   }
 
   public get totalMass(): number {
@@ -682,6 +826,7 @@ export class LunarBuggy {
     const s = this.state;
     const m = this.totalMass;
     const cog = this.cogHeight;
+    const env = this.env;
     const inertia = m * (1.35 * 1.35 + 0.85 * 0.85) * 0.9;
     const rollInertia = m * 0.55;
 
@@ -819,15 +964,34 @@ export class LunarBuggy {
       brakeTotal = 0;
     }
 
-    // Steer angle & speed-sensitive derating (spec 16 §2.6): full 0.78 rad lock
-    // holds below BUGGY_STEER_FULL_LOCK_V, then the Spec-15 derating law
-    // delta_0 / (1 + 0.08·|v|) applies to the speed above that band.
+    // Brake bias (Spec 17 §2.3.2): the front axle carries
+    // BUGGY_BRAKE_BIAS_FRONT of the total service demand (acceleration load
+    // transfer unloads the rear), the rear axle the remainder.
+    const brakeFrontShare = brakeTotal * BUGGY_BRAKE_BIAS_FRONT;
+    const brakeRearShare = brakeTotal * (1 - BUGGY_BRAKE_BIAS_FRONT);
+
+    // ABS pulse clock (15 Hz, Spec 17 §2.3.2): a locked corner's brake share
+    // is released while the oscillator is off, re-applied when on — the
+    // modulation cadence that keeps the sliding patch searching for grip.
+    this.absClock += dt;
+    const absPeriod = 1 / BUGGY_ABS_PULSE_HZ;
+    const absPulseOn = this.absClock % absPeriod < absPeriod * BUGGY_ABS_DUTY;
+
+    // Steer angle — Spec 17 §2.2.1 speed-sensitive lock law:
+    //   δmax(v) = δ_high + (δ_low − δ_high) / (1 + (v / v_steer_half)²)
+    // with δ_low = 45° (tight pivot authority at standstill) easing to
+    // δ_high = 14° at speed. steerAngle = rawSteer · δmax(|vLong|).
     const rawSteer = clamp(input.steer, -1, 1);
     const isZeroSteer = Math.abs(rawSteer) < 1e-3;
-    const overLockSpeed = Math.max(0, Math.abs(s.vLong) - BUGGY_STEER_FULL_LOCK_V);
-    const maxSteer = BUGGY_MAX_STEER / (1 + 0.08 * overLockSpeed);
-    const steerAngle = isZeroSteer ? 0 : rawSteer * maxSteer;
-    this.steerAngle = steerAngle;
+    const maxSteer = speedSensitiveSteerLock(s.vLong);
+    // Active straight-line centering (Spec 17 §2.2.2): with the stick released
+    // the rack walks back to zero; quicker at speed (∝ 1 + v²/v_half² shape).
+    const centeringRate = 10 + 2 * (s.vLong * s.vLong) /
+      (BUGGY_STEER_HALF_SPEED * BUGGY_STEER_HALF_SPEED);
+    const steerAngle = isZeroSteer
+      ? approach(this.steerAngle, 0, centeringRate, dt)
+      : rawSteer * maxSteer;
+    this.steerAngle = Math.abs(steerAngle) < 1e-6 ? 0 : steerAngle;
 
     const isHillHold = this.driveMode === 'STOPPED' && Math.abs(rawThrottle) < 0.05;
     const parkSlipLock = input.parkBrake || isHillHold;
@@ -893,8 +1057,10 @@ export class LunarBuggy {
       totalNormal += fz;
 
       const loadN = Math.max(fz, 0);
-      const loadFrac = loadN / Math.max(m * LUNAR_GRAVITY / 4, 1);
-      const mu = BUGGY_MU_PEAK * (1.12 - 0.12 * loadFrac);
+      const loadFrac = loadN / Math.max(m * env.gravity / 4, 1);
+      // Surface μ comes from the active environment (Spec 17 §2.1); the
+      // load-sensitivity shaping is the legacy grouser-soil term.
+      const mu = env.surfaceFrictionMu * (1.12 - 0.12 * loadFrac);
 
       // Wheel kinematics with Ackermann steering geometry for front wheels.
       let wheelSteer = 0;
@@ -914,14 +1080,11 @@ export class LunarBuggy {
       const wheel = s.wheels[i];
       if (parkSlipLock) wheel.spin = 0;
 
-      // Drive force shared equally; regen, service brake (reversal-capped) and
-      // the reverse-limiter retarding force applied at all four corners.
-      let forceAlong = driveForce / 4 + (brakeTotal + limiterForce) / 4;
-
-      // Slip ratio (motion-based, simplified).
-      const refSpeed = Math.max(Math.abs(wx), 0.8);
+      // Slip ratio (Spec 17 §2.3.2): s_i = (R_wheel·ω_i − v_x) / max(|v_x|, 0.1).
+      // s < 0 ⇒ the wheel surface trails the chassis (braking/driving slip);
+      // a fully locked wheel reads s = −1.
       const wheelSurface = wheel.spin * BUGGY_WHEEL_RADIUS;
-      let slip = (wheelSurface - wx) / refSpeed;
+      let slip = (wheelSurface - wx) / Math.max(Math.abs(wx), 0.1);
       if (Math.abs(slip) > 4) slip = Math.sign(slip) * 4;
 
       // Grouser-limited active longitudinal force (spec 16 §2.5): a rigid
@@ -935,13 +1098,65 @@ export class LunarBuggy {
         BUGGY_WHEEL_FORCE * clamp(loadFrac, 0, 1),
         mu * loadN,
       );
+
+      // Brake share for this corner (Spec 17 §2.3.2): front axle carries
+      // BUGGY_BRAKE_BIAS_FRONT of the total service-brake demand under
+      // acceleration-load-transfer, the rear the remainder.
+      const perWheelBrakeN = (isFront ? brakeFrontShare : brakeRearShare) / 2;
+
+      // ABS modulation (Spec 17 §2.3.2): if THIS wheel locks (s_i < −0.25)
+      // while the buggy is still rolling above BUGGY_ABS_MIN_SPEED, its brake
+      // torque is pulsed at 15 Hz — the release windows let the contact patch
+      // re-grip so the driver retains steering authority through a panic stop.
+      // Lock state latches at pulse boundaries and frees instantly once the
+      // wheel recovers (s_i ≥ −0.10 hysteresis) or the buggy slows away.
+      if (!parkSlipLock) {
+        if (this.absLocked[i]) {
+          if (slip >= -0.1 || speedRef <= BUGGY_ABS_MIN_SPEED) this.absLocked[i] = false;
+        } else if (slip < BUGGY_ABS_SLIP_THRESHOLD && speedRef > BUGGY_ABS_MIN_SPEED
+          && Math.abs(perWheelBrakeN) > 1) {
+          this.absLocked[i] = true;
+        }
+      } else {
+        this.absLocked[i] = false;
+      }
+      const absScale = this.absLocked[i] && !absPulseOn ? BUGGY_ABS_RELEASE_SCALE : 1;
+
+      // Drive force shared equally; the (bias-split, ABS-pulsed) brake and the
+      // reverse-limiter retarding force apply at all four corners.
+      let forceAlong = driveForce / 4 + (perWheelBrakeN * absScale + limiterForce / 4);
+
+      if (!parkSlipLock) {
+        if (this.absLocked[i] && !absPulseOn) {
+          // ABS release phase: with the valve dumped, the sliding patch's
+          // traction re-rotates the free wheel to rolling fast (the physical
+          // reason cadence recovers grip — far quicker than coast relaxation).
+          wheel.spin = approach(wheel.spin, wx / BUGGY_WHEEL_RADIUS, 90, dt);
+        } else {
+          // Over-braked wheel: brake torque beyond the ground's traction cap
+          // collapses the wheel's rotation into a slide (the lock ABS detects).
+          // The excess spin-down rate is the surplus torque over an effective
+          // wheel inertia; spin never reverses — a locked wheel, not a siren.
+          const overBrakeN = Math.max(0, Math.abs(perWheelBrakeN * absScale) - grouserCap);
+          if (overBrakeN > 0) {
+            wheel.spin -= Math.sign(wx || s.vLong) * (overBrakeN * BUGGY_WHEEL_RADIUS / BUGGY_WHEEL_INERTIA) * dt;
+            if (wx >= 0) wheel.spin = Math.max(wheel.spin, 0);
+            else wheel.spin = Math.min(wheel.spin, 0);
+          }
+        }
+      }
       forceAlong = clamp(forceAlong, -grouserCap, grouserCap);
 
-      // Lateral Pacejka-style force.
+      // Lateral Pacejka-style force. Rear corners run a HIGHER cornering
+      // stiffness (the C·B term inside the arctangent, Spec 17 §2.2.3) than
+      // the front, so the rear axle builds side force at smaller slip angles
+      // while both axles keep the same μ·N saturation plateau — the front-end
+      // washes out progressively under push instead of the tail snapping.
+      const latStiff = isFront ? BUGGY_LATERAL_STIFFNESS_FRONT : BUGGY_LATERAL_STIFFNESS_REAR;
       const refLat = Math.max(Math.abs(wy), 0.6);
       const alpha = Math.atan2(wy, Math.max(Math.abs(wx), 0.6));
       const alphaHat = wy / refLat;
-      let Fy = mu * loadN * atanCurve(9 * (alphaHat + 0.6 * alphaHat * Math.abs(alphaHat))) * (refLat > 0.25 || speedRef > 0.25 ? 1 : 0);
+      let Fy = mu * loadN * atanCurve(latStiff * 9 * (alphaHat + 0.6 * alphaHat * Math.abs(alphaHat))) * (refLat > 0.25 || speedRef > 0.25 ? 1 : 0);
       void alpha;
 
       // Combined-force ellipse: active longitudinal shares the patch with
@@ -1009,7 +1224,7 @@ export class LunarBuggy {
       Math.abs(s.vLong) < BUGGY_YAW_ASSIST_SPEED
     ) {
       const envelope = BUGGY_YAW_ASSIST_TORQUE * (1 - Math.abs(s.vLong) / BUGGY_YAW_ASSIST_SPEED);
-      const steerMag = clamp(Math.abs(steerAngle) / BUGGY_MAX_STEER, 0, 1);
+      const steerMag = clamp(Math.abs(steerAngle) / BUGGY_STEER_LOCK_LOW, 0, 1);
       const targetYaw = Math.sign(steerAngle) * steerMag * PIVOT_RATE * (1 - Math.abs(s.vLong) / BUGGY_YAW_ASSIST_SPEED);
       const mVec = clamp(3.5 * inertia * (targetYaw - s.yawRate), -envelope, envelope);
       yawMoment += mVec;
@@ -1018,12 +1233,18 @@ export class LunarBuggy {
     // -- Body accelerations -----------------------------------------------------
     const n = sumZ;
     const aDrive = (FxBody - (FxBody >= 0 ? 0 : 0)) / m;
-    const rolling = BUGGY_ROLLING_RESISTANCE * n * Math.sign(s.vLong) * (speedRef > 0.02 ? 1 : 0);
-    const plume = BUGGY_DRAG * speedRef * s.vLong;
-    const gravLong = -LUNAR_GRAVITY * Math.sin(slopePitch) * cp;
-    const gravLat = LUNAR_GRAVITY * Math.sin(slopeRoll);
+    // Tyre rolling resistance follows the active surface (Spec 17 §2.1).
+    const rolling = env.tireRollingResistance * n * Math.sign(s.vLong) * (speedRef > 0.02 ? 1 : 0);
+    // Aerodynamic drag (Spec 17 §2.1): F = ½·ρ·CdA·v², opposing motion. The
+    // lunar profile carries CdA = 0 (vacuum) so only Earth air resists.
+    const aeroDrag = 0.5 * DRAG_RHO_AIR * env.airResistanceCdA * speedRef * s.vLong;
+    // Regolith saltation plume — mechanical grit drag, not aerodynamic, so it
+    // survives the vacuum: present on loose-surface (CdA = 0) environments.
+    const plume = env.airResistanceCdA > 0 ? 0 : BUGGY_DRAG * speedRef * s.vLong;
+    const gravLong = -env.gravity * Math.sin(slopePitch) * cp;
+    const gravLat = env.gravity * Math.sin(slopeRoll);
 
-    s.vLong += (aDrive - (rolling + plume) / m + gravLong) * dt;
+    s.vLong += (aDrive - (rolling + aeroDrag + plume) / m + gravLong) * dt;
     s.vLat += (FyBody / m - gravLat) * dt;
 
     if (isZeroSteer && Math.abs(s.vLat) < 0.015) {
@@ -1046,7 +1267,7 @@ export class LunarBuggy {
     if (this.state.rolled) s.yawRate *= Math.exp(-3 * dt);
 
     // -- Heave & attitude dynamics ----------------------------------------------
-    const weight = m * LUNAR_GRAVITY;
+    const weight = m * env.gravity;
     s.vBody += ((n - weight) / m) * dt;
     s.bodyHeight += s.vBody * dt;
 
@@ -1064,8 +1285,8 @@ export class LunarBuggy {
     // (θ ≈ m·a·h_cg / (k·L²)); the pitch gain is sized for the Spec-16 15.2 kN
     // launch force and keeps every corner inside its spring travel (x0 > 0 at
     // the front) so full throttle never lifts a wheel off the regolith.
-    const accelPitch = Math.atan(FxBody / m / LUNAR_GRAVITY) * 0.035;
-    const accelRoll = Math.atan((FyBody / m + s.vLong * s.yawRate) / LUNAR_GRAVITY) * 0.15;
+    const accelPitch = Math.atan(FxBody / m / env.gravity) * 0.035;
+    const accelRoll = Math.atan((FyBody / m + s.vLong * s.yawRate) / env.gravity) * 0.15;
 
     const targetPitch = clamp(slopePitchTarget + accelPitch, -0.35, 0.35);
     const targetRoll = clamp(slopeRollTarget + accelRoll, -0.5, 0.5);
@@ -1085,7 +1306,7 @@ export class LunarBuggy {
       minLoadFrac = Math.min(minLoadFrac, cornerLoad[i] / Math.max(weight / 4, 1));
     }
     const latAccel = Math.abs(s.vLong * s.yawRate);
-    if (!this.state.rolled && minLoadFrac < -0.35 && latAccel > LUNAR_GRAVITY * 0.25) {
+    if (!this.state.rolled && minLoadFrac < -0.35 && latAccel > env.gravity * 0.25) {
       this.state.rolled = true;
     }
 
@@ -1480,6 +1701,12 @@ export interface TraversalSnapshot {
 export interface TraversalPhysicsOptions {
   /** Terrain sampler shared by every mode (elevation of surface, metres). */
   groundElevation?: GroundElevationFn;
+  /**
+   * Physics environment for modes with a surface (Spec 17 §2.1) — the buggy
+   * (and suit ground-friction) run under this gravity/material preset.
+   * Defaults to `ENV_LUNAR_FRONTIER` (legacy behaviour).
+   */
+  environment?: EnvironmentProfile;
   suit?: Partial<SuitState>;
   buggy?: BuggyOptions & { x?: number; y?: number; heading?: number };
   railCar?: RailCarSpec;
@@ -1492,6 +1719,8 @@ export interface TraversalPhysicsOptions {
  */
 export class TraversalPhysics {
   private readonly ground: GroundElevationFn;
+  /** Active physics environment handed to every buggy this engine owns. */
+  private readonly env: EnvironmentProfile;
   private readonly suit: LunarEvaSuit;
   private buggy: LunarBuggy | null;
   private rail: RailCar | null = null;
@@ -1503,12 +1732,13 @@ export class TraversalPhysics {
 
   constructor(options: TraversalPhysicsOptions = {}) {
     this.ground = options.groundElevation ?? FLAT_GROUND;
+    this.env = options.environment ?? ENV_LUNAR_FRONTIER;
     this.suit = new LunarEvaSuit(options.suit);
     this.buggy =
       options.buggy === undefined
         ? null
         : new LunarBuggy(
-            { ...options.buggy, groundElevation: options.buggy.groundElevation ?? this.ground },
+            { environment: this.env, ...options.buggy, groundElevation: options.buggy.groundElevation ?? this.ground },
             { x: options.buggy.x, y: options.buggy.y, heading: options.buggy.heading },
           );
   }
@@ -1534,7 +1764,7 @@ export class TraversalPhysics {
 
   /** Place (or replace) the buggy the prospector shares the map with. */
   public placeBuggy(x: number, y: number, heading = 0): LunarBuggy {
-    this.buggy = new LunarBuggy({ groundElevation: this.ground }, { x, y, heading, bodyHeight: BUGGY_WHEEL_RADIUS + 0.229 });
+    this.buggy = new LunarBuggy({ environment: this.env, groundElevation: this.ground }, { x, y, heading, bodyHeight: BUGGY_WHEEL_RADIUS + 0.229 });
     return this.buggy;
   }
 

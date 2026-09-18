@@ -36,10 +36,19 @@ import {
   BUGGY_MAX_STEER,
   BUGGY_MOTOR_POWER,
   BUGGY_REGEN_FORCE,
+  BUGGY_STEER_LOCK_HIGH,
+  BUGGY_STEER_LOCK_LOW,
+  BUGGY_STEER_HALF_SPEED,
+  BUGGY_BRAKE_BIAS_FRONT,
+  BUGGY_BRAKE_BIAS_REAR,
+  BUGGY_LATERAL_STIFFNESS_FRONT,
+  BUGGY_LATERAL_STIFFNESS_REAR,
   BUGGY_THROTTLE_RISE,
   BUGGY_TRACK,
   BUGGY_WHEEL_FORCE,
   BUGGY_WHEEL_RADIUS,
+  ENV_EARTH_PROVING_GROUNDS,
+  ENV_LUNAR_FRONTIER,
   IDLE_BUGGY_INPUT,
   LunarBuggy,
   type BuggyInput,
@@ -532,18 +541,34 @@ check('BUGGY_MAX_STEER = 0.78 rad (45 deg lock)', Math.abs(BUGGY_MAX_STEER - 0.7
   pivoter.dispose();
 }
 
-// (e) Speed-sensitive steering contract (Spec 15 law re-cut by Spec 16 §2.6):
-//     full 0.78 lock below 3 m/s, delta_0/(1 + 0.08*(|v|-3)) above it.
+// (e) Speed-sensitive steering contract (Spec 17 §2.2.1, superseding the
+//     Spec-15/16 band law): δmax(v) = δ_high + (δ_low − δ_high)/(1 + (v/10)²)
+//     with δ_low = 45° (0.785398 rad), δ_high = 14° (0.244346 rad).
 {
   const steerAt = (v: number): number => {
     const b = new LunarBuggy({}, { vLong: v });
     return b.step(DT, { ...IDLE_BUGGY_INPUT, steer: 1, parkBrake: false }).steerAngle ?? 0;
   };
-  const formula = (v: number): number => BUGGY_MAX_STEER / (1 + 0.08 * Math.max(0, v - 3));
-  check('full 0.78 lock at standstill', Math.abs(steerAt(0) - BUGGY_MAX_STEER) < 1e-6, `${steerAt(0)}`);
-  check('full lock held through 3 m/s band', Math.abs(steerAt(2) - BUGGY_MAX_STEER) < 1e-3, `${steerAt(2)}`);
-  check('derating law delta_0/(1+0.08*(v-3)) above the band', Math.abs(steerAt(10) - formula(10)) < 1e-3, `${steerAt(10).toFixed(4)} vs ${formula(10).toFixed(4)}`);
-  check('high-speed steer angle still below low-speed lock', steerAt(20) < BUGGY_MAX_STEER * 0.55, `${steerAt(20).toFixed(3)}`);
+  const formula = (v: number): number =>
+    BUGGY_STEER_LOCK_HIGH + (BUGGY_STEER_LOCK_LOW - BUGGY_STEER_LOCK_HIGH) / (1 + (v / BUGGY_STEER_HALF_SPEED) ** 2);
+  check('δ_low = 45° lock at standstill', Math.abs(steerAt(0) - BUGGY_STEER_LOCK_LOW) < 1e-6, `${steerAt(0)}`);
+  check('δ constants: 45°/14°/10 m/s', Math.abs(BUGGY_STEER_LOCK_LOW - 0.785398) < 1e-6
+    && Math.abs(BUGGY_STEER_LOCK_HIGH - 0.244346) < 1e-6 && BUGGY_STEER_HALF_SPEED === 10.0,
+  `${BUGGY_STEER_LOCK_LOW}/${BUGGY_STEER_LOCK_HIGH}/${BUGGY_STEER_HALF_SPEED}`);
+  check('lock law δ_high+(δ_low−δ_high)/(1+(v/10)²) at v=5', Math.abs(steerAt(5) - formula(5)) < 1e-3, `${steerAt(5).toFixed(4)} vs ${formula(5).toFixed(4)}`);
+  check('lock law holds at v=10 (halfway point)', Math.abs(steerAt(10) - formula(10)) < 1e-3, `${steerAt(10).toFixed(4)} vs ${formula(10).toFixed(4)}`);
+  check('lock law holds at v=20', Math.abs(steerAt(20) - formula(20)) < 1e-3, `${steerAt(20).toFixed(4)} vs ${formula(20).toFixed(4)}`);
+  check('high-speed lock asymptotes to δ_high (< 0.55·δ_low at 20 m/s)', steerAt(20) < BUGGY_STEER_LOCK_LOW * 0.55, `${steerAt(20).toFixed(3)}`);
+  // Active straight-line centering (Spec 17 §2.2.2): a released wheel walks
+  // back to zero rather than latching at the last command.
+  const centerer = new LunarBuggy({}, { vLong: 12 });
+  centerer.step(DT, { ...IDLE_BUGGY_INPUT, steer: 1, parkBrake: false });
+  let centerFrames = -1;
+  for (let i = 0; i < 120; i++) {
+    const sa = centerer.step(DT, { ...IDLE_BUGGY_INPUT, steer: 0, parkBrake: false }).steerAngle ?? 0;
+    if (Math.abs(sa) < 1e-6) { centerFrames = i + 1; break; }
+  }
+  check('released steering actively centers to zero', centerFrames >= 1, centerFrames < 0 ? 'never centered' : `${centerFrames} frames`);
 }
 
 // (f) Instant brake-to-reverse: pedal release at a standstill hands reverse
@@ -569,6 +594,84 @@ check('BUGGY_MAX_STEER = 0.78 rad (45 deg lock)', Math.abs(BUGGY_MAX_STEER - 0.7
     check('b2r: driveMode flipped to REVERSE', b2r.getState().driveMode === 'REVERSE');
   }
   b2r.dispose();
+}
+
+// ---------------------------------------------------------------------------
+// 11. Spec 17 Phase 1 — EnvironmentProfile / ABS / brake bias / understeer
+// ---------------------------------------------------------------------------
+section('11. spec-17 phase 1: two-tier environment, ABS modulation, brake bias');
+
+// (a) Environment presets carry the exact mandated numbers (spec §2.1).
+check('ENV_EARTH_PROVING_GROUNDS = {9.81, 1.05, 0.45, 0.015}',
+  ENV_EARTH_PROVING_GROUNDS.gravity === 9.81 && ENV_EARTH_PROVING_GROUNDS.surfaceFrictionMu === 1.05
+  && ENV_EARTH_PROVING_GROUNDS.airResistanceCdA === 0.45 && ENV_EARTH_PROVING_GROUNDS.tireRollingResistance === 0.015);
+check('ENV_LUNAR_FRONTIER = {1.62, 0.68, 0.0, 0.035}',
+  ENV_LUNAR_FRONTIER.gravity === 1.62 && ENV_LUNAR_FRONTIER.surfaceFrictionMu === 0.68
+  && ENV_LUNAR_FRONTIER.airResistanceCdA === 0.0 && ENV_LUNAR_FRONTIER.tireRollingResistance === 0.035);
+
+// (b) Backward compatibility: default environment is lunar; setter/getter round-trip.
+{
+  const envBuggy = new LunarBuggy({}, {});
+  check('default environment is ENV_LUNAR_FRONTIER', envBuggy.getEnvironment().name === 'lunar_frontier');
+  const applied = envBuggy.setEnvironment(ENV_EARTH_PROVING_GROUNDS);
+  check('setEnvironment returns the applied profile', applied.name === 'earth_proving_grounds'
+    && envBuggy.getEnvironment().gravity === 9.81);
+  // Earth gravity must actually reach the suspension: static corner load at
+  // ~6× the lunar load for the same mass.
+  const earthBuggy = new LunarBuggy({ environment: ENV_EARTH_PROVING_GROUNDS }, {});
+  let earthLoad = 0;
+  for (let i = 0; i < 240; i++) earthLoad = (earthBuggy.step(DT, IDLE_BUGGY_INPUT).wheels[0].load);
+  const moonBuggy = new LunarBuggy({}, {});
+  let moonLoad = 0;
+  for (let i = 0; i < 240; i++) moonLoad = (moonBuggy.step(DT, IDLE_BUGGY_INPUT).wheels[0].load);
+  const ratio = earthLoad / moonLoad;
+  check('environment gravity drives corner loads (≈9.81/1.62 ratio)', ratio > 5.7 && ratio < 6.35, `ratio=${ratio.toFixed(3)}`);
+  // Mid-run swap mid-flight: profile changes take effect next substep.
+  envBuggy.setEnvironment(ENV_LUNAR_FRONTIER);
+  check('setEnvironment restores lunar mid-run', envBuggy.getEnvironment().name === 'lunar_frontier');
+}
+
+// (c) ABS: a panic stop from 15 m/s wheel-locks briefly, the valve modulates,
+//     and the buggy still stops inside the gate with every wheel recovered.
+{
+  const absBuggy = new LunarBuggy({}, {});
+  for (let i = 0; i < 3_600; i++) if (absBuggy.step(DT, drive()).vLong >= 15) break;
+  let absFrames = 0;
+  let worstSlip = 0;
+  let tStop = -1;
+  for (let i = 0; i < 400; i++) {
+    const s = absBuggy.step(DT, drive({ throttle: 0, brake: 1 }));
+    if (absBuggy.absActive) absFrames++;
+    for (const w of s.wheels) worstSlip = Math.min(worstSlip, w.slip);
+    if (Math.abs(s.vLong) < 0.05) { tStop = (i + 1) * DT; break; }
+  }
+  check('ABS engages during panic stop (lock detected & pulsed)', absFrames > 0 && worstSlip < -0.25,
+    `absFrames=${absFrames} worstSlip=${worstSlip.toFixed(2)}`);
+  check('ABS stop still inside gate (<= 1.8 s)', tStop > 0 && tStop <= 1.8, tStop < 0 ? 'never stopped' : `${tStop.toFixed(2)}s`);
+  const final = absBuggy.getState();
+  check('all wheels rolling again at standstill (no permanent lock)', final.wheels.every((w) => Math.abs(w.slip) < 0.25));
+}
+
+// (d) Brake bias constants match the spec split exactly.
+check('brake bias 0.62 front / 0.38 rear', Math.abs(BUGGY_BRAKE_BIAS_FRONT - 0.62) < 1e-12
+  && Math.abs(BUGGY_BRAKE_BIAS_REAR - 0.38) < 1e-12, `${BUGGY_BRAKE_BIAS_FRONT}/${BUGGY_BRAKE_BIAS_REAR}`);
+
+// (e) Progressive understeer: rear lateral stiffness exceeds the front.
+check('rear lateral stiffness > front (progressive understeer)', BUGGY_LATERAL_STIFFNESS_REAR > BUGGY_LATERAL_STIFFNESS_FRONT,
+  `${BUGGY_LATERAL_STIFFNESS_FRONT} / ${BUGGY_LATERAL_STIFFNESS_REAR}`);
+
+// (f) Earth environment: aerodynamic drag (CdA 0.45) caps terminal speed below
+//     the lunar value — the profile's air actually pushes back.
+{
+  const coast = (env: typeof ENV_LUNAR_FRONTIER): number => {
+    const b = new LunarBuggy({ environment: env }, { vLong: 20 });
+    for (let i = 0; i < 300; i++) b.step(DT, { ...IDLE_BUGGY_INPUT, parkBrake: false });
+    return b.getState().vLong;
+  };
+  const moonSlow = coast(ENV_LUNAR_FRONTIER);
+  const earthSlow = coast(ENV_EARTH_PROVING_GROUNDS);
+  check('earth air + asphalt rolling bleeds speed faster than lunar plume', earthSlow < moonSlow - 0.1,
+    `earth=${earthSlow.toFixed(2)} lunar=${moonSlow.toFixed(2)}`);
 }
 
 // ---------------------------------------------------------------------------
