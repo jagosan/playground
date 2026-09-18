@@ -1,5 +1,6 @@
 /**
- * Lunar Frontier — open-top lunar buggy entity (TASK-PLAY-049b).
+ * Lunar Frontier — open-top lunar buggy entity (TASK-PLAY-049b; Spec 17 §4
+ * visual realism overhaul, TASK-PLAY-064e).
  *
  * Visual/interaction wrapper over the EXISTING traversal physics module: owns
  * one `LunarBuggy` (from ../physics/TraversalPhysics.ts) and dresses it in a
@@ -8,10 +9,17 @@
  * owned buggy exactly once and copies the resulting `BuggyState` onto meshes,
  * wheels and headlights.
  *
- * Meshes (procedural only, no GLB): chassis box, flatbed box, seat base +
- * back, three-cylinder roll bar, axle stub, and four cylinders at
- * ±BUGGY_TRACK/2 with radius BUGGY_WHEEL_RADIUS, spinning from the per-wheel
- * `WheelState.spin` rates. Two SpotLight headlights sit outboard up front.
+ * Spec 17 §4 assembly (procedural only, no GLB): chassis tub with underbody
+ * skid plate, tubular powder-coated space frame + double roll hoop cage with
+ * roof longons and X cross-bracing, reinforced front winch/bumper bar, twin
+ * LED lightbars with translucent front light cones, racing bucket seat with
+ * 4-point harness straps, live digital telemetry dash (speed/power segment
+ * bars rastered into a RawTexture), per-corner double-wishbone A-arms,
+ * coaxial coilover spring + damper-rod assemblies that visibly compress with
+ * per-wheel suspension compression, and steering tie-rods from the rack to
+ * the front knuckles that track the Ackermann-solved steer angle in real
+ * time. PBR palette per §4.4: powder-coated frame, carbon-fibre textured
+ * bed, matte rubber tyres, polished suspension stanchions.
  *
  * Frame convention matches TraversalPhysics / CameraRig: world metres
  * (x, y lateral, z up) map to Babylon (x, z↑, -y) via the shared
@@ -31,13 +39,15 @@
 import { Color3 } from '@babylonjs/core/Maths/math.color.js';
 import { Quaternion, Vector3 } from '@babylonjs/core/Maths/math.vector.js';
 import { NullEngine } from '@babylonjs/core/Engines/nullEngine.js';
+import { Engine } from '@babylonjs/core/Engines/engine.js';
 import type { AbstractEngine } from '@babylonjs/core/Engines/abstractEngine.js';
 import { SpotLight } from '@babylonjs/core/Lights/spotLight.js';
 import { PBRMaterial } from '@babylonjs/core/Materials/PBR/pbrMaterial.js';
+import { RawTexture } from '@babylonjs/core/Materials/Textures/rawTexture.js';
 import { MeshBuilder } from '@babylonjs/core/Meshes/meshBuilder.js';
 import { TransformNode } from '@babylonjs/core/Meshes/transformNode.js';
 import { Scene } from '@babylonjs/core/scene.js';
-import type { Mesh } from '@babylonjs/core/Meshes/mesh.js';
+import { Mesh } from '@babylonjs/core/Meshes/mesh.js';
 
 import {
   BUGGY_BATTERY_KWH,
@@ -64,6 +74,27 @@ export const HEADLIGHT_INTENSITY = 3.2;
 export const HEADLIGHT_ANGLE_DEG = 58;
 /** Headlight beam range, metres. */
 export const HEADLIGHT_RANGE_M = 65;
+
+/** Coilover spring body length scale at full droop (compression = 0). */
+export const COIL_SCALE_DROOP = 1.15;
+/** Coilover spring body length scale at the bump stop (compression = 1). */
+export const COIL_SCALE_BUMP = 0.72;
+/** Damper rod visible-length scale at full droop (compression = 0). */
+export const ROD_SCALE_DROOP = 1.18;
+/** Damper rod visible-length scale at the bump stop (compression = 1). */
+export const ROD_SCALE_BUMP = 0.62;
+
+/** Linear coilover spring scale from suspension compression 0..1 (Spec 17 §4.2). */
+export function coilScaleFor(compression: number): number {
+  const c = compression < 0 ? 0 : compression > 1 ? 1 : compression;
+  return COIL_SCALE_DROOP + (COIL_SCALE_BUMP - COIL_SCALE_DROOP) * c;
+}
+
+/** Linear damper-rod scale from suspension compression 0..1 (Spec 17 §4.2). */
+export function rodScaleFor(compression: number): number {
+  const c = compression < 0 ? 0 : compression > 1 ? 1 : compression;
+  return ROD_SCALE_DROOP + (ROD_SCALE_BUMP - ROD_SCALE_DROOP) * c;
+}
 
 /** Options for the entity; physics tuning delegates to `BuggyOptions`. */
 export interface OpenBuggyOptions extends BuggyOptions {
@@ -104,6 +135,8 @@ export interface OpenBuggyTelemetry {
   rideHeight: number;
   /** Mean suspension compression, 0 drooped .. 1 bump stop. */
   suspensionCompression: number;
+  /** Instantaneous drivetrain mechanical output (kW), Spec 17 §4.3 dash feed. */
+  powerKw: number;
   isGrounded: boolean;
   airborne: boolean;
   rolled: boolean;
@@ -120,11 +153,19 @@ const GEO = {
   bed: { width: 1.5, height: 0.18, depth: 1.7, z: -0.55, y: 0.42 },
   seat: { width: 0.55, height: 0.14, depth: 0.55, z: 0.3, y: 0.5, x: -0.26 },
   seatBack: { width: 0.55, height: 0.55, depth: 0.12, z: 0.02, y: 0.78, x: -0.26 },
-  rollPost: { diameter: 0.08, height: 1.0, y: 0.9, z: -0.62, dx: 0.62 },
-  rollBar: { diameter: 0.08, length: 1.5, y: 1.38, z: -0.62 },
   wheel: { depth: 0.34, tessellation: 20, axle: 1.35 },
-  hub: { diameter: 0.16, length: 1.62 },
   lamp: { lateral: 0.66, y: 0.42, z: 1.35 },
+  /** Tubular space-frame members (Spec 17 §4.1 chamfered structural tubes). */
+  tube: { diameter: 0.07 },
+  /** Reinforced front winch/bumper bar. */
+  bumper: { z: 1.66, y: 0.16, width: 1.62 },
+  /** Coilover mounts (chassis-local frame): upper on the frame rail, lower
+   *  at the lower A-arm outer ball joint. */
+  coil: { upperX: 0.56, upperY: 0.3, lowerX: 0.78, lowerY: 0.02, zScale: 0.94 },
+  /** Steering rack (tie-rod anchor rail, chassis-local). */
+  rack: { y: 0.2, z: 1.12, halfWidth: 0.4, diameter: 0.07 },
+  /** Tie-rod outer attach offset from the front knuckle centre (upright). */
+  tieAttach: { x: 0.1, y: -0.08, z: -0.14 },
 } as const;
 
 /** Wheel mount slots: front-left, front-right, rear-left, rear-right. */
@@ -136,6 +177,7 @@ const WHEEL_SLOTS: ReadonlyArray<{ z: number; side: 1 | -1 }> = [
 ];
 
 const AXIS_X = new Vector3(1, 0, 0);
+const AXIS_Y = new Vector3(0, 1, 0);
 /** Chassis datum rise above the wheel-centre plane at rest spawn ride (m).
  *  Mirrors the physics module's initial `bodyHeight = R + 0.229`. */
 const CHASSIS_DATUM_RISE = 0.229;
@@ -146,9 +188,32 @@ const LAMP_POINTS = [
   new Vector3(GEO.lamp.lateral, GEO.lamp.y, GEO.lamp.z),
   new Vector3(-GEO.lamp.lateral, GEO.lamp.y, GEO.lamp.z),
 ];
+/** Dash readout texture raster (segment-bar telemetry display, Spec 17 §4.3). */
+const DASH_W = 64;
+const DASH_H = 32;
+/** Dash gauge full-scale values: m/s and kW (4 × 18 kW motors, Spec 16 §2.5). */
+const DASH_SPEED_FSK = 30;
+const DASH_POWER_FSKW = 72;
 
 function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
+}
+
+/**
+ * Quaternion rotating local +y onto the (normalised) direction `dir`, with
+ * the parallel/antiparallel edge cases handled explicitly. Babylon 9 ships
+ * `Quaternion.FromUnitVectorsToRef`; the degenerate fallbacks keep build and
+ * sync branch-free of NaNs for vertical members.
+ */
+function alignYTo(dir: Vector3, out: Quaternion): void {
+  if (1 - dir.y < 1e-9) {
+    out.set(0, 0, 0, 1);
+  } else if (1 + dir.y < 1e-9) {
+    // +y → −y: half-turn about any perpendicular axis (x here).
+    Quaternion.RotationAxisToRef(AXIS_X, Math.PI, out);
+  } else {
+    Quaternion.FromUnitVectorsToRef(AXIS_Y, dir, out);
+  }
 }
 
 /** Structural view of `LunarBuggy` covering the module's mount helpers. */
@@ -183,12 +248,26 @@ export class OpenBuggy {
   private parts: Mesh[] = [];
   private wheels: Mesh[] = [];
   private cornerPivots: TransformNode[] = [];
+  /** Front steering knuckles, uprights index 0 = FL, 1 = FR (Spec 17 §4.2). */
   private steeringKnuckles: (TransformNode | Mesh)[] = [];
+  /** Coilover spring bodies (index = wheel slot) — compress with heave. */
+  private coilovers: Mesh[] = [];
+  /** Damper rods telescoping out of each coilover body. */
+  private damperRods: Mesh[] = [];
+  /** Steering tie-rods: [left, right] front corners (Spec 17 §4.2). */
+  private tieRods: Mesh[] = [];
+  /** Nominal tie-rod chord (m) at straight-ahead rest geometry. */
+  private tieRodRestLen = 1;
+  /** Live telemetry dash texture (speed/power segment bars). */
+  private dashTexture: RawTexture | null = null;
+  private dashPixels: Uint8Array | null = null;
   private cargoCrates: Mesh | null = null;
   private taillights: Mesh | null = null;
   private taillightMaterial: PBRMaterial | null = null;
   private lamps: SpotLight[] = [];
   private materials: PBRMaterial[] = [];
+  /** Procedural textures owned by the entity (dash, carbon weave). */
+  private ownedTextures: RawTexture[] = [];
 
   private lampOn: boolean;
   private mounted = false;
@@ -198,11 +277,18 @@ export class OpenBuggy {
   private wheelPhase = 0;
   /** Most recently stepped state — keeps getters honest across scene life. */
   private last: BuggyState;
+  /** Previous cumulative motor energy (J) for the kW dash readout. */
+  private lastMotorEnergyJ = 0;
+  /** Last synced drivetrain output (kW), fed to telemetry between frames. */
+  private lastPowerKw = 0;
 
   /** Scratch objects for the per-frame lamp maths (no GC churn). */
   private readonly scratchAim = new Vector3(1, 0, 0);
   private readonly scratchPoint = new Vector3();
   private readonly scratchSpin = new Quaternion();
+  /** Scratch for coilover/tie-rod articulation (no GC churn). */
+  private readonly scratchDir = new Vector3();
+  private readonly scratchQuat = new Quaternion();
 
   constructor(options: OpenBuggyOptions = {}) {
     this.prefix = options.namePrefix ?? 'buggy';
@@ -217,6 +303,7 @@ export class OpenBuggy {
       { x: options.x, y: options.y, heading: options.heading },
     );
     this.last = this.physics.getState();
+    this.lastMotorEnergyJ = this.last.motorEnergyJ;
     this.lampOn = options.headlights ?? true;
   }
 
@@ -257,9 +344,10 @@ export class OpenBuggy {
 
   /**
    * Advance one frame: step the owned physics buggy, then sync the chassis
-   * transform, road-wheel spin and headlights from the result. Performs no
-   * integration of its own and mutates no input. Safe after `dispose()`
-   * (physics-only — keeps stepping and still returns finite state).
+   * transform, wheels, suspension, tie-rods, dash and headlights from the
+   * result. Performs no integration of its own and mutates no input. Safe
+   * after `dispose()` (physics-only — keeps stepping, still returns finite
+   * state).
    *
    * @param dt    seconds since last frame (`LunarBuggy` sub-steps/clamps it)
    * @param input this frame's drive input (idle with park brake if omitted)
@@ -292,6 +380,13 @@ export class OpenBuggy {
     this.steeringKnuckles = [];
     for (const pivot of this.cornerPivots) OpenBuggy.disposeQuietly(pivot);
     this.cornerPivots = [];
+    for (const tex of this.ownedTextures) OpenBuggy.disposeQuietly(tex);
+    this.ownedTextures = [];
+    this.dashTexture = null;
+    this.dashPixels = null;
+    this.coilovers = [];
+    this.damperRods = [];
+    this.tieRods = [];
     OpenBuggy.disposeQuietly(this.chassisBody);
     this.chassisBody = null;
     for (const material of this.materials) OpenBuggy.disposeQuietly(material);
@@ -326,6 +421,32 @@ export class OpenBuggy {
   /** The two headlight SpotLights (empty before init / after dispose). */
   getHeadlights(): SpotLight[] {
     return [...this.lamps];
+  }
+
+  /**
+   * Coilover spring bodies, one per wheel corner (index = wheel slot).
+   * Their local `scaling.y` tracks suspension compression — longer toward
+   * droop, shorter at the bump stop (Spec 17 §4.2, `coilScaleFor`).
+   */
+  getCoilovers(): Mesh[] {
+    return [...this.coilovers];
+  }
+
+  /** Damper rods telescoping from each coilover body (`rodScaleFor`). */
+  getDamperRods(): Mesh[] {
+    return [...this.damperRods];
+  }
+
+  /** The two steering tie-rods `[left, right]` (Spec 17 §4.2). Their
+   *  position, aim and stretch follow the Ackermann front-knuckle yaw and
+   *  suspension heave live, every synced frame. */
+  getTieRods(): Mesh[] {
+    return [...this.tieRods];
+  }
+
+  /** Front steering knuckles `[FL, FR]` (uprights that carry steer yaw). */
+  getSteeringKnuckles(): Array<TransformNode | Mesh> {
+    return [...this.steeringKnuckles];
   }
 
   /** Chassis datum in the **physics** frame (x, y lateral; z = elevation). */
@@ -422,6 +543,7 @@ export class OpenBuggy {
       totalMass: this.physics.totalMass,
       rideHeight: s.bodyHeight,
       suspensionCompression: compression,
+      powerKw: this.instantPowerKw(),
       isGrounded: !s.airborne,
       airborne: s.airborne,
       rolled: s.rolled,
@@ -562,11 +684,61 @@ export class OpenBuggy {
 
   // -- internals --------------------------------------------------------------
 
-  /** Procedural rover: cohesive chassis hierarchy, wishbones, knuckles, wheels, and lighting. */
+  /**
+   * Ackermann-solved steer angle for front wheel `i` (0 = FL, 1 = FR) given
+   * the mean steer angle δ, with a 2.7 m wheelbase and 1.7 m track. Returns
+   * 0 when δ is inside the deadband. Shared by knuckles, road wheels and
+   * tie-rods so all three always agree (Spec 17 §4.2).
+   */
+  private ackermannFor(i: number, steerAngle: number): number {
+    if (!Number.isFinite(steerAngle) || Math.abs(steerAngle) < 1e-4) return 0;
+    const r = 2.7 / Math.tan(steerAngle);
+    const fy = i === 0 ? 0.85 : -0.85;
+    const effRadius = fy < 0 ? r - 0.85 : r + 0.85;
+    return Math.atan(2.7 / effRadius);
+  }
+
+  /**
+   * Chassis-local tie-rod chord for front corner `i` at steer angle δ. The
+   * rod spans the fixed rack end (on the steering-rack rail) to the knuckle
+   * outer attach point, whose in-plane offset is Ackermann-rotated about the
+   * upright king-pin. The corner pivot rides with the wheel plane while the
+   * chassis heaves independently, so `relativeHeave` — the wheel-plane minus
+   * chassis-datum height in Babylon y — stretches the chord with suspension
+   * travel. `rackEnd`/`attach` are caller-owned scratch vectors.
+   */
+  private tieRodChord(
+    i: number,
+    steerAngle: number,
+    relativeHeave: number,
+    rackEnd: Vector3,
+    attach: Vector3,
+  ): number {
+    const slot = WHEEL_SLOTS[i];
+    const side = slot.side;
+    rackEnd.set(side * GEO.rack.halfWidth, GEO.rack.y, GEO.rack.z);
+
+    const delta = this.ackermannFor(i, steerAngle);
+    const offX = -side * GEO.tieAttach.x;
+    const offZ = GEO.tieAttach.z;
+    const cosd = Math.cos(delta);
+    const sind = Math.sin(delta);
+    attach.set(
+      side * (BUGGY_TRACK / 2) + (offX * cosd + offZ * sind),
+      relativeHeave + GEO.tieAttach.y,
+      slot.z + (-offX * sind + offZ * cosd),
+    );
+    return Vector3.Distance(rackEnd, attach);
+  }
+
+  /** Procedural rover: cohesive chassis hierarchy, double wishbones,
+   *  coilovers, tie-rods, knuckles, wheels, cockpit and lighting
+   *  (Spec 17 §4). */
   private buildRover(scene: Scene): void {
     const p = this.prefix;
+    const tube = GEO.tube.diameter;
 
-    // Spec 15 §2.3 PBR Materials Palette
+    // -- Spec 17 §4.4 PBR Materials Palette --------------------------------
     const gold = new PBRMaterial(`${p}-gold`, scene);
     gold.albedoColor = new Color3(0.92, 0.76, 0.20); // Kapton foil
     gold.metallic = 0.85;
@@ -585,11 +757,29 @@ export class OpenBuggy {
     aluminum.roughness = 0.35;
     aluminum.environmentIntensity = 0.05;
 
+    // Spec 17 §4.4: matte rubber tyres (near-zero metallic, high roughness).
     const tire = new PBRMaterial(`${p}-tire`, scene);
-    tire.albedoColor = new Color3(0.18, 0.18, 0.20); // Titanium chevron tread
-    tire.metallic = 0.40;
-    tire.roughness = 0.85;
+    tire.albedoColor = new Color3(0.09, 0.09, 0.10);
+    tire.metallic = 0.05;
+    tire.roughness = 0.95;
     tire.environmentIntensity = 0.05;
+
+    // Spec 17 §4.4: powder-coated steel space-frame tubing.
+    const powdercoat = new PBRMaterial(`${p}-powdercoat`, scene);
+    powdercoat.albedoColor = new Color3(0.72, 0.28, 0.06); // Safety orange
+    powdercoat.metallic = 0.30;
+    powdercoat.roughness = 0.62;
+    powdercoat.environmentIntensity = 0.05;
+
+    // Spec 17 §4.4: carbon-fibre woven tow texture (procedural twill weave).
+    const carbon = this.buildCarbonFibreMaterial(scene, `${p}-carbon`);
+
+    // Spec 17 §4.4: polished suspension stanchions / chrome hardware.
+    const polished = new PBRMaterial(`${p}-polished`, scene);
+    polished.albedoColor = new Color3(0.88, 0.90, 0.92);
+    polished.metallic = 1.0;
+    polished.roughness = 0.12;
+    polished.environmentIntensity = 0.05;
 
     const taillightMat = new PBRMaterial(`${p}-taillight-mat`, scene);
     taillightMat.albedoColor = new Color3(0.8, 0.05, 0.05);
@@ -598,13 +788,38 @@ export class OpenBuggy {
     taillightMat.roughness = 0.5;
     this.taillightMaterial = taillightMat;
 
+    // Live digital telemetry dash (Spec 17 §4.3): segment bars rastered into
+    // a RawTexture — no DOM canvas, so NullEngine-safe.
     const dashMat = new PBRMaterial(`${p}-dash-mat`, scene);
-    dashMat.albedoColor = new Color3(0.05, 0.1, 0.2);
-    dashMat.emissiveColor = new Color3(0.15, 0.4, 0.8);
+    dashMat.albedoColor = new Color3(1, 1, 1);
+    dashMat.emissiveColor = new Color3(0.55, 0.6, 0.7);
     dashMat.metallic = 0.1;
-    dashMat.roughness = 0.5;
+    dashMat.roughness = 0.4;
+    this.dashPixels = new Uint8Array(DASH_W * DASH_H * 4);
+    const dashTex = new RawTexture(this.dashPixels, DASH_W, DASH_H, Engine.TEXTUREFORMAT_RGBA, scene, false);
+    dashTex.hasAlpha = false;
+    this.dashTexture = dashTex;
+    this.ownedTextures.push(dashTex);
+    dashMat.albedoTexture = dashTex;
 
-    this.materials = [gold, hazard, aluminum, tire, taillightMat, dashMat];
+    // Twin LED lightbar emission (Spec 17 §4.3).
+    const ledMat = new PBRMaterial(`${p}-led`, scene);
+    ledMat.albedoColor = new Color3(0.95, 0.97, 1.0);
+    ledMat.emissiveColor = new Color3(0.9, 0.94, 1.0);
+    ledMat.metallic = 0.0;
+    ledMat.roughness = 0.3;
+
+    // Translucent volumetric-style front light cones (Spec 17 §4.3):
+    // alpha-blended emissive shells in front of the LED bars.
+    const lens = new PBRMaterial(`${p}-lens`, scene);
+    lens.albedoColor = new Color3(1.0, 0.97, 0.86);
+    lens.emissiveColor = new Color3(0.45, 0.44, 0.34);
+    lens.metallic = 0.0;
+    lens.roughness = 0.2;
+    lens.alpha = 0.14;
+    lens.disableLighting = true;
+
+    this.materials = [gold, hazard, aluminum, tire, powdercoat, carbon, polished, taillightMat, dashMat, ledMat, lens];
     this.root = new TransformNode(`${p}-rover`, scene);
 
     // Unified rigid chassis body node: all chassis elements share this transform
@@ -612,123 +827,245 @@ export class OpenBuggy {
     chassisBody.parent = this.root;
     this.chassisBody = chassisBody;
 
-    // 1. Structural chassis tub with underside skid plate
-    const tub = MeshBuilder.CreateBox(
-      `${p}-tub-chassis`,
-      { width: 1.42, height: 0.25, depth: 2.9 },
-      scene,
+    const chassisMeshes: Mesh[] = [];
+    /** Register a chassis-body child mesh (parent bookkeeping only). */
+    const register = (mesh: Mesh, mat: PBRMaterial): Mesh => {
+      mesh.material = mat;
+      mesh.parent = chassisBody;
+      chassisMeshes.push(mesh);
+      return mesh;
+    };
+    /** Straight tube between two chassis-local points (merged naming by caller). */
+    const tubeBetween = (
+      name: string,
+      from: readonly [number, number, number],
+      to: readonly [number, number, number],
+      mat: PBRMaterial,
+    ): Mesh => {
+      const dx = to[0] - from[0];
+      const dy = to[1] - from[1];
+      const dz = to[2] - from[2];
+      const len = Math.hypot(dx, dy, dz);
+      this.scratchDir.set(dx, dy, dz).normalize();
+      alignYTo(this.scratchDir, this.scratchQuat);
+      const rod = MeshBuilder.CreateCylinder(name, { diameter: tube, height: len, tessellation: 10 }, scene);
+      rod.rotationQuaternion = this.scratchQuat.clone();
+      rod.position.set((from[0] + to[0]) / 2, (from[1] + to[1]) / 2, (from[2] + to[2]) / 2);
+      return register(rod, mat);
+    };
+
+    // -- 1. Structural chassis tub + underbody skid plate (Spec 17 §4.1) ---
+    const tub = register(
+      MeshBuilder.CreateBox(
+        `${p}-tub-chassis`,
+        { width: GEO.chassis.width, height: 0.25, depth: GEO.chassis.depth },
+        scene,
+      ),
+      aluminum,
     );
     tub.position.set(0, 0.12, 0);
-    tub.material = aluminum;
-    tub.parent = chassisBody;
-    this.chassis = tub;
 
-    // 2. Tubular roll cage & perimeter space frame
-    const frame = MeshBuilder.CreateBox(
-      `${p}-tubular-frame`,
-      { width: 1.46, height: 0.95, depth: 1.8 },
-      scene,
-    );
-    frame.position.set(0, 0.72, -0.3);
-    frame.material = hazard;
-    frame.parent = chassisBody;
+    register(
+      MeshBuilder.CreateBox(`${p}-skid-plate`, { width: 1.32, height: 0.05, depth: 3.05 }, scene),
+      aluminum,
+    ).position.set(0, -0.03, 0.05);
 
-    // 3. Sloped front cowl & sensor pod
-    const cowl = MeshBuilder.CreateBox(
-      `${p}-front-cowl`,
-      { width: 1.25, height: 0.28, depth: 0.8 },
-      scene,
-    );
-    cowl.position.set(0, 0.35, 1.15);
-    cowl.material = gold;
-    cowl.parent = chassisBody;
+    // -- 2. Tubular space frame + double roll hoop cage, X cross-braced ----
+    tubeBetween(`${p}-frame-rail-l`, [0.62, 0.1, -1.45], [0.62, 0.1, 1.35], powdercoat);
+    tubeBetween(`${p}-frame-rail-r`, [-0.62, 0.1, -1.45], [-0.62, 0.1, 1.35], powdercoat);
+    tubeBetween(`${p}-frame-crossmember-front`, [-0.62, 0.1, 1.35], [0.62, 0.1, 1.35], powdercoat);
+    tubeBetween(`${p}-frame-crossmember-rear`, [-0.62, 0.1, -1.45], [0.62, 0.1, -1.45], powdercoat);
+    // Front hoop (posts + top bar)
+    tubeBetween(`${p}-cage-hoop-front-post-l`, [0.6, 0.2, 0.55], [0.52, 1.32, 0.4], powdercoat);
+    tubeBetween(`${p}-cage-hoop-front-post-r`, [-0.6, 0.2, 0.55], [-0.52, 1.32, 0.4], powdercoat);
+    tubeBetween(`${p}-cage-hoop-front-top`, [-0.52, 1.32, 0.4], [0.52, 1.32, 0.4], powdercoat);
+    // Rear hoop
+    tubeBetween(`${p}-cage-hoop-rear-post-l`, [0.62, 0.2, -1.05], [0.55, 1.32, -0.95], powdercoat);
+    tubeBetween(`${p}-cage-hoop-rear-post-r`, [-0.62, 0.2, -1.05], [-0.55, 1.32, -0.95], powdercoat);
+    tubeBetween(`${p}-cage-hoop-rear-top`, [-0.55, 1.32, -0.95], [0.55, 1.32, -0.95], powdercoat);
+    // Roof longons + X cross-bracing
+    tubeBetween(`${p}-cage-roof-longon-l`, [0.52, 1.32, 0.4], [0.55, 1.32, -0.95], powdercoat);
+    tubeBetween(`${p}-cage-roof-longon-r`, [-0.52, 1.32, 0.4], [-0.55, 1.32, -0.95], powdercoat);
+    tubeBetween(`${p}-cage-cross-brace-1`, [-0.52, 1.32, 0.4], [0.55, 1.32, -0.95], powdercoat);
+    tubeBetween(`${p}-cage-cross-brace-2`, [0.52, 1.32, 0.4], [-0.55, 1.32, -0.95], powdercoat);
 
-    // 4. Cockpit: seat base, seat back, T-bar joystick, dash display
-    const seatBase = MeshBuilder.CreateBox(
-      `${p}-seat-base`,
-      { width: 0.55, height: 0.14, depth: 0.55 },
-      scene,
+    // -- 3. Reinforced winch/bumper bar (Spec 17 §4.1) ----------------------
+    register(
+      MeshBuilder.CreateBox(
+        `${p}-winch-bumper`,
+        { width: GEO.bumper.width, height: 0.09, depth: 0.09 },
+        scene,
+      ),
+      powdercoat,
+    ).position.set(0, GEO.bumper.y, GEO.bumper.z);
+    register(
+      MeshBuilder.CreateCylinder(
+        `${p}-winch-bumper-stub-l`,
+        { diameter: tube, height: 0.3, tessellation: 8 },
+        scene,
+      ),
+      powdercoat,
+    ).position.set(GEO.bumper.width / 2 - 0.08, GEO.bumper.y + 0.12, GEO.bumper.z - 0.1);
+    register(
+      MeshBuilder.CreateCylinder(
+        `${p}-winch-bumper-stub-r`,
+        { diameter: tube, height: 0.3, tessellation: 8 },
+        scene,
+      ),
+      powdercoat,
+    ).position.set(-GEO.bumper.width / 2 + 0.08, GEO.bumper.y + 0.12, GEO.bumper.z - 0.1);
+    const winchDrum = register(
+      MeshBuilder.CreateCylinder(
+        `${p}-winch-drum`,
+        { diameter: 0.14, height: 0.22, tessellation: 12 },
+        scene,
+      ),
+      polished,
     );
-    seatBase.position.set(-0.28, 0.32, 0.3);
-    seatBase.material = tire;
-    seatBase.parent = chassisBody;
+    winchDrum.rotation.set(0, 0, Math.PI / 2);
+    winchDrum.position.set(0, GEO.bumper.y + 0.02, GEO.bumper.z - 0.06);
 
-    const seatBack = MeshBuilder.CreateBox(
-      `${p}-seat-back`,
-      { width: 0.55, height: 0.55, depth: 0.12 },
-      scene,
-    );
-    seatBack.position.set(-0.28, 0.62, 0.02);
-    seatBack.material = tire;
-    seatBack.parent = chassisBody;
+    // -- 4. Sloped front cowl -----------------------------------------------
+    register(
+      MeshBuilder.CreateBox(`${p}-front-cowl`, { width: 1.25, height: 0.28, depth: 0.8 }, scene),
+      gold,
+    ).position.set(0, 0.35, 1.15);
 
-    const tBar = MeshBuilder.CreateCylinder(
-      `${p}-steering-t-bar`,
-      { diameter: 0.05, height: 0.45 },
-      scene,
+    // -- 5. Cockpit: bucket seat + 4-pt harness + T-bar + live dash (§4.3) --
+    register(
+      MeshBuilder.CreateBox(`${p}-seat-base`, { width: 0.55, height: 0.14, depth: 0.55 }, scene),
+      tire,
+    ).position.set(-0.28, 0.32, 0.3);
+    register(
+      MeshBuilder.CreateBox(`${p}-seat-back`, { width: 0.55, height: 0.72, depth: 0.12 }, scene),
+      tire,
+    ).position.set(-0.28, 0.7, 0.02);
+    // Bucket side bolsters
+    register(
+      MeshBuilder.CreateBox(`${p}-seat-bolster-l`, { width: 0.09, height: 0.3, depth: 0.5 }, scene),
+      tire,
+    ).position.set(-0.28 + 0.26, 0.46, 0.3);
+    register(
+      MeshBuilder.CreateBox(`${p}-seat-bolster-r`, { width: 0.09, height: 0.3, depth: 0.5 }, scene),
+      tire,
+    ).position.set(-0.28 - 0.26, 0.46, 0.3);
+    // 4-point harness: two shoulder straps + two lap straps
+    const harnessSl = register(
+      MeshBuilder.CreateBox(`${p}-harness-shoulder-l`, { width: 0.07, height: 0.62, depth: 0.02 }, scene),
+      hazard,
     );
+    harnessSl.rotation.set(0.35, 0, 0);
+    harnessSl.position.set(-0.28 + 0.14, 0.72, 0.1);
+    const harnessSr = register(
+      MeshBuilder.CreateBox(`${p}-harness-shoulder-r`, { width: 0.07, height: 0.62, depth: 0.02 }, scene),
+      hazard,
+    );
+    harnessSr.rotation.set(0.35, 0, 0);
+    harnessSr.position.set(-0.28 - 0.14, 0.72, 0.1);
+    register(
+      MeshBuilder.CreateBox(`${p}-harness-lap-l`, { width: 0.24, height: 0.05, depth: 0.02 }, scene),
+      hazard,
+    ).position.set(-0.28 + 0.14, 0.4, 0.54);
+    register(
+      MeshBuilder.CreateBox(`${p}-harness-lap-r`, { width: 0.24, height: 0.05, depth: 0.02 }, scene),
+      hazard,
+    ).position.set(-0.28 - 0.14, 0.4, 0.54);
+
+    const tBar = register(
+      MeshBuilder.CreateCylinder(`${p}-steering-t-bar`, { diameter: 0.05, height: 0.45 }, scene),
+      aluminum,
+    );
+    tBar.rotation.set(Math.PI / 3.2, 0, 0);
     tBar.position.set(-0.28, 0.52, 0.62);
-    tBar.material = aluminum;
-    tBar.parent = chassisBody;
 
-    const dash = MeshBuilder.CreateBox(
-      `${p}-dash-display`,
-      { width: 0.45, height: 0.2, depth: 0.1 },
-      scene,
+    const dash = register(
+      MeshBuilder.CreateBox(`${p}-dash-display`, { width: 0.45, height: 0.24, depth: 0.06 }, scene),
+      dashMat,
     );
-    dash.position.set(-0.28, 0.48, 0.75);
-    dash.material = dashMat;
-    dash.parent = chassisBody;
+    dash.rotation.set(Math.PI / 5, 0, 0);
+    dash.position.set(-0.28, 0.52, 0.78);
 
-    // 5. Cargo bay: cargo bed & dynamic mineral crates
-    const bed = MeshBuilder.CreateBox(
-      `${p}-cargo-bed`,
-      { width: 1.5, height: 0.18, depth: 1.6 },
-      scene,
-    );
-    bed.position.set(0, 0.25, -0.65);
-    bed.material = aluminum;
-    bed.parent = chassisBody;
-
-    const crates = MeshBuilder.CreateBox(
-      `${p}-cargo-crates`,
-      { width: 1.3, height: 0.45, depth: 1.4 },
-      scene,
+    // -- 6. Cargo bay: carbon bed + dynamic mineral crates -------------------
+    register(
+      MeshBuilder.CreateBox(`${p}-cargo-bed`, { width: 1.5, height: 0.18, depth: 1.6 }, scene),
+      carbon,
+    ).position.set(0, 0.25, -0.65);
+    const crates = register(
+      MeshBuilder.CreateBox(`${p}-cargo-crates`, { width: 1.3, height: 0.45, depth: 1.4 }, scene),
+      gold,
     );
     crates.position.set(0, 0.55, -0.65);
-    crates.material = gold;
-    crates.parent = chassisBody;
     this.cargoCrates = crates;
 
-    // 6. Lighting: lightbar & reactive taillights
-    const lightbar = MeshBuilder.CreateBox(
-      `${p}-lightbar`,
-      { width: 1.35, height: 0.08, depth: 0.08 },
-      scene,
-    );
-    lightbar.position.set(0, 0.42, 1.45);
-    lightbar.material = aluminum;
-    lightbar.parent = chassisBody;
-
-    const taillights = MeshBuilder.CreateBox(
-      `${p}-taillights`,
-      { width: 1.35, height: 0.08, depth: 0.06 },
-      scene,
+    // -- 7. Lighting: twin LED lightbars + taillights + cone shells (§4.3) --
+    register(
+      MeshBuilder.CreateBox(`${p}-lightbar-l`, { width: 0.52, height: 0.07, depth: 0.08 }, scene),
+      ledMat,
+    ).position.set(0.3, 1.4, 0.4);
+    register(
+      MeshBuilder.CreateBox(`${p}-lightbar-r`, { width: 0.52, height: 0.07, depth: 0.08 }, scene),
+      ledMat,
+    ).position.set(-0.3, 1.4, 0.4);
+    const taillights = register(
+      MeshBuilder.CreateBox(`${p}-taillights`, { width: 1.35, height: 0.08, depth: 0.06 }, scene),
+      taillightMat,
     );
     taillights.position.set(0, 0.28, -1.45);
-    taillights.material = taillightMat;
-    taillights.parent = chassisBody;
     this.taillights = taillights;
 
-    // 7. Suspension corners (FL, FR, RL, RR)
+    // Translucent front light cones: cylinder axis oriented onto model +z;
+    // the narrow end sits at the lamp and the beam spreads forward past the
+    // bumper (apex → wide base along +z).
+    const coneLen = 2.2;
+    for (let i = 0; i < LAMP_POINTS.length; i++) {
+      const cone = MeshBuilder.CreateCylinder(
+        `${p}-light-cone-${i === 0 ? 'l' : 'r'}`,
+        {
+          diameterTop: 1.15,
+          diameterBottom: 0.05,
+          height: coneLen,
+          tessellation: 14,
+        },
+        scene,
+      );
+      cone.rotationQuaternion = Quaternion.RotationAxis(AXIS_X, Math.PI / 2);
+      cone.position.set(LAMP_POINTS[i].x, LAMP_POINTS[i].y, LAMP_POINTS[i].z + coneLen / 2);
+      register(cone, lens);
+    }
+
+    // -- 8. Steering rack (tie-rod anchor rail, Spec 17 §4.2) ----------------
+    const rack = register(
+      MeshBuilder.CreateCylinder(
+        `${p}-steering-rack`,
+        { diameter: GEO.rack.diameter, height: GEO.rack.halfWidth * 2, tessellation: 10 },
+        scene,
+      ),
+      polished,
+    );
+    rack.rotation.set(0, 0, Math.PI / 2);
+    rack.position.set(0, GEO.rack.y, GEO.rack.z);
+
+    // -- 9. Suspension corners (FL, FR, RL, RR) (§4.2) -----------------------
     const cornerPivots: TransformNode[] = [];
-    const steeringKnuckles: (TransformNode | Mesh)[] = [];
-    const aArmsList: Mesh[] = [];
+    const steeringKnuckles: TransformNode[] = [];
+    const upperArms: Mesh[] = [];
+    const lowerArms: Mesh[] = [];
+    const coilovers: Mesh[] = [];
+    const damperRods: Mesh[] = [];
+    const tieRods: Mesh[] = [];
     const hubList: Mesh[] = [];
     const wheelsList: Mesh[] = [];
     const mudFlapsList: Mesh[] = [];
 
     const wheelDiameter = BUGGY_WHEEL_RADIUS * 2;
+
+    // Nominal tie-rod chord (rest length) straight ahead at static ride:
+    // wheel plane sits CHASSIS_DATUM_RISE below the chassis datum.
+    {
+      const a = new Vector3();
+      const b = new Vector3();
+      this.tieRodRestLen = this.tieRodChord(0, 0, -CHASSIS_DATUM_RISE, a, b);
+    }
 
     for (let i = 0; i < WHEEL_SLOTS.length; i++) {
       const slot = WHEEL_SLOTS[i];
@@ -738,24 +1075,105 @@ export class OpenBuggy {
       cornerPivot.position.set(slot.side * (BUGGY_TRACK / 2), BUGGY_WHEEL_RADIUS, slot.z);
       cornerPivots.push(cornerPivot);
 
-      // A-arms (double wishbone)
-      const aArms = MeshBuilder.CreateBox(
-        `${p}-a-arms-${i}`,
-        { width: 0.35, height: 0.06, depth: 0.2 },
+      // Double wishbone A-arms: upper + lower V-struts, each merged from two
+      // tubes running from chassis-side inner pivots to the wheel-upright
+      // outer ball joints (cornerPivot-local frame, Spec 17 §4.2).
+      const makeWishbone = (name: string, innerY: number, outerY: number, zFore: number, zAft: number): Mesh => {
+        const strut = (suffix: string, z: number): Mesh => {
+          const from = new Vector3(-slot.side * 0.5, innerY, z);
+          const to = new Vector3(-slot.side * 0.02, outerY, z * 0.5);
+          const dir = to.subtract(from);
+          const len = dir.length();
+          dir.normalize();
+          alignYTo(dir, this.scratchQuat);
+          const rod = MeshBuilder.CreateCylinder(
+            `${name}-${suffix}`,
+            { diameter: tube * 0.85, height: len, tessellation: 8 },
+            scene,
+          );
+          rod.rotationQuaternion = this.scratchQuat.clone();
+          rod.position.copyFrom(from.add(to).scale(0.5));
+          return rod;
+        };
+        const fwd = strut('fwd', zFore);
+        const aft = strut('aft', zAft);
+        const merged = Mesh.MergeMeshes([fwd, aft], true, true, undefined, false, false)
+          ?? MeshBuilder.CreateBox(name, { size: 0.1 }, scene);
+        merged.name = name;
+        merged.material = aluminum;
+        merged.parent = cornerPivot;
+        return merged;
+      };
+      upperArms.push(makeWishbone(`${p}-a-arm-upper-${i}`, 0.35, 0.24, 0.26, -0.26));
+      lowerArms.push(makeWishbone(`${p}-a-arm-lower-${i}`, 0.02, -0.04, 0.3, -0.3));
+
+      // Coaxial coilover: merged torus stack (visible coils) + telescoping
+      // polished damper rod, anchored at the chassis upper mount and
+      // oriented along the nominal spring axis (Spec 17 §4.2). Parented to
+      // chassisBody so the top mount rides with the sprung mass; compression
+      // scales the spring stack along its own axis.
+      const upper = new Vector3(slot.side * GEO.coil.upperX, GEO.coil.upperY, slot.z * GEO.coil.zScale);
+      const lower = new Vector3(slot.side * GEO.coil.lowerX, GEO.coil.lowerY, slot.z * GEO.coil.zScale);
+      const coilAxis = lower.subtract(upper);
+      const coilLen = coilAxis.length();
+      coilAxis.normalize();
+
+      const coilGroup = new TransformNode(`${p}-coilover-mount-${i}`, scene);
+      coilGroup.parent = chassisBody;
+      coilGroup.position.copyFrom(upper);
+      alignYTo(coilAxis, this.scratchQuat);
+      coilGroup.rotationQuaternion = this.scratchQuat.clone();
+
+      const coils: Mesh[] = [];
+      const coilCount = 6;
+      for (let k = 0; k < coilCount; k++) {
+        const turn = MeshBuilder.CreateTorus(
+          `${p}-coilover-${i}-turn-${k}`,
+          { diameter: 0.15, thickness: 0.022, tessellation: 12 },
+          scene,
+        );
+        turn.position.y = ((k + 0.5) / coilCount) * coilLen;
+        coils.push(turn);
+      }
+      const spring = Mesh.MergeMeshes(coils, true, true, undefined, false, false)
+        ?? MeshBuilder.CreateCylinder(`${p}-coilover-spring-${i}`, { diameter: 0.15, height: coilLen }, scene);
+      spring.name = `${p}-coilover-spring-${i}`;
+      spring.material = polished;
+      spring.parent = coilGroup;
+      spring.position.set(0, 0, 0);
+      coilovers.push(spring);
+
+      const rod = MeshBuilder.CreateCylinder(
+        `${p}-coilover-damper-${i}`,
+        { diameter: 0.05, height: coilLen * 1.18, tessellation: 10 },
         scene,
       );
-      aArms.position.set(-slot.side * 0.15, 0, 0);
-      aArms.material = aluminum;
-      aArms.parent = cornerPivot;
-      aArmsList.push(aArms);
+      rod.material = aluminum;
+      rod.parent = coilGroup;
+      rod.position.y = coilLen * (1.18 / 2) - 0.06;
+      damperRods.push(rod);
 
-      // Steering knuckle (front wheels articulate steering yaw)
-      let knuckleParent: TransformNode | Mesh = cornerPivot;
+      // Steering knuckle: front uprights carry hub + wheel steer yaw; rear
+      // corners hang their hub straight off the corner pivot.
+      let knuckleParent: TransformNode = cornerPivot;
       if (isFront) {
         const knuckle = new TransformNode(`${p}-steering-knuckle-${i}`, scene);
         knuckle.parent = cornerPivot;
         steeringKnuckles.push(knuckle);
         knuckleParent = knuckle;
+      }
+
+      // Tie-rod assembly on the FRONT corners only (Spec 17 §4.2): spans
+      // rack end → knuckle outer attach, re-aimed every synced frame.
+      if (isFront) {
+        const tie = MeshBuilder.CreateCylinder(
+          `${p}-tie-rod-${slot.side > 0 ? 'l' : 'r'}`,
+          { diameter: 0.045, height: this.tieRodRestLen, tessellation: 8 },
+          scene,
+        );
+        tie.material = polished;
+        tie.parent = chassisBody;
+        tieRods.push(tie);
       }
 
       // Wheel hub
@@ -765,7 +1183,7 @@ export class OpenBuggy {
         scene,
       );
       hub.rotation.set(0, 0, -Math.PI / 2);
-      hub.material = aluminum;
+      hub.material = polished;
       hub.parent = knuckleParent;
       hubList.push(hub);
 
@@ -795,20 +1213,17 @@ export class OpenBuggy {
     this.cornerPivots = cornerPivots;
     this.steeringKnuckles = steeringKnuckles;
     this.wheels = wheelsList;
+    this.coilovers = coilovers;
+    this.damperRods = damperRods;
+    this.tieRods = tieRods;
 
     this.parts = [
-      tub,
-      frame,
-      cowl,
-      seatBase,
-      seatBack,
-      tBar,
-      dash,
-      bed,
-      crates,
-      lightbar,
-      taillights,
-      ...aArmsList,
+      ...chassisMeshes,
+      ...upperArms,
+      ...lowerArms,
+      ...coilovers,
+      ...damperRods,
+      ...tieRods,
       ...hubList,
       ...wheelsList,
       ...mudFlapsList,
@@ -835,6 +1250,89 @@ export class OpenBuggy {
       lamp.diffuse = new Color3(1, 0.96, 0.86);
       return lamp;
     });
+  }
+
+  /**
+   * Procedural carbon-fibre twill weave material (Spec 17 §4.4): a tiny RGBA
+   * raster of interlocking tows tiled with u/v scale so it reads as woven
+   * carbon over the bed panels. RawTexture keeps it NullEngine-safe.
+   */
+  private buildCarbonFibreMaterial(scene: Scene, name: string): PBRMaterial {
+    const W = 16;
+    const H = 16;
+    const px = new Uint8Array(W * H * 4);
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const i = (y * W + x) * 4;
+        // 2×2 twill: alternating warp/weft over-floats with a fine sheen.
+        const over = ((x >> 1) + (y >> 1)) % 2 === 0;
+        const grain = (x + y) % 4 === 0 ? 18 : 0;
+        const v = over ? 58 + grain : 30 + grain;
+        px[i] = v;
+        px[i + 1] = v;
+        px[i + 2] = v + 12; // cool carbon tint
+        px[i + 3] = 255;
+      }
+    }
+    const tex = new RawTexture(px, W, H, Engine.TEXTUREFORMAT_RGBA, scene, true);
+    tex.uScale = 8;
+    tex.vScale = 8;
+    tex.hasAlpha = false;
+    this.ownedTextures.push(tex);
+    const mat = new PBRMaterial(name, scene);
+    mat.albedoTexture = tex;
+    mat.metallic = 0.55;
+    mat.roughness = 0.38;
+    mat.environmentIntensity = 0.05;
+    return mat;
+  }
+
+  /**
+   * Paint the digital telemetry dash (Spec 17 §4.3): cyan speed segment bar,
+   * amber power segment bar and a direction pip, rastered into the
+   * persistent RGBA buffer and pushed to the GPU with `RawTexture.update` —
+   * no DOM canvas, so it runs on NullEngine.
+   */
+  private drawDash(speed: number, powerKw: number): void {
+    const px = this.dashPixels;
+    const tex = this.dashTexture;
+    if (px === null || tex === null) return;
+    px.fill(0);
+    const put = (x: number, y: number, r: number, g: number, b: number): void => {
+      if (x < 0 || x >= DASH_W || y < 0 || y >= DASH_H) return;
+      const i = (y * DASH_W + x) * 4;
+      px[i] = r;
+      px[i + 1] = g;
+      px[i + 2] = b;
+      px[i + 3] = 255;
+    };
+    const bar = (x0: number, y0: number, w: number, h: number, frac: number, r: number, g: number, b: number): void => {
+      const filled = Math.round(clamp(frac, 0, 1) * w);
+      for (let seg = 0; seg < w; seg++) {
+        const on = seg < filled;
+        const groove = seg % 4 === 3;
+        for (let yy = 0; yy < h; yy++) {
+          if (groove) put(x0 + seg, y0 + yy, 8, 8, 10);
+          else if (on) put(x0 + seg, y0 + yy, r, g, b);
+          else put(x0 + seg, y0 + yy, 20, 22, 30);
+        }
+      }
+    };
+    bar(2, 3, 60, 9, speed / DASH_SPEED_FSK, 40, 220, 255);
+    bar(2, 20, 60, 9, powerKw / DASH_POWER_FSKW, 255, 180, 40);
+    for (let x = 2; x < 62; x++) put(x, 15, 12, 14, 18);
+    put(Math.round(clamp(powerKw / DASH_POWER_FSKW, 0, 1) * 58) + 2, 15, 255, 90, 60);
+    tex.update(px);
+  }
+
+  /** Instantaneous drivetrain output (kW) from the module's own energy tally. */
+  private instantPowerKw(): number {
+    if (this.built && !this.disposed) return this.lastPowerKw;
+    // Sceneless path: F·v estimate straight off the physics state.
+    const s = this.last;
+    let force = 0;
+    for (const w of s.wheels) force += w.force;
+    return (Math.abs(force) * Math.abs(s.vLong)) / 1000;
   }
 
   /** Copy physics state onto the rover transform, wheels and lamps. */
@@ -885,21 +1383,23 @@ export class OpenBuggy {
       );
     }
 
-    // Steering knuckles yaw articulation (front wheels)
-    if (state.steerAngle !== undefined) {
-      const tanSteer = Math.tan(state.steerAngle);
-      for (let i = 0; i < 2; i++) {
-        if (Math.abs(state.steerAngle) < 1e-4) {
-          this.steeringKnuckles[i]?.rotation.set(0, 0, 0);
-        } else {
-          const r = 2.7 / tanSteer;
-          const fy = i === 0 ? 0.85 : -0.85;
-          const effRadius = fy < 0 ? r - 0.85 : r + 0.85;
-          const ackermannAngle = Math.atan(2.7 / effRadius);
-          this.steeringKnuckles[i]?.rotation.set(0, ackermannAngle, 0);
-        }
-      }
+    // -- Spec 17 §4.2: coilovers compress with per-wheel suspension --------
+    // The spring stack scales along its axis (anchored at the chassis top
+    // mount); the polished rod telescopes inversely so compression pulls
+    // more rod INTO the body. Deterministic: scale = coilScaleFor(compr).
+    for (let i = 0; i < this.coilovers.length; i++) {
+      const c = state.wheels[i]?.compression ?? 0.5;
+      this.coilovers[i].scaling.set(1, coilScaleFor(c), 1);
+      const rod = this.damperRods[i];
+      if (rod !== undefined) rod.scaling.set(1, rodScaleFor(c), 1);
     }
+
+    // -- Spec 17 §4.2: Ackermann knuckle yaw + live tie-rod tracking ------
+    const steerAngle = state.steerAngle ?? 0;
+    for (let i = 0; i < 2 && i < this.steeringKnuckles.length; i++) {
+      this.steeringKnuckles[i].rotation.set(0, this.ackermannFor(i, steerAngle), 0);
+    }
+    this.applyTieRods(state);
 
     // Reactive taillights brightening on braking/reversing
     if (this.taillightMaterial !== null) {
@@ -914,8 +1414,55 @@ export class OpenBuggy {
       this.cargoCrates.scaling.y = Math.max(0.1, cargoFrac);
     }
 
+    // Live telemetry dash: speed + drivetrain kW segment bars.
+    const dJ = state.motorEnergyJ - this.lastMotorEnergyJ;
+    const powerKw = Number.isFinite(dJ) && dJ >= 0 ? dJ / Math.max(dt, 1e-6) / 1000 : 0;
+    this.lastPowerKw = powerKw;
+    this.drawDash(Math.abs(state.vLong), powerKw);
+    this.lastMotorEnergyJ = state.motorEnergyJ;
+
     this.applyWheelSpin(state, dt);
     this.applyLamps(state);
+  }
+
+  /**
+   * Re-aim both tie-rods between the (fixed) steering-rack ends and the
+   * (steering) front knuckle outer attach points, in the chassis-local
+   * frame. Each rod's stretch is the true chord length over the rest
+   * length, so the rods visibly push/pull with the Ackermann yaw and the
+   * chassis-vs-wheel heave — the same solve the knuckles use, every synced
+   * frame (Spec 17 §4.2).
+   */
+  private applyTieRods(state: BuggyState): void {
+    if (this.tieRods.length < 2) return;
+    const steerAngle = state.steerAngle ?? 0;
+    const chassisY = this.chassisBody !== null ? this.chassisBody.position.y : BUGGY_WHEEL_RADIUS + CHASSIS_DATUM_RISE;
+    const rackEnd = new Vector3();
+    const attach = new Vector3();
+    for (let i = 0; i < 2; i++) {
+      const rod = this.tieRods[i];
+      // Wheel-plane height minus chassis-datum height, in chassis-local y:
+      // corner pivot sits at R + springOffset (root frame), datum at
+      // chassisY, so relative heave = R + springOffset − chassisY.
+      const springOffset = -(state.wheels[i].compression - 0.5) * BUGGY_SPRING_TRAVEL;
+      const relativeHeave = BUGGY_WHEEL_RADIUS + springOffset - chassisY;
+      const chord = this.tieRodChord(i, steerAngle, relativeHeave, rackEnd, attach);
+
+      const dx = attach.x - rackEnd.x;
+      const dy = attach.y - rackEnd.y;
+      const dz = attach.z - rackEnd.z;
+      if (chord > 1e-9) {
+        this.scratchDir.set(dx / chord, dy / chord, dz / chord);
+        if (rod.rotationQuaternion === null) rod.rotationQuaternion = new Quaternion();
+        alignYTo(this.scratchDir, rod.rotationQuaternion);
+      }
+      rod.position.set(
+        (rackEnd.x + attach.x) / 2,
+        (rackEnd.y + attach.y) / 2,
+        (rackEnd.z + attach.z) / 2,
+      );
+      rod.scaling.set(1, chord / this.tieRodRestLen, 1);
+    }
   }
 
   /** Animate road-wheel rotation from the physics spin rates (visual only). */
@@ -934,14 +1481,12 @@ export class OpenBuggy {
       this.scratchSpin.multiplyToRef(LAY_DOWN, wheel.rotationQuaternion);
 
       // Articulate front wheels steering yaw with spin: WheelRotation = R_steer(delta) * R_spin(theta)
-      if (i < 2 && state.steerAngle !== undefined && Math.abs(state.steerAngle) >= 1e-4) {
-        const tanSteer = Math.tan(state.steerAngle);
-        const r = 2.7 / tanSteer;
-        const fy = i === 0 ? 0.85 : -0.85;
-        const effRadius = fy < 0 ? r - 0.85 : r + 0.85;
-        const ackermannAngle = Math.atan(2.7 / effRadius);
-        const steerQuat = Quaternion.RotationAxis(new Vector3(0, 1, 0), ackermannAngle);
-        steerQuat.multiplyToRef(wheel.rotationQuaternion, wheel.rotationQuaternion);
+      if (i < 2) {
+        const delta = this.ackermannFor(i, state.steerAngle ?? 0);
+        if (delta !== 0) {
+          const steerQuat = Quaternion.RotationAxis(AXIS_Y, delta);
+          steerQuat.multiplyToRef(wheel.rotationQuaternion, wheel.rotationQuaternion);
+        }
       }
     }
   }
