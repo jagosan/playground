@@ -37,6 +37,38 @@ export const HUD_ROOT_ID = 'lunar-hud';
 export const HUD_TRADE_ID = 'lunar-hud-trade';
 export const HUD_COMPASS_ID = 'lunar-hud-compass';
 export const HUD_TUTORIAL_ID = 'lunar-hud-tutorial';
+export const HUD_LAP_ID = 'lunar-hud-lap';
+
+/** Sector split slots on the proving-grounds lap panel (S1/S2 + total). */
+export const HUD_LAP_SECTOR_SLOTS = 3;
+
+/**
+ * A structural clone of Spec 17's `LapTelemetry` (from
+ * `engine/ProvingGroundsScene.ts`) declared locally so the HUD keeps its
+ * zero-import contract — `import type` from the engine barrel would drag
+ * Babylon into HUD-only harnesses. Structurally identical; the scene type
+ * is assignable to this one.
+ */
+export interface HudLapTelemetry {
+  /** Lap in progress (1-based; 0 = post-dispose/idle). */
+  currentLap: number;
+  /** Elapsed time on the current lap, seconds. */
+  currentLapTimeS: number;
+  /** Best completed lap, seconds; null until the first valid lap. */
+  bestLapTimeS: number | null;
+  /** Most recent completed lap, seconds; null before the first. */
+  lastLapTimeS: number | null;
+  /** Completed sector splits of the current lap, seconds (in order). */
+  sectorTimesS: number[];
+  /** Instantaneous road speed, km/h. */
+  currentSpeedKmh: number;
+  /** Top speed since reset, km/h. */
+  topSpeedKmh: number;
+  /** Best speed-trap capture, km/h; null until captured. */
+  speedTrapKmh: number | null;
+  /** Last sector split minus the same sector of the previous lap (s). */
+  sectorDeltaS: number | null;
+}
 
 /** Compass tape: 8 major ticks (every 45° = 360/8), window ±90° of heading. */
 export const HUD_COMPASS_TAPE_TICKS = 8;
@@ -260,6 +292,29 @@ function angleDelta(deg: number, from: number): number {
 
 const COMPASS_CARDINALS: readonly string[] = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
 
+/**
+ * Lap-clock formatter: seconds → `MM:SS.mmm` (Spec 17 Phase 4 HUD).
+ * Negative times keep a leading `−`; non-finite renders as an em dash.
+ */
+export function formatLapTime(seconds: number | null | undefined): string {
+  if (seconds === null || seconds === undefined || !Number.isFinite(seconds)) return '—';
+  const sign = seconds < 0 ? '−' : '';
+  const total = Math.abs(seconds);
+  const mins = Math.floor(total / 60);
+  const secs = Math.floor(total % 60);
+  // Round (not floor): binary fractions land just BELOW their decimal value
+  // (24.9 → 24.8999…), and floor would render 00:24.899 on the HUD clock.
+  const millis = Math.round((total - Math.floor(total)) * 1000) % 1000;
+  return `${sign}${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}.${String(millis).padStart(3, '0')}`;
+}
+
+/** Signed signed-time delta formatter: `+1.234` / `−0.045` seconds. */
+export function formatLapDelta(seconds: number | null | undefined): string {
+  if (seconds === null || seconds === undefined || !Number.isFinite(seconds)) return '—';
+  const sign = seconds < 0 ? '−' : '+';
+  return `${sign}${Math.abs(seconds).toFixed(3)}`;
+}
+
 /** 8-wind cardinal label for a bearing (0° → N, 45° → NE, …). */
 function cardinal(bearingDeg: number): string {
   return COMPASS_CARDINALS[Math.round(wrap360(bearingDeg) / 45) % 8];
@@ -291,6 +346,9 @@ export class LunarHUD {
   private tutorialSteps: Elementish[] = [];
   private tutorialMarks: Elementish[] = [];
   private marketTable: Elementish | null = null;
+  /** Proving-grounds sector split cells (S1 / S2 / running remainder). */
+  private lapSectorEls: Elementish[] = [];
+  private lapPanelVisible = false;
   private readonly tradeRows = new Map<
     string,
     { row: Elementish; base: Elementish; buy: Elementish; sell: Elementish; reserve: Elementish; holding: Elementish }
@@ -332,6 +390,7 @@ export class LunarHUD {
     this.buildCompass();
     this.buildLifeSupport();
     this.buildBuggyPanel();
+    this.buildLapPanel();
     this.buildScanner();
     this.buildPrompts();
     this.buildTutorial();
@@ -364,6 +423,7 @@ export class LunarHUD {
     this.compassPinReadouts.clear();
     this.tutorialSteps = [];
     this.tutorialMarks = [];
+    this.lapSectorEls = [];
     this.els.clear();
     this.tradeRoot.remove();
     this.root.remove();
@@ -462,6 +522,66 @@ export class LunarHUD {
     this.setChip('mounted-chip', t.mounted === true);
     this.setChip('rolled-chip', t.rolled === true);
     this.setChip('airborne-chip', t.airborne === true);
+  }
+
+  // -- proving grounds lap timing (Spec 17 Phase 4) --------------------------------
+
+  /** Show or hide the proving-grounds lap-timing panel (track mode only). */
+  setLapPanelVisible(visible: boolean): void {
+    if (this.disposed) return;
+    this.lapPanelVisible = visible;
+    this.setClass('lap-panel', 'is-hidden', !visible);
+  }
+
+  isLapPanelVisible(): boolean {
+    return this.lapPanelVisible && !this.disposed;
+  }
+
+  /**
+   * Paint the proving-grounds lap-timing overlay (Spec 17 §3.3): lap counter,
+   * current lap clock (MM:SS.mmm), best lap, per-sector splits with delta
+   * against the previous lap, speed-trap and top-speed readouts.
+   */
+  updateLapTelemetry(t: HudLapTelemetry): void {
+    if (this.disposed) return;
+
+    this.setText('lap-count-value', t.currentLap > 0 ? `LAP ${t.currentLap}` : '—');
+    this.setText('lap-current-value', formatLapTime(t.currentLapTimeS));
+    this.setText('lap-best-value', formatLapTime(t.bestLapTimeS));
+    this.setText('lap-last-value', formatLapTime(t.lastLapTimeS));
+
+    // Sector splits: slot 0 = S1, slot 1 = S2, slot 2 = the running remainder
+    // of the lap once both gates are behind the driver (S3 completes on the
+    // finish crossing, which also clears the slots).
+    const splits = Array.isArray(t.sectorTimesS) ? t.sectorTimesS : [];
+    for (let i = 0; i < this.lapSectorEls.length; i++) {
+      const el = this.lapSectorEls[i];
+      if (i < 2) {
+        el.textContent = i < splits.length ? formatLapTime(splits[i]) : '—';
+      } else {
+        let done = 0;
+        for (const v of splits) done += Number.isFinite(v) ? v : 0;
+        el.textContent =
+          splits.length >= 2 ? formatLapTime(Math.max(0, t.currentLapTimeS - done)) : '—';
+      }
+    }
+
+    const delta = t.sectorDeltaS;
+    const deltaEl = this.els.get('lap-delta-value');
+    if (deltaEl !== undefined) {
+      deltaEl.textContent = formatLapDelta(delta);
+      this.setClassEl(deltaEl, 'is-faster', delta !== null && delta < 0);
+      this.setClassEl(deltaEl, 'is-slower', delta !== null && delta !== 0 && delta >= 0);
+    }
+
+    this.setText(
+      'speed-trap-value',
+      t.speedTrapKmh === null || t.speedTrapKmh === undefined
+        ? '—'
+        : `${num(t.speedTrapKmh, 1)} km/h`,
+    );
+    this.setText('top-speed-value', `${num(t.topSpeedKmh, 1)} km/h`);
+    this.setLamp('speed-trap-lamp', t.speedTrapKmh !== null && t.speedTrapKmh !== undefined);
   }
 
   // -- mineral scanner -----------------------------------------------------------------
@@ -917,6 +1037,56 @@ export class LunarHUD {
       chips.appendChild(chip);
     }
     panel.appendChild(chips);
+  }
+
+  /**
+   * Proving-grounds lap-timing overlay (Spec 17 Phase 4): lap counter, big
+   * current-lap clock (MM:SS.mmm), best/last lap, S1/S2 splits with running
+   * remainder, sector delta, and the speed-trap / top-speed readouts.
+   * Hidden until `setLapPanelVisible(true)` (track mode only).
+   */
+  private buildLapPanel(): void {
+    const panel = this.make(
+      'section',
+      HUD_LAP_ID,
+      'hud-panel lap-timing is-hidden',
+      'lap-panel',
+    );
+    this.root.appendChild(panel);
+    panel.appendChild(this.heading('PROVING GROUNDS'));
+
+    panel.appendChild(this.labeledField('lap-count', 'LAP', '—'));
+
+    const clock = this.make('div', 'lunar-hud-lap-current', 'hud-speed-row', 'lap-current-row');
+    const big = this.make('span', 'hud-lap-current-value', 'hud-speed-big', 'lap-current-value');
+    big.textContent = '00:00.000';
+    clock.appendChild(big);
+    panel.appendChild(clock);
+
+    panel.appendChild(this.labeledField('lap-best', 'BEST LAP', '—'));
+    panel.appendChild(this.labeledField('lap-last', 'LAST LAP', '—'));
+
+    // Sector split row: S1, S2, running S3 remainder.
+    const sectors = this.make('div', 'lunar-hud-lap-sectors', 'hud-lap-sectors', 'lap-sectors');
+    this.lapSectorEls = [];
+    const slotLabels = ['S1', 'S2', 'S3'].slice(0, HUD_LAP_SECTOR_SLOTS);
+    for (const label of slotLabels) {
+      const cell = this.make('span', `hud-lap-split-${label.toLowerCase()}`, 'hud-lap-split', `lap-split-${label.toLowerCase()}`);
+      cell.textContent = '—';
+      const wrap = this.make('span', undefined, 'hud-lap-split-cell');
+      const cap = this.make('span', undefined, 'hud-lap-split-label');
+      cap.textContent = label;
+      wrap.appendChild(cap);
+      wrap.appendChild(cell);
+      sectors.appendChild(wrap);
+      this.lapSectorEls.push(cell);
+    }
+    panel.appendChild(sectors);
+
+    panel.appendChild(this.labeledField('lap-delta', 'SECTOR Δ', '—'));
+    panel.appendChild(this.labeledField('speed-trap', 'SPEED TRAP', '—'));
+    panel.appendChild(this.labeledField('top-speed', 'TOP SPEED', '0.0 km/h'));
+    panel.appendChild(this.lamp('hud-speed-trap-lamp', 'TRAP ARMED', 'speed-trap-lamp'));
   }
 
   private buildScanner(): void {

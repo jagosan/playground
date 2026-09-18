@@ -714,6 +714,48 @@
   }
 }
 
+/* --- proving grounds lap timing (Spec 17 Phase 4) -------------------------- */
+
+#lunar-hud-lap {
+  top: 288px;
+  right: 16px;
+  width: 232px;
+}
+
+.hud-lap-sectors {
+  display: flex;
+  gap: 8px;
+  margin: 4px 0 6px;
+}
+
+.hud-lap-split-cell {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  flex: 1;
+  gap: 2px;
+}
+
+.hud-lap-split-label {
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  color: var(--lf-dim);
+}
+
+.hud-lap-split {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--lf-text);
+}
+
+#hud-lap-delta-value.is-faster {
+  color: var(--lf-good);
+}
+
+#hud-lap-delta-value.is-slower {
+  color: var(--lf-bad);
+}
+
 /* --- small screens (GPD Win Max 2 / handhelds) ----------------------------- */
 
 @media (max-width: 900px) {
@@ -732,6 +774,9 @@
   }
   #lunar-hud-tutorial {
     width: 200px;
+  }
+  #lunar-hud-lap {
+    width: 190px;
   }
   .compass-pin-readout {
     display: none;
