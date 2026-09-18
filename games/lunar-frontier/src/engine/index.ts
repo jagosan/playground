@@ -33,4 +33,33 @@ export {
   type CameraRigOptions,
 } from './CameraRig.ts';
 
+export {
+  ProvingGroundsScene,
+  LapTimingSystem,
+  buildKappaProfile,
+  integrateCentreline,
+  elevationAtS,
+  bankAtS,
+  sectorAtS,
+  sectionAtS,
+  wrapTrackS,
+  TRACK_TOTAL_LENGTH_M,
+  TRACK_WIDTH_M,
+  CURB_WIDTH_M,
+  SWEEPER_RADIUS_M,
+  SWEEPER_BANK_RAD,
+  BANK_EASE_M,
+  SLALOM_RADIUS_M,
+  HAIRPIN_RADIUS_M,
+  CREST_ELEVATION_M,
+  SPEED_TRAP_ZONE,
+  GATE_S,
+  type TrackWaypoint,
+  type TrackLocator,
+  type CircuitSectionInfo,
+  type LapTelemetry,
+  type LapTimingOptions,
+  type ProvingGroundsSceneOptions,
+} from './ProvingGroundsScene.ts';
+
 export { WorldScene as default } from './WorldScene.ts';

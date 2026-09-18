@@ -42,6 +42,7 @@ import { Color3 } from '@babylonjs/core/Maths/math.color.js';
 import type { Mesh } from '@babylonjs/core/Meshes/mesh.js';
 
 import { WorldScene, worldToBabylon, type CameraMode } from '../engine/index.ts';
+import { ProvingGroundsScene, type LapTelemetry } from '../engine/ProvingGroundsScene.ts';
 import { EvaSuitAvatar } from '../entities/AstronautSuit.ts';
 import { OpenBuggy, MOUNT_RADIUS_M } from '../entities/OpenBuggy.ts';
 import { TraversalController } from './TraversalController.ts';
@@ -50,6 +51,8 @@ import { TunnelNetwork } from '../infrastructure/TunnelNetwork.ts';
 import { RailSystem } from '../infrastructure/RailSystem.ts';
 import {
   BUGGY_SPEED_LIMIT,
+  ENV_EARTH_PROVING_GROUNDS,
+  ENV_LUNAR_FRONTIER,
   IDLE_BUGGY_INPUT,
   type BuggyInput,
   type GroundElevationFn,
@@ -233,6 +236,8 @@ export const ACTION_KEYS: Readonly<Record<string, string>> = {
   KeyM: 'mine',
   KeyC: 'claim',
   KeyT: 'trade',
+  // Spec 17 Phase 4: environment toggle — Earth Proving Grounds ⇄ Lunar.
+  KeyR: 'track',
   Escape: 'close-ui',
 };
 
@@ -260,6 +265,8 @@ const VEIN_KIND_TO_RESOURCE: Record<string, MiningResource> = {
 // Options & shapes
 // ---------------------------------------------------------------------------
 
+export type EnvironmentMode = 'lunar_frontier' | 'earth_proving_grounds';
+
 export interface ClientAppOptions {
   /** World seed handed to `WorldScene`/`LunarWorldGenerator`. */
   seed?: string | number;
@@ -286,6 +293,12 @@ export interface ClientAppOptions {
   /** Terrain tuning passthrough. */
   terrainSize?: number;
   terrainResolution?: number;
+  /**
+   * Spec 17 Phase 4: start in Earth Proving Grounds track mode instead of
+   * the Lunar Frontier surface (equivalent to calling
+   * {@link ClientApp.enableProvingGrounds} right after `init()`).
+   */
+  startInProvingGrounds?: boolean;
 }
 
 export interface ClientInputFrame {
@@ -531,6 +544,12 @@ export class ClientApp {
   private factionBases: FactionBases | null = null;
   private tunnelNetwork: TunnelNetwork | null = null;
   private railSystem: RailSystem | null = null;
+  /** Spec 17 Phase 4: Earth track environment (built on first enable). */
+  private provingGrounds: ProvingGroundsScene | null = null;
+  /** Active environment: lunar surface vs. Earth proving grounds. */
+  private envMode: EnvironmentMode = 'lunar_frontier';
+  /** Terrain mesh hidden (not disposed) while the track mode is active. */
+  private lunarTerrainHidden = false;
   private buggyBeacon: Mesh | null = null;
   private baseBeacon: Mesh | null = null;
   private veinBeacon: Mesh | null = null;
@@ -600,7 +619,7 @@ export class ClientApp {
 
     this.world.init(canvasOrEngine as never);
 
-    const ground: GroundElevationFn = (x, y) => this.world.getGroundHeightAt(x, y);
+    const ground: GroundElevationFn = (x, y) => this.groundAt(x, y);
     const scene = this.world.getScene();
     const spawn = this.resolveSpawn();
     this.tutorialPrevPos = { x: spawn.x, y: spawn.y };
@@ -684,6 +703,10 @@ export class ClientApp {
     }
 
     this.initialized = true;
+    if (this.options.startInProvingGrounds === true) {
+      // Spec 17 Phase 4: cold-start straight into the Earth track environment.
+      this.enableProvingGrounds();
+    }
     this.hudSay('surface suit');
     this.hud?.setConnection(this.network?.state ?? 'offline');
     this.refreshTutorialHud();
@@ -709,6 +732,9 @@ export class ClientApp {
     // the button snapshot for the following frame).
     this.pumpGamepadActions();
     this.stepEntities(dt);
+    // Spec 17 Phase 4: step the circuit lap-timing state machine with the
+    // freshly stepped buggy pose and repaint the lap HUD panel.
+    this.pumpLapTiming(dt);
     this.syncCamera(dt);
     this.pumpMoveStream(dt);
     // Clock-domain rule (ADR-013-2): NetworkClient interpolates against the
@@ -754,6 +780,160 @@ export class ClientApp {
     } catch {
       /* headless engines have nothing to resize */
     }
+  }
+
+  // -- proving grounds track mode (Spec 17 Phase 4) --------------------------------
+
+  /**
+   * Switch into the Earth Proving Grounds environment (Spec 17 §3/§5):
+   * builds the ~1,200 m circuit (lazily, once), hides the lunar terrain,
+   * warps the buggy onto the start/finish line, flips the physics profile
+   * to `ENV_EARTH_PROVING_GROUNDS` (1 g asphalt), and shows the lap-timing
+   * HUD. Idempotent. The reverse is {@link disableProvingGrounds}.
+   */
+  enableProvingGrounds(): this {
+    if (this.disposed || !this.initialized) return this;
+    if (this.envMode === 'earth_proving_grounds') return this;
+
+    if (this.provingGrounds === null) {
+      this.provingGrounds = new ProvingGroundsScene({
+        standaloneAtmosphere: false,
+        silent: this.options.silent ?? false,
+      }).init(this.world.getScene());
+    }
+
+    // Hide (not dispose) the lunar terrain + sky furniture so the track
+    // reads as a self-contained Earth site; restoring restores them.
+    const terrain = this.world.getTerrainMesh();
+    if (terrain !== null) {
+      terrain.setEnabled(false);
+      this.lunarTerrainHidden = true;
+    }
+
+    // Warp the buggy onto the start/finish line, at rest, facing forward —
+    // through the physics state itself (the single source of truth), using
+    // the duck-typed access pattern established by the smoke harnesses.
+    const seat = this.requireBuggy().physics as unknown as {
+      state: {
+        x: number; y: number; z: number; heading: number;
+        vLong: number; vLat: number; vBody: number; yawRate: number;
+        roll: number; pitch: number; airborne: boolean; rolled: boolean;
+      };
+    };
+    const pose = this.provingGrounds.getStartPose();
+    const st = seat.state;
+    st.x = pose.x;
+    st.y = pose.y;
+    st.z = pose.z + 0.45;
+    st.heading = pose.headingRad;
+    st.vLong = 0;
+    st.vLat = 0;
+    st.vBody = 0;
+    st.yawRate = 0;
+    st.roll = 0;
+    st.pitch = 0;
+    st.airborne = false;
+    st.rolled = false;
+
+    // Terrestrial gravity + asphalt (Spec 17 §2.1) from the next substep.
+    this.requireBuggy().physics.setEnvironment(ENV_EARTH_PROVING_GROUNDS);
+    // Zero-dt update: refreshes the entity's cached state snapshot + mesh
+    // transform without stepping physics (dt 0 executes no substeps).
+    this.requireBuggy().update(0);
+
+    this.provingGrounds.resetLapTiming();
+    this.envMode = 'earth_proving_grounds';
+    this.hud?.setLapPanelVisible(true);
+    this.log('proving grounds: track mode live (earth gravity, lap timer armed)');
+    return this;
+  }
+
+  /**
+   * Switch back to the Lunar Frontier surface environment: restore the
+   * terrain, put the buggy back on the lunar datum under lunar gravity, and
+   * hide the lap-timing HUD. The circuit itself stays built (cheap toggle).
+   */
+  disableProvingGrounds(): this {
+    if (this.disposed || !this.initialized) return this;
+    if (this.envMode !== 'earth_proving_grounds') return this;
+    this.envMode = 'lunar_frontier';
+
+    const terrain = this.world.getTerrainMesh();
+    if (terrain !== null && this.lunarTerrainHidden) {
+      terrain.setEnabled(true);
+      this.lunarTerrainHidden = false;
+    }
+
+    const spawn = this.resolveSpawn();
+    const seat = this.requireBuggy().physics as unknown as {
+      state: {
+        x: number; y: number; z: number; heading: number;
+        vLong: number; vLat: number; vBody: number; yawRate: number;
+        roll: number; pitch: number; airborne: boolean; rolled: boolean;
+      };
+    };
+    const st = seat.state;
+    const [bx, by] = BUGGY_PARK_OFFSET;
+    st.x = spawn.x + bx;
+    st.y = spawn.y + by;
+    st.z = this.world.getGroundHeightAt(st.x, st.y) + 0.45;
+    st.heading = 0;
+    st.vLong = 0;
+    st.vLat = 0;
+    st.vBody = 0;
+    st.yawRate = 0;
+    st.roll = 0;
+    st.pitch = 0;
+    st.airborne = false;
+    st.rolled = false;
+
+    // Restore the lunar preset (gravity 1.62, regolith μ, vacuum).
+    this.requireBuggy().physics.setEnvironment(ENV_LUNAR_FRONTIER);
+    this.requireBuggy().update(0);
+    this.hud?.setLapPanelVisible(false);
+    this.log('proving grounds: back on the lunar surface');
+    return this;
+  }
+
+  /** Which environment the buggy is currently simulated in. */
+  getEnvironmentMode(): EnvironmentMode {
+    return this.envMode;
+  }
+
+  /** The track mode telemetry stream (null while lunar mode is active). */
+  getLapTelemetry(): LapTelemetry | null {
+    return this.envMode === 'earth_proving_grounds'
+      ? this.provingGrounds?.getLapTelemetry() ?? null
+      : null;
+  }
+
+  /** The built circuit (null until either mode method has built it). */
+  getProvingGrounds(): ProvingGroundsScene | null {
+    return this.provingGrounds;
+  }
+
+  /**
+   * Ground the entities ride: the track surface in proving-grounds mode,
+   * the lunar heightfield otherwise. Both buggy and suit read elevation
+   * through this single seam.
+   */
+  private groundAt(x: number, y: number): number {
+    if (this.envMode === 'earth_proving_grounds' && this.provingGrounds !== null) {
+      return this.provingGrounds.getTrackElevation(x, y);
+    }
+    return this.world.getGroundHeightAt(x, y);
+  }
+
+  /**
+   * Per-frame lap-timing pump: step the circuit's state machine with the
+   * buggy's live pose/speed and push the snapshot to the HUD.
+   */
+  private pumpLapTiming(dt: number): void {
+    if (this.envMode !== 'earth_proving_grounds' || this.provingGrounds === null) return;
+    const buggy = this.requireBuggy();
+    const p = buggy.getPosition();
+    const telemetry = this.provingGrounds.stepLapTiming(dt, p.x, p.y, buggy.getSpeed());
+    this.hud?.updateLapTelemetry(telemetry);
   }
 
   /** Full teardown: entities, world, network, HUD, DOM listeners. Idempotent. */
@@ -806,6 +986,10 @@ export class ClientApp {
     this.factionBases = null;
     this.tunnelNetwork = null;
     this.railSystem = null;
+    // Track mode teardown (meshes live in the world scene; its own dispose
+    // unparents them — idempotent even after the world is gone).
+    this.provingGrounds?.dispose();
+    this.provingGrounds = null;
     this.world.dispose();
     this.hud?.dispose();
     this.hud = null;
@@ -1121,6 +1305,11 @@ export class ClientApp {
         break;
       case 'trade':
         this.toggleTradeTerminal();
+        break;
+      case 'track':
+        // Spec 17 Phase 4: R toggles Earth Proving Grounds ⇄ Lunar surface.
+        if (this.envMode === 'earth_proving_grounds') this.disableProvingGrounds();
+        else this.enableProvingGrounds();
         break;
       case 'close-ui':
         this.hud?.hideTradeDialog();
