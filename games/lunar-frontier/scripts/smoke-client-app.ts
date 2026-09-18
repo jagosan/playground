@@ -31,7 +31,19 @@ import assert from 'node:assert';
 
 import { NullEngine } from '@babylonjs/core/Engines/nullEngine.js';
 
-import { ClientApp, NAV_SCAN_RANGE_M, SCAN_RANGE_M } from '../src/client/ClientApp.ts';
+import {
+  ClientApp,
+  GAMEPAD_STEER_DEADZONE,
+  GAMEPAD_STEER_GAMMA,
+  GAMEPAD_THROTTLE_GAMMA,
+  NAV_SCAN_RANGE_M,
+  RUMBLE_MIN_INTERVAL_MS,
+  SCAN_RANGE_M,
+  computeBuggyRumble,
+  gamepadBrakeCurve,
+  gamepadSteerCurve,
+  gamepadThrottleCurve,
+} from '../src/client/ClientApp.ts';
 import { TraversalController } from '../src/client/TraversalController.ts';
 import NetworkClient from '../src/network/NetworkClient.ts';
 import LunarHUD, { HUD_ROOT_ID, HUD_TRADE_ID } from '../src/ui/LunarHUD.ts';
@@ -689,8 +701,16 @@ section('D. input routing & hotkeys');
 
   fakePad.axes[0] = 1;
   check('left stick X → strafe (right = +1)', app.sampleInput().strafe === 1);
+  fakePad.axes[0] = 0.12;
+  check(
+    'steering deadzone: axis at 0.12 reads centred (Spec 17 §2.2.2 dz)',
+    app.sampleInput().strafe === 0,
+  );
   fakePad.axes[0] = 0.15;
-  check('deadzone: axis at 0.15 reads centred', app.sampleInput().strafe === 0);
+  check(
+    'steering just off deadzone is a small deflection (0.0034, Spec 17 dz 0.12)',
+    Math.abs(app.sampleInput().strafe - Math.pow((0.15 - 0.12) / 0.88, 1.6)) < 1e-12,
+  );
   fakePad.axes[0] = 0;
 
   fakePad.axes[1] = -0.8; // raw stick-up is negative
@@ -704,10 +724,18 @@ section('D. input routing & hotkeys');
   fakePad.axes[2] = 0;
 
   pressPad(7, true, 0.4);
-  check('right trigger → forward throttle', app.sampleInput().forward === 0.4);
+  check(
+    'right trigger → progressive gamma throttle (0.4^1.4, Spec 17 §2.3.1)',
+    Math.abs(app.sampleInput().forward - Math.pow(0.4, 1.4)) < 1e-12,
+    `f=${app.sampleInput().forward}`,
+  );
   pressPad(7, false, 0);
   pressPad(6, true, 0.9);
-  check('left trigger → analog brake', app.sampleInput().brake === 0.9);
+  check(
+    'left trigger → analog brake curve (0.9^0.8, Spec 17 §2.3.2)',
+    Math.abs(app.sampleInput().brake - Math.pow(0.9, 0.8)) < 1e-12,
+    `b=${app.sampleInput().brake}`,
+  );
   pressPad(6, false, 0);
   pressPad(0);
   check('A button → jump', app.sampleInput().jump === true);
@@ -806,6 +834,271 @@ section('D. input routing & hotkeys');
     'no pad after teardown → keyboard-only frame stays safe',
     app.sampleInput().forward === 0 && app.sampleInput().brake === 0,
   );
+}
+
+// ===========================================================================
+// LAYER D2 — TASK-PLAY-064b: Spec 17 Phase 2 analog calibration & haptics
+// ===========================================================================
+{
+  // Gamma curves asserted literally at spec sample points (pure functions).
+  check(
+    'γ_throttle 1.4: 0.5 pull → 0.5^1.4 ≈ 0.3789 torque',
+    Math.abs(gamepadThrottleCurve(0.5) - Math.pow(0.5, 1.4)) < 1e-12 &&
+      Math.abs(gamepadThrottleCurve(0.5) - 0.37893) < 1e-4 &&
+      gamepadThrottleCurve(0) === 0 &&
+      gamepadThrottleCurve(1) === 1,
+    `got ${gamepadThrottleCurve(0.5)}`,
+  );
+  check(
+    'γ_throttle monotonic progressive (0.25 < 0.5 < full)',
+    gamepadThrottleCurve(0.25) < gamepadThrottleCurve(0.5) &&
+      gamepadThrottleCurve(0.5) < gamepadThrottleCurve(1),
+  );
+  check(
+    'steering exponential: sign(x)·((|x|−0.12)/0.88)^1.6 at sample points',
+    gamepadSteerCurve(0.12) === 0 &&
+      gamepadSteerCurve(-0.12) === 0 &&
+      gamepadSteerCurve(0) === 0 &&
+      Math.abs(gamepadSteerCurve(0.5) - Math.pow((0.5 - 0.12) / 0.88, 1.6)) < 1e-12 &&
+      Math.abs(gamepadSteerCurve(-1) + 1) < 1e-12 &&
+      Math.abs(gamepadSteerCurve(1) - 1) < 1e-12,
+    `u(0.5)=${gamepadSteerCurve(0.5)}`,
+  );
+  check(
+    'steering curve is progressive (below linear mid-travel)',
+    gamepadSteerCurve(0.5) < 0.5 && gamepadSteerCurve(0.8) > gamepadSteerCurve(0.5),
+  );
+  check(
+    'analog brake curve: L2^0.8 progressive bite (0.5 → 0.5743, monotonic)',
+    Math.abs(gamepadBrakeCurve(0.5) - Math.pow(0.5, 0.8)) < 1e-12 &&
+      Math.abs(gamepadBrakeCurve(0.5) - 0.57435) < 1e-4 &&
+      gamepadBrakeCurve(0.2) < gamepadBrakeCurve(0.6) &&
+      gamepadBrakeCurve(1) === 1 &&
+      gamepadBrakeCurve(-0.5) === 0,
+    `b(0.5)=${gamepadBrakeCurve(0.5)}`,
+  );
+  check(
+    'spec constants exported: dz 0.12, γ_steer 1.6, γ_throttle 1.4',
+    GAMEPAD_STEER_DEADZONE === 0.12 &&
+      GAMEPAD_STEER_GAMMA === 1.6 &&
+      GAMEPAD_THROTTLE_GAMMA === 1.4 &&
+      RUMBLE_MIN_INTERVAL_MS === 40,
+  );
+  check(
+    'computeBuggyRumble priority: ABS > emergency > slip > wheelspin',
+    computeBuggyRumble({ absActive: true, brakeDemand: 1, throttleDemand: 1, speed: 10, lateralSlip: 5 })!
+      .strongMagnitude === 0.9 &&
+      computeBuggyRumble({ absActive: false, brakeDemand: 0.9, throttleDemand: 0, speed: 10, lateralSlip: 5 })!
+        .duration === 90 &&
+      computeBuggyRumble({ absActive: false, brakeDemand: 0, throttleDemand: 0, speed: 10, lateralSlip: -2.5 })!
+        .weakMagnitude === 0.6 &&
+      computeBuggyRumble({ absActive: false, brakeDemand: 0, throttleDemand: 1, speed: 1, lateralSlip: 0 })!
+        .duration === 30 &&
+      computeBuggyRumble({ absActive: false, brakeDemand: 0, throttleDemand: 0, speed: 10, lateralSlip: 0 }) === null,
+  );
+  check(
+    'redline cue hums above 90% of limiter, silence below',
+    computeBuggyRumble({ absActive: false, brakeDemand: 0, throttleDemand: 0, speed: 21, lateralSlip: 0 }) !== null &&
+      computeBuggyRumble({ absActive: false, brakeDemand: 0, throttleDemand: 0, speed: 10, lateralSlip: 0 }) === null,
+  );
+
+  // --- End-to-end drive scenario through a fake pad + recording actuator ----
+  const navRestore = (globalThis as { navigator?: unknown }).navigator;
+  const hPad = {
+    axes: [0, 0, 0, 0],
+    buttons: Array.from({ length: 12 }, () => ({ value: 0, pressed: false })),
+    vibrationActuator: {
+      playEffect(type: string, params: { startDelay: number; duration: number; weakMagnitude: number; strongMagnitude: number }) {
+        // Snapshot the ABS state at the moment of the call — the harness ties
+        // the strong pulse to physics absActive, not to a hoped-for ordering.
+        effects.push({ type, ...params, absActive: hApp.getBuggy().physics.absActive });
+        return Promise.resolve();
+      },
+    },
+  };
+  const effects: Array<{
+    type: string;
+    startDelay: number;
+    duration: number;
+    weakMagnitude: number;
+    strongMagnitude: number;
+    absActive: boolean;
+  }> = [];
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    writable: true,
+    value: { getGamepads: () => [hPad] },
+  });
+
+  const hApp = new ClientApp({
+    seed: 'mala-voyage-2431',
+    username: 'haptic',
+    faction: 'ARTEMIS',
+    network: null,
+    autoConnect: false,
+    createHud: false,
+    silent: true,
+  });
+  await hApp.init(new NullEngine() as never);
+  const hFrame = (n = 1): void => {
+    for (let i = 0; i < n; i++) {
+      nowMs += 16;
+      hApp.update(nowMs);
+    }
+  };
+  const setTrigger = (index: number, v: number): void => {
+    hPad.buttons[index]!.pressed = v > 0;
+    hPad.buttons[index]!.value = v;
+  };
+
+  const hBuggyPos = hApp.getBuggy().getPosition();
+  hApp.getSuit().teleport(hBuggyPos.x - 0.5, hBuggyPos.y - 0.5);
+  check('haptic rig mounts the buggy', hApp.toggleMount() === true && hApp.getMode() === 'buggy');
+  // D2-a — launch: R2 mashed from standstill. The gamma curve + anti-jerk
+  // filter mean the physics throttle approaches, never steps; the launch
+  // wheelspin cue (subtle, 30 ms weak-only) fires while speed < 6 m/s.
+  effects.length = 0;
+  setTrigger(7, 1);
+  hFrame(4);
+  const launchCue = effects.find((e) => e.duration === 30 && e.weakMagnitude === 0.22 && e.strongMagnitude === 0);
+  check(
+    'launch wheelspin → subtle dual-rumble pulse played on actuator',
+    launchCue !== undefined && launchCue.type === 'dual-rumble' && launchCue.startDelay === 0,
+    JSON.stringify(effects.slice(0, 2)),
+  );
+  check(
+    'every actuator call is dual-rumble shaped (magnitudes 0..1)',
+    effects.length > 0 &&
+      effects.every(
+        (e) =>
+          e.type === 'dual-rumble' &&
+          e.weakMagnitude >= 0 && e.weakMagnitude <= 1 &&
+          e.strongMagnitude >= 0 && e.strongMagnitude <= 1 &&
+          e.duration > 0,
+      ),
+  );
+
+  // Rate limit: 10 frames × 16 ms of sustained demand ≤ 1 per 40 ms window.
+  effects.length = 0;
+  hFrame(10);
+  check(
+    'rumble rate-limit: ≤1 effect per 40 ms window (10 frames ≤ 5 effects)',
+    effects.length <= 5,
+    `got ${effects.length}`,
+  );
+
+  // D2-b — panic stop from speed: emergency demand → medium rumble, and once
+  // physics ABS starts pulse-modulating the locked corner → strong pulse with
+  // absActive true at the call site.
+  for (let i = 0; i < 160 && hApp.getBuggy().getSpeed() < 15; i++) hFrame(1);
+  const cruiseSpeed = hApp.getBuggy().getSpeed();
+  effects.length = 0;
+  setTrigger(7, 0);
+  setTrigger(6, 1);
+  for (let i = 0; i < 200 && hApp.getBuggy().getSpeed() > 0.05; i++) hFrame(1);
+  const absCues = effects.filter((e) => e.strongMagnitude === 0.9);
+  const emergencyCues = effects.filter((e) => e.duration === 90 && e.strongMagnitude === 0.6);
+  check(
+    'panic stop fires ABS modulation from speed (sanity)',
+    cruiseSpeed > 10,
+    `cruise=${cruiseSpeed.toFixed(1)}`,
+  );
+  check(
+    'ABS active → strong rumble pulse played with absActive true',
+    absCues.length > 0 && absCues.every((e) => e.absActive === true) && absCues[0].weakMagnitude === 0.45,
+    `absCues=${absCues.length}`,
+  );
+  check(
+    'hard emergency braking → medium rumble pulse',
+    emergencyCues.length > 0 && emergencyCues[0].weakMagnitude === 0.5,
+    `emergencyCues=${emergencyCues.length}`,
+  );
+
+  // D2-c — lateral slip / skid: build sweep lateral velocity, weak pulse.
+  setTrigger(6, 0);
+  setTrigger(7, 1);
+  for (let i = 0; i < 200 && hApp.getBuggy().getSpeed() < 18; i++) hFrame(1);
+  // Kick the chassis sideways (harness-only duck-type into the physics state,
+  // same pattern smoke-open-buggy uses for seat injection).
+  (hApp.getBuggy().physics as unknown as { state: { vLat: number } }).state.vLat = 3.4;
+  effects.length = 0;
+  hFrame(2);
+  const slipCues = effects.filter((e) => e.weakMagnitude === 0.6 && e.strongMagnitude === 0.05);
+  check(
+    'high lateral tire slip → weak rumble pulse',
+    slipCues.length > 0 && slipCues[0].duration === 70,
+    `effects=${JSON.stringify(effects)}`,
+  );
+
+  // D2-d — defensive haptics: emergency demand (L2 held) guarantees the pump
+  // WANTS an effect every frame, so a throwing actuator / rejected promise /
+  // missing actuator are all exercised on the live call path and must never
+  // break a driving frame.
+  setTrigger(6, 1);
+  (hPad as { vibrationActuator: unknown }).vibrationActuator = {
+    playEffect: (): never => {
+      throw new Error('rumble exploded');
+    },
+  };
+  let threw = false;
+  try {
+    hFrame(4);
+  } catch {
+    threw = true;
+  }
+  check('throwing vibrationActuator never breaks the frame', !threw && hApp.getMode() === 'buggy');
+  (hPad as { vibrationActuator: unknown }).vibrationActuator = {
+    playEffect: () => Promise.reject(new Error('not allowed')),
+  };
+  let rejected = false;
+  try {
+    hFrame(4);
+  } catch {
+    rejected = true;
+  }
+  check('rejected playEffect promise is swallowed (no throw)', !rejected);
+  // Pad without any vibrationActuator at all (the common GPD Win case).
+  delete (hPad as { vibrationActuator?: unknown }).vibrationActuator;
+  let actless = false;
+  const speedBeforeActless = hApp.getBuggy().getSpeed();
+  try {
+    hFrame(4);
+  } catch {
+    actless = true;
+  }
+  check(
+    'pad without vibrationActuator drives silently',
+    !actless && hApp.getBuggy().getSpeed() <= speedBeforeActless + 1e-9,
+  );
+  setTrigger(6, 0);
+
+  // D2-e — anti-jerk filter: a keyboard W mashed from standstill ramps the
+  // physics throttle over frames, so acceleration builds progressively
+  // instead of stepping to full torque on frame 1. (The long test drive
+  // drained the pack — top it up first, drive force is battery-gated.)
+  (hApp.getBuggy().physics as unknown as { state: { batteryKwh: number } }).state.batteryKwh = 2.2;
+  for (let i = 0; i < 500 && hApp.getBuggy().getSpeed() > 0.05; i++) hFrame(1);
+  hFrame(5); // park-settle
+  const ramped: number[] = [];
+  hApp.handleKeyInput('KeyW', 'down');
+  for (let i = 0; i < 3; i++) {
+    const before = hApp.getBuggy().getSpeed();
+    hFrame(1);
+    ramped.push(hApp.getBuggy().getSpeed() - before);
+  }
+  hApp.handleKeyInput('KeyW', 'up');
+  check(
+    'anti-jerk filter: launch accel is progressive (later frames out-push the first)',
+    ramped[1] > ramped[0] && ramped[2] > ramped[0],
+    JSON.stringify(ramped),
+  );
+
+  hApp.dispose();
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    writable: true,
+    value: navRestore,
+  });
 }
 
 // ===========================================================================
