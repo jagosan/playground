@@ -8,8 +8,10 @@
  *    from the TraversalPhysics heading with damped smoothing.
  *  - `eva_third_person`  — `ArcRotateCamera` orbiting the suit at a fixed
  *    radius/behind-the-back azimuth, slowly trailing the target.
- *  - `vehicle_chase`     — `ArcRotateCamera` locked behind the rover heading
- *    at a longer, lower orbit so the cargo bed and terrain ahead stay framed.
+ *  - `vehicle_chase`     — Spec 17 "Above and Behind": high-attitude elevated
+ *    orbit (8.5 m back, 3.8 m up, −18° nose-down) framing the hood, horizon
+ *    and upcoming apexes, with velocity-vector lookahead so the vehicle reads
+ *    as rotating into drifts while the road ahead stays centred.
  *
  * World-frame convention matches `LunarWorldGenerator` / `TraversalPhysics`:
  * metres, **z up**, yaw radians in the x-y plane with 0 = +x. Babylon's
@@ -60,9 +62,42 @@ export const CAMERA_MODES: readonly CameraMode[] = [
   'vehicle_chase',
 ];
 
+// -- Spec 17 §2.4 chase-camera constants -------------------------------------
+
+/** Chase nose-down pitch tilt: −18° toward the hood, radians (≈ PI/2 − 1.2566). */
+export const CHASE_PITCH_TILT_RAD = 0.3142;
+/** Chase FOV at rest, degrees. */
+export const CHASE_FOV_BASE_DEG = 60;
+/** Chase FOV at reference top speed, degrees. */
+export const CHASE_FOV_MAX_DEG = 78;
+/** Speed (m/s) at which the FOV reaches `CHASE_FOV_MAX_DEG`. */
+export const CHASE_SPEED_REF_MPS = 22;
+/** Velocity-vector lookahead blend weight β (spec 17 §2.4.2). */
+export const CHASE_LOOKAHEAD_BETA = 0.35;
+/** Speed gate (m/s): no lookahead lookahead below |v| ≤ 2.0 m/s. */
+export const CHASE_LOOKAHEAD_MIN_SPEED = 2.0;
+
+/**
+ * Spec 17 §2.4.2 velocity-vector lookahead (drift tracking):
+ *
+ *   θ_look = θ_body + β · atan2(vLat, vLong),  β = 0.35 for |v| > 2.0 m/s
+ *
+ * Below the 2.0 m/s gate the body heading is returned unmodified (β → 0),
+ * so parked/creeping vehicles never get an azimuth bias from sensor noise.
+ */
+export function velocityLookaheadTheta(
+  thetaBody: number,
+  vLong: number,
+  vLat: number,
+): number {
+  const speed = Math.hypot(vLong, vLat);
+  if (speed <= CHASE_LOOKAHEAD_MIN_SPEED) return thetaBody;
+  return thetaBody + CHASE_LOOKAHEAD_BETA * Math.atan2(vLat, vLong);
+}
+
 /** Per-mode tuning. FOV is degrees (converted to Babylon radians internally). */
 export interface CameraModeConfig {
-  /** Vertical field of view in degrees (spec band 55–65). */
+  /** Vertical field of view in degrees (EVA band 55–65; chase base 60). */
   fovDegrees: number;
   /** Third-person / chase orbit radius in metres. */
   distance: number;
@@ -116,9 +151,10 @@ export const DEFAULT_MODE_CONFIGS: Record<CameraMode, CameraModeConfig> = {
     groundClearance: 0.9,
   },
   vehicle_chase: {
-    fovDegrees: 55,
-    distance: 7.5,
-    heightOffset: 2.8,
+    // Spec 17 §2.4.1 high-attitude "Above and Behind" orbit.
+    fovDegrees: 60,
+    distance: 8.5,
+    heightOffset: 3.8,
     positionSmoothing: 5.5,
     rotationSmoothing: 4.5,
     groundClearance: 1.1,
@@ -218,7 +254,7 @@ export class CameraRig {
     this.chase = new ArcRotateCamera(
       'rig_vehicle_chase',
       Math.PI,
-      Math.PI / 2.15,
+      Math.PI / 2 - CHASE_PITCH_TILT_RAD, // -18° hood incline (spec 17 §2.4.1)
       chaseCfg.distance,
       new Vector3(0, 0, 0),
       scene,
@@ -294,6 +330,10 @@ export class CameraRig {
    * @param dt        seconds since last update.
    * @param targetPitch optional look pitch (radians, + = up).
    * @param speedFraction optional normalized speed (0..1) for dynamic chase FOV.
+   * @param velocity optional body-frame velocity `{ vLong, vLat }` (m/s). When
+   *   supplied in chase mode the target azimuth blends toward the velocity
+   *   vector lookahead θ_look (spec 17 §2.4.2 drift tracking); omitting it
+   *   keeps the legacy body-yaw-only tracking.
    */
   update(
     targetPos: { x: number; y: number; z: number },
@@ -301,6 +341,7 @@ export class CameraRig {
     dt: number,
     targetPitch = 0,
     speedFraction = 0,
+    velocity?: { vLong: number; vLat: number },
   ): void {
     if (this.disposed) return;
     const cfg = this.configs[this.mode];
@@ -347,9 +388,17 @@ export class CameraRig {
       this.firstPerson.rotation.z = 0;
     } else {
       const arc = this.mode === 'vehicle_chase' ? this.chase : this.thirdPerson;
+      // Spec 17 §2.4.2: in chase mode the azimuth goal tracks the velocity
+      // vector lookahead θ_look = θ_body + β·atan2(vLat, vLong) (β = 0.35 above
+      // 2 m/s, 0 below) so the vehicle visibly rotates into drifts while the
+      // road ahead stays centred. EVA third-person keeps pure body-yaw lock.
+      const lookYaw =
+        this.mode === 'vehicle_chase' && velocity !== undefined
+          ? velocityLookaheadTheta(targetYaw, velocity.vLong, velocity.vLat)
+          : targetYaw;
       // Orbit azimuth places the camera behind the moving target: offset dir
       // (−cos yaw, 0, sin yaw) ⇒ α = π − yaw (Babylon: pos ∝ (cos α, ·, sin α)).
-      const goalAzimuth = Math.PI - this.wrapTargetYaw(targetYaw);
+      const goalAzimuth = Math.PI - this.wrapTargetYaw(lookYaw);
       // At very low speeds, stabilize camera rotation to prevent wild swinging
       const effRotT = this.mode === 'vehicle_chase' && speedFraction < 0.05
         ? smoothFactor(cfg.rotationSmoothing * 0.4, dt)
@@ -357,14 +406,20 @@ export class CameraRig {
       this.currentOrbitAzimuth = approachAngle(this.currentOrbitAzimuth, goalAzimuth, effRotT);
       arc.alpha = this.currentOrbitAzimuth;
 
-      // Spec 15 §4.2: Pitch tilt -12 deg (-0.21 rad)
-      const tiltOffset = this.mode === 'vehicle_chase' ? 0.209 : 0.32;
-      arc.beta = clamp(Math.PI / 2 - tiltOffset - this.currentPitch * 0.35, 0.35, 1.5);
-
-      // Spec 15 §4.2: Dynamic FOV expansion with speed (55 deg to 68 deg at top speed)
       if (this.mode === 'vehicle_chase') {
-        const targetFov = 55 + (68 - 55) * clamp(speedFraction, 0, 1);
+        // Spec 17 §2.4.1: −18° (0.3142 rad) nose-down tilt toward the hood.
+        arc.beta = clamp(
+          Math.PI / 2 - CHASE_PITCH_TILT_RAD - this.currentPitch * 0.35,
+          0.35,
+          1.5,
+        );
+        // Spec 17 §2.4: dynamic FOV 60° at rest → 78° at top speed (v/22).
+        const targetFov =
+          CHASE_FOV_BASE_DEG +
+          (CHASE_FOV_MAX_DEG - CHASE_FOV_BASE_DEG) * clamp(speedFraction, 0, 1);
         this.setFovDegrees(approach(this.getFovDegrees(), targetFov, smoothFactor(3.0, dt)));
+      } else {
+        arc.beta = clamp(Math.PI / 2 - 0.32 - this.currentPitch * 0.35, 0.35, 1.5);
       }
 
       const pivotX = approach(arc.target.x, bx, posT);

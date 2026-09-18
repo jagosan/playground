@@ -364,6 +364,24 @@ export class OpenBuggy {
     return Math.abs(this.last.vLong);
   }
 
+  /**
+   * Body-frame longitudinal velocity (m/s, + forward). Spec 17 §2.4.2 feeds
+   * this (with `getVLat()`) to the chase camera's velocity-vector lookahead.
+   */
+  getVLong(): number {
+    return this.last.vLong;
+  }
+
+  /** Body-frame lateral velocity (m/s, + left). Zero while traction holds. */
+  getVLat(): number {
+    return this.last.vLat;
+  }
+
+  /** Body-frame velocity pair for the chase-cam lookahead (spec 17 §2.4.2). */
+  getVelocity(): { vLong: number; vLat: number } {
+    return { vLong: this.last.vLong, vLat: this.last.vLat };
+  }
+
   /** Traction battery remaining, kWh. */
   getBattery(): number {
     return this.last.batteryKwh;
