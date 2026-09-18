@@ -49,6 +49,7 @@ import { FactionBases } from '../infrastructure/Factions.ts';
 import { TunnelNetwork } from '../infrastructure/TunnelNetwork.ts';
 import { RailSystem } from '../infrastructure/RailSystem.ts';
 import {
+  BUGGY_SPEED_LIMIT,
   IDLE_BUGGY_INPUT,
   type BuggyInput,
   type GroundElevationFn,
@@ -110,6 +111,57 @@ export const CLAIM_RADIUS_M = 20;
  * as centred, so a pad with drift/wander never creeps the suit or the buggy.
  */
 export const GAMEPAD_DEADZONE = 0.15;
+
+/**
+ * Steering deadzone for the exponential stick curve (Spec 17 §2.2.2). Axis
+ * magnitudes at or below this read as centred; beyond it the response is
+ * re-normalised to (0..1) before the exponent, so a slightly-drifting pad
+ * never creeps the buggy and the curve still reaches full lock at |x| = 1.
+ */
+export const GAMEPAD_STEER_DEADZONE = 0.12;
+
+/** Exponential steering exponent γ_steer (Spec 17 §2.2.2): 1.6. */
+export const GAMEPAD_STEER_GAMMA = 1.6;
+
+/**
+ * Throttle trigger exponent γ_throttle (Spec 17 §2.3.1):
+ * `T_throttle = R2^1.4 · T_max`. The γ > 1 shape spends less travel near
+ * zero (0.5 pull → 0.379 torque) killing launch wheelspin, while the last
+ * 10 % of travel still hands over full torque when the trigger is mashed.
+ */
+export const GAMEPAD_THROTTLE_GAMMA = 1.4;
+
+/**
+ * Service-brake trigger exponent (Spec 17 §2.3.2 dual-stage progressive
+ * braking). γ < 1 front-loads the bite point so the first millimetres of L2
+ * modulate the pad gently, then the pedal firms toward full demand.
+ */
+export const GAMEPAD_BRAKE_GAMMA = 0.8;
+
+/**
+ * Anti-jerk smoothing rate (1/s) applied to the analog triggers after the
+ * gamma curves (Spec 17 Phase 2 "anti-jerk filter"): a mashed trigger ramps
+ * to full in ~1/(rate·dt) frames instead of a discontinuous step, taking the
+ * jolt out of launches and panic modulations while staying transparently
+ * fast at frame rates (≈125 ms to full at 60 fps).
+ */
+export const GAMEPAD_TRIGGER_FILTER_RATE = 12.5;
+
+/** Emergency-brake haptic threshold: L2 demand at/above this reads as a panic stop. */
+export const RUMBLE_EMERGENCY_BRAKE = 0.85;
+/** Lateral slip haptic threshold (m/s of body-frame lateral velocity). */
+export const RUMBLE_SLIP_VLAT = 2.0;
+/** Launch/redline wheelspin cue: throttle demand at/above this low speed (m/s). */
+export const RUMBLE_WHEELSPIN_THROTTLE = 0.6;
+export const RUMBLE_WHEELSPIN_MAX_V = 6.0;
+/** Throttle speed-fraction above which the redline hum hums (90 % of the limiter). */
+export const RUMBLE_REDLINE_FRAC = 0.9;
+/**
+ * Minimum spacing between `playEffect` calls per pad (ms) — ABS pulses at
+ * 15 Hz physically, and 40 ms is the shortest window the Gamepad Haptics API
+ * guarantees, so the pump never floods the browser event loop.
+ */
+export const RUMBLE_MIN_INTERVAL_MS = 40;
 
 /**
  * Standard-mapping axis slots (spec 14 §3.1): left stick X → strafe/steer,
@@ -270,6 +322,101 @@ export interface ClientInputFrame {
 export interface GamepadLike {
   readonly axes: readonly number[];
   readonly buttons: readonly { readonly value: number; readonly pressed: boolean }[];
+  /**
+   * Dual-rumble haptics (Spec 17 Phase 2): the structural slice of
+   * `GamepadHapticActuator` the client calls. Optional and duck-typed — the
+   * harness hands in a recorder, real pads hand in the browser actuator, and
+   * pads without one (or a locked-down browser) simply never rumble.
+   */
+  readonly vibrationActuator?: {
+    playEffect?(
+      type: string,
+      params: { startDelay: number; duration: number; weakMagnitude: number; strongMagnitude: number },
+    ): unknown;
+  } | null;
+}
+
+/** One dual-rumble frame handed to `GamepadHapticActuator.playEffect`. */
+export interface RumbleEffect {
+  startDelay: number;
+  duration: number;
+  weakMagnitude: number;
+  strongMagnitude: number;
+}
+
+// ---------------------------------------------------------------------------
+// Spec 17 Phase 2 — input shaping curves (pure, exported for the harness)
+// ---------------------------------------------------------------------------
+
+/**
+ * Progressive analog throttle trigger (Spec 17 §2.3.1):
+ * `f = R2^γ` with γ = 1.4. 0.5 → 0.3789 — torque builds progressively off
+ * the bite instead of shocking the regolith into wheelspin.
+ */
+export function gamepadThrottleCurve(raw: number): number {
+  const v = clamp(raw, 0, 1);
+  return Math.pow(v, GAMEPAD_THROTTLE_GAMMA);
+}
+
+/**
+ * Progressive service-brake trigger (Spec 17 §2.3.2 dual-stage):
+ * `f = L2^γ` with γ = 0.8 — a soft bite stage for threshold modulation,
+ * firming to full demand for the emergency stage.
+ */
+export function gamepadBrakeCurve(raw: number): number {
+  const v = clamp(raw, 0, 1);
+  return Math.pow(v, GAMEPAD_BRAKE_GAMMA);
+}
+
+/**
+ * Exponential steering curve (Spec 17 §2.2.2):
+ * `u = sign(x) · ((|x| − dz) / (1 − dz))^γ`, dz = 0.12, γ = 1.6. Dead-band
+ * first, re-normalised to full scale, then eased so the centre feels precise
+ * and the lock region progressive.
+ */
+export function gamepadSteerCurve(raw: number): number {
+  if (!Number.isFinite(raw)) return 0;
+  const sign = Math.sign(raw);
+  const abs = clamp(Math.abs(raw), 0, 1);
+  if (abs <= GAMEPAD_STEER_DEADZONE) return 0;
+  const norm = (abs - GAMEPAD_STEER_DEADZONE) / (1 - GAMEPAD_STEER_DEADZONE);
+  return sign * Math.pow(norm, GAMEPAD_STEER_GAMMA);
+}
+
+/**
+ * Map one physics frame of buggy telemetry to a dual-rumble effect, or null
+ * for silence. Priority order (one effect per frame keeps the haptics API
+ * from stacking over itself):
+ *   1. ABS modulating          → strong pulse   (the pedal-kick the driver expects)
+ *   2. emergency brake demand  → medium rumble  (panic stop building)
+ *   3. lateral slip / skid     → weak pulse     (traction budget warning)
+ *   4. launch wheelspin / redline → subtle short rumble (motor-overspeed tick)
+ */
+export function computeBuggyRumble(t: {
+  absActive: boolean;
+  brakeDemand: number;
+  throttleDemand: number;
+  speed: number;
+  lateralSlip: number;
+  speedLimit?: number;
+}): RumbleEffect | null {
+  const limit = t.speedLimit ?? BUGGY_SPEED_LIMIT;
+  const speed = Math.abs(t.speed);
+  if (t.absActive) {
+    return { startDelay: 0, duration: 45, weakMagnitude: 0.45, strongMagnitude: 0.9 };
+  }
+  if (t.brakeDemand >= RUMBLE_EMERGENCY_BRAKE) {
+    return { startDelay: 0, duration: 90, weakMagnitude: 0.5, strongMagnitude: 0.6 };
+  }
+  if (Math.abs(t.lateralSlip) >= RUMBLE_SLIP_VLAT) {
+    return { startDelay: 0, duration: 70, weakMagnitude: 0.6, strongMagnitude: 0.05 };
+  }
+  const launching = t.throttleDemand >= RUMBLE_WHEELSPIN_THROTTLE && speed < RUMBLE_WHEELSPIN_MAX_V;
+  const redline = speed >= limit * RUMBLE_REDLINE_FRAC;
+  if (launching || redline) {
+    return { startDelay: 0, duration: 30, weakMagnitude: 0.22, strongMagnitude: 0.0 };
+  }
+  return null;
 }
 
 /** Live remote puppet: physics is network-driven, meshes follow the render pos. */
@@ -351,6 +498,27 @@ export class ClientApp {
    */
   private prevGamepadButtons: boolean[] = [];
   private lastGamepadButtons: boolean[] = [];
+
+  /**
+   * Spec 17 Phase 2 anti-jerk trigger filter: the gamma-shaped R2/L2 demand
+   * smoothed per physics frame so launches and panic modulations ramp
+   * continuously instead of stepping. Owned by `stepEntities()` (one advance
+   * per frame — `sampleInput()` stays a stateless query).
+   */
+  private filteredThrottle = 0;
+  private filteredBrake = 0;
+
+  /** Frame-driven haptic clock (ms) + last `playEffect` timestamp (rate limit). */
+  private rumbleClockMs = 0;
+  private lastRumbleAt = Number.NEGATIVE_INFINITY;
+
+  /**
+   * Gamma-shaped trigger demands from the latest `sampleInput()` (pre-filter
+   * driver intent). The haptic pump reads the emergency-brake and launch
+   * thresholds off these; physics consumes the anti-jerk-filtered copies.
+   */
+  private lastThrottleDemand = 0;
+  private lastBrakeDemand = 0;
 
   private lastFrameAt: number | null = null;
   private moveAccumulatorMs = 0;
@@ -825,35 +993,54 @@ export class ClientApp {
     // axes sleep with the page keys (B still closes via the edge pump).
     const pad = this.pollGamepad();
     this.lastGamepadButtons = pad === null ? [] : pad.buttons.map((b) => b.pressed);
-    if (pad === null || (this.hud?.isTradeDialogOpen() ?? false)) return frame;
+    if (pad === null || (this.hud?.isTradeDialogOpen() ?? false)) {
+      // Pad asleep (or absent): no driver demand, no haptic cue.
+      this.lastThrottleDemand = 0;
+      this.lastBrakeDemand = 0;
+      return frame;
+    }
 
     const axis = (index: number): number => {
       const v = pad.axes[index];
       if (typeof v !== 'number' || !Number.isFinite(v) || Math.abs(v) <= GAMEPAD_DEADZONE) return 0;
       return clamp(v, -1, 1);
     };
-    // Spec 15 §4.1: Proportional steering with 15% deadzone and polynomial response (x^1.4)
-    const steerCurve = (v: number): number => {
-      const sign = Math.sign(v);
-      const abs = Math.abs(v);
-      if (abs <= GAMEPAD_DEADZONE) return 0;
-      const norm = (abs - GAMEPAD_DEADZONE) / (1 - GAMEPAD_DEADZONE);
-      return sign * Math.pow(norm, 1.4);
-    };
-    const trigger = (index: number): number => {
+    // Spec 17 §2.3.1 progressive trigger curves: T = R2^1.4, L2^0.8. The
+    // shaped demand is stashed for the haptic pump (driver-intent threshold,
+    // e.g. L2 ≥ 0.85 = emergency stop) while stepEntities() runs it through
+    // the anti-jerk filter before the physics sees it.
+    const rawTrigger = (index: number): number => {
       const v = pad.buttons[index]?.value;
       if (typeof v !== 'number' || !Number.isFinite(v)) return 0;
       return clamp(v, 0, 1);
     };
+    const trigger = (index: number): number => gamepadThrottleCurve(rawTrigger(index));
+    const brakeTrigger = (): number => gamepadBrakeCurve(rawTrigger(GAMEPAD_BUTTONS.brake));
+    this.lastThrottleDemand = trigger(GAMEPAD_BUTTONS.throttle);
+    this.lastBrakeDemand = brakeTrigger();
 
     frame.forward = clamp(
-      frame.forward + axis(GAMEPAD_AXES.throttle) * -1 + trigger(GAMEPAD_BUTTONS.throttle),
+      frame.forward + axis(GAMEPAD_AXES.throttle) * -1 + this.lastThrottleDemand,
       -1,
       1,
     );
-    frame.strafe = clamp(frame.strafe + steerCurve(axis(GAMEPAD_AXES.strafe)), -1, 1);
+    // Spec 17 §2.2.2: exponential steering curve (dz 0.12, γ 1.6) on the
+    // left stick — dead-band, re-normalise, ease. The curve carries its OWN
+    // (tighter) deadzone, so it reads the raw clamped axis rather than the
+    // 0.15-cut generic one; keyboard steering is digital and never passes
+    // through it.
+    const rawAxis = (index: number): number => {
+      const v = pad.axes[index];
+      if (typeof v !== 'number' || !Number.isFinite(v)) return 0;
+      return clamp(v, -1, 1);
+    };
+    frame.strafe = clamp(
+      frame.strafe + (keyStrafe === 0 ? gamepadSteerCurve(rawAxis(GAMEPAD_AXES.strafe)) : 0),
+      -1,
+      1,
+    );
     frame.yaw = clamp(frame.yaw + axis(GAMEPAD_AXES.yaw), -1, 1);
-    frame.brake = trigger(GAMEPAD_BUTTONS.brake);
+    frame.brake = this.lastBrakeDemand;
     frame.sprint =
       frame.sprint ||
       (pad.buttons[GAMEPAD_BUTTONS.sprintLeft]?.pressed ?? false) ||
@@ -1124,22 +1311,35 @@ export class ClientApp {
 
   private stepEntities(dt: number): void {
     const frame = this.sampleInput();
+    // Spec 17 Phase 2 anti-jerk filter: one exponential approach per frame on
+    // the shaped trigger demands (rate-limited slew, never a step). Advanced
+    // here — the single physics-step site — so repeated sampleInput() calls
+    // cannot double-filter.
+    const slew = clamp(GAMEPAD_TRIGGER_FILTER_RATE * dt, 0, 1);
+    this.filteredThrottle += (frame.forward - this.filteredThrottle) * slew;
+    this.filteredBrake += (frame.brake - this.filteredBrake) * slew;
+    if (Math.abs(this.filteredThrottle) < 1e-4) this.filteredThrottle = 0;
+    if (Math.abs(this.filteredBrake) < 1e-4) this.filteredBrake = 0;
     if (this.mode === 'buggy') {
       const buggy = this.requireBuggy();
       const steerInput = frame.strafe !== 0 ? frame.strafe : frame.yaw;
       const handbrake = frame.jump; // Space on keyboard, Button A on pad
+      const physicsThrottle = clamp(this.filteredThrottle, -1, 1);
       const input: BuggyInput = {
-        throttle: clamp(frame.forward, -1, 1),
-        brake: clamp(frame.brake, 0, 1),
-        regen: frame.forward < 0 && buggy.getSpeed() > 0.5 ? 1 : 0,
+        throttle: physicsThrottle,
+        brake: clamp(this.filteredBrake, 0, 1),
+        regen: physicsThrottle < 0 && buggy.getSpeed() > 0.5 ? 1 : 0,
         steer: clamp(steerInput, -1, 1),
         parkBrake: handbrake,
       };
       buggy.update(dt, input);
       if (buggy.getState().rolled) buggy.getPhysics().right();
+      this.pumpHaptics(dt, buggy);
     } else {
-      const suit = this.requireSuit();
+      // EVA path is untouched by the trigger filter (no analog triggers on
+      // foot — keep the legacy digital keyboard feel byte-for-byte).
       const speedScale = frame.sprint ? 1 : 0.55;
+      const suit = this.requireSuit();
       const input: SuitInput = {
         forward: clamp(frame.forward, -1, 1) * speedScale,
         strafe: clamp(frame.strafe, -1, 1) * speedScale,
@@ -1154,6 +1354,47 @@ export class ClientApp {
       suit.update(dt, input);
       // Parked buggy still settles on its suspension while abandoned.
       this.buggy?.update(dt, { ...IDLE_BUGGY_INPUT, parkBrake: true });
+      this.rumbleClockMs += dt * 1000;
+    }
+  }
+
+  // -- haptics --------------------------------------------------------------------
+
+  /**
+   * Frame-rate haptic pump (Spec 17 Phase 2): reads the buggy telemetry
+   * (ABS modulation, brake demand, lateral slip, launch/redline), decides on
+   * one dual-rumble effect via {@link computeBuggyRumble}, and hands it to
+   * the pad's `GamepadHapticActuator`.
+   *
+   * Defensive by construction — a pad without `vibrationActuator`, an
+   * actuator without `playEffect`, a synchronous throw, or a rejected
+   * promise are all swallowed: haptics must never break a driving frame.
+   * Effects are rate-limited to one per {@link RUMBLE_MIN_INTERVAL_MS} per
+   * pad so a 15 Hz ABS pulse cannot flood the browser event loop.
+   */
+  private pumpHaptics(dt: number, buggy: OpenBuggy): void {
+    this.rumbleClockMs += dt * 1000;
+    const state = buggy.getState();
+    const effect = computeBuggyRumble({
+      absActive: buggy.physics.absActive,
+      brakeDemand: this.lastBrakeDemand,
+      throttleDemand: this.lastThrottleDemand,
+      speed: state.vLong,
+      lateralSlip: state.vLat,
+    });
+    if (effect === null) return;
+    if (this.rumbleClockMs - this.lastRumbleAt < RUMBLE_MIN_INTERVAL_MS) return;
+    const pad = this.pollGamepad();
+    const actuator = pad?.vibrationActuator;
+    if (actuator === undefined || actuator === null || typeof actuator.playEffect !== 'function') return;
+    this.lastRumbleAt = this.rumbleClockMs;
+    try {
+      const result = actuator.playEffect('dual-rumble', effect);
+      if (result !== null && typeof result === 'object' && typeof (result as Promise<unknown>).then === 'function') {
+        (result as Promise<unknown>).catch(() => undefined);
+      }
+    } catch {
+      /* haptics are advisory — a pad that refuses to rumble still drives */
     }
   }
 
