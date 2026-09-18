@@ -4,8 +4,10 @@
  * Boots `OpenBuggy` headless (self-owned NullEngine + explicit NullEngine
  * injection) and verifies:
  *
- *   1. Build: rover constructs without a DOM, 12 procedural meshes, root
- *      node + 2 headlight SpotLights + materials present, idempotent init.
+ *   1. Build: rover constructs without a DOM, 69 procedural meshes (Spec 17
+ *      §4 realism overhaul: space-frame cage, winch bumper, A-arms,
+ *      coilovers, tie-rods, cockpit, light cones), root node + 2 headlight
+ *      SpotLights + 11 PBR materials present, idempotent init.
  *   2. Driving: throttle moves the vehicle forward and every state channel
  *      is BIT-IDENTICAL to a standalone `LunarBuggy` oracle stepped with the
  *      same inputs (the wrapper adds zero physics of its own).
@@ -26,8 +28,16 @@
 
 import { NullEngine } from '@babylonjs/core/Engines/nullEngine.js';
 import { Vector3 } from '@babylonjs/core/Maths/math.vector.js';
+import { PBRMaterial } from '@babylonjs/core/Materials/PBR/pbrMaterial.js';
 
-import { OpenBuggy, HEADLIGHT_INTENSITY, MOUNT_RADIUS_M } from '../src/entities/OpenBuggy.ts';
+import {
+  OpenBuggy,
+  HEADLIGHT_INTENSITY,
+  MOUNT_RADIUS_M,
+  COIL_SCALE_BUMP,
+  coilScaleFor,
+  rodScaleFor,
+} from '../src/entities/OpenBuggy.ts';
 import { EvaSuitAvatar } from '../src/entities/AstronautSuit.ts';
 import {
   BUGGY_BRAKE_FORCE,
@@ -99,14 +109,47 @@ check('no headlights before init', rover.getHeadlights().length === 0);
 rover.init(); // no args → self-owned NullEngine fallback
 check('init() builds under NullEngine', rover.isBuilt() === true);
 check('init() is idempotent', rover.init().isBuilt() === true);
-check('27 procedural meshes (cohesive hierarchy)', rover.getMeshes().length === 27, `got ${rover.getMeshes().length}`);
+check('69 procedural meshes (Spec 17 §4 realism hierarchy)', rover.getMeshes().length === 69, `got ${rover.getMeshes().length}`);
 check('all meshes named buggy-*', rover.getMeshes().every((m) => m.name.startsWith('buggy-')));
 check('root transform node present', rover.getRootNode() !== null);
 check('2 spotlight headlights', rover.getHeadlights().length === 2);
 check('headlights lit at spawn by default', rover.isHeadlightsOn() === true);
 
 const materials = new Set(rover.getMeshes().map((m) => m.material));
-check('meshes carry materials (6 PBR materials)', materials.size === 6 && [...materials].every((mm) => mm !== null));
+check('meshes carry materials (11 PBR materials)', materials.size === 11 && [...materials].every((mm) => mm !== null));
+
+// Spec 17 §4.4: every material is a PBRMaterial with finite metallic/roughness.
+const pbrOk = [...materials].every(
+  (mm) => mm instanceof PBRMaterial
+    && Number.isFinite((mm as PBRMaterial).metallic) && Number.isFinite((mm as PBRMaterial).roughness)
+    && (mm as PBRMaterial).metallic >= 0 && (mm as PBRMaterial).metallic <= 1
+    && (mm as PBRMaterial).roughness >= 0 && (mm as PBRMaterial).roughness <= 1,
+);
+check('all materials valid PBR (metallic/roughness in 0..1)', pbrOk);
+
+// Spec 17 §4.4 signature finishes: matte rubber vs polished stanchions split.
+const matByName = new Map([...materials].map((mm) => [mm!.name, mm as PBRMaterial]));
+check(
+  'matte rubber tyres (metallic ≤ 0.1, roughness ≥ 0.9)',
+  (() => {
+    const t = matByName.get('buggy-tire');
+    return !!t && t.metallic <= 0.1 && t.roughness >= 0.9;
+  })(),
+);
+check(
+  'polished suspension stanchions (metallic ≥ 0.9, roughness ≤ 0.2)',
+  (() => {
+    const s = matByName.get('buggy-polished');
+    return !!s && s.metallic >= 0.9 && s.roughness <= 0.2;
+  })(),
+);
+check(
+  'carbon-fibre textured bed (textured PBR panel)',
+  (() => {
+    const c = matByName.get('buggy-carbon');
+    return !!c && !!c.albedoTexture;
+  })(),
+);
 
 const wheelMeshes = rover.getMeshes().filter((m) => m.name.includes('wheel'));
 const expectedDia = BUGGY_WHEEL_RADIUS * 2;
@@ -139,6 +182,29 @@ check(
   'rigid chassis hierarchy (components share unified chassis parent)',
   chassisParts.length >= 8 && chassisParts.every((m) => m.parent === sharedParent && m.parent !== null),
 );
+
+// Spec 17 §4.1: skid plate, winch bumper, cage bracing present on the chassis.
+const named = (frag: string): number => rover.getMeshes().filter((m) => m.name.includes(frag)).length;
+check('underbody skid plate present', named('skid-plate') === 1);
+check('reinforced winch bumper bar + stubs + drum', named('winch') >= 4);
+check('tubular cage: 4 frame rails, 6 hoop tubes, 2 longons, 2 X braces',
+  named('frame-rail') === 2 && named('frame-crossmember') === 2
+  && named('cage-hoop') === 6 && named('cage-roof-longon') === 2 && named('cage-cross-brace') === 2);
+check('twin LED lightbars + front light cones', named('lightbar') === 2 && named('light-cone') === 2);
+check('bucket seat bolsters + 4-point harness straps',
+  named('seat-bolster') === 2 && named('harness-shoulder') === 2 && named('harness-lap') === 2);
+check('digital telemetry dash display textured', named('dash-display') === 1);
+
+// Spec 17 §4.2: per-corner double wishbones, coilover + damper, front tie-rods.
+check('double wishbones: upper + lower A-arm per corner',
+  named('a-arm-upper') === 4 && named('a-arm-lower') === 4);
+check('coilover springs: one per corner', rover.getCoilovers().length === 4
+  && rover.getCoilovers().every((c) => c.name.startsWith('buggy-coilover-spring-')));
+check('damper rods: one per corner', rover.getDamperRods().length === 4
+  && rover.getDamperRods().every((r) => r.name.startsWith('buggy-coilover-damper-')));
+check('steering tie-rod assemblies: left + right', rover.getTieRods().length === 2
+  && rover.getTieRods()[0].name === 'buggy-tie-rod-l' && rover.getTieRods()[1].name === 'buggy-tie-rod-r');
+check('front knuckles exist (2)', rover.getSteeringKnuckles().length === 2);
 
 // ---------------------------------------------------------------------------
 // 2. Driving — zero duplicated physics & straight-line stability
@@ -672,6 +738,111 @@ check('rear lateral stiffness > front (progressive understeer)', BUGGY_LATERAL_S
   const earthSlow = coast(ENV_EARTH_PROVING_GROUNDS);
   check('earth air + asphalt rolling bleeds speed faster than lunar plume', earthSlow < moonSlow - 0.1,
     `earth=${earthSlow.toFixed(2)} lunar=${moonSlow.toFixed(2)}`);
+}
+
+// ---------------------------------------------------------------------------
+// 12. Spec 17 Phase 5 — articulated suspension & steering visual realism
+//     (TASK-PLAY-064e, spec §4.2/§4.3, gate 7.3)
+// ---------------------------------------------------------------------------
+section('12. spec-17 phase 5: tie-rod steering articulation & coilover compression');
+
+// (a) Tie-rods exist and articulate with the live steering angle: the rod
+//     chord stretch responds monotonically to steer command, its aim
+//     quaternion re-solves per frame, and both ends track the Ackermann
+//     knuckles the wheels use.
+{
+  const rig = new OpenBuggy().init();
+  const rodL = rig.getTieRods()[0];
+  const rodR = rig.getTieRods()[1];
+  check('tie-rod assemblies present (L + R, chassis-parented)',
+    rig.getTieRods().length === 2 && rodL.parent !== null && rodR.parent !== null);
+
+  const chordAt = (cmd: number): { left: number; right: number; knuckleL: number } => {
+    for (let i = 0; i < 90; i++) rig.update(DT, drive({ throttle: 0.05, steer: cmd }));
+    const kn = rig.getSteeringKnuckles();
+    return {
+      left: rodL.scaling.y,
+      right: rodR.scaling.y,
+      knuckleL: kn[0].rotation.y,
+    };
+  };
+  const straight = chordAt(0);
+  const mid = chordAt(0.5);
+  const full = chordAt(1);
+  check('straight-ahead tie-rods near nominal rest chord',
+    Math.abs(straight.left - 1) < 0.08 && Math.abs(straight.right - 1) < 0.08,
+    `L=${straight.left.toFixed(3)} R=${straight.right.toFixed(3)}`);
+  check('tie-rods articulate with steering angle (chord changes with δ)',
+    Math.abs(full.left - straight.left) > 0.02 || Math.abs(full.right - straight.right) > 0.02,
+    `ΔL=${(full.left - straight.left).toFixed(3)} ΔR=${(full.right - straight.right).toFixed(3)}`);
+  check('knuckle yaw follows Ackermann (left wheel inside right at lock)',
+    Math.abs(full.knuckleL) > 0.3 && Math.abs(mid.knuckleL) > 0.1 && straight.knuckleL === 0,
+    `δL full=${full.knuckleL.toFixed(3)} mid=${mid.knuckleL.toFixed(3)}`);
+  check('tie-rod aim quaternion stays a finite unit rotation',
+    (() => {
+      const q = rodL.rotationQuaternion;
+      return q !== null && q.length() > 0.99 && q.length() < 1.01
+        && Number.isFinite(q.x) && Number.isFinite(q.y) && Number.isFinite(q.z) && Number.isFinite(q.w);
+    })());
+  check('tie-rod midpoint stays on the rack→knuckle line (finite, plausible)',
+    Math.abs(rodL.position.y) < 0.5 && Math.abs(Math.abs(rodL.position.x) - 0.65) < 0.35
+    && Math.abs(rodL.position.z - 1.15) < 0.5,
+    `pos=(${rodL.position.x.toFixed(2)},${rodL.position.y.toFixed(2)},${rodL.position.z.toFixed(2)})`);
+  rig.dispose();
+}
+
+// (b) Coilover dampers visibly compress with wheel suspension compression:
+//     the spring stack length scales by coilScaleFor(compression) every
+//     frame, and driving the buggy over a step terrain reaches the bump
+//     stop with the damper rod pulled in.
+{
+  const step = (x: number, _y: number): number => (x > 6 && x < 9 ? 0.25 : 0);
+  const rig = new OpenBuggy({ groundElevation: step }).init();
+  let maxCompression = 0;
+  let minCoil = Infinity;
+  let lawHolds = true;
+  for (let i = 0; i < 900; i++) {
+    const s = rig.update(DT, drive());
+    for (let c = 0; c < 4; c++) {
+      if (Math.abs(rig.getCoilovers()[c].scaling.y - coilScaleFor(s.wheels[c].compression)) > 1e-9) lawHolds = false;
+      if (Math.abs(rig.getDamperRods()[c].scaling.y - rodScaleFor(s.wheels[c].compression)) > 1e-9) lawHolds = false;
+    }
+    maxCompression = Math.max(maxCompression, ...s.wheels.map((w) => w.compression));
+    minCoil = Math.min(minCoil, rig.getCoilovers()[0].scaling.y);
+  }
+  check('coilover scaling law = coilScaleFor/rodScaleFor(compression) per frame', lawHolds);
+  check('coilovers visibly compress over terrain (scale drops below rest)',
+    minCoil < coilScaleFor(0.72) - 1e-6, `minCoil=${minCoil.toFixed(4)}`);
+  check('suspension reaches bump stop on the step (compression ≈ 1)',
+    maxCompression > 0.99, `maxCompression=${maxCompression.toFixed(4)}`);
+  check('compressed coilover hits the hard bump-stop scale exactly',
+    Math.abs(minCoil - COIL_SCALE_BUMP) < 1e-6, `minCoil=${minCoil.toFixed(4)} bump=${COIL_SCALE_BUMP}`);
+
+  // Per-corner independence: a ridge under the left wheels compresses the
+  // left coilovers and leaves the right ones near droop.
+  const ridge = (_x: number, y: number): number => (y > 0 ? 0.15 : 0);
+  const ridged = new OpenBuggy({ groundElevation: ridge }).init();
+  for (let i = 0; i < 300; i++) ridged.update(DT, IDLE_BUGGY_INPUT);
+  const rc = ridged.getCoilovers();
+  check('corner coilovers articulate independently (left ridge ≠ right plaine)',
+    rc[0].scaling.y < rc[1].scaling.y - 0.2,
+    `L=${rc[0].scaling.y.toFixed(3)} R=${rc[1].scaling.y.toFixed(3)}`);
+  rig.dispose();
+  ridged.dispose();
+}
+
+// (c) Digital telemetry dash: speed/power readouts stay live & finite while
+//     the dash mesh carries the emitted texture (Spec 17 §4.3).
+{
+  const rig = new OpenBuggy().init();
+  for (let i = 0; i < 120; i++) rig.update(DT, drive());
+  const t = rig.getTelemetry();
+  check('telemetry power readout live & finite under throttle',
+    Number.isFinite(t.powerKw) && t.powerKw > 1, `powerKw=${t.powerKw.toFixed(1)}`);
+  const dashMesh = rig.getMeshes().find((m) => m.name === 'buggy-dash-display');
+  const dashMat = dashMesh?.material as PBRMaterial | undefined;
+  check('dash display mesh carries its texture', dashMat !== undefined && dashMat.albedoTexture !== null);
+  rig.dispose();
 }
 
 // ---------------------------------------------------------------------------
