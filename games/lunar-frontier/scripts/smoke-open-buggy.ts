@@ -30,9 +30,15 @@ import { Vector3 } from '@babylonjs/core/Maths/math.vector.js';
 import { OpenBuggy, HEADLIGHT_INTENSITY, MOUNT_RADIUS_M } from '../src/entities/OpenBuggy.ts';
 import { EvaSuitAvatar } from '../src/entities/AstronautSuit.ts';
 import {
+  BUGGY_BRAKE_FORCE,
   BUGGY_CHASSIS_MASS,
   BUGGY_MAX_CARGO,
+  BUGGY_MAX_STEER,
+  BUGGY_MOTOR_POWER,
+  BUGGY_REGEN_FORCE,
+  BUGGY_THROTTLE_RISE,
   BUGGY_TRACK,
+  BUGGY_WHEEL_FORCE,
   BUGGY_WHEEL_RADIUS,
   IDLE_BUGGY_INPUT,
   LunarBuggy,
@@ -192,7 +198,18 @@ check(
   Math.abs(noseAzimuth - last.heading) < 1e-6,
   `azimuth=${noseAzimuth.toFixed(6)} heading=${last.heading.toFixed(6)}`,
 );
-check('chassis visibly tilts under acceleration (pitch/roll applied)', Math.abs(nose.y) > 1e-3, `nose.y=${nose.y.toFixed(4)}`);
+// Chassis attitude under drive (Spec 16 §2.2/§2.5): the load-transfer pitch is
+// sampled through the LAUNCH phase — under the Spec-16 powertrain the buggy is
+// already in limiter cruise by frame 300 (drive force ≈ 0, squat relieved), so
+// a cruise-frame sample would prove nothing about accel squat.
+const tiltRover = new OpenBuggy().init();
+let maxNoseTilt = 0;
+for (let i = 0; i < 120; i++) {
+  tiltRover.update(DT, drive());
+  const noseL = Vector3.TransformNormal(new Vector3(0, 0, 1), tiltRover.getRootNode()!.getWorldMatrix());
+  maxNoseTilt = Math.max(maxNoseTilt, Math.abs(noseL.y));
+}
+check('chassis visibly tilts under acceleration (launch-phase pitch/roll)', maxNoseTilt > 1e-3, `max|nose.y|=${maxNoseTilt.toFixed(4)}`);
 check('getBabylonYaw() = PI/2 + heading', Math.abs(driver.getBabylonYaw() - (Math.PI / 2 + last.heading)) < 1e-12);
 
 // ---------------------------------------------------------------------------
@@ -453,6 +470,106 @@ check('full throttle keeps all 4 corners ground-loaded', allCornersLoaded);
 
 restRover.dispose();
 launcher.dispose();
+
+// ---------------------------------------------------------------------------
+// 10. Spec 16 Phase 4 — powertrain & agile turnaround (TASK-PLAY-063d,
+//     spec §1.6/§1.7, §2.5/§2.6, gate 5 & 6)
+// ---------------------------------------------------------------------------
+section('10. spec-16 phase 4: acceleration / braking / turnaround / brake-to-reverse');
+
+// (a) Mandated constants (spec §2.5/§2.6) — assert the contract exactly.
+check('BUGGY_WHEEL_FORCE = 3800 N/wheel', BUGGY_WHEEL_FORCE === 3_800, `${BUGGY_WHEEL_FORCE}`);
+check('BUGGY_MOTOR_POWER = 18 kW/motor (72 kW AWD)', BUGGY_MOTOR_POWER === 18_000, `${BUGGY_MOTOR_POWER}`);
+check('BUGGY_REGEN_FORCE = 8000 N', BUGGY_REGEN_FORCE === 8_000, `${BUGGY_REGEN_FORCE}`);
+check('BUGGY_BRAKE_FORCE = 14000 N', BUGGY_BRAKE_FORCE === 14_000, `${BUGGY_BRAKE_FORCE}`);
+check('throttle torque rise rate = 12.0 /s', BUGGY_THROTTLE_RISE === 12.0, `${BUGGY_THROTTLE_RISE}`);
+check('BUGGY_MAX_STEER = 0.78 rad (45 deg lock)', Math.abs(BUGGY_MAX_STEER - 0.78) < 1e-12, `${BUGGY_MAX_STEER}`);
+
+// (b) Gate 5 — acceleration: >= 15 m/s within 3.0 s from standstill.
+{
+  const accelRover = new OpenBuggy().init();
+  let t15 = -1;
+  for (let i = 0; i < 600 && t15 < 0; i++) {
+    if (accelRover.update(DT, drive()).vLong >= 15) t15 = (i + 1) * DT;
+  }
+  check('GATE5: 0 -> 15 m/s in <= 3.0 s', t15 >= 0 && t15 <= 3.0, t15 < 0 ? 'never reached 15' : `${t15.toFixed(2)}s`);
+  accelRover.dispose();
+}
+
+// (c) Gate 6a — braking: 15 m/s -> standstill within 1.8 s.
+{
+  const braker = new OpenBuggy().init();
+  for (let i = 0; i < 3_600; i++) if (braker.update(DT, drive()).vLong >= 15) break;
+  let tb = -1;
+  for (let i = 0; i < 300; i++) {
+    if (Math.abs(braker.update(DT, drive({ throttle: 0, brake: 1 })).vLong) < 0.05) { tb = (i + 1) * DT; break; }
+  }
+  check('GATE6: 15 -> 0 m/s in <= 1.8 s', tb >= 0 && tb <= 1.8, tb < 0 ? 'never stopped' : `${tb.toFixed(2)}s`);
+  braker.dispose();
+}
+
+// (d) Gate 6b — agile low-speed turnaround: full lock from standstill with a
+//     blended brake pedal, the torque-vectoring pivot reverses heading in
+//     < 3.0 s. Turning radius = half the path chord of the 180° reversal (the
+//     space the maneuver needs; a pure pivot scores ~0). All motion must stay
+//     inside the low-speed regime (< 4 m/s assist cut-off).
+{
+  const pivoter = new OpenBuggy().init();
+  for (let i = 0; i < 60; i++) pivoter.update(DT, IDLE_BUGGY_INPUT);
+  const p0 = pivoter.getState();
+  let acc = 0, t180 = -1, vMax = 0;
+  for (let i = 0; i < 600 && t180 < 0; i++) {
+    const s = pivoter.update(DT, drive({ throttle: 1, steer: 1, brake: 0.6 }));
+    acc += Math.abs(s.yawRate) * DT;
+    vMax = Math.max(vMax, Math.hypot(s.vLong, s.vLat));
+    if (acc >= Math.PI) t180 = (i + 1) * DT;
+  }
+  const p1 = pivoter.getState();
+  const turnRadius = Math.hypot(p1.x - p0.x, p1.y - p0.y) / 2;
+  check('GATE6: 180 deg turnaround in < 3.0 s (low speed, torque-vectored)', t180 > 0 && t180 < 3.0, t180 < 0 ? 'never turned 180' : `${t180.toFixed(2)}s`);
+  check('turning radius < 3.5 m (half-chord of the reversal)', turnRadius < 3.5, `R=${turnRadius.toFixed(2)}m`);
+  check('turnaround stays inside the low-speed regime (< 4 m/s)', vMax < 4.0, `vMax=${vMax.toFixed(2)}`);
+  pivoter.dispose();
+}
+
+// (e) Speed-sensitive steering contract (Spec 15 law re-cut by Spec 16 §2.6):
+//     full 0.78 lock below 3 m/s, delta_0/(1 + 0.08*(|v|-3)) above it.
+{
+  const steerAt = (v: number): number => {
+    const b = new LunarBuggy({}, { vLong: v });
+    return b.step(DT, { ...IDLE_BUGGY_INPUT, steer: 1, parkBrake: false }).steerAngle ?? 0;
+  };
+  const formula = (v: number): number => BUGGY_MAX_STEER / (1 + 0.08 * Math.max(0, v - 3));
+  check('full 0.78 lock at standstill', Math.abs(steerAt(0) - BUGGY_MAX_STEER) < 1e-6, `${steerAt(0)}`);
+  check('full lock held through 3 m/s band', Math.abs(steerAt(2) - BUGGY_MAX_STEER) < 1e-3, `${steerAt(2)}`);
+  check('derating law delta_0/(1+0.08*(v-3)) above the band', Math.abs(steerAt(10) - formula(10)) < 1e-3, `${steerAt(10).toFixed(4)} vs ${formula(10).toFixed(4)}`);
+  check('high-speed steer angle still below low-speed lock', steerAt(20) < BUGGY_MAX_STEER * 0.55, `${steerAt(20).toFixed(3)}`);
+}
+
+// (f) Instant brake-to-reverse: pedal release at a standstill hands reverse
+//     authority back within a few frames — no 0.2 m/s coast-down gate.
+{
+  const b2r = new OpenBuggy().init();
+  for (let i = 0; i < 3_600; i++) if (b2r.update(DT, drive()).vLong >= 15) break;
+  // Brake (with reverse intent) to a dead stop, pedal held.
+  let held = false;
+  for (let i = 0; i < 300; i++) {
+    const s = b2r.update(DT, drive({ throttle: -1, brake: 1 }));
+    if (Math.abs(s.vLong) < 0.02) { held = true; break; }
+  }
+  check('b2r: held brake pins a dead standstill (< 0.02 m/s)', held);
+  if (held) {
+    // Release the brake, keep the reverse intent: motion must start NOW.
+    let t = -1;
+    for (let i = 0; i < 30; i++) {
+      const s = b2r.update(DT, drive({ throttle: -1, brake: 0 }));
+      if (s.vLong < -0.05) { t = (i + 1) * DT; break; }
+    }
+    check('b2r: reverse motion starts <= 0.5 s after pedal release', t >= 0 && t <= 0.5, t < 0 ? 'no reverse motion' : `${(t * 1000).toFixed(0)}ms`);
+    check('b2r: driveMode flipped to REVERSE', b2r.getState().driveMode === 'REVERSE');
+  }
+  b2r.dispose();
+}
 
 // ---------------------------------------------------------------------------
 // Verdict

@@ -18,6 +18,8 @@
   --lf-dim: rgba(223, 238, 251, 0.55);
   --lf-cyan: #56e0ff;
   --lf-good: #5ce6a4;
+  /* Alias for the vein-nav green (TASK-PLAY-063c). */
+  --lf-green: #5ce6a4;
   --lf-warn: #ffcc55;
   --lf-bad: #ff5d5c;
   --lf-radius: 14px;
@@ -215,6 +217,20 @@
 .compass-pin-readout {
   color: var(--lf-text);
   letter-spacing: 0.06em;
+}
+
+/* Vein nav pin & guidance arrow (TASK-PLAY-063c) */
+.compass-pin[data-target="vein"] {
+  border-color: rgba(92, 230, 164, 0.6);
+}
+
+.compass-pin[data-target="vein"] .compass-pin-icon {
+  color: var(--lf-green);
+}
+
+.compass-pin[data-target="vein"] .compass-pin-arrow {
+  color: var(--lf-cyan);
+  font-weight: bold;
 }
 
 /* --- onboarding checklist (spec 14 §3.5) ------------------------------------------- */

@@ -83,6 +83,13 @@ export const MOVE_INTERVAL_MS = 50;
 /** Handheld scanner sweep radius (vein surface distance), metres. */
 export const SCAN_RANGE_M = 80;
 
+/**
+ * Long-range mineral scanner envelope for the compass nav pin
+ * (TASK-PLAY-063c): the HUD steers toward the best qualified vein within
+ * this slant distance, not only the handheld-reachable ones.
+ */
+export const NAV_SCAN_RANGE_M = 1200;
+
 /** Vein surface distance within which the geo-drill reaches, metres. */
 export const MINE_RANGE_M = 25;
 
@@ -292,6 +299,12 @@ function wrap360(deg: number): number {
   return ((deg % 360) + 360) % 360;
 }
 
+/** Wrap degrees to (-180, 180] — a relative bearing offset from heading. */
+function wrap180(deg: number): number {
+  const w = wrap360(deg);
+  return w > 180 ? w - 360 : w;
+}
+
 /**
  * Compass bearing (degrees, 0 = North, clockwise) from one world-frame point
  * to another. World +y is North and physics heading θ runs counter-clockwise
@@ -369,6 +382,9 @@ export class ClientApp {
   private scannerReadout: HudScannerReadout = { found: false, message: 'SCANNING…' };
   private nearestVein: ResourceVein | null = null;
   private nearestVeinRangeM: number | null = null;
+  /** Long-range nav target (TASK-PLAY-063c) — best vein within NAV_SCAN_RANGE_M. */
+  private navVein: ResourceVein | null = null;
+  private navVeinRangeM: number | null = null;
 
   private started = false;
   private initialized = false;
@@ -698,6 +714,17 @@ export class ClientApp {
   getNearestVein(): { vein: ResourceVein; rangeM: number } | null {
     if (this.nearestVein === null || this.nearestVeinRangeM === null) return null;
     return { vein: this.nearestVein, rangeM: this.nearestVeinRangeM };
+  }
+
+  /**
+   * Long-range nav target (TASK-PLAY-063c): nearest non-regolith vein within
+   * NAV_SCAN_RANGE_M, falling back to the nearest regolith; null when nothing
+   * qualifies.
+   */
+  getNavVein(): { vein: ResourceVein; rangeM: number } | null {
+    return this.navVein !== null && this.navVeinRangeM !== null
+      ? { vein: this.navVein, rangeM: this.navVeinRangeM }
+      : null;
   }
 
   /** The frame the movement stream would send right now. */
@@ -1263,6 +1290,12 @@ export class ClientApp {
 
     let best: ResourceVein | null = null;
     let bestRange = Number.POSITIVE_INFINITY;
+    // Long-range nav survey (TASK-PLAY-063c): nearest non-regolith within
+    // NAV_SCAN_RANGE_M wins the compass pin; nearest regolith is fallback.
+    let nav: ResourceVein | null = null;
+    let navRange = Number.POSITIVE_INFINITY;
+    let regolith: ResourceVein | null = null;
+    let regolithRange = Number.POSITIVE_INFINITY;
     for (const vein of snapshot.veins) {
       const d =
         Math.sqrt(
@@ -1272,7 +1305,22 @@ export class ClientApp {
         bestRange = d;
         best = vein;
       }
+      if (d <= NAV_SCAN_RANGE_M) {
+        if (vein.kind !== 'regolith') {
+          if (d < navRange) {
+            navRange = d;
+            nav = vein;
+          }
+        } else if (d < regolithRange) {
+          regolithRange = d;
+          regolith = vein;
+        }
+      }
     }
+    const navTarget = nav ?? regolith;
+    this.navVein = navTarget;
+    this.navVeinRangeM =
+      navTarget !== null ? Math.max(0, nav !== null ? navRange : regolithRange) : null;
 
     if (best !== null && bestRange <= SCAN_RANGE_M) {
       this.nearestVein = best;
@@ -1477,12 +1525,19 @@ export class ClientApp {
       };
     }
 
-    const vein = this.getNearestVein();
-    if (vein !== null) {
+    const nav = this.getNavVein() ?? this.getNearestVein();
+    if (nav !== null) {
+      const bearingDeg = compassBearingDeg(p, nav.vein.center);
+      const relBearing = wrap180(bearingDeg - headingDeg);
+      let arrow = '▲';
+      if (relBearing < -15) arrow = '◀';
+      else if (relBearing > 15) arrow = '▶';
       targets.vein = {
-        kind: vein.vein.kind,
-        bearing: compassBearingDeg(p, vein.vein.center),
-        dist: vein.rangeM,
+        kind: nav.vein.kind,
+        bearing: bearingDeg,
+        dist: nav.rangeM,
+        relBearing,
+        arrow,
       };
     }
 

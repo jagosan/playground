@@ -153,6 +153,10 @@ export interface HudCompassBaseBearing extends HudCompassBearing {
 export interface HudCompassVeinBearing extends HudCompassBearing {
   /** Vein resource kind shown beside the 💎 pin (e.g. `ilmenite`). */
   kind: string;
+  /** Bearing minus heading, wrapped to (-180, 180] (TASK-PLAY-063c). */
+  relBearing?: number;
+  /** Guidance arrow prefixed to the readout: '◀' | '▲' | '▶' (TASK-PLAY-063c). */
+  arrow?: string;
 }
 
 /** Everything `updateCompass()` can pin at once — any subset may be absent. */
@@ -581,9 +585,12 @@ export class LunarHUD {
     const label = name !== undefined && name.length > 0 ? String(name).toUpperCase() : '';
     const readout = this.compassPinReadouts.get(key);
     if (readout !== undefined) {
+      const arrow = (target as HudCompassVeinBearing).arrow;
+      const arrowPrefix = arrow !== undefined && arrow.length > 0 ? `${arrow} ` : '';
       readout.textContent =
-        `${label.length > 0 ? `${label} ` : ''}${Math.round(wrap360(target.bearing))}° · ${num(target.dist, 0)} m`;
+        `${arrowPrefix}${label.length > 0 ? `${label} ` : ''}${Math.round(wrap360(target.bearing))}° · ${num(target.dist, 0)} m`;
     }
+    pin.setAttribute('data-arrow', (target as HudCompassVeinBearing).arrow ?? '');
     this.setClassEl(pin, 'is-hidden', false);
     this.setClassEl(pin, 'is-edge', Math.abs(delta) > HUD_COMPASS_WINDOW_DEG);
   }
