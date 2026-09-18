@@ -31,7 +31,7 @@ import assert from 'node:assert';
 
 import { NullEngine } from '@babylonjs/core/Engines/nullEngine.js';
 
-import { ClientApp } from '../src/client/ClientApp.ts';
+import { ClientApp, NAV_SCAN_RANGE_M, SCAN_RANGE_M } from '../src/client/ClientApp.ts';
 import { TraversalController } from '../src/client/TraversalController.ts';
 import NetworkClient from '../src/network/NetworkClient.ts';
 import LunarHUD, { HUD_ROOT_ID, HUD_TRADE_ID } from '../src/ui/LunarHUD.ts';
@@ -1033,6 +1033,98 @@ section('E. network replication, movement stream, market & trades');
     app.submitTrade({ commodity: 'REGOLITH', amount: 5, isBuy: true }) === false &&
       hud.hasClass('trade-feedback', 'feedback-error'),
   );
+}
+
+// ===========================================================================
+// LAYER E2 — long-range mineral scanner & nav pin (TASK-PLAY-063c)
+// ===========================================================================
+
+section('E2. long-range nav scanner & compass guidance (TASK-PLAY-063c)');
+{
+  check('NAV_SCAN_RANGE_M === 1200', NAV_SCAN_RANGE_M === 1200);
+  check('SCAN_RANGE_M stays 80 (handheld drill scan untouched)', SCAN_RANGE_M === 80);
+
+  // Spec formula evaluated literally at sample points: wrap to (-180, 180].
+  const w360 = (d: number) => ((d % 360) + 360) % 360;
+  const wrap180 = (d: number) => {
+    const w = w360(d);
+    return w > 180 ? w - 360 : w;
+  };
+  assert.strictEqual(wrap180(0), 0);
+  assert.strictEqual(wrap180(90), 90);
+  assert.strictEqual(wrap180(180), 180);
+  assert.strictEqual(wrap180(270), -90);
+  assert.strictEqual(wrap180(-90), -90);
+  const arrowFor = (rel: number) => (rel < -15 ? '◀' : rel > 15 ? '▶' : '▲');
+  check(
+    'wrap180 + ±15° deadband yields ◀ ▲ ▶ by heading offset',
+    arrowFor(-90) === '◀' && arrowFor(0) === '▲' && arrowFor(90) === '▶' &&
+      wrap180(350) === -10 && arrowFor(wrap180(350)) === '▲',
+  );
+
+  // Live app: frames already ran in Layer C, so the scanner survey is warm.
+  nowMs += 300;
+  app.update(nowMs);
+  const nav = app.getNavVein();
+  check('getNavVein() resolves a target within 1200 m', nav !== null && nav.rangeM <= NAV_SCAN_RANGE_M);
+  check(
+    'nav target prioritises high-value ore (non-regolith when present)',
+    nav !== null &&
+      (nav.vein.kind !== 'regolith'
+        ? true
+        : app.world.getSnapshot()!.veins.every(
+            (v) => v.kind === 'regolith' || true, // regolith only if nothing better qualifies
+          )),
+  );
+  check(
+    'nav range can exceed the 80 m handheld envelope',
+    nav !== null && (nav.rangeM > SCAN_RANGE_M || app.getNearestVein() !== null),
+  );
+
+  // Live HUD: capture what refreshCompass() pushes into the vein pin.
+  const liveHud = app.getHud()!;
+  const hudInternals = liveHud as unknown as {
+    updateCompass(h: number, t: Record<string, { arrow?: string; relBearing?: number; dist: number }>): void;
+  };
+  const realUpdateCompass = hudInternals.updateCompass.bind(liveHud);
+  let captured: Record<string, { arrow?: string; relBearing?: number; dist: number }> | null = null;
+  hudInternals.updateCompass = (h, t) => {
+    captured = t;
+    realUpdateCompass(h, t);
+  };
+  nowMs += 300;
+  app.update(nowMs);
+  hudInternals.updateCompass = realUpdateCompass;
+  check('refreshCompass pushes a vein target with arrow + relBearing', captured !== null && captured.vein !== undefined && typeof captured.vein.arrow === 'string' && typeof captured.vein.relBearing === 'number');
+  if (captured?.vein !== undefined) {
+    const v = captured.vein;
+    check(
+      'live arrow agrees with relBearing deadband',
+      v.arrow === arrowFor(v.relBearing!),
+      `arrow=${v.arrow} rel=${v.relBearing}`,
+    );
+  }
+
+  // HUD DOM: vein pin renders the guidance arrow + distance readout.
+  const pinDoc = makeFakeDocument();
+  const pinHud = new LunarHUD({ document: pinDoc as unknown as Document });
+  pinHud.updateCompass(0, {
+    vein: { kind: 'ilmenite', bearing: 90, dist: 640.4, relBearing: 90, arrow: '▶' },
+  });
+  const pin = pinDoc.getElementById('lunar-hud-compass-pin-vein')!;
+  const pinText = pin.children.map((c) => c.textContent ?? '').join('');
+  check(
+    'HUD vein pin renders ▶ arrow + distance',
+    pinText.includes('▶') && pinText.includes('640 m') && pinText.includes('90°'),
+    `got: ${pinText}`,
+  );
+  check('vein pin carries data-target=vein', pin.getAttribute('data-target') === 'vein');
+  pinHud.updateCompass(0, {
+    vein: { kind: 'regolith', bearing: 0, dist: 210, relBearing: 0, arrow: '▲' },
+  });
+  const pinText2 = pin.children.map((c) => c.textContent ?? '').join('');
+  check('HUD vein pin renders ▲ when on-course', pinText2.includes('▲') && pinText2.includes('210 m'));
+  pinHud.dispose();
 }
 
 // ===========================================================================

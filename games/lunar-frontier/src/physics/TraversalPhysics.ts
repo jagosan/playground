@@ -449,12 +449,32 @@ export const BUGGY_SPRING_TRAVEL = 0.2;
 export const BUGGY_MU_PEAK = REGOLITH_MU;
 /** Slip ratio at which peak traction occurs (simplified Pacejka shaping). */
 export const BUGGY_SLIP_PEAK = 0.14;
-/** Per-wheel peak tractive force at the contact patch (N). */
-export const BUGGY_WHEEL_FORCE = 2_400;
-/** Per-motor continuous power limit (W). */
-export const BUGGY_MOTOR_POWER = 9_000;
-/** Peak motor regenerative braking force (N, total). */
-export const BUGGY_REGEN_FORCE = 4_500;
+/**
+ * Peak wheel force at the contact patch, drive OR brake (N). Spec 16 §2.5
+ * raises this to 3,800 N/wheel (15.2 kN AWD launch traction): the wheel is a
+ * geared ground-implement — grousers engage regolith mechanically, so the
+ * active longitudinal force is governed by this drivetrain limit rather than
+ * the passive soil friction circle.
+ */
+export const BUGGY_WHEEL_FORCE = 3_800;
+/** Per-motor continuous power limit (W) — 72 kW quad-motor AWD (spec 16 §2.5). */
+export const BUGGY_MOTOR_POWER = 18_000;
+/** Peak motor regenerative braking force (N, total, spec 16 §2.6). */
+export const BUGGY_REGEN_FORCE = 8_000;
+/** Peak friction (service) brake force at the road wheels (N, total, spec 16 §2.6). */
+export const BUGGY_BRAKE_FORCE = 14_000;
+/** Throttle torque rise approach rate (1/s) — spec 16 §2.5 (was 4.0). */
+export const BUGGY_THROTTLE_RISE = 12.0;
+/** Speed (m/s) below which full steering lock holds; derating applies above (spec 16 §2.6). */
+export const BUGGY_STEER_FULL_LOCK_V = 3.0;
+/** Low-speed torque-vectoring / skid-steer assist moment (N·m, spec 16 §2.6). */
+export const BUGGY_YAW_ASSIST_TORQUE = 5_200;
+/** Assist cut-off speed (m/s): M = sign(δ)·τ·(1 − |v|/4.0), zero at/above this (spec 16 §2.6). */
+export const BUGGY_YAW_ASSIST_SPEED = 4.0;
+/** Assist yaw-rate saturation (rad/s) — the pivot bites once the regolith gives. */
+export const BUGGY_YAW_ASSIST_MAX_RATE = 1.8;
+/** Brake-hold window (m/s): throttle intent flips the drive direction instantly inside it (spec 16 §2.6). */
+export const BUGGY_REVERSE_ENGAGE_V = 0.4;
 /** Regenerator round-trip efficiency. */
 export const BUGGY_REGEN_EFFICIENCY = 0.62;
 /** Rolling resistance coefficient into loose regolith (Spec 15: 0.04). */
@@ -467,8 +487,8 @@ export const BUGGY_SPEED_LIMIT = 22;
 export const BUGGY_REVERSE_SPEED_LIMIT = 5.0;
 /** Onboard traction battery (kWh). */
 export const BUGGY_BATTERY_KWH = 2.2;
-/** Max road-wheel steering angle (rad). */
-export const BUGGY_MAX_STEER = 0.55;
+/** Max road-wheel steering angle (rad) — 45° low-speed lock (spec 16 §2.6, was 0.55). */
+export const BUGGY_MAX_STEER = 0.78;
 /** Roll-over stability index at zero cargo: a_lat / g. */
 export const BUGGY_EMPTY_ROLLOVER_INDEX = BUGGY_TRACK / (2 * 0.75);
 
@@ -687,7 +707,7 @@ export class LunarBuggy {
     const rawBrake = clamp(input.brake, 0, 1);
 
     if (this.driveMode === 'FORWARD') {
-      if (s.vLong <= 0.2 && rawThrottle < -0.05) {
+      if (s.vLong <= BUGGY_REVERSE_ENGAGE_V && rawThrottle < -0.05) {
         this.driveMode = 'REVERSE';
       } else if (Math.abs(s.vLong) < 0.2 && Math.abs(rawThrottle) <= 0.05) {
         this.driveMode = 'STOPPED';
@@ -699,7 +719,7 @@ export class LunarBuggy {
         this.driveMode = 'REVERSE';
       }
     } else if (this.driveMode === 'REVERSE') {
-      if (s.vLong >= -0.2 && rawThrottle > 0.05) {
+      if (s.vLong >= -BUGGY_REVERSE_ENGAGE_V && rawThrottle > 0.05) {
         this.driveMode = 'FORWARD';
       } else if (Math.abs(s.vLong) < 0.2 && Math.abs(rawThrottle) <= 0.05) {
         this.driveMode = 'STOPPED';
@@ -734,9 +754,21 @@ export class LunarBuggy {
     if (this.state.rolled) targetTorqueDemand = 0;
     if (s.vLong > BUGGY_SPEED_LIMIT && targetTorqueDemand > 0) targetTorqueDemand = 0;
     if (s.vLong < -BUGGY_REVERSE_SPEED_LIMIT && targetTorqueDemand < 0) targetTorqueDemand = 0;
+    // Brake-priority override (spec 16 §2.6): pedal pressure scales drive torque
+    // out so the 14 kN friction brake does the stopping instead of fighting the
+    // motors. Below the reverse-engage window a heavy pedal instead VETOS drive
+    // outright — a held brake pins the buggy dead (stable, no drive-vs-brake
+    // limit cycle), and releasing the pedal hands full authority back to the
+    // motors the same frame: instant zero-threshold brake-to-reverse.
+    const isBrakeHold = speedRef < BUGGY_REVERSE_ENGAGE_V && serviceBrakeDemand >= 0.5;
+    if (isBrakeHold) {
+      targetTorqueDemand = 0;
+    } else if (speedRef > BUGGY_REVERSE_ENGAGE_V) {
+      targetTorqueDemand *= 1 - clamp(serviceBrakeDemand, 0, 1);
+    }
 
-    // Smooth motor torque rise: approach(tau_current, tau_target, 4.0, dt)
-    this.motorTorque = approach(this.motorTorque, targetTorqueDemand, 4.0, dt);
+    // Smooth motor torque rise: approach(tau_current, tau_target, 12.0, dt)
+    this.motorTorque = approach(this.motorTorque, targetTorqueDemand, BUGGY_THROTTLE_RISE, dt);
     if (Math.abs(this.motorTorque) < 1e-4) this.motorTorque = 0;
 
     const powerCap = (BUGGY_MOTOR_POWER * 4) / Math.max(Math.abs(s.vLong), 1.0);
@@ -744,18 +776,56 @@ export class LunarBuggy {
     let driveForce = this.motorTorque * maxTractive;
     if (this.state.batteryKwh <= 0) driveForce = 0;
 
+    // Hard speed governor (spec 15 §3.2 limiter, hard-enforced for the Spec-16
+    // powertrain): beyond a limiter cut drive instantly (a mere zeroed target
+    // leaves ~0.2 s of full 15.2 kN torque in the pipe), then ease back with a
+    // proportional retarding force so reverse settles AT the limit instead of
+    // overshooting from torque lag.
+    let limiterForce = 0;
+    if (s.vLong < -BUGGY_REVERSE_SPEED_LIMIT) {
+      if (driveForce < 0) {
+        driveForce = 0;
+        this.motorTorque = 0;
+      }
+      limiterForce = Math.min(
+        (-s.vLong - BUGGY_REVERSE_SPEED_LIMIT) * 4_000,
+        BUGGY_WHEEL_FORCE * 4,
+      );
+    } else if (s.vLong > BUGGY_SPEED_LIMIT && driveForce > 0) {
+      driveForce = 0;
+      this.motorTorque = 0;
+    }
+
     // Regen + friction brake
     const regenDemand = clamp(input.regen, 0, 1) * BUGGY_REGEN_FORCE
       + serviceBrakeDemand * BUGGY_REGEN_FORCE * 0.7;
     let regenForce = speedRef > 0.1 ? -Math.sign(s.vLong) * Math.min(regenDemand, BUGGY_REGEN_FORCE) : 0;
     if (this.state.rolled || this.state.batteryKwh >= BUGGY_BATTERY_KWH) regenForce = 0;
 
-    const frictionBrakeForce = speedRef > 0.05 ? -Math.sign(s.vLong) * serviceBrakeDemand * 6000 : 0;
+    const frictionBrakeForce =
+      speedRef > 0.05 ? -Math.sign(s.vLong) * serviceBrakeDemand * BUGGY_BRAKE_FORCE : 0;
 
-    // Steer angle & speed-sensitive derating
+    // A brake can only arrest existing motion, never drive it backwards:
+    // cap regen + friction so one substep of braking removes at most the
+    // remaining velocity. Without this, the 14 kN brake + 8 kN regen would
+    // ramp through zero and fling the buggy into spurious counter-motion,
+    // which also blocks instant brake-to-reverse (the mode machine keeps
+    // seeing velocity of the wrong sign).
+    let brakeTotal = regenForce + frictionBrakeForce;
+    if (Math.abs(s.vLong) > 1e-6) {
+      const maxBrake = (Math.abs(s.vLong) * m) / dt;
+      brakeTotal = clamp(brakeTotal, -maxBrake, maxBrake);
+    } else {
+      brakeTotal = 0;
+    }
+
+    // Steer angle & speed-sensitive derating (spec 16 §2.6): full 0.78 rad lock
+    // holds below BUGGY_STEER_FULL_LOCK_V, then the Spec-15 derating law
+    // delta_0 / (1 + 0.08·|v|) applies to the speed above that band.
     const rawSteer = clamp(input.steer, -1, 1);
     const isZeroSteer = Math.abs(rawSteer) < 1e-3;
-    const maxSteer = BUGGY_MAX_STEER / (1 + 0.08 * Math.abs(s.vLong));
+    const overLockSpeed = Math.max(0, Math.abs(s.vLong) - BUGGY_STEER_FULL_LOCK_V);
+    const maxSteer = BUGGY_MAX_STEER / (1 + 0.08 * overLockSpeed);
     const steerAngle = isZeroSteer ? 0 : rawSteer * maxSteer;
     this.steerAngle = steerAngle;
 
@@ -844,8 +914,9 @@ export class LunarBuggy {
       const wheel = s.wheels[i];
       if (parkSlipLock) wheel.spin = 0;
 
-      // Drive force shared equally; regen and service brake applied at all four corners.
-      let forceAlong = driveForce / 4 + (regenForce + frictionBrakeForce) / 4;
+      // Drive force shared equally; regen, service brake (reversal-capped) and
+      // the reverse-limiter retarding force applied at all four corners.
+      let forceAlong = driveForce / 4 + (brakeTotal + limiterForce) / 4;
 
       // Slip ratio (motion-based, simplified).
       const refSpeed = Math.max(Math.abs(wx), 0.8);
@@ -853,15 +924,18 @@ export class LunarBuggy {
       let slip = (wheelSurface - wx) / refSpeed;
       if (Math.abs(slip) > 4) slip = Math.sign(slip) * 4;
 
-      const curve = atanCurve(slip / BUGGY_SLIP_PEAK);
-      const driveSign = driveForce + regenForce >= 0 ? 1 : -1;
-      let Fx = mu * loadN * curve * (Math.abs(driveForce) + Math.abs(regenForce) > 0 ? 1 : driveSign);
-      // Longitudinal force must obey the demand when traction allows.
-      Fx = clamp(Fx, -mu * loadN, mu * loadN);
-      forceAlong = clamp(forceAlong, -mu * loadN * 4, mu * loadN * 4);
-      // Blend demanded force through the traction limit.
-      const tractionCap = mu * loadN * Math.sqrt(Math.max(0, 1 - 0.5 * Math.min(1, Math.abs(slip))));
-      forceAlong = clamp(forceAlong, -Math.max(tractionCap, 0), Math.max(tractionCap, 0));
+      // Grouser-limited active longitudinal force (spec 16 §2.5): a rigid
+      // groused lunar wheel is a ground-implement — drive AND braking forces
+      // are governed by the drivetrain's wheel-force ceiling (3.8 kN), not the
+      // passive soil circle (μ·N ≈ 0.24 kN here — an order of magnitude
+      // too small to launch 880 kg). The cap fades out with contact fraction
+      // so an airborne wheel produces no reactionless thrust, and heavy loads
+      // may still exceed it through pure traction.
+      const grouserCap = Math.max(
+        BUGGY_WHEEL_FORCE * clamp(loadFrac, 0, 1),
+        mu * loadN,
+      );
+      forceAlong = clamp(forceAlong, -grouserCap, grouserCap);
 
       // Lateral Pacejka-style force.
       const refLat = Math.max(Math.abs(wy), 0.6);
@@ -870,10 +944,11 @@ export class LunarBuggy {
       let Fy = mu * loadN * atanCurve(9 * (alphaHat + 0.6 * alphaHat * Math.abs(alphaHat))) * (refLat > 0.25 || speedRef > 0.25 ? 1 : 0);
       void alpha;
 
-      // Friction ellipse: clip combined force to mu*N.
+      // Combined-force ellipse: active longitudinal shares the patch with
+      // passive lateral grip (grouser axis vs μ axis respectively).
       const fMax = mu * loadN;
       const fLongTotal = forceAlong;
-      const norm = Math.hypot(fLongTotal / Math.max(fMax, 1), Fy / Math.max(fMax, 1));
+      const norm = Math.hypot(fLongTotal / Math.max(grouserCap, 1), Fy / Math.max(fMax, 1));
       let fxOut = fLongTotal;
       let fyOut = Fy;
       if (norm > 1) {
@@ -916,6 +991,28 @@ export class LunarBuggy {
     // Active straight-line yaw stabilizer to eliminate numerical yaw drift
     if (isZeroSteer) {
       yawMoment -= 8.0 * inertia * s.yawRate;
+    }
+
+    // Low-speed torque vectoring / skid-steer assist (spec 16 §2.6):
+    // M = sign(δ)·τ_assist·(1 − |v|/4.0), saturated to that envelope by a yaw-
+    // rate tracking controller aiming at the pivot rate PIVOT_RATE. The grouser
+    // patch holds laterally at walking pace, so the differential wheel-force
+    // pair pivots the chassis about its centre instead of waiting for the slow
+    // Ackermann weathervane — the snappy 180° turnaround. Sign follows the
+    // Ackermann convention (δ > 0 yaws heading up); the (1 − |v|/4) envelope
+    // matches the spec formula and tapers the pivot out as speed rises so the
+    // pivot never rides along into a high-speed spin.
+    const PIVOT_RATE = 1.7; // rad/s pivot target at full lock
+    if (
+      !isZeroSteer &&
+      !this.state.rolled &&
+      Math.abs(s.vLong) < BUGGY_YAW_ASSIST_SPEED
+    ) {
+      const envelope = BUGGY_YAW_ASSIST_TORQUE * (1 - Math.abs(s.vLong) / BUGGY_YAW_ASSIST_SPEED);
+      const steerMag = clamp(Math.abs(steerAngle) / BUGGY_MAX_STEER, 0, 1);
+      const targetYaw = Math.sign(steerAngle) * steerMag * PIVOT_RATE * (1 - Math.abs(s.vLong) / BUGGY_YAW_ASSIST_SPEED);
+      const mVec = clamp(3.5 * inertia * (targetYaw - s.yawRate), -envelope, envelope);
+      yawMoment += mVec;
     }
 
     // -- Body accelerations -----------------------------------------------------
@@ -964,9 +1061,10 @@ export class LunarBuggy {
     // already carried by the slope targets — no double counting). Positive Fx
     // transfers load REARWARD (nose-up squat), positive leftward a_lat rolls
     // the left side up. Gains are the kinematic analogue of Σk_s deflection
-    // (θ ≈ m·a·h_cg / (k·L²)); steeper values would command more pitch than
-    // the springs can hold and lift a corner off the ground under throttle.
-    const accelPitch = Math.atan(FxBody / m / LUNAR_GRAVITY) * 0.1;
+    // (θ ≈ m·a·h_cg / (k·L²)); the pitch gain is sized for the Spec-16 15.2 kN
+    // launch force and keeps every corner inside its spring travel (x0 > 0 at
+    // the front) so full throttle never lifts a wheel off the regolith.
+    const accelPitch = Math.atan(FxBody / m / LUNAR_GRAVITY) * 0.035;
     const accelRoll = Math.atan((FyBody / m + s.vLong * s.yawRate) / LUNAR_GRAVITY) * 0.15;
 
     const targetPitch = clamp(slopePitchTarget + accelPitch, -0.35, 0.35);
