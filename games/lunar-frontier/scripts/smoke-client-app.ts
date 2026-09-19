@@ -1077,7 +1077,15 @@ section('D. input routing & hotkeys');
   // instead of stepping to full torque on frame 1. (The long test drive
   // drained the pack — top it up first, drive force is battery-gated.)
   (hApp.getBuggy().physics as unknown as { state: { batteryKwh: number } }).state.batteryKwh = 2.2;
-  for (let i = 0; i < 500 && hApp.getBuggy().getSpeed() > 0.05; i++) hFrame(1);
+  // Spec 17 Phase 6: the drain is trigger-state INDEPENDENT (release R2, hold
+  // the service brake to a dead stop) so the anti-jerk launch always starts
+  // from standstill. Post-Fy-sign (TraversalPhysics Spec 17 §2.2.3) the D2-c
+  // vLat kick recovers cleanly and the buggy could otherwise arrive here still
+  // cruising on the R2 left down from D2-d — an accidental coast, not a launch.
+  setTrigger(7, 0);
+  setTrigger(6, 1);
+  for (let i = 0; i < 600 && hApp.getBuggy().getSpeed() > 0.05; i++) hFrame(1);
+  setTrigger(6, 0);
   hFrame(5); // park-settle
   const ramped: number[] = [];
   hApp.handleKeyInput('KeyW', 'down');

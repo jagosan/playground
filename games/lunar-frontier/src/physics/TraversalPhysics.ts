@@ -567,8 +567,16 @@ export function speedSensitiveSteerLock(v: number): number {
   const ratio = 1 / (1 + (speed / BUGGY_STEER_HALF_SPEED) * (speed / BUGGY_STEER_HALF_SPEED));
   return BUGGY_STEER_LOCK_HIGH + (BUGGY_STEER_LOCK_LOW - BUGGY_STEER_LOCK_HIGH) * ratio;
 }
-/** Low-speed torque-vectoring / skid-steer assist moment (N·m, spec 16 §2.6). */
-export const BUGGY_YAW_ASSIST_TORQUE = 5_200;
+/** Low-speed torque-vectoring / skid-steer assist moment (N·m, spec 16 §2.6).
+ *  Re-cut to 18 kN·m by Spec 17 Phase 6: with the forensically-corrected tyre
+ *  corner velocity (§2.2.3 v_{y,i} — ω×r now reaches the slip angle), a
+ *  pivoting chassis scrubs real μ·N friction at all four corners, ≈12 kN·m on
+ *  Earth asphalt at the pivot rate. The assist envelope must exceed THAT
+ *  (per surface, per gravity) for the §7.1 turnaround gate (180° < 2.2 s) to
+ *  be reachable in both presets; the (1 − |v|/4) taper still starves it out
+ *  completely above the low-speed regime. Lunar scrub is only ~1.3 kN·m, so
+ *  the lunar pivot stays tracking-rate-limited, never torque-limited. */
+export const BUGGY_YAW_ASSIST_TORQUE = 18_000;
 /** Assist cut-off speed (m/s): M = sign(δ)·τ·(1 − |v|/4.0), zero at/above this (spec 16 §2.6). */
 export const BUGGY_YAW_ASSIST_SPEED = 4.0;
 /** Assist yaw-rate saturation (rad/s) — the pivot bites once the regolith gives. */
@@ -704,6 +712,8 @@ export class LunarBuggy {
   private readonly absLocked: boolean[] = [false, false, false, false];
   private absClock = 0;
   private motorTorque = 0;
+  /** Leaky integrator of the pivot yaw-rate error (rad·s, Spec 17 Phase 6). */
+  private pivotIntegral = 0;
   private driveMode: 'FORWARD' | 'STOPPED' | 'REVERSE' = 'STOPPED';
   private steerAngle = 0;
   /** Attitude rates (rad/s) realised last substep — feed suspension corner v_z. */
@@ -833,6 +843,21 @@ export class LunarBuggy {
     const ch = Math.cos(s.heading);
     const sh = Math.sin(s.heading);
 
+    // -- Spec 17 §5 Step C: gravity-scaled suspension -------------------------
+    // BUGGY_SPRING_RATE / BUGGY_DAMPER are the LUNAR-tuned constants (the
+    // legacy hard-coded 1.62 m/s² regime). Migrating the refined control
+    // stack to the Earth Proving Grounds profile re-cuts the spring stiffness
+    // by g/g_moon and the damping by its square root, so the static
+    // compression fraction and damping ratio ζ stay invariant across gravity
+    // wells. Unscaled, Earth weight (8.63 kN) overwhelms the full bottomed
+    // spring stack (4 × 4200 × 0.2 × 2.5 = 8.4 kN) and the chassis sinks
+    // through its own travel — the exact floaty/instrument-destroying be-
+    // haviour §5 exists to eliminate. Lunar scale factor is exactly 1, so
+    // every lunar caller stays bit-identical.
+    const suspScale = env.gravity / LUNAR_GRAVITY;
+    const springK = BUGGY_SPRING_RATE * suspScale;
+    const damperC = BUGGY_DAMPER * Math.sqrt(suspScale);
+
     // -- Roll / pitch attitude -> corner chassis heights ---------------------
     const cr = Math.cos(s.roll);
     const sr = Math.sin(s.roll);
@@ -947,8 +972,19 @@ export class LunarBuggy {
     let regenForce = speedRef > 0.1 ? -Math.sign(s.vLong) * Math.min(regenDemand, BUGGY_REGEN_FORCE) : 0;
     if (this.state.rolled || this.state.batteryKwh >= BUGGY_BATTERY_KWH) regenForce = 0;
 
+    // Friction brake effort follows the same Spec 17 §5 Step C surface law as
+    // the grouser cap: BUGGY_BRAKE_FORCE is the regolith-calibrated (μ 0.68)
+    // service effort, and a groused wheel on higher-friction surface can bite
+    // proportionally harder before shearing. Ratio is exactly 1 on lunar, so
+    // lunar panic stops stay bit-identical; asphalt gains the authority the
+    // §7.1 < 18 m emergency-stop gate demands.
     const frictionBrakeForce =
-      speedRef > 0.05 ? -Math.sign(s.vLong) * serviceBrakeDemand * BUGGY_BRAKE_FORCE : 0;
+      speedRef > 0.05
+        ? -Math.sign(s.vLong) *
+          serviceBrakeDemand *
+          BUGGY_BRAKE_FORCE *
+          (env.surfaceFrictionMu / REGOLITH_MU)
+        : 0;
 
     // A brake can only arrest existing motion, never drive it backwards:
     // cap regen + friction so one substep of braking removes at most the
@@ -1042,8 +1078,9 @@ export class LunarBuggy {
 
       // Critically damped spring-seat force with hard bump/droop stops
       // (spec 16 §2.2): F_z = max(0, k·x - c·vz), c = 1360 = 2·ζ·√(k·m/4).
-      let fz = BUGGY_SPRING_RATE * x - BUGGY_DAMPER * vzCorner;
-      fz = clamp(fz, 0, BUGGY_SPRING_RATE * BUGGY_SPRING_TRAVEL * 2.5);
+      // k/c are the gravity-scaled values (Spec 17 §5 Step C above).
+      let fz = springK * x - damperC * vzCorner;
+      fz = clamp(fz, 0, springK * BUGGY_SPRING_TRAVEL * 2.5);
 
       if (fx > 0) frontZ += zg;
       else rearZ += zg;
@@ -1074,8 +1111,19 @@ export class LunarBuggy {
           wheelSteer = Math.atan(2.7 / effRadius);
         }
       }
-      const wx = Math.cos(wheelSteer) * s.vLong + Math.sin(wheelSteer) * s.vLat;
-      const wy = -Math.sin(wheelSteer) * s.vLong + Math.cos(wheelSteer) * s.vLat;
+      // Corner velocity (Spec 17 §2.2.3 v_{y,i}): a point (fx, fy) on a
+      // chassis rotating at yawRate sweeps laterally at vLat + fx·ω and
+      // longitudinally at vLong − fy·ω. Spec 17 Phase 6 forensics: the wheel
+      // kinematics below previously fed the RAW body velocity, dropping the
+      // ω×r term entirely — the tyres then felt no yaw damping at all, so a
+      // brake-plus-steer panic stop wound the chassis up (yawRate climbed past
+      // 9 rad/s while ABS pulsed) instead of weathervaning. With the corner
+      // term the classic α_f = arctan((vLat + a·ω)/vx) − δ / α_r =
+      // arctan((vLat − b·ω)/vx) pair emerges and yaw self-limits.
+      const cornerVLong = s.vLong - fy * s.yawRate;
+      const cornerVLat = s.vLat + fx * s.yawRate;
+      const wx = Math.cos(wheelSteer) * cornerVLong + Math.sin(wheelSteer) * cornerVLat;
+      const wy = -Math.sin(wheelSteer) * cornerVLong + Math.cos(wheelSteer) * cornerVLat;
 
       const wheel = s.wheels[i];
       if (parkSlipLock) wheel.spin = 0;
@@ -1093,9 +1141,15 @@ export class LunarBuggy {
       // passive soil circle (μ·N ≈ 0.24 kN here — an order of magnitude
       // too small to launch 880 kg). The cap fades out with contact fraction
       // so an airborne wheel produces no reactionless thrust, and heavy loads
-      // may still exceed it through pure traction.
+      // may still exceed it through pure traction. Spec 17 §5 Step C: the
+      // 3.8 kN figure was calibrated against regolith μ 0.68 — migrating to a
+      // different surface re-scales the ceiling by that surface's friction
+      // authority (μ/0.68). The ratio is exactly 1 on ENV_LUNAR_FRONTIER, so
+      // every lunar caller stays bit-identical; asphalt (μ 1.05) grants the
+      // groused wheel proportionally more braking/pull before shear, which is
+      // what makes the §7.1 < 18 m panic-stop gate physically reachable.
       const grouserCap = Math.max(
-        BUGGY_WHEEL_FORCE * clamp(loadFrac, 0, 1),
+        BUGGY_WHEEL_FORCE * clamp(loadFrac, 0, 1) * (env.surfaceFrictionMu / REGOLITH_MU),
         mu * loadN,
       );
 
@@ -1147,16 +1201,28 @@ export class LunarBuggy {
       }
       forceAlong = clamp(forceAlong, -grouserCap, grouserCap);
 
-      // Lateral Pacejka-style force. Rear corners run a HIGHER cornering
-      // stiffness (the C·B term inside the arctangent, Spec 17 §2.2.3) than
-      // the front, so the rear axle builds side force at smaller slip angles
-      // while both axles keep the same μ·N saturation plateau — the front-end
-      // washes out progressively under push instead of the tail snapping.
+      // Lateral Pacejka-style force (Spec 17 §2.2.3):
+      //   F_y,i = −μ·F_z,i·sin(C·arctan(B·α_i))
+      // The leading minus is RESTORING: the tyre resists its slip angle.
+      // Spec 17 Phase 6 forensics: the original code dropped that minus and
+      // compensated by feeding the yaw moment the NEGATED cross-product
+      // (below). The pair reproduced the right steer→heading direction but
+      // inverted ONLY the lateral-velocity channel: any side slip at speed
+      // ACCELERATED instead of weathervaning back — the root cause of the
+      // §7.1 high-speed slalom spinouts and of uncontrolled chassis
+      // oscillation on lunar regolith. With the restoring sign here AND the
+      // true τ_z below, steer > 0 still yaws the heading up (front-axle side
+      // force +K·δ at the nose) exactly as the yaw assist and every harness
+      // convention encode, and vLat now decays toward zero. Rear corners run
+      // a HIGHER cornering stiffness (the C·B term inside the arctangent)
+      // than the front — weathervane stability (rear-biased K) with the
+      // front axle washing out progressively under push instead of the tail
+      // snapping.
       const latStiff = isFront ? BUGGY_LATERAL_STIFFNESS_FRONT : BUGGY_LATERAL_STIFFNESS_REAR;
       const refLat = Math.max(Math.abs(wy), 0.6);
       const alpha = Math.atan2(wy, Math.max(Math.abs(wx), 0.6));
       const alphaHat = wy / refLat;
-      let Fy = mu * loadN * atanCurve(latStiff * 9 * (alphaHat + 0.6 * alphaHat * Math.abs(alphaHat))) * (refLat > 0.25 || speedRef > 0.25 ? 1 : 0);
+      let Fy = -mu * loadN * atanCurve(latStiff * 9 * (alphaHat + 0.6 * alphaHat * Math.abs(alphaHat))) * (refLat > 0.25 || speedRef > 0.25 ? 1 : 0);
       void alpha;
 
       // Combined-force ellipse: active longitudinal shares the patch with
@@ -1190,7 +1256,12 @@ export class LunarBuggy {
 
       FxBody += bx;
       FyBody += by;
-      yawMoment += bx * fy - by * fx;
+      // Yaw moment τ_z = r_x·F_y − r_y·F_x (heading-increase positive in this
+      // x-forward / y-left body frame), with the RESTORING lateral force
+      // above. (Was `bx*fy − by*fx` — the negated torque — as half of the
+      // double sign inversion forensically removed at the Fy site; see the
+      // comment there.)
+      yawMoment += fx * by - fy * bx;
 
       // Spin update (relaxation toward rolling, locked when parked).
       if (!parkSlipLock) {
@@ -1216,18 +1287,52 @@ export class LunarBuggy {
     // Ackermann weathervane — the snappy 180° turnaround. Sign follows the
     // Ackermann convention (δ > 0 yaws heading up); the (1 − |v|/4) envelope
     // matches the spec formula and tapers the pivot out as speed rises so the
-    // pivot never rides along into a high-speed spin.
-    const PIVOT_RATE = 1.7; // rad/s pivot target at full lock
+    // pivot never rides along into a high-speed spin. Spec 17 §7.1 re-cuts the
+    // turnaround gate to 180° < 2.2 s: the pivot target rises to 2.2 rad/s and
+    // the envelope torque to 6.4 kN·m, so the ramp onto pivot plus the π-radian
+    // sweep lands inside the gate at both gravity wells. Lunar calibration
+    // only — the assist lives entirely below the 4 m/s cut-off.
+    const PIVOT_RATE = 2.2; // rad/s pivot target at full lock (Spec 17 §7.1)
     if (
       !isZeroSteer &&
       !this.state.rolled &&
       Math.abs(s.vLong) < BUGGY_YAW_ASSIST_SPEED
     ) {
-      const envelope = BUGGY_YAW_ASSIST_TORQUE * (1 - Math.abs(s.vLong) / BUGGY_YAW_ASSIST_SPEED);
+      // Envelope scales with the surface's friction authority AND gravity —
+      // the scrub moment a pivoting chassis fights is ∝ μ·m·g·lever, so the
+      // Earth asphalt pivot needs ≈9× the lunar moment budget (both factors
+      // are exactly 1 on ENV_LUNAR_FRONTIER).
+      const envelope =
+        BUGGY_YAW_ASSIST_TORQUE *
+        (env.surfaceFrictionMu / REGOLITH_MU) *
+        (env.gravity / LUNAR_GRAVITY) *
+        (1 - Math.abs(s.vLong) / BUGGY_YAW_ASSIST_SPEED);
       const steerMag = clamp(Math.abs(steerAngle) / BUGGY_STEER_LOCK_LOW, 0, 1);
       const targetYaw = Math.sign(steerAngle) * steerMag * PIVOT_RATE * (1 - Math.abs(s.vLong) / BUGGY_YAW_ASSIST_SPEED);
-      const mVec = clamp(3.5 * inertia * (targetYaw - s.yawRate), -envelope, envelope);
+      // Spec 17 Phase 6: leaky-integral yaw-rate tracking. A groused chassis
+      // scrubbing through a pivot on high-μ surface carries a large steady
+      // friction moment (∝ μ·load·lever); proportional-only tracking leaves
+      // the rate error M_scrub/(Kp·I) and stalls the pivot short of the gate.
+      // The integrator (leak 2.5/s so it bleeds off the instant the assist
+      // window closes) is what real torque-vectoring ECUs do — it walks the
+      // differential out until the realised rate matches the target exactly.
+      this.pivotIntegral = clamp(
+        this.pivotIntegral + (targetYaw - s.yawRate) * dt,
+        -2.5,
+        2.5,
+      );
+      const mVec = clamp(
+        inertia * (3.5 * (targetYaw - s.yawRate) + 9.0 * this.pivotIntegral),
+        -envelope,
+        envelope,
+      );
       yawMoment += mVec;
+    } else if (this.pivotIntegral !== 0) {
+      // Assist window closed — bleed the integrator so a pivot moment can
+      // never ride along into the weathervane regime (Spec 17 §2.2 stability).
+      this.pivotIntegral = Math.abs(this.pivotIntegral) < 1e-4
+        ? 0
+        : this.pivotIntegral * Math.exp(-6 * dt);
     }
 
     // -- Body accelerations -----------------------------------------------------
