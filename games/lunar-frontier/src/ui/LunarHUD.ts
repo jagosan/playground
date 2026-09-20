@@ -38,6 +38,10 @@ export const HUD_TRADE_ID = 'lunar-hud-trade';
 export const HUD_COMPASS_ID = 'lunar-hud-compass';
 export const HUD_TUTORIAL_ID = 'lunar-hud-tutorial';
 export const HUD_LAP_ID = 'lunar-hud-lap';
+/** Spec 18 §6.2 — narrative comms terminal (glassmorphic CRT panel). */
+export const HUD_COMMS_ID = 'lunar-hud-comms';
+/** Spec 18 §6.1 — 2D screen-edge clamped hint arrow element. */
+export const HUD_HINT_ARROW_ID = 'lunar-hud-hint-arrow';
 
 /** Sector split slots on the proving-grounds lap panel (S1/S2 + total). */
 export const HUD_LAP_SECTOR_SLOTS = 3;
@@ -198,6 +202,69 @@ export interface HudCompassTargets {
   vein?: HudCompassVeinBearing;
 }
 
+// -- Spec 18: comms terminal & hint arrow payloads -------------------------
+
+/** Audio burst tone shown by the comms status pip (spec 18 §6.2). */
+export type HudCommsTone = 'burst' | 'alert' | 'success' | 'static';
+
+/**
+ * Structural clone of QuestEngine's `CommsDialogue` (spec 18 §4.1) declared
+ * locally so the HUD keeps its zero-import contract — importing from
+ * `client/QuestEngine.ts` would couple HUD-only harnesses to the quest
+ * module. Field-for-field compatible; a QuestEngine dialogue assigns here.
+ */
+export interface HudCommsDialogue {
+  sender: string;
+  callsign: string;
+  transmission: string;
+  audioTone?: HudCommsTone;
+  /** Hide automatically this many ms after reveal (0/absent = sticky). */
+  autoDismissMs?: number;
+}
+
+/**
+ * Frame payload for the screen-edge clamped hint arrow (spec 18 §6.1,
+ * ADR-18-2). Emitted by `HintArrowSystem.update()` every frame; `null`
+ * hides the element entirely.
+ */
+export interface HudHintArrowData {
+  visible: boolean;
+  /** Screen px (CSS left/top semantics: origin top-left, y down). */
+  screenX?: number;
+  screenY?: number;
+  /** Compass-style rotation of the arrow glyph, degrees. */
+  angleDeg?: number;
+  /** Slant range to the waypoint, metres. */
+  distanceM?: number;
+  /** Waypoint display label ("Ilmenite outcrop"). */
+  label?: string;
+  /** True when the target is off-screen and this is a perimeter clamp. */
+  isOffScreen?: boolean;
+}
+
+/**
+ * Dynamic quest overlay for `updateTutorial()` (spec 18 Phase 3): when a
+ * QuestEngine-backed stage is passed, the panel re-titles itself and renders
+ * that stage's objectives instead of the legacy static checklist rows.
+ */
+export interface HudQuestStageDisplay {
+  /** Quest title shown as the panel heading context line. */
+  questTitle?: string;
+  /** Active stage title ("Boots on the Ground"). */
+  stageTitle?: string;
+  /** 1-based stage number (progress readout becomes `2 / 5`-style). */
+  stageNumber?: number;
+  /** Total stage count of the active quest. */
+  stageTotal?: number;
+  /** Objectives of the active stage (multi-objective rendering). */
+  objectives?: readonly {
+    id: string;
+    description: string;
+    completed?: boolean;
+  }[];
+}
+
+
 export interface LunarHUDOptions {
   /** Document to build into (injected by headless harnesses). */
   document?: Document;
@@ -345,6 +412,10 @@ export class LunarHUD {
   /** Tutorial checklist rows + their ✔/□ glyph cells. */
   private tutorialSteps: Elementish[] = [];
   private tutorialMarks: Elementish[] = [];
+  /** Dynamic QuestEngine objective rows + marks (spec 18 Phase 3). */
+  private questObjectiveRows: Elementish[] = [];
+  private questObjectiveMarks: Elementish[] = [];
+  private questBodyEl: Elementish | null = null;
   private marketTable: Elementish | null = null;
   /** Proving-grounds sector split cells (S1 / S2 / running remainder). */
   private lapSectorEls: Elementish[] = [];
@@ -359,6 +430,15 @@ export class LunarHUD {
   private hudHidden = false;
   private feedbackTimer: ReturnType<typeof setTimeout> | null = null;
   private disposed = false;
+
+  /** Spec 18 §6.2 — comms terminal state. */
+  private commsVisible = false;
+  private commsDismissTimer: ReturnType<typeof setTimeout> | null = null;
+  private commsTypeTimer: ReturnType<typeof setInterval> | null = null;
+  private commsFullText = '';
+  private commsCharsShown = 0;
+  /** Last hint-arrow payload painted (harness / integration readback). */
+  private hintArrowData: HudHintArrowData | null = null;
 
   constructor(options: LunarHUDOptions = {}) {
     const doc = (options.document ?? (globalThis as { document?: unknown }).document) as
@@ -394,6 +474,8 @@ export class LunarHUD {
     this.buildScanner();
     this.buildPrompts();
     this.buildTutorial();
+    this.buildCommsPanel();
+    this.buildHintArrow();
     this.buildTradeTerminal(options.commodities ?? HUD_DEFAULT_COMMODITIES);
 
     // Escape closes the terminal even if ClientApp's own listener is absent.
@@ -416,6 +498,7 @@ export class LunarHUD {
       clearTimeout(this.feedbackTimer);
       this.feedbackTimer = null;
     }
+    this.clearCommsTimers();
     this.tradeRows.clear();
     this.tradeOptions.clear();
     this.promptEls = [];
@@ -423,6 +506,8 @@ export class LunarHUD {
     this.compassPinReadouts.clear();
     this.tutorialSteps = [];
     this.tutorialMarks = [];
+    this.questObjectiveRows = [];
+    this.questObjectiveMarks = [];
     this.lapSectorEls = [];
     this.els.clear();
     this.tradeRoot.remove();
@@ -650,6 +735,22 @@ export class LunarHUD {
     return HUD_PROMPT_KINDS[(prompt.kind ?? 'trade') as HudPromptKind]?.order ?? 50;
   }
 
+  /** Cancel both comms timers (typewriter + auto-dismiss). Idempotent. */
+  private clearCommsTimers(): void {
+    this.clearCommsTypeTimer();
+    if (this.commsDismissTimer !== null) {
+      clearTimeout(this.commsDismissTimer);
+      this.commsDismissTimer = null;
+    }
+  }
+
+  private clearCommsTypeTimer(): void {
+    if (this.commsTypeTimer !== null) {
+      clearInterval(this.commsTypeTimer);
+      this.commsTypeTimer = null;
+    }
+  }
+
   // -- compass (spec 14 §3.4) --------------------------------------------------------
 
   /**
@@ -749,6 +850,211 @@ export class LunarHUD {
     if (this.disposed) return;
     this.setClass('tutorial-panel', 'is-hidden', !visible);
   }
+
+  /**
+   * Quest-aware tutorial paint (Spec 18 Phase 3). The legacy
+   * `updateTutorial(stepIndex, completed)` call shape keeps working; passing
+   * the optional third argument overlays the active QuestEngine stage: the
+   * panel heading gains the quest title, a stage-title line renders below the
+   * progress readout, and the body re-renders as the stage's (possibly
+   * multiple) objectives instead of the static 5-step checklist. Omitting
+   * `quest` (or passing one with no objectives) restores the legacy rows.
+   */
+  setQuestStage(
+    stepIndex: number,
+    completed: boolean[],
+    quest?: HudQuestStageDisplay,
+  ): void {
+    if (this.disposed) return;
+    const objectives = quest?.objectives ?? [];
+    if (objectives.length === 0) {
+      // Legacy mode: hide the dynamic body, repaint the static checklist.
+      if (this.questBodyEl !== null) this.setClassEl(this.questBodyEl, 'is-hidden', true);
+      this.setClassEl(this.els.get('tutorial-stage-title') ?? this.root, 'is-hidden', true);
+      for (const row of this.tutorialSteps) this.setClassEl(row, 'is-hidden', false);
+      this.setClass('tutorial-panel', 'quest-mode', false);
+      this.updateTutorial(stepIndex, completed);
+      return;
+    }
+
+    // Dynamic quest mode: the static 5-step checklist yields to the live
+    // objective rows so the panel never renders two competing lists.
+    for (const row of this.tutorialSteps) this.setClassEl(row, 'is-hidden', true);
+    this.setClass('tutorial-panel', 'quest-mode', true);
+    if (this.questBodyEl !== null) this.setClassEl(this.questBodyEl, 'is-hidden', false);
+    const questTitle = quest?.questTitle;
+    this.setText(
+      'tutorial-heading',
+      questTitle !== undefined && questTitle.length > 0
+        ? `MISSION · ${questTitle.toUpperCase()}`
+        : 'MISSION ONBOARDING',
+    );
+    const stageTitleEl = this.els.get('tutorial-stage-title');
+    if (stageTitleEl !== undefined) {
+      stageTitleEl.textContent = quest?.stageTitle ?? '';
+      this.setClassEl(stageTitleEl, 'is-hidden', (quest?.stageTitle ?? '').length === 0);
+    }
+    if (quest?.stageNumber !== undefined && quest?.stageTotal !== undefined) {
+      this.setText(
+        'tutorial-progress',
+        `${quest.stageNumber} / ${quest.stageTotal}`,
+      );
+    }
+
+    // Objective rows: reuse pooled rows, rebuild labels, stamp done/active.
+    for (let i = 0; i < objectives.length; i++) {
+      let row = this.questObjectiveRows[i];
+      if (row === undefined) {
+        row = this.make(
+          'div',
+          undefined,
+          'tutorial-step tutorial-objective is-pending',
+          `quest-objective-row-${i}`,
+        );
+        const mark = this.make('span', undefined, 'tutorial-mark', `quest-objective-mark-${i}`);
+        mark.textContent = '□';
+        const label = this.make('span', undefined, 'tutorial-label');
+        row.appendChild(mark);
+        row.appendChild(label);
+        this.questObjectiveRows[i] = row;
+        this.questObjectiveMarks[i] = mark;
+        this.questBodyEl?.appendChild(row);
+      }
+      const objective = objectives[i];
+      row.setAttribute('data-objective-id', objective.id);
+      const labelEl = row.children[1];
+      if (labelEl !== undefined) labelEl.textContent = objective.description;
+      const done = objective.completed === true;
+      const active = !done && i === 0;
+      this.questObjectiveMarks[i].textContent = done ? '✔' : '□';
+      this.setClassEl(row, 'is-done', done);
+      this.setClassEl(row, 'is-active', active);
+      this.setClassEl(row, 'is-pending', !done && !active);
+    }
+    for (let i = objectives.length; i < this.questObjectiveRows.length; i++) {
+      this.setClassEl(this.questObjectiveRows[i], 'is-hidden', true);
+    }
+  }
+
+  // -- narrative comms terminal (spec 18 §6.2) ---------------------------------
+
+  /**
+   * Reveal a corporate burst transmission in the comms terminal: header
+   * (dispatcher callsign + sender + faction insignia pip), typewriter body
+   * (full text always mirrored into `data-full` for headless assertions),
+   * and a tone pip (`burst`/`alert`/`success`/`static`). Schedules
+   * {@link hideComms} after `autoDismissMs` when provided.
+   */
+  showComms(dialogue: HudCommsDialogue): void {
+    if (this.disposed) return;
+    this.clearCommsTimers();
+
+    this.setText('comms-sender', String(dialogue.callsign ?? 'UNKNOWN'));
+    this.setText('comms-origin', String(dialogue.sender ?? ''));
+    const tone: HudCommsTone = dialogue.audioTone ?? 'static';
+    this.setText('comms-tone', tone.toUpperCase());
+    for (const candidate of ['burst', 'alert', 'success', 'static'] as const) {
+      this.setClass('comms-tone-pulse', `tone-${candidate}`, candidate === tone);
+    }
+
+    // Typewriter reveal. The DOM text animates; `data-full` is authoritative
+    // immediately so smoke harnesses (and screen readers) see the finished
+    // transmission without waiting on interval scheduling.
+    this.commsFullText = String(dialogue.transmission ?? '');
+    this.commsCharsShown = 0;
+    const body = this.els.get('comms-body');
+    if (body !== undefined) {
+      body.setAttribute('data-full', this.commsFullText);
+      body.setAttribute('data-tone', tone);
+      body.textContent = '';
+    }
+    const step = Math.max(1, Math.ceil(this.commsFullText.length / 48));
+    this.commsTypeTimer = setInterval(() => {
+      if (this.disposed) return;
+      this.commsCharsShown = Math.min(this.commsCharsShown + step, this.commsFullText.length);
+      this.setText('comms-text', this.commsFullText.slice(0, this.commsCharsShown));
+      if (this.commsCharsShown >= this.commsFullText.length) {
+        this.clearCommsTypeTimer();
+      }
+    }, 28);
+    const typeHandle = this.commsTypeTimer as unknown as { unref?: () => void };
+    if (typeof typeHandle.unref === 'function') typeHandle.unref();
+
+    this.setClass('comms-panel', 'is-hidden', false);
+    this.commsVisible = true;
+
+    const dismissMs = dialogue.autoDismissMs;
+    if (dismissMs !== undefined && Number.isFinite(dismissMs) && dismissMs > 0) {
+      this.commsDismissTimer = setTimeout(() => {
+        this.commsDismissTimer = null;
+        if (!this.disposed) this.hideComms();
+      }, dismissMs);
+      const handle = this.commsDismissTimer as unknown as { unref?: () => void };
+      if (typeof handle.unref === 'function') handle.unref();
+    }
+  }
+
+  /** Dismiss the comms terminal (cancels typewriter + auto-dismiss timers). */
+  hideComms(): void {
+    if (this.disposed) return;
+    this.clearCommsTimers();
+    this.commsVisible = false;
+    this.setClass('comms-panel', 'is-hidden', true);
+  }
+
+  /** True while a transmission is on screen. */
+  isCommsVisible(): boolean {
+    return this.commsVisible && !this.disposed;
+  }
+
+  // -- 2D screen-edge hint arrow (spec 18 §6.1, ADR-18-2) -----------------------
+
+  /**
+   * Paint the perimeter hint arrow from a `HintArrowSystem` frame payload.
+   * `null` / `{visible:false}` hides the widget. When off-screen the element
+   * snaps to the clamped border coordinates and its glyph rotates to
+   * `angleDeg`; when in-view it trails the 3D chevron showing only the
+   * distance chip.
+   */
+  updateHintArrow(data: HudHintArrowData | null): void {
+    if (this.disposed) return;
+    this.hintArrowData = data;
+    const arrow = this.els.get('hint-arrow');
+    if (arrow === undefined) return;
+
+    if (data === null || data.visible !== true) {
+      this.setClassEl(arrow, 'is-hidden', true);
+      return;
+    }
+
+    const x = Number.isFinite(data.screenX) ? (data.screenX as number) : 0;
+    const y = Number.isFinite(data.screenY) ? (data.screenY as number) : 0;
+    const angle = Number.isFinite(data.angleDeg) ? (data.angleDeg as number) : 0;
+    arrow.style['left'] = `${x.toFixed(1)}px`;
+    arrow.style['top'] = `${y.toFixed(1)}px`;
+
+    const glyph = this.els.get('hint-arrow-glyph');
+    if (glyph !== undefined) {
+      glyph.style['transform'] = `rotate(${angle.toFixed(1)}deg)`;
+    }
+    this.setText(
+      'hint-arrow-distance',
+      data.distanceM !== undefined && Number.isFinite(data.distanceM)
+        ? `${Math.round(data.distanceM)}m`
+        : '',
+    );
+    this.setText('hint-arrow-label', data.label ?? '');
+
+    this.setClassEl(arrow, 'is-offscreen', data.isOffScreen === true);
+    this.setClassEl(arrow, 'is-inview', data.isOffScreen !== true);
+    this.setClassEl(arrow, 'is-hidden', false);
+  }
+
+  /** Last payload handed to {@link updateHintArrow} (harness readback). */
+  getHintArrowData(): HudHintArrowData | null {
+    return this.hintArrowData;
+  }
+
 
   // -- status strip --------------------------------------------------------------------------
 
@@ -1124,11 +1430,25 @@ export class LunarHUD {
   private buildTutorial(): void {
     const panel = this.make('section', HUD_TUTORIAL_ID, 'hud-panel tutorial-panel', 'tutorial-panel');
     this.root.appendChild(panel);
-    panel.appendChild(this.heading('MISSION ONBOARDING'));
+    // Heading carries a logical key: `setQuestStage` re-titles it with the
+    // active quest name while the legacy flow leaves "MISSION ONBOARDING".
+    const head = this.make('div', undefined, 'hud-heading', 'tutorial-heading');
+    head.textContent = 'MISSION ONBOARDING';
+    panel.appendChild(head);
 
     const progress = this.make('div', 'lunar-hud-tutorial-progress', 'tutorial-progress', 'tutorial-progress');
     progress.textContent = `1 / ${HUD_TUTORIAL_STEPS.length}`;
     panel.appendChild(progress);
+
+    // Dynamic stage-title line (spec 18 Phase 3) — hidden until a quest paints it.
+    const stageTitle = this.make(
+      'div',
+      'lunar-hud-tutorial-stage',
+      'tutorial-stage-title is-hidden',
+      'tutorial-stage-title',
+    );
+    stageTitle.textContent = '';
+    panel.appendChild(stageTitle);
 
     this.tutorialSteps = [];
     this.tutorialMarks = [];
@@ -1145,6 +1465,92 @@ export class LunarHUD {
       this.tutorialSteps.push(row);
       this.tutorialMarks.push(mark);
     }
+
+    // QuestEngine objective body (multi-objective stages). Rows are pooled
+    // lazily by `setQuestStage`; the container hides with the legacy rows.
+    this.questObjectiveRows = [];
+    this.questObjectiveMarks = [];
+    this.questBodyEl = this.make(
+      'div',
+      'lunar-hud-tutorial-quest',
+      'tutorial-quest-body is-hidden',
+      'tutorial-quest-body',
+    );
+    panel.appendChild(this.questBodyEl);
+  }
+
+  /**
+   * Narrative comms terminal (Spec 18 §6.2): glassmorphic CRT panel docked
+   * left-centre with scanline overlay, dispatcher header (callsign + sender
+   * insignia pip), tone pip (`burst`/`alert`/`success`/`static`), and the
+   * typewriter transmission body. Hidden until `showComms()`.
+   */
+  private buildCommsPanel(): void {
+    const panel = this.make(
+      'section',
+      HUD_COMMS_ID,
+      'hud-panel comms-terminal is-hidden',
+      'comms-panel',
+    );
+    this.root.appendChild(panel);
+
+    // CRT scanline veil (decorative, pointer-events: none via CSS).
+    panel.appendChild(this.make('div', 'lunar-hud-comms-scanlines', 'comms-scanlines'));
+
+    const head = this.make('div', 'lunar-hud-comms-head', 'comms-head');
+    const insignia = this.make('span', 'lunar-hud-comms-insignia', 'comms-insignia', 'comms-insignia');
+    insignia.textContent = '◈';
+    head.appendChild(insignia);
+    const sender = this.make('span', 'lunar-hud-comms-sender', 'comms-sender', 'comms-sender');
+    sender.textContent = '——';
+    head.appendChild(sender);
+    const toneWrap = this.make('span', 'lunar-hud-comms-tone', 'comms-tone-wrap');
+    const pip = this.make('span', 'lunar-hud-comms-tone-pip', 'comms-tone-pip', 'comms-tone-pulse');
+    toneWrap.appendChild(pip);
+    const tone = this.make('span', 'lunar-hud-comms-tone-label', 'comms-tone-label', 'comms-tone');
+    tone.textContent = 'STANDBY';
+    toneWrap.appendChild(tone);
+    head.appendChild(toneWrap);
+    panel.appendChild(head);
+
+    // Sender org line ("Caelus Extraction Corp — Corporate Dispatch").
+    const origin = this.make('div', 'lunar-hud-comms-origin', 'comms-origin', 'comms-origin');
+    origin.textContent = '';
+    panel.appendChild(origin);
+
+    const body = this.make('div', 'lunar-hud-comms-body', 'comms-body', 'comms-body');
+    body.textContent = '';
+    const text = this.make('span', 'lunar-hud-comms-text', 'comms-text', 'comms-text');
+    text.textContent = '';
+    body.appendChild(text);
+    const caret = this.make('span', 'lunar-hud-comms-caret', 'comms-cursor');
+    caret.textContent = '▌';
+    body.appendChild(caret);
+    panel.appendChild(body);
+  }
+
+  /**
+   * 2D screen-edge clamped hint arrow (Spec 18 §6.1, ADR-18-2): a rotated
+   * glyph + distance chip + label that `updateHintArrow()` positions either
+   * over the in-view chevron or clamped to the viewport perimeter.
+   */
+  private buildHintArrow(): void {
+    const arrow = this.make(
+      'div',
+      HUD_HINT_ARROW_ID,
+      'hint-arrow is-hidden',
+      'hint-arrow',
+    );
+    this.root.appendChild(arrow);
+    const glyph = this.make('span', 'lunar-hud-hint-arrow-glyph', 'hint-arrow-glyph', 'hint-arrow-glyph');
+    glyph.textContent = '➤';
+    arrow.appendChild(glyph);
+    const distance = this.make('span', 'lunar-hud-hint-arrow-distance', 'hint-arrow-distance', 'hint-arrow-distance');
+    distance.textContent = '';
+    arrow.appendChild(distance);
+    const label = this.make('span', 'lunar-hud-hint-arrow-label', 'hint-arrow-label', 'hint-arrow-label');
+    label.textContent = '';
+    arrow.appendChild(label);
   }
 
   private buildTradeTerminal(commodities: readonly string[]): void {

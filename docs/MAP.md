@@ -14,6 +14,7 @@
 - `docs/architecture/15-lunar-buggy-overhaul.md`: Lunar rover visual overhaul, cohesive chassis assembly, straight-line stability, progressive acceleration/braking & keyboard/gamepad controller calibration.
 - `docs/architecture/16-lunar-rover-experience-overhaul.md`: Dramatic lunar rover experience, cockpit beacon fix, damped chassis kinematics, terrain smoothing, shadow frustum, mineral nav arrow & agile powertrain tuning.
 - `docs/architecture/17-lunar-buggy-simulation-track-and-control-refinement.md`: Terrestrial proving grounds racetrack, speed-sensitive steering, ABS trigger braking, elevated velocity-vector chase camera & realistic buggy visual overhaul.
+- `docs/architecture/18-new-player-ux-and-quest-framework.md`: New player onboarding, narrative quest engine, 3D hint arrow spatial guidance, buggy dash telemetry & 4-tier lunar industrial loop.
 - `docs/architecture/15-subagent-context-pruning-and-turn-budgeting.md`: Subagent context pruning, N-3 turn-budget circuit breaker, AST extraction, and Beehive Neo4j symbol discovery.
 - `specs/`:
   - `specs/00-system-overview.md`: Project vision, minigame architecture, rendering stack.
@@ -29,6 +30,7 @@
   - `specs/15-lunar-buggy-overhaul.md`: Lunar rover visual overhaul, unified kinematics, straight-line stability & keyboard/gamepad controller tuning.
   - `specs/16-lunar-rover-experience-overhaul.md`: Dramatic lunar rover experience, cockpit beacon removal, critically damped suspension, terrain flattening & shadows, mineral nav arrow, snappy acceleration & rapid turnaround.
   - `specs/17-lunar-buggy-simulation-track-and-control-refinement.md`: Terrestrial proving grounds racetrack, speed-sensitive steering, ABS trigger braking, elevated velocity-vector chase camera, realistic buggy overhaul & lunar migration.
+  - `specs/18-new-player-ux-and-quest-framework.md`: New player UX, narrative quest engine, 3D hint arrows, buggy dashboard telemetry & 4-tier lunar resource progression.
 
 ## Lunar Frontier Multiplayer & Economy Subsystem (Spec 12)
 - `games/lunar-frontier/server/`: Fastify + `ws` server, SQLite schema, market pricing, 20Hz tick (`LunarServer.ts`, `Database.ts`).
@@ -37,8 +39,8 @@
 - `games/lunar-frontier/src/entities/`: Astronaut suit EVA controller, open-top buggy, dock mechs (`AstronautSuit.ts`, `OpenBuggy.ts`, `LoadingDockMech.ts`).
 - `games/lunar-frontier/src/infrastructure/`: Procedural tunnel mesh builder, rail line spline renderer, ore cart runner (`TunnelNetwork.ts`, `RailSystem.ts`).
 - `games/lunar-frontier/src/network/`: WebSocket client, state delta interpolator, player manager (`NetworkClient.ts`).
-- `games/lunar-frontier/src/ui/`: Glassmorphic telemetry HUD, life support meters, commodity trade modal (`LunarHUD.ts`, `hud.css`).
-- `games/lunar-frontier/src/client/`: Interactive Babylon.js client game loop and Vite web entry (`ClientApp.ts`, `main.ts`).
+- `games/lunar-frontier/src/ui/`: Glassmorphic telemetry HUD, life support meters, commodity trade modal, hint arrow & comms terminal (`LunarHUD.ts`, `hud.css`).
+- `games/lunar-frontier/src/client/`: Interactive Babylon.js client game loop, quest engine, hint navigation, and Vite web entry (`ClientApp.ts`, `QuestEngine.ts`, `HintArrowSystem.ts`, `main.ts`).
 - `docs/runbooks/lunar-frontier-operations.md`: Operational runbook, controller layouts, test commands, and production build deployment.
 
 ## Blender Asset Pipeline (Spec 05)

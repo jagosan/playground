@@ -96,6 +96,51 @@ export function rodScaleFor(compression: number): number {
   return ROD_SCALE_DROOP + (ROD_SCALE_BUMP - ROD_SCALE_DROOP) * c;
 }
 
+/**
+ * Quest/contractor telemetry mirrored onto the cockpit dash (Spec 18 §6.3,
+ * ADR-18-3). Fed by `ClientApp` whenever the player boards the buggy and on
+ * every quest state change; every field is optional so partial updates merge
+ * cleanly into the last snapshot. Rastered into the same RawTexture buffer as
+ * the speed/power segment bars — no DOM canvas, NullEngine-safe.
+ */
+export interface BuggyDashTelemetry {
+  /** Active quest title (e.g. "A One-Way Ticket to the Frontier"). */
+  questTitle?: string;
+  /** Current objective text shown under the title. */
+  objectiveText?: string;
+  /** Slant range to the active objective, metres. */
+  targetDistanceM?: number;
+  /** Compass bearing to the active objective, degrees (0 = north, CW). */
+  targetBearingDeg?: number;
+  /** Haul aboard, kg (dash cargo meter; independent of physics cargo). */
+  cargoKg?: number;
+  /** Cargo capacity, kg (default `BUGGY_MAX_CARGO`). */
+  maxCargoKg?: number;
+  /** Contractor corporation / faction tag (insignia line). */
+  faction?: string;
+  /** Radio link status readout (e.g. "ONLINE - 128 kbps"). */
+  linkStatus?: string;
+}
+
+/**
+ * Last rastered dash state — the inspection surface headless tests use to
+ * verify quest telemetry landed (Spec 18 §8.3: entering the buggy updates the
+ * dashboard with quest coordinates and cargo inventory).
+ */
+export interface BuggyDashView {
+  /** True once quest/contractor telemetry has been installed. */
+  questActive: boolean;
+  questTitle: string | null;
+  objectiveText: string | null;
+  /** Null only when no target distance has ever been received. */
+  targetDistanceM: number | null;
+  targetBearingDeg: number | null;
+  cargoKg: number;
+  maxCargoKg: number;
+  faction: string | null;
+  linkStatus: string | null;
+}
+
 /** Options for the entity; physics tuning delegates to `BuggyOptions`. */
 export interface OpenBuggyOptions extends BuggyOptions {
   /** Spawn position (physics frame). Defaults to the origin. */
@@ -194,6 +239,8 @@ const DASH_H = 32;
 /** Dash gauge full-scale values: m/s and kW (4 × 18 kW motors, Spec 16 §2.5). */
 const DASH_SPEED_FSK = 30;
 const DASH_POWER_FSKW = 72;
+/** Quest range-ladder full scale (Spec 18 §6.3): 120 m to the objective. */
+const DASH_RANGE_FULL_M = 120;
 
 function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
@@ -281,6 +328,27 @@ export class OpenBuggy {
   private lastMotorEnergyJ = 0;
   /** Last synced drivetrain output (kW), fed to telemetry between frames. */
   private lastPowerKw = 0;
+  /**
+   * Live quest/contractor dashboard snapshot (Spec 18 §6.3, ADR-18-3).
+   * Partial updates merge into this; `drawDash` rasterizes it under the
+   * existing speed/power segment bars every synced frame.
+   */
+  private questDash: Required<
+    Pick<
+      BuggyDashView,
+      'questActive' | 'questTitle' | 'objectiveText' | 'targetDistanceM' | 'targetBearingDeg' | 'cargoKg' | 'maxCargoKg' | 'faction' | 'linkStatus'
+    >
+  > = {
+    questActive: false,
+    questTitle: null,
+    objectiveText: null,
+    targetDistanceM: null,
+    targetBearingDeg: null,
+    cargoKg: 0,
+    maxCargoKg: BUGGY_MAX_CARGO,
+    faction: null,
+    linkStatus: null,
+  };
 
   /** Scratch objects for the per-frame lamp maths (no GC churn). */
   private readonly scratchAim = new Vector3(1, 0, 0);
@@ -595,6 +663,73 @@ export class OpenBuggy {
   /** Load fraction 0..1 of `BUGGY_MAX_CARGO`. */
   getCargoMassFraction(): number {
     return clamp(this.getCargoMass() / BUGGY_MAX_CARGO, 0, 1);
+  }
+
+  // -- quest dashboard telemetry (Spec 18 §6.3, ADR-18-3) ------------------------
+
+  /**
+   * Install / update the quest + contractor telemetry rastered onto the
+   * cockpit dash (Spec 18 §6.3): quest title & objective strip, nav pip
+   * toward the active target, cargo capacity meter, radio link LED and a
+   * target-range ladder. Every field is optional — partial updates merge
+   * into the last snapshot; non-finite numbers are ignored. Works before
+   * `init()` and after `dispose()` (state is recorded either way; the raster
+   * only runs while built), so headless harnesses can drive it without a GPU.
+   *
+   * @returns the merged dashboard snapshot (same object {@link
+   * getDashboardTelemetry} returns a copy of).
+   */
+  setQuestDashboardTelemetry(data: BuggyDashTelemetry): BuggyDashView {
+    const d = this.questDash;
+    if (typeof data.questTitle === 'string') d.questTitle = data.questTitle;
+    if (typeof data.objectiveText === 'string') d.objectiveText = data.objectiveText;
+    if (typeof data.targetDistanceM === 'number' && Number.isFinite(data.targetDistanceM)) {
+      d.targetDistanceM = Math.max(0, data.targetDistanceM);
+    }
+    if (typeof data.targetBearingDeg === 'number' && Number.isFinite(data.targetBearingDeg)) {
+      d.targetBearingDeg = ((data.targetBearingDeg % 360) + 360) % 360;
+    }
+    if (typeof data.cargoKg === 'number' && Number.isFinite(data.cargoKg)) {
+      d.cargoKg = Math.max(0, data.cargoKg);
+    }
+    if (typeof data.maxCargoKg === 'number' && Number.isFinite(data.maxCargoKg) && data.maxCargoKg > 0) {
+      d.maxCargoKg = data.maxCargoKg;
+    }
+    if (typeof data.faction === 'string') d.faction = data.faction;
+    if (typeof data.linkStatus === 'string') d.linkStatus = data.linkStatus;
+    d.questActive =
+      d.questTitle !== null ||
+      d.objectiveText !== null ||
+      d.targetDistanceM !== null ||
+      d.targetBearingDeg !== null;
+    // Repaint immediately so a harness that never steps a frame still sees
+    // the update land on the texture.
+    if (this.built && !this.disposed) {
+      this.drawDash(Math.abs(this.last.vLong), this.lastPowerKw, this.last.heading);
+    }
+    return this.getDashboardTelemetry();
+  }
+
+  /**
+   * Copy of the live dashboard snapshot — the headless inspection helper
+   * Spec 18 §8.3 requires ("entering the buggy updates the dashboard with
+   * current quest coordinates and cargo inventory").
+   */
+  getDashboardTelemetry(): BuggyDashView {
+    return { ...this.questDash };
+  }
+
+  /**
+   * Read one RGBA pixel from the dash raster (0..DASH_W-1, 0..DASH_H-1).
+   * Returns null before `init()` / after `dispose()`. Lets smoke tests
+   * verify the nav pip, cargo meter and link LED actually painted.
+   */
+  readDashPixel(x: number, y: number): readonly [number, number, number, number] | null {
+    const px = this.dashPixels;
+    if (px === null || !Number.isInteger(x) || !Number.isInteger(y)) return null;
+    if (x < 0 || x >= DASH_W || y < 0 || y >= DASH_H) return null;
+    const i = (y * DASH_W + x) * 4;
+    return [px[i] as number, px[i + 1] as number, px[i + 2] as number, px[i + 3] as number];
   }
 
   // -- mount / dismount -------------------------------------------------------------
@@ -1292,8 +1427,15 @@ export class OpenBuggy {
    * amber power segment bar and a direction pip, rastered into the
    * persistent RGBA buffer and pushed to the GPU with `RawTexture.update` —
    * no DOM canvas, so it runs on NullEngine.
+   *
+   * Spec 18 §6.3 / ADR-18-3 overlay (only while quest telemetry is active,
+   * and never over the two segment bars): magenta quest-title text strip
+   * (rows 0–1), a relative-bearing nav pip row under the speed bar (rows
+   * 12–14), a green cargo capacity meter (rows 16–18) with the radio-link
+   * LED at its right end, and an orange target-range ladder along the bottom
+   * edge (rows 29–31).
    */
-  private drawDash(speed: number, powerKw: number): void {
+  private drawDash(speed: number, powerKw: number, heading = 0): void {
     const px = this.dashPixels;
     const tex = this.dashTexture;
     if (px === null || tex === null) return;
@@ -1322,6 +1464,55 @@ export class OpenBuggy {
     bar(2, 20, 60, 9, powerKw / DASH_POWER_FSKW, 255, 180, 40);
     for (let x = 2; x < 62; x++) put(x, 15, 12, 14, 18);
     put(Math.round(clamp(powerKw / DASH_POWER_FSKW, 0, 1) * 58) + 2, 15, 255, 90, 60);
+
+    // -- Spec 18 §6.3 quest overlay (rows 0–1, 12–14, 16–18, 29–31) ---------
+    const q = this.questDash;
+    if (q.questActive) {
+      // Quest title / objective text strip: a two-pixel-tall dot-matrix run
+      // (the diegetic stand-in for the title + directive lines).
+      const textLen = Math.max(4, Math.min(60, ((q.questTitle?.length ?? 0) + (q.objectiveText?.length ?? 0)) >> 1));
+      for (let x = 0; x < textLen; x++) {
+        for (let y = 0; y < 2; y++) {
+          if ((x + y) % 2 === 0) put(2 + x, y, 236, 64, 255);
+        }
+      }
+      // Nav pip row: relative compass bearing of the active target, mapped
+      // (-180..180] across the dash width. Own bearing = 90° − heading°
+      // (same convention as the HUD compass tape).
+      const trackY = 13;
+      for (let x = 2; x < 62; x++) {
+        put(x, trackY - 1, 14, 16, 22);
+        put(x, trackY + 1, 14, 16, 22);
+      }
+      put(32, trackY - 1, 90, 96, 110);
+      put(32, trackY + 1, 90, 96, 110);
+      if (q.targetBearingDeg !== null) {
+        const ownBearing = ((90 - (heading * 180) / Math.PI) % 360 + 360) % 360;
+        let rel = q.targetBearingDeg - ownBearing;
+        rel = ((rel + 540) % 360) - 180; // wrap to (-180, 180]
+        const pipX = Math.round(clamp(rel / 180, -1, 1) * 29) + 32;
+        for (let y = trackY - 1; y <= trackY + 1; y++) put(pipX, y, 255, 255, 255);
+      }
+      // Cargo capacity meter (green) + radio-link LED at the right end.
+      bar(2, 16, 56, 3, q.cargoKg / q.maxCargoKg, 60, 230, 120);
+      const online = q.linkStatus !== null && /^online/i.test(q.linkStatus);
+      const ledR = q.linkStatus === null ? 30 : online ? 40 : 180;
+      const ledG = q.linkStatus === null ? 34 : online ? 255 : 40;
+      const ledB = q.linkStatus === null ? 40 : online ? 120 : 40;
+      for (let y = 16; y < 19; y++) put(60, y, ledR, ledG, ledB);
+      // Target-range ladder (orange): 0 at full-scale DASH_RANGE_FULL_M.
+      if (q.targetDistanceM !== null) {
+        const ladderFrac = 1 - clamp(q.targetDistanceM / DASH_RANGE_FULL_M, 0, 1);
+        const ladderFilled = Math.round(ladderFrac * 59);
+        for (let seg = 0; seg < 60; seg++) {
+          const on = seg < ladderFilled && seg % 2 === 0;
+          if (on) {
+            put(2 + seg, 29, 255, 120, 60);
+            put(2 + seg, 30, 255, 120, 60);
+          }
+        }
+      }
+    }
     tex.update(px);
   }
 
@@ -1414,11 +1605,12 @@ export class OpenBuggy {
       this.cargoCrates.scaling.y = Math.max(0.1, cargoFrac);
     }
 
-    // Live telemetry dash: speed + drivetrain kW segment bars.
+    // Live telemetry dash: speed + drivetrain kW segment bars, plus the
+    // Spec 18 §6.3 quest overlay (nav pip / cargo / link) when active.
     const dJ = state.motorEnergyJ - this.lastMotorEnergyJ;
     const powerKw = Number.isFinite(dJ) && dJ >= 0 ? dJ / Math.max(dt, 1e-6) / 1000 : 0;
     this.lastPowerKw = powerKw;
-    this.drawDash(Math.abs(state.vLong), powerKw);
+    this.drawDash(Math.abs(state.vLong), powerKw, state.heading);
     this.lastMotorEnergyJ = state.motorEnergyJ;
 
     this.applyWheelSpin(state, dt);

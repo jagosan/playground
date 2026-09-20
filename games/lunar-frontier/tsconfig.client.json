@@ -11,6 +11,8 @@
   "include": [
     "src/client/ClientApp.ts",
     "src/client/main.ts",
+    "src/client/QuestEngine.ts",
+    "src/client/HintArrowSystem.ts",
     "src/client/TraversalController.ts",
     "src/ui/LunarHUD.ts",
     "src/engine/index.ts",

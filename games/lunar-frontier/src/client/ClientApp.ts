@@ -44,12 +44,21 @@ import type { Mesh } from '@babylonjs/core/Meshes/mesh.js';
 import { WorldScene, worldToBabylon, type CameraMode } from '../engine/index.ts';
 import { ProvingGroundsScene, type LapTelemetry } from '../engine/ProvingGroundsScene.ts';
 import { EvaSuitAvatar } from '../entities/AstronautSuit.ts';
-import { OpenBuggy, MOUNT_RADIUS_M } from '../entities/OpenBuggy.ts';
+import { OpenBuggy, MOUNT_RADIUS_M, type BuggyDashTelemetry } from '../entities/OpenBuggy.ts';
 import { TraversalController } from './TraversalController.ts';
+import {
+  QuestEngine,
+  createTutorialQuest,
+  type CommsDialogue,
+  type QuestCompletedPayload,
+  type QuestStorage,
+} from './QuestEngine.ts';
+import { HintArrowSystem, type HintArrowTarget } from './HintArrowSystem.ts';
 import { FactionBases } from '../infrastructure/Factions.ts';
 import { TunnelNetwork } from '../infrastructure/TunnelNetwork.ts';
 import { RailSystem } from '../infrastructure/RailSystem.ts';
 import {
+  BUGGY_MAX_CARGO,
   BUGGY_SPEED_LIMIT,
   ENV_EARTH_PROVING_GROUNDS,
   ENV_LUNAR_FRONTIER,
@@ -238,6 +247,8 @@ export const ACTION_KEYS: Readonly<Record<string, string>> = {
   KeyT: 'trade',
   // Spec 17 Phase 4: environment toggle — Earth Proving Grounds ⇄ Lunar.
   KeyR: 'track',
+  // Spec 18 §6.2: comms log toggle — hide/re-open the last transmission.
+  KeyL: 'comms',
   Escape: 'close-ui',
 };
 
@@ -299,6 +310,18 @@ export interface ClientAppOptions {
    * {@link ClientApp.enableProvingGrounds} right after `init()`).
    */
   startInProvingGrounds?: boolean;
+  /**
+   * Spec 18 §5: explicit quest storage backend (headless harnesses inject an
+   * `InMemoryQuestStorage`; omitting it auto-detects localStorage with an
+   * in-memory fallback).
+   */
+  questStorage?: QuestStorage;
+  /**
+   * Spec 18 §5: set false to boot WITHOUT the tutorial quest auto-starting
+   * (the QuestEngine is still constructed and wired; QA can `startQuest()`
+   * manually or restore a saved run).
+   */
+  startQuest?: boolean;
 }
 
 export interface ClientInputFrame {
@@ -493,6 +516,26 @@ export class ClientApp {
   private network: NetworkClient | null;
   private hud: LunarHUD | null;
   private readonly ownsNetwork: boolean;
+
+  /**
+   * Spec 18 §5/§7 — narrative quest layer: the staged quest state machine,
+   * the 3D hint-arrow visual, and the last comms burst (for the [L] log
+   * toggle). Built in `init()`; the quest ships with populated world
+   * coordinates (perimeter beacon, mineral vein, buggy spawn, trade
+   * terminal) resolved from the live world snapshot.
+   */
+  private questEngine: QuestEngine | null = null;
+  private hintArrowSystem: HintArrowSystem | null = null;
+  private lastComms: CommsDialogue | null = null;
+  /** Quest reward credited (Spec 18 §5 Stage 5: 500 cr) — harness readback. */
+  private questRewardCredits = 0;
+  /** Per-frame locomotion accumulators feeding `recordMoveDistance` (m). */
+  private questFootPrev: { x: number; y: number } | null = null;
+  private questBuggyPrev: { x: number; y: number } | null = null;
+  /** Frame counter for the ~10 Hz buggy-dash quest mirror (60 Hz / 6). */
+  private questDashFrame = 0;
+  /** Teleport guard (same rule as the legacy tutorial): >25 m ≠ footstep. */
+  private static readonly QUEST_TELEPORT_GUARD_M = 25;
 
   private suit: EvaSuitAvatar | null = null;
   private buggy: OpenBuggy | null = null;
@@ -693,6 +736,66 @@ export class ClientApp {
       }
     }
 
+    // Spec 18 §5/§7 — narrative quest layer. The tutorial quest ships with
+    // populated world coordinates: the survey-beacon perimeter (spawn), the
+    // nearest surveyed mineral vein, the parked buggy, and the faction
+    // exchange terminal (nearest faction base). The hint arrow renders the
+    // active objective in 3D / on the screen edge; quest callbacks drive the
+    // comms terminal and the mission checklist.
+    this.questEngine = new QuestEngine({
+      ...(this.options.questStorage !== undefined
+        ? { storage: this.options.questStorage }
+        : {}),
+      ...(this.options.startQuest === false ? { autosave: false } : {}),
+    });
+    this.questEngine.onCommsReceived((dialogue) => {
+      this.lastComms = dialogue;
+      this.hud?.showComms(dialogue);
+    });
+    this.questEngine.onObjectiveUpdated(() => this.pushQuestStageToHud());
+    this.questEngine.onStageAdvanced(() => {
+      this.pushQuestStageToHud();
+      this.syncQuestDashboardTelemetry();
+    });
+    this.questEngine.onQuestCompleted((payload: QuestCompletedPayload) => {
+      this.questRewardCredits = payload.rewardCredits;
+      this.hud?.showFeedback(
+        `QUEST COMPLETE · +${payload.rewardCredits} cr · +${payload.rewardXp} xp`,
+        'success',
+      );
+      this.pushQuestStageToHud();
+    });
+    this.hintArrowSystem = new HintArrowSystem({
+      scene: this.world.getScene(),
+      onHudUpdate: (payload) => this.hud?.updateHintArrow(payload),
+    });
+    if (this.options.startQuest !== false) {
+      this.questEngine.startQuest(
+        createTutorialQuest({
+          faction: this.options.faction ?? 'CEC',
+          spawnPosition: { x: spawn.x, y: spawn.y, z: this.groundAt(spawn.x, spawn.y) },
+          veinPosition: this.veinAnchorFor(spawn.x, spawn.y) ?? {
+            x: spawn.x,
+            y: spawn.y + 45,
+            z: this.groundAt(spawn.x, spawn.y + 45),
+          },
+          buggyPosition: (() => {
+            const b = this.buggy?.getPosition() ?? { x: spawn.x + 9, y: spawn.y + 4, z: 0 };
+            return { x: b.x, y: b.y, z: b.z };
+          })(),
+          terminalPosition: this.nearestBaseTo({ x: spawn.x, y: spawn.y })?.position ?? {
+            x: spawn.x - 60,
+            y: spawn.y - 80,
+            z: this.groundAt(spawn.x - 60, spawn.y - 80),
+          },
+          buggyEntityId: 'buggy-local',
+        }),
+      );
+    }
+    this.questFootPrev = { x: spawn.x, y: spawn.y };
+    this.questBuggyPrev = null;
+    this.pushQuestStageToHud();
+
     this.wireNetwork();
     this.attachDomInput();
 
@@ -746,6 +849,11 @@ export class ClientApp {
     this.syncRemoteAvatars();
     this.refreshScanner(timestamp);
     this.updateTutorialSensors();
+    // Spec 18 §7 — quest sensors (foot/drive odometers + reach probes) run
+    // after physics & camera sync so positions, positions-of-record and the
+    // hint-arrow projection all consume this frame's state.
+    this.updateQuestSensors();
+    this.refreshHintArrow(timestamp);
     this.refreshWaypoints(timestamp);
     this.refreshHud();
     this.world.render();
@@ -978,6 +1086,12 @@ export class ClientApp {
     this.buggy?.dispose();
     this.suit = null;
     this.buggy = null;
+    // Spec 18 quest layer teardown: the hint-arrow meshes live in the world
+    // scene; the engine is pure state. Both idempotent.
+    this.hintArrowSystem?.dispose();
+    this.hintArrowSystem = null;
+    this.questEngine = null;
+    this.lastComms = null;
     // Infrastructure teardown before the world itself goes away (their meshes
     // live in the world scene; dispose() unparents and releases materials).
     this.factionBases?.dispose();
@@ -1311,6 +1425,10 @@ export class ClientApp {
         if (this.envMode === 'earth_proving_grounds') this.disableProvingGrounds();
         else this.enableProvingGrounds();
         break;
+      case 'comms':
+        // Spec 18 §6.2: [L] toggles the narrative comms terminal.
+        this.toggleCommsLog();
+        break;
       case 'close-ui':
         this.hud?.hideTradeDialog();
         break;
@@ -1335,6 +1453,11 @@ export class ClientApp {
       if (!buggy.mount(suit)) return false;
       this.mode = 'buggy';
       this.lastEvaCamera = this.world.getCameraRig().getMode();
+      // Spec 18 §7: the board event feeds `board_buggy` objectives, and the
+      // dash lights up with the current quest telemetry the instant the
+      // driver sits down (Spec 18 §6.3 / ADR-18-3).
+      this.questEngine?.recordBuggyBoarded();
+      this.syncQuestDashboardTelemetry();
       // Spec 16 §2.1: the rover beacon guides the EVA astronaut on foot — it
       // must never shine up into the driver's field of view from the roof.
       this.buggyBeacon?.setEnabled(false);
@@ -1408,6 +1531,11 @@ export class ClientApp {
       return false;
     }
     this.lastMineAt = now;
+
+    // Spec 18 §7: extraction success feeds the quest engine's
+    // `extract_mineral` objectives (kind-matched; the tutorial vein is
+    // regolith-grade by construction).
+    this.questEngine?.recordMineralMined(resource, amount);
 
     // Onboarding: a fired drill frame completes the extraction step.
     this.tutorialTrigger('mine');
@@ -2042,6 +2170,208 @@ export class ClientApp {
     }
   }
 
+  // -- narrative quest layer (spec 18 §5/§7, ADR-18-1/2/3) ------------------------
+
+  /** The wired quest state machine (null before `init()` / after dispose). */
+  getQuestEngine(): QuestEngine | null {
+    return this.questEngine;
+  }
+
+  /** The wired 3D hint-arrow system (null before `init()` / after dispose). */
+  getHintArrowSystem(): HintArrowSystem | null {
+    return this.hintArrowSystem;
+  }
+
+  /** Credits awarded by the last `QUEST_COMPLETED` (Spec 18 §5: 500 cr). */
+  getQuestRewardCredits(): number {
+    return this.questRewardCredits;
+  }
+
+  /** Last comms burst delivered by the quest engine (for the [L] log). */
+  getLastComms(): CommsDialogue | null {
+    return this.lastComms;
+  }
+
+  /**
+   * `[L]` — toggle the narrative comms terminal (Spec 18 §6.2: the comms log
+   * stays accessible after the auto-dismiss collapse). Re-shows the last
+   * transmission verbatim; returns the post-toggle visibility.
+   */
+  toggleCommsLog(): boolean {
+    const hud = this.hud;
+    if (hud === null || this.disposed) return false;
+    if (hud.isCommsVisible()) {
+      hud.hideComms();
+      return false;
+    }
+    if (this.lastComms !== null) {
+      hud.showComms(this.lastComms);
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Per-frame quest sensors (Spec 18 §7): accumulate foot vs buggy-drive
+   * odometers into `recordMoveDistance(meters, isBuggy)`, feed the live
+   * position into `recordPosition` (drives `reach_target` objectives), and
+   * keep the buggy dash telemetry warm at ~10 Hz. The teleport guard mirrors
+   * the legacy tutorial rule — a single-frame displacement larger than 25 m
+   * is a server spawn correction, not a footstep.
+   */
+  private updateQuestSensors(): void {
+    const engine = this.questEngine;
+    if (engine === null || this.disposed) return;
+
+    const suitPos = this.requireSuit().getPosition();
+    const buggyPos = this.requireBuggy().getPosition();
+
+    if (this.questFootPrev !== null && this.mode === 'suit') {
+      const step = Math.hypot(suitPos.x - this.questFootPrev.x, suitPos.y - this.questFootPrev.y);
+      if (step > 0 && step < ClientApp.QUEST_TELEPORT_GUARD_M) {
+        engine.recordMoveDistance(step, false);
+      }
+    }
+    this.questFootPrev = { x: suitPos.x, y: suitPos.y };
+
+    if (this.questBuggyPrev !== null && this.mode === 'buggy') {
+      const roll = Math.hypot(buggyPos.x - this.questBuggyPrev.x, buggyPos.y - this.questBuggyPrev.y);
+      if (roll > 0 && roll < ClientApp.QUEST_TELEPORT_GUARD_M) {
+        engine.recordMoveDistance(roll, true);
+      }
+    }
+    this.questBuggyPrev = { x: buggyPos.x, y: buggyPos.y };
+
+    engine.recordPosition(this.activePosition());
+
+    // Dash telemetry mirror: ~10 Hz while mounted (frame-counted so it is
+    // deterministic under virtual-clock harnesses — no wall clock involved).
+    if (this.mode === 'buggy' && ++this.questDashFrame % 6 === 0) {
+      this.syncQuestDashboardTelemetry();
+    }
+  }
+
+  /**
+   * Spec 18 §6.1 / §7 — steer the hint arrow from the active objective and
+   * emit the screen-space payload into `hud.updateHintArrow()`. The camera is
+   * the scene's active camera (already pose-synced this frame by
+   * `syncCamera`); the viewport is the live backbuffer size, so NullEngine
+   * harnesses with an explicit render size get real projection results.
+   */
+  private refreshHintArrow(_now: number): void {
+    const hints = this.hintArrowSystem;
+    const engine = this.questEngine;
+    if (hints === null || engine === null || this.disposed) return;
+    const target: HintArrowTarget | null = engine.getHintArrowTarget();
+    hints.setTarget(target);
+    const camera = this.world.getScene().activeCamera;
+    const engineGfx = this.world.getEngine();
+    hints.update(camera, target, engineGfx.getRenderWidth(), engineGfx.getRenderHeight());
+  }
+
+  /**
+   * Push the active QuestEngine stage into the LunarHUD mission panel
+   * (Spec 18 §6.2 / Phase 3 contract): quest title, stage title, stage
+   * counter and the live objective rows. With no active quest the legacy
+   * checklist is restored unchanged.
+   */
+  private pushQuestStageToHud(): void {
+    const hud = this.hud;
+    if (hud === null || this.disposed) return;
+    const quest = this.questEngine?.getActiveQuest() ?? null;
+    const stage = this.questEngine?.getActiveStage() ?? null;
+    const legacy = this.getTutorialProgress();
+    if (quest === null || stage === null || quest.isCompleted) {
+      hud.setQuestStage(legacy.index, legacy.completed);
+      return;
+    }
+    hud.setQuestStage(legacy.index, legacy.completed, {
+      questTitle: quest.title,
+      stageTitle: stage.stageTitle,
+      stageNumber: stage.stageNumber,
+      stageTotal: quest.stages.length,
+      objectives: stage.objectives.map((o) => ({
+        id: o.id,
+        description: o.description,
+        completed: o.completed,
+      })),
+    });
+  }
+
+  /**
+   * Mirror quest + contractor telemetry onto the buggy cockpit dash
+   * (Spec 18 §6.3, ADR-18-3): quest title/objective strip, nav pip bearing,
+   * target range, cargo capacity, faction insignia tag and radio link state.
+   * Safe on NullEngine — the raster is pure RGBA.
+   */
+  private syncQuestDashboardTelemetry(): void {
+    const engine = this.questEngine;
+    if (engine === null || this.disposed) return;
+    const quest = engine.getActiveQuest();
+    const stage = engine.getActiveStage();
+    const pendingObjective = stage?.objectives.find((o) => !o.completed) ?? null;
+    const reading = engine.computeHintReading(this.activePosition());
+    const net = this.network;
+    const data: BuggyDashTelemetry = {
+      ...(quest !== null && !quest.isCompleted
+        ? { questTitle: quest.title }
+        : {}),
+      objectiveText:
+        stage !== null && quest !== null && !quest.isCompleted
+          ? pendingObjective?.description ?? stage.stageTitle
+          : 'ALL OBJECTIVES COMPLETE',
+      ...(reading !== null
+        ? { targetDistanceM: reading.distanceM, targetBearingDeg: reading.bearingDeg }
+        : {}),
+      cargoKg: this.requireBuggy().getCargoMass(),
+      maxCargoKg: BUGGY_MAX_CARGO,
+      faction: quest?.faction ?? this.options.faction ?? 'CEC',
+      linkStatus: net !== null && net.state === 'open' ? 'ONLINE - 128 kbps' : 'OFFLINE',
+    };
+    this.requireBuggy().setQuestDashboardTelemetry(data);
+  }
+
+  /**
+   * Pick the tutorial quest's mineral-vein anchor from the generated world:
+   * a regolith-grade vein that is provably the nearest vein AT ITS OWN
+   * centre (so a contractor standing on it always sees exactly this vein in
+   * the scanner and the mining hook records a quest-matching resource).
+   * Falls back to null when the snapshot carries no veins.
+   */
+  private veinAnchorFor(
+    fromX: number,
+    fromY: number,
+  ): { x: number; y: number; z: number } | null {
+    const veins = this.world.getSnapshot()?.veins ?? null;
+    if (veins === null || veins.length === 0) return null;
+    const surfaceDistance = (v: { center: { x: number; y: number; z: number }; radius: number }) =>
+      Math.hypot(v.center.x - fromX, v.center.y - fromY) - v.radius;
+    const candidates = [...veins]
+      .filter((v) => (VEIN_KIND_TO_RESOURCE[v.kind] ?? v.kind) === 'regolith')
+      .sort((a, b) => surfaceDistance(a) - surfaceDistance(b));
+    for (const candidate of candidates) {
+      // Nearest-at-own-centre test: every OTHER vein must sit shallower
+      // (strictly) at this point than the candidate's own −radius.
+      let anchorHolds = true;
+      for (const other of veins) {
+        if (other === candidate) continue;
+        const d =
+          Math.hypot(candidate.center.x - other.center.x, candidate.center.y - other.center.y) -
+          other.radius;
+        if (d < -candidate.radius) {
+          anchorHolds = false;
+          break;
+        }
+      }
+      if (anchorHolds) {
+        return { x: candidate.center.x, y: candidate.center.y, z: candidate.center.z };
+      }
+    }
+    // No self-dominant regolith vein: take the closest vein of any kind.
+    const best = [...veins].sort((a, b) => surfaceDistance(a) - surfaceDistance(b))[0];
+    return best ? { x: best.center.x, y: best.center.y, z: best.center.z } : null;
+  }
+
   // -- network wiring -----------------------------------------------------------------------
 
   private wireNetwork(): void {
@@ -2100,6 +2430,13 @@ export class ClientApp {
         newBalance: ev.newBalance,
       });
       this.hud?.updateInventory(ev.inventory);
+      // Spec 18 §7: a confirmed exchange feeds `trade_commodity` objectives
+      // (engine filters by commodity — the tutorial wants a regolith dump).
+      // Runs AFTER the terminal confirmation so a quest-completion banner is
+      // the final word in the feedback line.
+      if (!ev.isBuy) {
+        this.questEngine?.recordTrade(ev.commodity.toLowerCase(), ev.amount);
+      }
     });
 
     net.on('claim_staked', (ev: ClaimStakedEvent) => {

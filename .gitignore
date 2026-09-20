@@ -30,3 +30,7 @@ dist/
 .idea/
 *.swp
 *.swo
+
+# Hermes
+.hermes/
+
