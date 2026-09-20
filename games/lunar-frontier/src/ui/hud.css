@@ -756,6 +756,217 @@
   color: var(--lf-bad);
 }
 
+/* --- narrative comms terminal (Spec 18 §6.2) ------------------------------ */
+
+#lunar-hud-comms {
+  top: 34%;
+  left: 16px;
+  width: 320px;
+  overflow: hidden;
+  background: linear-gradient(
+    160deg,
+    rgba(12, 22, 26, 0.72),
+    rgba(8, 13, 14, 0.88)
+  );
+  border-color: rgba(120, 220, 255, 0.32);
+  box-shadow:
+    0 10px 40px rgba(0, 0, 0, 0.55),
+    inset 0 0 32px rgba(86, 224, 255, 0.06);
+}
+
+/* CRT scanline veil — the encrypted-burst look (spec 18 §2.2). */
+.comms-scanlines {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  border-radius: inherit;
+  background: repeating-linear-gradient(
+    180deg,
+    rgba(120, 220, 255, 0.05) 0px,
+    rgba(120, 220, 255, 0.05) 1px,
+    transparent 1px,
+    transparent 3px
+  );
+  animation: lf-comms-flicker 4.2s steps(2, end) infinite;
+}
+
+.comms-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border-bottom: 1px solid var(--lf-rule);
+  padding-bottom: 6px;
+  margin-bottom: 8px;
+}
+
+.comms-insignia {
+  color: var(--lf-warn);
+  font-size: 14px;
+  text-shadow: 0 0 8px rgba(255, 204, 85, 0.55);
+}
+
+.comms-sender {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  color: var(--lf-cyan);
+}
+
+.comms-tone-wrap {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.comms-tone-pip {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.2);
+}
+
+/* Tone pip colours — burst cyan, alert amber, success green, static grey. */
+.tone-burst .comms-tone-pip {
+  background: var(--lf-cyan);
+  box-shadow: 0 0 10px 2px rgba(86, 224, 255, 0.7);
+  animation: lf-pulse 0.9s ease-in-out infinite;
+}
+
+.tone-alert .comms-tone-pip {
+  background: var(--lf-warn);
+  box-shadow: 0 0 10px 2px rgba(255, 204, 85, 0.7);
+  animation: lf-pulse 0.6s ease-in-out infinite;
+}
+
+.tone-success .comms-tone-pip {
+  background: var(--lf-good);
+  box-shadow: 0 0 10px 2px rgba(92, 230, 164, 0.7);
+}
+
+.tone-static .comms-tone-pip {
+  background: rgba(200, 210, 220, 0.5);
+}
+
+.comms-tone-label {
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  color: var(--lf-dim);
+}
+
+.comms-origin {
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  color: var(--lf-dim);
+  margin-bottom: 6px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.comms-body {
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--lf-text);
+  min-height: 54px;
+  text-shadow: 0 0 6px rgba(86, 224, 255, 0.25), 0 1px 3px rgba(0, 0, 0, 0.9);
+}
+
+.comms-cursor {
+  color: var(--lf-cyan);
+  animation: lf-pulse 0.8s steps(2, end) infinite;
+}
+
+/* --- screen-edge hint arrow (Spec 18 §6.1, ADR-18-2) ---------------------- */
+
+#lunar-hud-hint-arrow {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: rgba(8, 13, 14, 0.72);
+  border: 1px solid rgba(86, 224, 255, 0.55);
+  box-shadow: 0 0 16px rgba(86, 224, 255, 0.25);
+  white-space: nowrap;
+  transition: left 60ms linear, top 60ms linear;
+  z-index: 30;
+}
+
+.hint-arrow-glyph {
+  display: inline-block;
+  color: var(--lf-cyan);
+  font-size: 15px;
+  line-height: 1;
+  text-shadow: 0 0 8px rgba(86, 224, 255, 0.8);
+}
+
+.hint-arrow-distance {
+  font-size: 12px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.08em;
+  color: var(--lf-text);
+}
+
+.hint-arrow-label {
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--lf-dim);
+}
+
+/* Perimeter clamp mode reads brighter — it is the only guidance you have. */
+#lunar-hud-hint-arrow.is-offscreen .hint-arrow-glyph {
+  animation: lf-pulse 1.2s ease-in-out infinite;
+}
+
+/* In-view mode trails the 3D chevron — keep it subtle. */
+#lunar-hud-hint-arrow.is-inview {
+  background: rgba(8, 13, 14, 0.5);
+  border-color: rgba(86, 224, 255, 0.3);
+  box-shadow: none;
+}
+
+#lunar-hud-hint-arrow.is-hidden {
+  display: none;
+}
+
+/* --- quest-driven tutorial panel (Spec 18 Phase 3) ------------------------ */
+
+.tutorial-stage-title {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  color: var(--lf-warn);
+  margin: 2px 0 6px;
+}
+
+.tutorial-objective {
+  line-height: 1.45;
+  white-space: normal;
+}
+
+#lunar-hud-tutorial.quest-mode .hud-heading {
+  color: var(--lf-warn);
+}
+
+@keyframes lf-comms-flicker {
+  0%,
+  94%,
+  100% {
+    opacity: 1;
+  }
+  95% {
+    opacity: 0.6;
+  }
+  97% {
+    opacity: 0.85;
+  }
+}
+
 /* --- small screens (GPD Win Max 2 / handhelds) ----------------------------- */
 
 @media (max-width: 900px) {
@@ -777,6 +988,12 @@
   }
   #lunar-hud-lap {
     width: 190px;
+  }
+  #lunar-hud-comms {
+    width: 220px;
+  }
+  .hint-arrow-label {
+    display: none;
   }
   .compass-pin-readout {
     display: none;

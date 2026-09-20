@@ -30,6 +30,18 @@
 import assert from 'node:assert';
 
 import { NullEngine } from '@babylonjs/core/Engines/nullEngine.js';
+import { Scene } from '@babylonjs/core/scene.js';
+import { Vector3 } from '@babylonjs/core/Maths/math.vector.js';
+import { UniversalCamera } from '@babylonjs/core/Cameras/universalCamera.js';
+
+import {
+  HintArrowSystem,
+  HINT_BOB_AMPLITUDE_M,
+  HINT_BOB_FREQUENCY_HZ,
+  HINT_EDGE_INSET_PX,
+  HINT_HEIGHT_OFFSET_M,
+  type HudHintArrowPayload,
+} from '../src/client/HintArrowSystem.ts';
 
 import {
   ClientApp,
@@ -45,8 +57,15 @@ import {
   gamepadThrottleCurve,
 } from '../src/client/ClientApp.ts';
 import { TraversalController } from '../src/client/TraversalController.ts';
+import { InMemoryQuestStorage } from '../src/client/QuestEngine.ts';
 import NetworkClient from '../src/network/NetworkClient.ts';
-import LunarHUD, { HUD_ROOT_ID, HUD_TRADE_ID } from '../src/ui/LunarHUD.ts';
+import LunarHUD, {
+  HUD_COMMS_ID,
+  HUD_HINT_ARROW_ID,
+  HUD_ROOT_ID,
+  HUD_TRADE_ID,
+  HUD_TUTORIAL_ID,
+} from '../src/ui/LunarHUD.ts';
 
 // ---------------------------------------------------------------------------
 // Harness clock — shared by the client frames AND the scripted network so
@@ -500,6 +519,321 @@ section('B. LunarHUD glassmorphic overlay (ADR-013-1)');
   );
   hud.dispose();
   check('dispose is idempotent', hud.isDisposed());
+}
+
+// ===========================================================================
+// LAYER B2 — Spec 18 comms terminal + screen-edge hint arrow (HUD side)
+// ===========================================================================
+
+section('B2. Spec 18 §6.1/§6.2 — comms terminal & HUD hint arrow');
+{
+  const doc = makeFakeDocument();
+  const hud = new LunarHUD({ document: doc as unknown as Document });
+
+  // B2-1 — comms skeleton exists and starts hidden.
+  check(
+    'comms panel #lunar-hud-comms built hidden',
+    doc.getElementById(HUD_COMMS_ID) !== null &&
+      doc.getElementById(HUD_COMMS_ID)!.classList.contains('is-hidden'),
+  );
+  check('isCommsVisible() false before first transmission', !hud.isCommsVisible());
+
+  // B2-2 — showComms paints header/tone/body and reveals the panel.
+  hud.showComms({
+    sender: 'Caelus Extraction Corp — Corporate Dispatch',
+    callsign: 'CEC-DISP',
+    transmission: 'Contractor 7-Echo, wake up. Life support telemetry verified.',
+    audioTone: 'burst',
+  });
+  check('showComms reveals panel + isCommsVisible()', hud.isCommsVisible());
+  check('callsign rendered in header', hud.textOf('comms-sender') === 'CEC-DISP');
+  check(
+    'sender org line rendered',
+    hud.textOf('comms-origin').includes('Caelus Extraction Corp'),
+  );
+  check('tone label uppercased', hud.textOf('comms-tone') === 'BURST');
+  check(
+    'tone pip class tone-burst set',
+    hud.hasClass('comms-tone-pulse', 'tone-burst'),
+  );
+  const commsBody = doc.getElementById('lunar-hud-comms-body')!;
+  check(
+    'full transmission mirrored to data-full (typewriter-safe)',
+    commsBody.getAttribute('data-full') ===
+      'Contractor 7-Echo, wake up. Life support telemetry verified.',
+  );
+  check('data-tone stamped', commsBody.getAttribute('data-tone') === 'burst');
+
+  // B2-3 — typewriter animates: after a beat, some chars are visible.
+  await new Promise((resolve) => setTimeout(resolve, 90));
+  const typed = hud.textOf('comms-text');
+  check(
+    'typewriter reveal in progress/complete',
+    typed.length > 0 &&
+      'Contractor 7-Echo, wake up. Life support telemetry verified.'.startsWith(typed),
+  );
+
+  // B2-4 — hideComms collapses; tone swaps replace cleanly.
+  hud.hideComms();
+  check('hideComms collapses panel', !hud.isCommsVisible() &&
+    doc.getElementById(HUD_COMMS_ID)!.classList.contains('is-hidden'));
+  hud.showComms({
+    sender: 'X',
+    callsign: 'Y',
+    transmission: 'ok',
+    audioTone: 'success',
+  });
+  check(
+    'tone swap: previous tone-burst removed, tone-success set',
+    !hud.hasClass('comms-tone-pulse', 'tone-burst') &&
+      hud.hasClass('comms-tone-pulse', 'tone-success'),
+  );
+
+  // B2-5 — autoDismissMs dismisses on its own (no manual hideComms).
+  hud.showComms({
+    sender: 'X',
+    callsign: 'Z',
+    transmission: 'This burst self-destructs.',
+    audioTone: 'alert',
+    autoDismissMs: 40,
+  });
+  check('auto-dismiss armed: still visible immediately', hud.isCommsVisible());
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  check('autoDismissMs hid the comms panel', !hud.isCommsVisible());
+
+  // B2-6 — hint arrow element skeleton + update painting.
+  check(
+    'hint arrow #lunar-hud-hint-arrow built hidden',
+    doc.getElementById(HUD_HINT_ARROW_ID) !== null &&
+      doc.getElementById(HUD_HINT_ARROW_ID)!.classList.contains('is-hidden'),
+  );
+  hud.updateHintArrow({
+    visible: true,
+    screenX: 640,
+    screenY: 360,
+    angleDeg: 45,
+    distanceM: 45.4,
+    label: 'Ilmenite outcrop',
+    isOffScreen: false,
+  });
+  const arrowEl = doc.getElementById(HUD_HINT_ARROW_ID)!;
+  const arrowStyle = arrowEl.style as unknown as Record<string, string>;
+  check(
+    'in-view arrow positioned + visible',
+    !arrowEl.classList.contains('is-hidden') &&
+      arrowEl.classList.contains('is-inview') &&
+      arrowStyle['left'] === '640.0px' &&
+      arrowStyle['top'] === '360.0px',
+  );
+  check('distance readout rounded (45m)', hud.textOf('hint-arrow-distance') === '45m');
+  check('target label rendered', hud.textOf('hint-arrow-label') === 'Ilmenite outcrop');
+
+  // B2-7 — off-screen clamp mode stamps is-offscreen + rotates glyph.
+  hud.updateHintArrow({
+    visible: true,
+    screenX: 48,
+    screenY: 300,
+    angleDeg: -90,
+    distanceM: 120.2,
+    label: 'Exchange terminal',
+    isOffScreen: true,
+  });
+  const glyphStyle = doc
+    .getElementById('lunar-hud-hint-arrow-glyph')!
+    .style as unknown as Record<string, string>;
+  check(
+    'off-screen clamp: is-offscreen class + glyph rotate(-90deg)',
+    arrowEl.classList.contains('is-offscreen') &&
+      !arrowEl.classList.contains('is-inview') &&
+      glyphStyle['transform'] === 'rotate(-90.0deg)',
+  );
+
+  // B2-8 — null payload hides; getHintArrowData readback.
+  hud.updateHintArrow(null);
+  check(
+    'null payload hides arrow',
+    arrowEl.classList.contains('is-hidden') && hud.getHintArrowData() === null,
+  );
+
+  // B2-9 — quest stage overlay: dynamic title + multi-objective rendering.
+  hud.setQuestStage(0, [false, false], {
+    questTitle: 'A One-Way Ticket to the Frontier',
+    stageTitle: 'The First Haul & Frontier Exchange',
+    stageNumber: 5,
+    stageTotal: 5,
+    objectives: [
+      { id: 's5_reach_hub', description: 'Drive the buggy to the Faction Exchange Terminal marker.', completed: false },
+      { id: 's5_dump_haul', description: 'Dump your cargo at the terminal with [T] for scrip.', completed: true },
+    ],
+  });
+  const tutorialPanel = doc.getElementById(HUD_TUTORIAL_ID)!;
+  check(
+    'quest mode: heading re-titled with quest name',
+    hud.textOf('tutorial-heading').includes('A ONE-WAY TICKET TO THE FRONTIER') &&
+      tutorialPanel.classList.contains('quest-mode'),
+  );
+  check(
+    'quest mode: stage title line rendered',
+    hud.textOf('tutorial-stage-title') === 'The First Haul & Frontier Exchange' &&
+      !doc.getElementById('lunar-hud-tutorial-stage')!.classList.contains('is-hidden'),
+  );
+  check('quest mode: progress readout 5 / 5', hud.textOf('tutorial-progress') === '5 / 5');
+  const questBody = doc.getElementById('lunar-hud-tutorial-quest')!;
+  check(
+    'multi-objective rows rendered with ids + done marks',
+    !questBody.classList.contains('is-hidden') &&
+      questBody.children.length === 2 &&
+      questBody.children[0].getAttribute('data-objective-id') === 's5_reach_hub' &&
+      questBody.children[0].classList.contains('is-active') &&
+      questBody.children[1].getAttribute('data-objective-id') === 's5_dump_haul' &&
+      questBody.children[1].classList.contains('is-done') &&
+      questBody.children[1].children[0].textContent === '✔',
+  );
+  check(
+    'quest mode hides the legacy static checklist rows',
+    doc.getElementById('lunar-hud-tutorial-step-1')!.classList.contains('is-hidden'),
+  );
+
+  // B2-10 — legacy updateTutorial keeps working (zero-import contract).
+  hud.setQuestStage(0, []);
+  check(
+    'legacy restore: quest body hidden again',
+    doc.getElementById('lunar-hud-tutorial-quest')!.classList.contains('is-hidden'),
+  );
+  hud.updateTutorial(1, [true, false, false, false, false]);
+  check(
+    'legacy checklist still paints (step 0 done, step 1 active)',
+    doc.getElementById('lunar-hud-tutorial-step-1')!.classList.contains('is-done') &&
+      doc.getElementById('lunar-hud-tutorial-step-2')!.classList.contains('is-active'),
+  );
+  hud.dispose();
+}
+
+// ===========================================================================
+// LAYER B3 — Spec 18 HintArrowSystem on NullEngine (3D chevron + clamp math)
+// ===========================================================================
+
+section('B3. Spec 18 §6.1 — HintArrowSystem frustum/edge projection');
+{
+  const engine = new NullEngine({ renderWidth: 1280, renderHeight: 720 } as never);
+  const scene = new Scene(engine);
+  // Camera at spawn (Babylon y-up), facing physics +y (north): worldToBabylon
+  // maps +y → −z, and a yaw-PI Babylon camera looks down −z.
+  const camera = new UniversalCamera('hint-test-cam', new Vector3(0, 1.6, 0), scene);
+  camera.rotation.y = Math.PI;
+  camera.inputs.clear();
+
+  let emitted: HudHintArrowPayload | null = null;
+  let fakeClockMs = 0;
+  const hints = new HintArrowSystem({
+    scene,
+    clock: () => fakeClockMs,
+    onHudUpdate: (payload) => (emitted = payload),
+  });
+
+  // B3-1 — spec constants.
+  check(
+    'bob ±0.3 m @ 1.2 Hz constants match spec §6.1',
+    HINT_BOB_AMPLITUDE_M === 0.3 && HINT_BOB_FREQUENCY_HZ === 1.2,
+  );
+  check(
+    'hover height + edge inset exported',
+    HINT_HEIGHT_OFFSET_M > 1 && HINT_EDGE_INSET_PX > 0,
+  );
+
+  // B3-2 — no target → hidden payload, no crash.
+  const none = hints.update(camera, null, 1280, 720);
+  check('no target emits hidden payload', none.visible === false && emitted !== null && emitted.visible === false);
+
+  // B3-3 — zero-size viewport (NullEngine canvas 0×0) stays safe.
+  const zero = hints.update(camera, { x: 0, y: 45, z: 0 }, 0, 0);
+  check('zero-size viewport short-circuits to hidden (no NaN)', zero.visible === false);
+
+  // B3-4 — target dead ahead in view: chevron enabled, screen centre-ish.
+  hints.setTarget({ x: 0, y: 45, z: 0, label: 'Ilmenite outcrop' });
+  const inView = hints.update(camera, null, 1280, 720);
+  check('in-view target → visible payload, isOffScreen false', inView.visible === true && inView.isOffScreen === false);
+  check(
+    'in-view distance ≈ 45 m',
+    inView.distanceM !== undefined && Math.abs(inView.distanceM - 45) < 1.7,
+    `got ${inView.distanceM}`,
+  );
+  check(
+    'projected screen pos near centre column',
+    inView.screenX !== undefined && Math.abs(inView.screenX - 640) < 8,
+  );
+  check('label passthrough', inView.label === 'Ilmenite outcrop');
+  const chevronMesh = scene.getMeshByName('hint-arrow-chevron');
+  check('3D chevron mesh built in scene', chevronMesh !== null && chevronMesh!.isEnabled());
+  check(
+    'chevron hovers above target (+y offset, bob at t=0 → sin 0 = 0)',
+    chevronMesh!.position.y > 1.5,
+  );
+
+  // B3-5 — bob animation: quarter period later the offset rises by amplitude.
+  fakeClockMs = 1000 / (4 * HINT_BOB_FREQUENCY_HZ); // sin(2π·1.2·t) = sin(π/2) = 1
+  hints.update(camera, null, 1280, 720);
+  const bobbedY = scene.getMeshByName('hint-arrow-chevron')!.position.y;
+  fakeClockMs = 0;
+  hints.update(camera, null, 1280, 720);
+  const baseY = scene.getMeshByName('hint-arrow-chevron')!.position.y;
+  check(
+    'bob peaks at +0.3 m a quarter-period in',
+    Math.abs(bobbedY - baseY - HINT_BOB_AMPLITUDE_M) < 1e-6,
+    `Δ=${bobbedY - baseY}`,
+  );
+
+  // B3-6 — pan 180° away: chevron hidden, perimeter clamp emitted.
+  camera.rotation.y = 0; // face south — target is behind the camera
+  camera.computeWorldMatrix(true);
+  const off = hints.update(camera, null, 1280, 720);
+  check('180° pan → off-screen clamp payload', off.visible === true && off.isOffScreen === true);
+  check('behind-camera view depth negative', (hints.getState().viewDepth ?? 1) < 0);
+  const insetX = HINT_EDGE_INSET_PX;
+  const insetY = HINT_EDGE_INSET_PX;
+  check(
+    'clamped coords lie on the inset perimeter rect',
+    Math.abs(off.screenX! - insetX) < 1 ||
+      Math.abs(off.screenX! - (1280 - insetX)) < 1 ||
+      Math.abs(off.screenY! - insetY) < 1 ||
+      Math.abs(off.screenY! - (720 - insetY)) < 1,
+    `x=${off.screenX} y=${off.screenY}`,
+  );
+  check(
+    'clamp angle finite + distance persists',
+    Number.isFinite(off.angleDeg) && off.distanceM !== undefined && Math.abs(off.distanceM - 45) < 1.7,
+  );
+  check(
+    '3D chevron hidden while off-screen',
+    !scene.getMeshByName('hint-arrow-chevron')!.isEnabled(),
+  );
+
+  // B3-7 — off-axis target (NE while facing north) still guides: in-view or
+  // clamped, never invisible, and clamp points eastward-ish.
+  camera.rotation.y = Math.PI;
+  camera.computeWorldMatrix(true);
+  const side = hints.update(camera, { x: 300, y: 10, z: 0 }, 1280, 720);
+  check('wide-angle target still emits guidance (never invisible)', side.visible === true);
+
+  // B3-8 — setTarget(null) clears; dispose is idempotent + post-dispose safe.
+  hints.setTarget(null);
+  check('setTarget(null) clears target', hints.getTarget() === null);
+  check('update with no target after clear hidden', hints.update(camera, null, 1280, 720).visible === false);
+  hints.dispose();
+  hints.dispose();
+  check('dispose idempotent', hints.isDisposed());
+  check(
+    'post-dispose update returns hidden payload without throwing',
+    hints.update(camera, { x: 1, y: 1, z: 1 }, 1280, 720).visible === false,
+  );
+  check(
+    'dispose releases scene meshes',
+    scene.getMeshByName('hint-arrow-chevron') === null &&
+      scene.getMeshByName('hint-arrow-ring') === null,
+  );
+
+  scene.dispose();
+  engine.dispose();
 }
 
 // ===========================================================================
@@ -1426,6 +1760,245 @@ section('E2. long-range nav scanner & compass guidance (TASK-PLAY-063c)');
   const pinText2 = pin.children.map((c) => c.textContent ?? '').join('');
   check('HUD vein pin renders ▲ when on-course', pinText2.includes('▲') && pinText2.includes('210 m'));
   pinHud.dispose();
+}
+
+// ===========================================================================
+// LAYER E3 — Spec 18 §8 E2E: full tutorial-quest pipeline through ClientApp
+// ===========================================================================
+
+section('E3. Spec 18 §5/§6/§7/§8 — end-to-end quest pipeline (NullEngine)');
+{
+  const e3Doc = makeFakeDocument();
+  const prevDoc = (globalThis as { document?: unknown }).document;
+  (globalThis as { document?: unknown }).document = e3Doc;
+
+  const e3 = makeScriptedNetwork();
+  const qApp = new ClientApp({
+    seed: 'mala-voyage-2431',
+    username: 'contractor7echo',
+    faction: 'CEC',
+    network: e3.net,
+    questStorage: new InMemoryQuestStorage(),
+    silent: true,
+  });
+  await qApp.init(new NullEngine({ renderWidth: 1280, renderHeight: 720 } as never));
+  const qHud = qApp.getHud()!;
+  const qEngine = qApp.getQuestEngine()!;
+  const hints = qApp.getHintArrowSystem()!;
+  const suit = qApp.getSuit();
+  const buggy = qApp.getBuggy();
+
+  // E3-1 — cold boot: Stage 1 active, dispatch received + displayed on HUD.
+  const stage1 = qEngine.getActiveStage()!;
+  check('E3-1 boots with tutorial Stage 1 active', stage1.stageNumber === 1 && qEngine.getActiveQuest()?.title === 'A One-Way Ticket to the Frontier');
+  check('E3-1 initial comms message received (CEC-DISP)', qApp.getLastComms()?.callsign === 'CEC-DISP');
+  check('E3-1 comms terminal displayed on HUD', qHud.isCommsVisible() && qHud.textOf('comms-sender') === 'CEC-DISP');
+  check(
+    'E3-1 transmission body carries the 7-Echo briefing',
+    (e3Doc.getElementById('lunar-hud-comms-body')!.getAttribute('data-full') ?? '').includes('Contractor 7-Echo'),
+  );
+  check(
+    'E3-1 mission panel shows the quest title',
+    qHud.textOf('tutorial-heading').includes('A ONE-WAY TICKET TO THE FRONTIER'),
+  );
+
+  // E3-2 — hint arrow points toward the Stage 1 survey beacon.
+  nowMs += 16;
+  qApp.update(nowMs);
+  const beacon = stage1.hintArrowTarget!;
+  const aimed = hints.getTarget()!;
+  check(
+    'E3-2 hint arrow locked to the Stage 1 beacon target',
+    aimed.x === beacon.x && aimed.y === beacon.y && aimed.label === 'Survey beacon',
+  );
+  const hint0 = hints.getLastPayload();
+  check(
+    'E3-2 HUD hint payload visible with a real distance readout',
+    hint0.visible === true && typeof hint0.distanceM === 'number' && hint0.distanceM > 0 && Number.isFinite(hint0.distanceM),
+    JSON.stringify(hint0),
+  );
+
+  // E3-3 — simulate walking 10 m → Stage 2 + comms update. Sub-frame hops
+  // stay under the 25 m teleport guard, so every step counts as foot travel.
+  let walkedM = 0;
+  for (let i = 0; i < 9 && (qEngine.getActiveStage()?.stageNumber ?? 0) === 1; i++) {
+    const p = suit.getPosition();
+    suit.teleport(p.x + 1.5, p.y);
+    walkedM += 1.5;
+    nowMs += 16;
+    qApp.update(nowMs);
+  }
+  check('E3-3 walking 10 m advances to Stage 2', qEngine.getActiveStage()?.stageNumber === 2, `walked=${walkedM.toFixed(1)} m`);
+  check(
+    'E3-3 Stage 2 comms update delivered (ilmenite surface scan)',
+    qHud.isCommsVisible() &&
+      (e3Doc.getElementById('lunar-hud-comms-body')!.getAttribute('data-full') ?? '').includes('ilmenite'),
+  );
+
+  // E3-4 — approach the mineral vein → Stage 3.
+  const vein = qEngine.getActiveStage()!.objectives[0].targetPosition!;
+  for (let i = 0; i < 40; i++) {
+    const p = suit.getPosition();
+    const dx = vein.x - p.x;
+    const dy = vein.y - p.y;
+    const d = Math.hypot(dx, dy);
+    if (d < 5) break;
+    const step = Math.min(24, d);
+    suit.teleport(p.x + (dx / d) * step, p.y + (dy / d) * step);
+    nowMs += 16;
+    qApp.update(nowMs);
+  }
+  nowMs += 260;
+  qApp.update(nowMs); // scanner re-sweep at the vein centre
+  check('E3-4 reaching the vein advances to Stage 3', qEngine.getActiveStage()?.stageNumber === 3);
+  check(
+    'E3-4 hint arrow re-aimed at the mineral vein',
+    hints.getTarget()?.x === vein.x && hints.getTarget()?.y === vein.y,
+  );
+
+  // E3-5 — mine 20 kg → Stage 4.
+  const mineAccepted = qApp.mineNearestVein(20);
+  nowMs += 16;
+  qApp.update(nowMs);
+  check('E3-5 mining frame accepted at the vein', mineAccepted === true);
+  check('E3-5 20 kg extraction advances to Stage 4', qEngine.getActiveStage()?.stageNumber === 4);
+
+  // E3-6 — stow the haul, board the LRV → Stage 5 + buggy dash telemetry.
+  buggy.setCargoMass(20);
+  for (let i = 0; i < 40; i++) {
+    const p = suit.getPosition();
+    const dx = buggy.getPosition().x - p.x;
+    const dy = buggy.getPosition().y - p.y;
+    const d = Math.hypot(dx, dy);
+    if (d < 1.8) break;
+    const step = Math.min(24, Math.max(1, d - 1));
+    suit.teleport(p.x + (dx / d) * step, p.y + (dy / d) * step);
+    nowMs += 16;
+    qApp.update(nowMs);
+  }
+  check('E3-6 [E] boards the requisitioned LRV', qApp.toggleMount() === true && qApp.getMode() === 'buggy');
+  check('E3-6 boarding advances to Stage 5', qEngine.getActiveStage()?.stageNumber === 5);
+  nowMs += 120;
+  qApp.update(nowMs); // 10 Hz dash mirror tick
+  const dash = buggy.getDashboardTelemetry();
+  check(
+    'E3-6 dash mirrors quest title + terminal objective',
+    dash.questActive === true &&
+      dash.questTitle === 'A One-Way Ticket to the Frontier' &&
+      (dash.objectiveText ?? '').toLowerCase().includes('terminal'),
+    JSON.stringify(dash),
+  );
+  check(
+    'E3-6 dash carries target range, cargo 20/500, faction + online link',
+    dash.targetDistanceM !== null && Number.isFinite(dash.targetDistanceM) && dash.targetDistanceM > 0 &&
+      dash.cargoKg === 20 && dash.maxCargoKg === 500 &&
+      dash.faction === 'CEC' && dash.linkStatus === 'ONLINE - 128 kbps',
+  );
+  const pxTitle = buggy.readDashPixel(4, 0);
+  check(
+    'E3-6 quest title strip rastered into the dash texture (magenta)',
+    pxTitle !== null && pxTitle[0] === 236 && pxTitle[1] === 64 && pxTitle[2] === 255 && pxTitle[3] === 255,
+    JSON.stringify(pxTitle),
+  );
+  const pxCargo = buggy.readDashPixel(2, 17);
+  check(
+    'E3-6 cargo meter meter segment rastered (green fill)',
+    pxCargo !== null && pxCargo[0] === 60 && pxCargo[1] === 230 && pxCargo[2] === 120,
+    JSON.stringify(pxCargo),
+  );
+  const pxLink = buggy.readDashPixel(60, 17);
+  check(
+    'E3-6 radio link LED lit online (green)',
+    pxLink !== null && pxLink[0] === 40 && pxLink[1] === 255 && pxLink[2] === 120,
+    JSON.stringify(pxLink),
+  );
+  let navPipFound = false;
+  for (let y = 12; y <= 14 && !navPipFound; y++) {
+    for (let x = 2; x <= 61; x++) {
+      const p = buggy.readDashPixel(x, y);
+      if (p !== null && p[0] === 255 && p[1] === 255 && p[2] === 255) {
+        navPipFound = true;
+        break;
+      }
+    }
+  }
+  check('E3-6 nav pip painted on the bearing track', navPipFound === true);
+
+  // E3-7 — drive to the exchange terminal. The dash range ladder (120 m
+  // full scale) must fill as the haul closes in; sampled mid-approach with a
+  // 6-frame step so the ~10 Hz dash mirror tick provably lands.
+  const hub = qEngine.getActiveStage()!.objectives[0].targetPosition!;
+  const warpBuggyToward = (tx: number, ty: number, stopDist: number): void => {
+    for (let i = 0; i < 40; i++) {
+      const p = buggy.getPosition();
+      const dx = tx - p.x;
+      const dy = ty - p.y;
+      const d = Math.hypot(dx, dy);
+      if (d <= stopDist) return;
+      const step = Math.max(1, Math.min(24, d - stopDist));
+      const seat = buggy as unknown as {
+        physics: { state: { x: number; y: number } };
+      };
+      seat.physics.state.x = p.x + (dx / d) * step;
+      seat.physics.state.y = p.y + (dy / d) * step;
+      nowMs += 16;
+      qApp.update(nowMs);
+    }
+  };
+  warpBuggyToward(hub.x, hub.y, 90);
+  for (let i = 0; i < 6; i++) {
+    nowMs += 16;
+    qApp.update(nowMs); // guarantees a 10 Hz dash-mirror frame
+  }
+  const dashMid = buggy.getDashboardTelemetry();
+  check(
+    'E3-7 dash range shrinks mid-approach (<120 m scale)',
+    dashMid.targetDistanceM !== null && dashMid.targetDistanceM < 120,
+    JSON.stringify(dashMid.targetDistanceM),
+  );
+  const pxLadder = buggy.readDashPixel(2, 29);
+  check(
+    'E3-7 target-range ladder fills near the objective (orange)',
+    pxLadder !== null && pxLadder[0] === 255 && pxLadder[1] === 120 && pxLadder[2] === 60,
+    JSON.stringify(pxLadder),
+  );
+  warpBuggyToward(hub.x, hub.y, 8);
+  nowMs += 16;
+  qApp.update(nowMs);
+  check('E3-7 terminal reach objective complete', qEngine.getActiveStage()?.objectives[0]?.completed === true);
+
+  // E3-8 — trade the haul → QUEST_COMPLETED + credit reward.
+  check(
+    'E3-8 SELL order at the terminal accepted',
+    qApp.submitTrade({ commodity: 'REGOLITH', amount: 20, isBuy: false }) === true,
+  );
+  e3.net.handleFrame(
+    frame('trade_confirmed', {
+      trade_id: 't-e3',
+      commodity: 'REGOLITH',
+      amount: 20,
+      is_buy: false,
+      unit_price: 5.2,
+      total_credits: 104,
+      new_balance: 1104,
+      inventory: { REGOLITH: 0 },
+    }),
+  );
+  check('E3-8 trade completes the quest', qEngine.getActiveQuest()?.isCompleted === true);
+  check('E3-8 quest reward is 500 credits', qApp.getQuestRewardCredits() === 500);
+  check('E3-8 completion feedback shown', qHud.textOf('trade-feedback').includes('QUEST COMPLETE'));
+  nowMs += 16;
+  qApp.update(nowMs);
+  check('E3-8 hint arrow retires after completion', hints.getLastPayload().visible === false);
+
+  // E3-9 — [L] toggles the comms log (hide then re-open the last burst).
+  check('E3-9 [L] handled as an action key', qApp.handleKeyInput('KeyL', 'down') === true);
+  check('E3-9 first [L] press hides the comms terminal', !qHud.isCommsVisible());
+  qApp.handleKeyInput('KeyL', 'down');
+  check('E3-9 second [L] press re-opens the log', qHud.isCommsVisible() === true);
+
+  qApp.dispose();
+  (globalThis as { document?: unknown }).document = prevDoc;
 }
 
 // ===========================================================================
