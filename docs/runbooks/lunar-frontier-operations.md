@@ -1,6 +1,49 @@
 # Lunar Frontier Operations Runbook
 
-## 1. Overview
+## 1. Quickstart — Running the Game Server & Client
+
+`games/lunar-frontier` requires two complementary processes to play:
+1. **Authoritative Server:** Fastify + WebSocket + SQLite on port `3030`.
+2. **Web Client Dev Server:** Vite on port `5174`, which automatically proxies `/ws` and `/api` to port `3030`.
+
+```
+Browser Client (http://<IP>:5174) 
+   │
+   ├─► Assets / HTML ────► Vite Dev Server (port 5174)
+   │
+   ├─► WebSocket (/ws) ──► Vite Proxy ──► Fastify Server (ws://127.0.0.1:3030/ws)
+   └─► HTTP API (/api) ──► Vite Proxy ──► Fastify Server (http://127.0.0.1:3030/api)
+```
+
+### One-Line Foreground Commands (from `games/lunar-frontier`):
+```bash
+# Terminal 1 — Authoritative Shard (Port 3030):
+PORT=3030 HOST=0.0.0.0 DB_PATH=./lunarfrontier.db npx tsx src/server/index.ts
+
+# Terminal 2 — Web Client (Port 5174):
+npx vite --host 0.0.0.0 --port 5174
+```
+
+### Background Service Launch (with log redirection):
+```bash
+# Start backend shard
+cd /home/jagosan/repos/playground/games/lunar-frontier
+PORT=3030 HOST=0.0.0.0 DB_PATH=./lunarfrontier.db npx tsx src/server/index.ts > ~/.hermes/logs/lunar-server.log 2>&1 &
+
+# Start Vite client
+npx vite --host 0.0.0.0 --port 5174 > ~/.hermes/logs/lunar-vite.log 2>&1 &
+```
+
+### Health & URL Endpoints:
+- **Tailscale (Remote / In-Flight):** `http://100.99.188.15:5174/`
+- **Local LAN:** `http://192.168.86.118:5174/`
+- **Localhost:** `http://localhost:5174/`
+- **Backend Health Check:** `curl -s http://127.0.0.1:3030/health` (`{"status":"ok","players":N,"uptime":S}`)
+- **Logs:** `~/.hermes/logs/lunar-server.log` and `~/.hermes/logs/lunar-vite.log`
+
+---
+
+## 2. Overview
 `games/lunar-frontier` is a persistent multiplayer lunar economy simulation and 3D terrain exploration game built on Babylon.js (WebGL2/WebGPU client) and Fastify + WebSocket + SQLite (headless authoritative server).
 
 ## 2. Rover Kinematics & Visual Architecture (Spec 15)

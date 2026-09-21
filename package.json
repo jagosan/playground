@@ -7,7 +7,9 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "lunar:server": "cd games/lunar-frontier && npm run server",
+    "lunar:client": "cd games/lunar-frontier && npm run client"
   },
   "dependencies": {
     "three": "^0.160.0"

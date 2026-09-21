@@ -16,6 +16,7 @@
 - `docs/architecture/17-lunar-buggy-simulation-track-and-control-refinement.md`: Terrestrial proving grounds racetrack, speed-sensitive steering, ABS trigger braking, elevated velocity-vector chase camera & realistic buggy visual overhaul.
 - `docs/architecture/18-new-player-ux-and-quest-framework.md`: New player onboarding, narrative quest engine, 3D hint arrow spatial guidance, buggy dash telemetry & 4-tier lunar industrial loop.
 - `docs/architecture/19-lunar-frontier-gamepad-controls-and-mining-ux.md`: Gamepad controls overhaul, Linux trigger mapping, brake-to-reverse, right-stick look pitch, offline mining fallback, 3D mining laser & tiered cargo capacity.
+- `docs/architecture/20-lunar-frontier-hill-hold-drift-fix-and-stick-layout.md`: Buggy hill-hold zero-drift braking, coast regen torque, slope gravity cancellation, decoupled dual-stick layout (drive-right / look-left).
 - `docs/architecture/15-subagent-context-pruning-and-turn-budgeting.md`: Subagent context pruning, N-3 turn-budget circuit breaker, AST extraction, and Beehive Neo4j symbol discovery.
 - `specs/`:
   - `specs/00-system-overview.md`: Project vision, minigame architecture, rendering stack.
@@ -33,6 +34,7 @@
   - `specs/17-lunar-buggy-simulation-track-and-control-refinement.md`: Terrestrial proving grounds racetrack, speed-sensitive steering, ABS trigger braking, elevated velocity-vector chase camera, realistic buggy overhaul & lunar migration.
   - `specs/18-new-player-ux-and-quest-framework.md`: New player UX, narrative quest engine, 3D hint arrows, buggy dashboard telemetry & 4-tier lunar resource progression.
   - `specs/19-lunar-frontier-gamepad-controls-and-mining-ux.md`: Gamepad controls overhaul, mining UX & audio-visuals, offline extraction fallback & suit/buggy cargo capacities.
+  - `specs/20-lunar-frontier-hill-hold-drift-fix-and-stick-layout.md`: Buggy hill-hold zero-drift braking, coast regen torque, slope gravity cancellation, decoupled dual-stick layout (drive-right / look-left).
 
 ## Lunar Frontier Multiplayer & Economy Subsystem (Spec 12)
 - `games/lunar-frontier/server/`: Fastify + `ws` server, SQLite schema, market pricing, 20Hz tick (`LunarServer.ts`, `Database.ts`).
