@@ -42,6 +42,14 @@ export const HUD_LAP_ID = 'lunar-hud-lap';
 export const HUD_COMMS_ID = 'lunar-hud-comms';
 /** Spec 18 §6.1 — 2D screen-edge clamped hint arrow element. */
 export const HUD_HINT_ARROW_ID = 'lunar-hud-hint-arrow';
+/**
+ * Spec 19 §2.2.2 / ADR-3 — floating operational toast banner. Every gameplay
+ * feedback message (mining, mount, capacity rejections) surfaces here at
+ * top-centre instead of hiding inside the trade terminal's feedback line.
+ */
+export const HUD_TOAST_ID = 'lunar-hud-toast';
+/** Auto-dismiss window for the toast banner (spec 19 §2.2.2: 3.5 s). */
+export const HUD_TOAST_DISMISS_MS = 3500;
 
 /** Sector split slots on the proving-grounds lap panel (S1/S2 + total). */
 export const HUD_LAP_SECTOR_SLOTS = 3;
@@ -102,6 +110,8 @@ export const HUD_DEFAULT_COMMODITIES: readonly string[] = [
 export const HUD_PROMPT_KINDS = {
   drive: { label: 'Drive Buggy', order: 10 },
   dismount: { label: 'Exit Buggy', order: 10 },
+  /** Spec 19 §2.3.3: transfer backpack haul to the parked rover's flatbed. */
+  stow: { label: 'Stow Cargo to Buggy', order: 12 },
   mine: { label: 'Mine Vein', order: 20 },
   claim: { label: 'Stake Claim', order: 30 },
   trade: { label: 'Trade', order: 40 },
@@ -124,6 +134,7 @@ export type HudInputSource = 'keyboard' | 'gamepad';
 export const HUD_GAMEPAD_GLYPHS: Readonly<Partial<Record<HudPromptKind, string>>> = {
   drive: 'X',
   dismount: 'X',
+  stow: 'X',
   mine: 'RB',
   trade: 'B',
 };
@@ -148,6 +159,10 @@ export interface HudSuitTelemetry {
   speed?: number;
   /** False once O₂ or battery bottoms out. */
   operational?: boolean;
+  /** Spec 19 §2.3.4: backpack load in kg (paints the CARGO field + bar). */
+  cargoMass?: number;
+  /** Backpack ceiling in kg (spec: 50). */
+  cargoCapacity?: number;
 }
 
 export interface HudBuggyTelemetry {
@@ -448,6 +463,8 @@ export class LunarHUD {
   private tradeOpen = false;
   private hudHidden = false;
   private feedbackTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Spec 19 §2.2.2 — toast auto-dismiss timer (independent of trade line). */
+  private toastTimer: ReturnType<typeof setTimeout> | null = null;
   private disposed = false;
 
   /**
@@ -497,6 +514,7 @@ export class LunarHUD {
 
     this.buildStatusStrip();
     this.buildCompass();
+    this.buildToast();
     this.buildLifeSupport();
     this.buildBuggyPanel();
     this.buildLapPanel();
@@ -526,6 +544,10 @@ export class LunarHUD {
     if (this.feedbackTimer !== null) {
       clearTimeout(this.feedbackTimer);
       this.feedbackTimer = null;
+    }
+    if (this.toastTimer !== null) {
+      clearTimeout(this.toastTimer);
+      this.toastTimer = null;
     }
     this.clearCommsTimers();
     this.tradeRows.clear();
@@ -557,6 +579,58 @@ export class LunarHUD {
     return this.hudHidden;
   }
 
+  /**
+   * Spec 19 §2.2.2 / ADR-3 — float the operational toast banner at top
+   * centre (glassmorphic pill). This is the VISIBLE gameplay feedback
+   * channel: mining results, mount/dismount, capacity rejections. Distinct
+   * from {@link showFeedback}, which paints the trade terminal's own line
+   * (only legible with the modal open). Re-arms the 3.5 s auto-dismiss on
+   * every message; `kind` paints the pill (`toast-success` / `toast-error`).
+   */
+  showToast(message: string, kind: HudFeedbackKind = 'info'): void {
+    if (this.disposed) return;
+    const toast = this.els.get('toast');
+    if (toast === undefined) return;
+    toast.textContent = message;
+    // Mirror into an attribute: headless DOMs without CSS cadence (and
+    // screen readers) read the finished toast immediately.
+    toast.setAttribute('data-toast', message);
+    toast.setAttribute('data-toast-kind', kind);
+    this.setClassEl(toast, 'toast-success', kind === 'success');
+    this.setClassEl(toast, 'toast-error', kind === 'error');
+    this.setClassEl(toast, 'is-hidden', message.length === 0);
+    if (this.toastTimer !== null) clearTimeout(this.toastTimer);
+    if (message.length > 0) {
+      this.toastTimer = setTimeout(() => {
+        this.toastTimer = null;
+        if (!this.disposed) this.clearToast();
+      }, HUD_TOAST_DISMISS_MS);
+      const handle = this.toastTimer as unknown as { unref?: () => void };
+      if (typeof handle.unref === 'function') handle.unref();
+    }
+  }
+
+  /** Retract the toast banner (cancels its auto-dismiss timer). */
+  clearToast(): void {
+    if (this.disposed) return;
+    if (this.toastTimer !== null) {
+      clearTimeout(this.toastTimer);
+      this.toastTimer = null;
+    }
+    const toast = this.els.get('toast');
+    if (toast === undefined) return;
+    toast.textContent = '';
+    toast.setAttribute('data-toast', '');
+    this.setClassEl(toast, 'is-hidden', true);
+    this.setClassEl(toast, 'toast-success', false);
+    this.setClassEl(toast, 'toast-error', false);
+  }
+
+  /** Current toast text ('' when retracted) — harness readback. */
+  toastText(): string {
+    return this.textOf('toast');
+  }
+
   /** Live lookup of a logical element key (test / integration affordance). */
   getElement(key: string): Elementish | undefined {
     return this.els.get(key);
@@ -586,6 +660,19 @@ export class LunarHUD {
     if (t.rcsFuel !== undefined) this.setText('rcs-value', pct(clamp(t.rcsFuel, 0, 100)));
     if (t.speed !== undefined) this.setText('suit-speed-value', `${num(t.speed, 1)} m/s`);
     if (t.altitude !== undefined) this.setText('altitude-value', `${num(t.altitude, 1)} m`);
+    // Spec 19 §2.3.4: backpack cargo — `CARGO: XX / 50 kg` + fill bar, using
+    // the same `is-full` treatment as the buggy flatbed meter (the on-foot
+    // mirror of the dash readout).
+    if (t.cargoMass !== undefined) {
+      const suitCapacity = t.cargoCapacity ?? 50;
+      const haul = clamp(t.cargoMass, 0, suitCapacity);
+      this.setText('suit-cargo-value', `${num(haul, 0)} / ${num(suitCapacity, 0)} kg`);
+      this.setBar(
+        'suit-cargo-bar',
+        (haul / suitCapacity) * 100,
+        haul >= suitCapacity ? 'is-full' : '',
+      );
+    }
     if (t.isGrounded !== undefined) {
       this.setText('contact-value', t.isGrounded ? 'CONTACT' : 'AIRBORNE');
     }
@@ -1353,6 +1440,18 @@ export class LunarHUD {
     }
   }
 
+  /**
+   * Floating operational toast (Spec 19 §2.2.2 / ADR-3): top-centre
+   * glassmorphic pill, hidden until `showToast()`. Text mirrors into the
+   * `data-toast` attribute for headless assertions (fake DOMs have no CSS
+   * cadence).
+   */
+  private buildToast(): void {
+    const toast = this.make('div', HUD_TOAST_ID, 'hud-toast is-hidden', 'toast');
+    toast.setAttribute('data-toast', '');
+    this.root.appendChild(toast);
+  }
+
   private buildLifeSupport(): void {
     const panel = this.make('section', 'lunar-hud-life', 'hud-panel life-support', 'life-panel');
     this.root.appendChild(panel);
@@ -1367,6 +1466,10 @@ export class LunarHUD {
     panel.appendChild(this.labeledField('battery', 'SUIT BAT', '100%'));
     panel.appendChild(this.bar('battery-bar'));
     panel.appendChild(this.labeledField('rcs', 'RCS', '100%'));
+    // Spec 19 §2.3.4: backpack haul readout — `CARGO: XX / 50 kg` + fill bar,
+    // the on-foot mirror of the buggy dash's 500 kg flatbed meter.
+    panel.appendChild(this.labeledField('suit-cargo', 'CARGO', '0 / 50 kg'));
+    panel.appendChild(this.bar('suit-cargo-bar'));
     panel.appendChild(this.labeledField('suit-speed', 'EVA SPD', '0.0 m/s'));
     panel.appendChild(this.lamp('hud-suit-lamp', 'SUIT LAMP', 'suit-lamp'));
     panel.appendChild(this.labeledField('altitude', 'ALT', '—'));

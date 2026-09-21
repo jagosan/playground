@@ -336,6 +336,55 @@
   animation: lf-vignette 1.4s ease-in-out infinite;
 }
 
+/* --- floating operational toast (Spec 19 §2.2.2 / ADR-3) --------------------
+   Top-centre glassmorphic pill that surfaces gameplay feedback (mining,
+   mount, capacity rejections) above every other panel. `pointer-events: none`
+   keeps it click-through; it fades in on reveal and out on the 3.5 s
+   auto-dismiss. Kind variants recolour the rule + text (success green,
+   error red) so a rejection cannot be mistaken for a drilling confirmation. */
+
+#lunar-hud-toast {
+  position: absolute;
+  top: 84px;
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: min(720px, 86vw);
+  padding: 9px 22px;
+  border-radius: 999px;
+  background: var(--lf-glass-solid);
+  backdrop-filter: blur(14px) saturate(130%);
+  -webkit-backdrop-filter: blur(14px) saturate(130%);
+  border: 1px solid var(--lf-rule);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.55);
+  color: var(--lf-text);
+  font-family: var(--lf-mono);
+  font-size: 14px;
+  letter-spacing: 0.03em;
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  opacity: 1;
+  transition: opacity 220ms ease;
+  pointer-events: none;
+  z-index: 30;
+}
+
+#lunar-hud-toast.is-hidden {
+  opacity: 0;
+  visibility: hidden;
+}
+
+#lunar-hud-toast.toast-success {
+  border-color: rgba(92, 230, 164, 0.55);
+  color: var(--lf-good);
+}
+
+#lunar-hud-toast.toast-error {
+  border-color: rgba(255, 93, 92, 0.6);
+  color: var(--lf-bad);
+}
+
 /* --- meters --------------------------------------------------------------- */
 
 .hud-bar {

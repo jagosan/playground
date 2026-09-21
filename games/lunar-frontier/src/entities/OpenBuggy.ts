@@ -665,6 +665,28 @@ export class OpenBuggy {
     return clamp(this.getCargoMass() / BUGGY_MAX_CARGO, 0, 1);
   }
 
+  /** Flatbed ceiling, kg (spec 19 §2.3: 500). */
+  getCargoCapacity(): number {
+    return BUGGY_MAX_CARGO;
+  }
+
+  /** True when `amountKg` more would still fit on the flatbed. */
+  canAcceptCargo(amountKg: number): boolean {
+    if (!Number.isFinite(amountKg) || amountKg <= 0) return false;
+    return this.getCargoMass() + amountKg <= BUGGY_MAX_CARGO + 1e-9;
+  }
+
+  /**
+   * Add ore to the flatbed through the physics loader (capped at
+   * `BUGGY_MAX_CARGO`). Returns the kilograms actually taken aboard.
+   */
+  addCargo(amountKg: number): number {
+    if (this.disposed || !Number.isFinite(amountKg) || amountKg <= 0) return 0;
+    const before = this.getCargoMass();
+    this.setCargoMass(before + amountKg);
+    return this.getCargoMass() - before;
+  }
+
   // -- quest dashboard telemetry (Spec 18 §6.3, ADR-18-3) ------------------------
 
   /**

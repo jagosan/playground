@@ -11,6 +11,8 @@
 export {
   WorldScene,
   type WorldSceneOptions,
+  // Spec 19 §2.2.3: mining-laser burst payload.
+  type MiningBeamEffect,
 } from './WorldScene.ts';
 
 export {

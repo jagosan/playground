@@ -68,6 +68,13 @@ export const LEG_SWING_RAD = 0.42;
 /** Torso counter-bob amplitude (m). */
 export const TORSO_BOB_M = 0.025;
 
+/**
+ * Spec 19 §2.3 / ADR-4: the suit backpack hauls at most this many kilograms
+ * of ore. The 50 kg ceiling is the logistical argument for deploying the
+ * 500 kg-capacity rover — mining on foot caps (or rejects) above it.
+ */
+export const SUIT_MAX_CARGO_KG = 50;
+
 export interface EvaSuitAvatarOptions {
   /** Seed for the owned `LunarEvaSuit` (spawn position, reserves…). */
   initial?: Partial<SuitState>;
@@ -77,6 +84,8 @@ export interface EvaSuitAvatarOptions {
   headlight?: boolean;
   /** Node/mesh/material name prefix (default `eva`). */
   namePrefix?: string;
+  /** Spec 19 §2.3: backpack load at spawn, kg (clamped to 0..50). */
+  initialCargo?: number;
 }
 
 /** Consolidated HUD readout, one allocation per call. */
@@ -98,6 +107,10 @@ export interface EvaSuitTelemetry {
   headlightOn: boolean;
   /** False once oxygen or battery bottoms out (suit is dead weight). */
   operational: boolean;
+  /** Spec 19 §2.3: ore mass in the backpack, kg (0..SUIT_MAX_CARGO_KG). */
+  cargoMass: number;
+  /** Spec 19 §2.3: backpack ceiling, kg (SUIT_MAX_CARGO_KG). */
+  cargoCapacity: number;
 }
 
 /** Body geometry, metres. Local frame: +y up, +z is the helmet facing. */
@@ -139,6 +152,12 @@ export class EvaSuitAvatar {
   private materials: PBRMaterial[] = [];
 
   private lampOn: boolean;
+  /**
+   * Spec 19 §2.3 / ADR-4: ore mass riding in the backpack, kg, always kept
+   * inside `[0, SUIT_MAX_CARGO_KG]`. Inventory bookkeeping only — the suit
+   * physics module never consumes it (the buggy's flatbed load does).
+   */
+  private cargoMass: number;
   private built = false;
   private disposed = false;
   /** Most recently stepped state — keeps getters honest across scene life. */
@@ -152,6 +171,11 @@ export class EvaSuitAvatar {
     this.suit = new LunarEvaSuit(options.initial ?? {});
     this.last = this.suit.getState();
     this.lampOn = options.headlight ?? true;
+    this.cargoMass = clamp(
+      Number.isFinite(options.initialCargo) ? (options.initialCargo as number) : 0,
+      0,
+      SUIT_MAX_CARGO_KG,
+    );
   }
 
   // -- lifecycle ---------------------------------------------------------------
@@ -303,6 +327,46 @@ export class EvaSuitAvatar {
     return this.last.rcsFuel;
   }
 
+  // -- cargo (spec 19 §2.3 / ADR-4) ------------------------------------------------
+
+  /** Backpack ore load (kg, 0..SUIT_MAX_CARGO_KG). */
+  getCargoMass(): number {
+    return this.cargoMass;
+  }
+
+  /** Backpack ceiling, kg (spec 19: 50). */
+  getCargoCapacity(): number {
+    return SUIT_MAX_CARGO_KG;
+  }
+
+  /**
+   * Hard-set the backpack load; clamps into `[0, SUIT_MAX_CARGO_KG]`.
+   * Returns the mass now aboard so callers can watch the clamp land.
+   */
+  setCargoMass(kg: number): number {
+    if (!Number.isFinite(kg)) return this.cargoMass;
+    this.cargoMass = clamp(kg, 0, SUIT_MAX_CARGO_KG);
+    return this.cargoMass;
+  }
+
+  /** True when `amountKg` more would still fit in the backpack. */
+  canAcceptCargo(amountKg: number): boolean {
+    if (!Number.isFinite(amountKg) || amountKg <= 0) return false;
+    return this.cargoMass + amountKg <= SUIT_MAX_CARGO_KG + 1e-9;
+  }
+
+  /**
+   * Add ore to the backpack, capping at the 50 kg ceiling. Returns the
+   * kilograms actually taken up (0 when already full or on bad input) —
+   * callers diff `requested − added` to know how much overflowed.
+   */
+  addCargo(amountKg: number): number {
+    if (this.disposed || !Number.isFinite(amountKg) || amountKg <= 0) return 0;
+    const before = this.cargoMass;
+    this.cargoMass = clamp(before + amountKg, 0, SUIT_MAX_CARGO_KG);
+    return this.cargoMass - before;
+  }
+
   /** Horizontal speed over the regolith, m/s. */
   getSpeed(): number {
     const s = this.last;
@@ -329,6 +393,8 @@ export class EvaSuitAvatar {
       isGrounded: s.isGrounded,
       headlightOn: this.lampOn,
       operational: s.oxygen > 0 && s.battery > 0,
+      cargoMass: this.cargoMass,
+      cargoCapacity: SUIT_MAX_CARGO_KG,
     };
   }
 

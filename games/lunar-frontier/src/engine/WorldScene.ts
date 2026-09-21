@@ -49,7 +49,7 @@ import { NullEngine } from '@babylonjs/core/Engines/nullEngine.js';
 import { Engine } from '@babylonjs/core/Engines/engine.js';
 import { AbstractEngine } from '@babylonjs/core/Engines/abstractEngine.js';
 import { Color3, Color4 } from '@babylonjs/core/Maths/math.color.js';
-import { Vector3 } from '@babylonjs/core/Maths/math.vector.js';
+import { Quaternion, Vector3 } from '@babylonjs/core/Maths/math.vector.js';
 import { Constants } from '@babylonjs/core/Engines/constants.js';
 import { Scene } from '@babylonjs/core/scene.js';
 import { DirectionalLight } from '@babylonjs/core/Lights/directionalLight.js';
@@ -59,6 +59,7 @@ import { PBRMaterial } from '@babylonjs/core/Materials/PBR/pbrMaterial.js';
 import { StandardMaterial } from '@babylonjs/core/Materials/standardMaterial.js';
 import { RawTexture } from '@babylonjs/core/Materials/Textures/rawTexture.js';
 import { Mesh } from '@babylonjs/core/Meshes/mesh.js';
+import { MeshBuilder } from '@babylonjs/core/Meshes/meshBuilder.js';
 import { TransformNode } from '@babylonjs/core/Meshes/transformNode.js';
 import { VertexData } from '@babylonjs/core/Meshes/mesh.vertexData.js';
 import type { AbstractMesh } from '@babylonjs/core/Meshes/abstractMesh.js';
@@ -116,6 +117,37 @@ const SUN_FOCUS_DISTANCE = 80;
 
 /** Spec 16 §2.3: tight shadow box around the focus target, metres. */
 const SUN_SHADOW_FRUSTUM_SIZE = 120;
+
+/**
+ * Spec 19 §2.2.3 / Architecture §2.3: payload for one 3D mining-laser burst
+ * (emissive beam between the drill emitter and the vein centre + an impact
+ * spark flare). Coordinates are physics-frame metres; the scene converts
+ * them to Babylon internally.
+ */
+export interface MiningBeamEffect {
+  startPos: { x: number; y: number; z: number };
+  endPos: { x: number; y: number; z: number };
+  durationMs: number;
+  colorHex: string;
+}
+
+/** Live bookkeeping record for one spawned laser burst. */
+interface MiningEffectRecord extends MiningBeamEffect {
+  beam: Mesh;
+  flare: Mesh;
+  beamMaterial: StandardMaterial;
+  flareMaterial: StandardMaterial;
+  /** Wall-clock ms at which the burst fades out (also drives the pulse). */
+  expiresAt: number;
+  startedAt: number;
+  timer: ReturnType<typeof setTimeout> | null;
+}
+
+/** Default laser-drill beam colour (HUD cyan, spec 19 §2.2.3). */
+const MINING_LASER_COLOR_HEX = '#56e0ff';
+
+/** Default drill burst length in ms (spec 19 §2.2.3). */
+const MINING_LASER_DEFAULT_MS = 600;
 
 // ---------------------------------------------------------------------------
 // Deterministic value noise (same seed family as the world generator)
@@ -205,6 +237,11 @@ export class WorldScene {
   private rig: CameraRig | null = null;
   private entities = new Set<AbstractMesh>();
   private renderLoopStarted = false;
+  /**
+   * Spec 19 §2.2.3: live mining-laser bursts (beam + impact flare). Each
+   * self-destructs on its own wall-clock timer and fades via `render()`.
+   */
+  private miningEffects: MiningEffectRecord[] = [];
 
   constructor(options: WorldSceneOptions = {}) {
     this.options = {
@@ -267,6 +304,7 @@ export class WorldScene {
   /** One frame. Safe before init (no-op). */
   render(): this {
     if (this.scene === null || this.disposed) return this;
+    this.updateMiningEffects();
     this.scene.render();
     return this;
   }
@@ -374,6 +412,8 @@ export class WorldScene {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+
+    this.disposeMiningEffects();
 
     try {
       this.rig?.dispose();
@@ -522,6 +562,175 @@ export class WorldScene {
     if (len < 1e-9) return;
     const back = dir.scale(-SUN_FOCUS_DISTANCE / len);
     this.sun.position = worldToBabylon(target).add(back);
+  }
+
+  // -- mining laser VFX (spec 19 §2.2.3) ------------------------------------------
+
+  /**
+   * Fire one emissive mining-laser burst between two world-frame points
+   * (drill emitter → vein centre): a pulsing beam cylinder plus a spark/dust
+   * flare sphere at the impact end. Both meshes are unlit emissive, never
+   * shadow casters, and self-destruct after `durationMs` (wall-clock — the
+   * burst is a cosmetic effect, not a simulation object). Headless-safe:
+   * builds fine on a `NullEngine`, and a silent no-op before `init()` or
+   * after `dispose()` so callers never need to guard.
+   */
+  spawnMiningLaser(
+    startPos: { x: number; y: number; z: number },
+    endPos: { x: number; y: number; z: number },
+    durationMs: number = MINING_LASER_DEFAULT_MS,
+    colorHex: string = MINING_LASER_COLOR_HEX,
+  ): MiningBeamEffect | null {
+    if (this.disposed || this.scene === null) return null;
+    const scene = this.scene;
+
+    const start = worldToBabylon(startPos);
+    const end = worldToBabylon(endPos);
+    const delta = end.subtract(start);
+    const length = delta.length();
+    // Degenerate burst (emitter on top of the target): skip the beam, keep
+    // the flare so the drill still visibly "hit".
+    const beamLength = Math.max(0.15, length);
+
+    const color = parseHexColor(colorHex);
+    const beam = MeshBuilder.CreateCylinder(
+      `mining-laser-${this.miningEffects.length + 1}`,
+      { diameter: 0.16, height: beamLength, tessellation: 8 },
+      scene,
+    );
+    const beamMaterial = new StandardMaterial(`${beam.name}-mat`, scene);
+    beamMaterial.disableLighting = true;
+    beamMaterial.emissiveColor = color;
+    beamMaterial.diffuseColor = new Color3(0, 0, 0);
+    beamMaterial.specularColor = new Color3(0, 0, 0);
+    beamMaterial.alpha = 0.9;
+    beam.material = beamMaterial;
+    beam.isPickable = false;
+    beam.receiveShadows = false;
+    // Babylon cylinders run along local +Y; rotate that axis onto the beam
+    // direction and park the cylinder mid-span.
+    const dirN = delta.scale(length > 1e-9 ? 1 / length : 0);
+    if (length > 1e-9) {
+      const q = new Quaternion();
+      Quaternion.FromUnitVectorsToRef(Vector3.UpReadOnly, dirN, q);
+      beam.rotationQuaternion = q;
+    }
+    beam.position.set(
+      (start.x + end.x) / 2,
+      (start.y + end.y) / 2,
+      (start.z + end.z) / 2,
+    );
+
+    const flare = MeshBuilder.CreateSphere(
+      `mining-flare-${this.miningEffects.length + 1}`,
+      { diameter: 0.9, segments: 8 },
+      scene,
+    );
+    const flareMaterial = new StandardMaterial(`${flare.name}-mat`, scene);
+    flareMaterial.disableLighting = true;
+    // Spark is a white-hot core of the beam colour.
+    flareMaterial.emissiveColor = new Color3(
+      Math.min(1, color.r + 0.45),
+      Math.min(1, color.g + 0.35),
+      Math.min(1, color.b + 0.25),
+    );
+    flareMaterial.diffuseColor = new Color3(0, 0, 0);
+    flareMaterial.specularColor = new Color3(0, 0, 0);
+    flareMaterial.alpha = 0.85;
+    flare.material = flareMaterial;
+    flare.isPickable = false;
+    flare.receiveShadows = false;
+    flare.position.copyFrom(end);
+
+    const now = miningClockMs();
+    const duration = Math.max(80, Math.min(5000, Number.isFinite(durationMs) ? durationMs : MINING_LASER_DEFAULT_MS));
+    const record: MiningEffectRecord = {
+      startPos: { ...startPos },
+      endPos: { ...endPos },
+      durationMs: duration,
+      colorHex,
+      beam,
+      flare,
+      beamMaterial,
+      flareMaterial,
+      startedAt: now,
+      expiresAt: now + duration,
+      timer: null,
+    };
+    // Belt-and-braces cleanup: `updateMiningEffects()` fades on frames while
+    // a render loop runs; this timer guarantees teardown even when nobody
+    // renders (headless, tab backgrounded).
+    const schedule = (globalThis as { setTimeout?: (fn: () => void, ms: number) => unknown })
+      .setTimeout;
+    if (typeof schedule === 'function') {
+      const handle = schedule(() => this.retireMiningEffect(record), duration);
+      record.timer = (handle as ReturnType<typeof setTimeout>) ?? null;
+      const unrefable = record.timer as unknown as { unref?: () => void };
+      if (typeof unrefable?.unref === 'function') unrefable.unref();
+    }
+    this.miningEffects.push(record);
+    return {
+      startPos: record.startPos,
+      endPos: record.endPos,
+      durationMs: record.durationMs,
+      colorHex: record.colorHex,
+    };
+  }
+
+  /** Live mining-laser bursts right now (harness readback). */
+  getActiveMiningEffectCount(): number {
+    return this.miningEffects.length;
+  }
+
+  /** Per-frame pulse/fade pass over live bursts; retires expired ones. */
+  private updateMiningEffects(): void {
+    if (this.miningEffects.length === 0) return;
+    const now = miningClockMs();
+    for (const record of [...this.miningEffects]) {
+      const elapsed = now - record.startedAt;
+      const progress = clamp01(elapsed / Math.max(1, record.durationMs));
+      // Hard edge: retired expired bursts never linger past their window.
+      if (now >= record.expiresAt) {
+        this.retireMiningEffect(record);
+        continue;
+      }
+      // Pulse the beam fast (≈8 Hz emissive flicker), then fade the last 30 %.
+      const pulse = 0.75 + 0.25 * Math.sin(elapsed * 0.05);
+      const fade = progress < 0.7 ? 1 : 1 - (progress - 0.7) / 0.3;
+      record.beamMaterial.alpha = 0.9 * pulse * fade;
+      // Flare flares UP at impact, then burns off faster than the beam.
+      const flareScale = (0.7 + 0.6 * Math.min(1, progress * 3)) * fade;
+      record.flare.scaling.setAll(Math.max(0.05, flareScale));
+      record.flareMaterial.alpha = 0.85 * fade;
+    }
+  }
+
+  /** Tear one burst down (idempotent; safe after scene/engine teardown). */
+  private retireMiningEffect(record: MiningEffectRecord): void {
+    const index = this.miningEffects.indexOf(record);
+    if (index >= 0) this.miningEffects.splice(index, 1);
+    if (record.timer !== null) {
+      try {
+        clearTimeout(record.timer);
+      } catch {
+        /* already fired */
+      }
+      record.timer = null;
+    }
+    try {
+      record.beam.dispose();
+      record.flare.dispose();
+      record.beamMaterial.dispose();
+      record.flareMaterial.dispose();
+    } catch {
+      /* scene torn down first — Babylon GC follows the engine */
+    }
+  }
+
+  /** Retire every live burst (dispose path). */
+  private disposeMiningEffects(): void {
+    for (const record of [...this.miningEffects]) this.retireMiningEffect(record);
+    this.miningEffects = [];
   }
 
   // -- build stages ---------------------------------------------------------------
@@ -859,6 +1068,26 @@ function seedStringToNumber(seed: string | number): number {
   }
   h = Math.imul(h ^ (h >>> 16), 2246822507);
   return (h >>> 0) ^ 0x9e3779b9;
+}
+
+/** Wall-clock ms for VFX timing (performance.now when present). */
+function miningClockMs(): number {
+  const perf = (globalThis as { performance?: { now?: () => number } }).performance;
+  if (perf !== undefined && typeof perf.now === 'function') return perf.now();
+  return Date.now();
+}
+
+function clamp01(v: number): number {
+  if (!Number.isFinite(v)) return 0;
+  return v < 0 ? 0 : v > 1 ? 1 : v;
+}
+
+/** Parse `#rrggbb` (garbage falls back to HUD cyan); alpha always opaque. */
+function parseHexColor(hex: string): Color3 {
+  const m = /^#?([0-9a-f]{6})$/i.exec(String(hex));
+  if (m === null) return new Color3(0.34, 0.88, 1);
+  const n = parseInt(m[1], 16);
+  return new Color3(((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255);
 }
 
 // ---------------------------------------------------------------------------

@@ -318,6 +318,9 @@ section('B. LunarHUD glassmorphic overlay (ADR-013-1)');
     'lunar-hud-battery-bar',
     'lunar-hud-cargo-bar',
     'lunar-hud-buggy-battery-bar',
+    // Spec 19 §2.2.2 / §2.3.4: floating toast pill + suit backpack meter.
+    'lunar-hud-toast',
+    'lunar-hud-suit-cargo-bar',
     'hud-suit-lamp',
     'hud-buggy-lamp',
     'lunar-hud-trade-commodity',
@@ -2170,6 +2173,9 @@ section('E3. Spec 18 §5/§6/§7/§8 — end-to-end quest pipeline (NullEngine)'
   check('E3-5 20 kg extraction advances to Stage 4', qEngine.getActiveStage()?.stageNumber === 4);
 
   // E3-6 — stow the haul, board the LRV → Stage 5 + buggy dash telemetry.
+  // Spec 19 §2.3.3 / ADR-4: boarding AUTO-transfers the backpack haul to the
+  // flatbed, so the dash mirrors 20 kg pre-staged + the 20 kg E3-5 pulled
+  // off the vein = 40 kg, and the suit backpack empties on the seat.
   buggy.setCargoMass(20);
   for (let i = 0; i < 40; i++) {
     const p = suit.getPosition();
@@ -2195,10 +2201,17 @@ section('E3. Spec 18 §5/§6/§7/§8 — end-to-end quest pipeline (NullEngine)'
     JSON.stringify(dash),
   );
   check(
-    'E3-6 dash carries target range, cargo 20/500, faction + online link',
+    'E3-6 dash carries target range, cargo 40/500 (20 staged + 20 auto-stowed), faction + online link',
     dash.targetDistanceM !== null && Number.isFinite(dash.targetDistanceM) && dash.targetDistanceM > 0 &&
-      dash.cargoKg === 20 && dash.maxCargoKg === 500 &&
+      dash.cargoKg === 40 && dash.maxCargoKg === 500 &&
       dash.faction === 'CEC' && dash.linkStatus === 'ONLINE - 128 kbps',
+    JSON.stringify(dash),
+  );
+  check(
+    'E3-6 boarding auto-stowed the backpack haul to the flatbed (spec 19 §2.3.3)',
+    suit.getCargoMass() === 0 &&
+      qHud.toastText().includes('Auto-stowed 20 kg to flatbed'),
+    qHud.toastText(),
   );
   const pxTitle = buggy.readDashPixel(4, 0);
   check(
@@ -2305,6 +2318,275 @@ section('E3. Spec 18 §5/§6/§7/§8 — end-to-end quest pipeline (NullEngine)'
 
   qApp.dispose();
   (globalThis as { document?: unknown }).document = prevDoc;
+}
+
+// ===========================================================================
+// LAYER E4 — Spec 19 Phase 2/3: offline mining, HUD toast, 3D laser, cargo
+// ===========================================================================
+
+section('E4. Spec 19 mining UX, offline fallback, laser VFX & tiered cargo');
+{
+  // REUSES the layer-C app (a fifth NullEngine ClientApp blows the 2 GB V8
+  // heap when stacked on the layers already resident; `app` is also torn
+  // down by layer F, so no extra lifecycle is introduced here).
+  const mApp = app;
+  const e4Doc = bootDoc;
+  const e4 = boot; // scripted network { net, sent, setState }
+  const mHud = mApp.getHud()!;
+  const mEngine = mApp.getQuestEngine()!;
+  const mSuit = mApp.getSuit();
+  const mBuggy = mApp.getBuggy();
+  mSuit.setCargoMass(0);
+  mBuggy.setCargoMass(0);
+  if (mApp.getMode() === 'buggy') mApp.toggleMount(); // back on foot for E4
+
+  // E4-0 — toast pill + suit backpack meter are part of the built skeleton.
+  check('E4-0 #lunar-hud-toast pill exists', e4Doc.getElementById('lunar-hud-toast') !== null);
+  check(
+    'E4-0 suit backpack field reads "/ 50 kg" at boot',
+    (mHud.getElement('suit-cargo-value')?.textContent ?? '').includes('/ 50 kg'),
+    mHud.getElement('suit-cargo-value')?.textContent ?? '(missing)',
+  );
+
+  // Jump to the extraction stage (Stage 3: 20 kg regolith) and park on the
+  // quest vein so the scanner locks exactly that vein (E3 anchoring rule).
+  mEngine.debugJumpToStage(2);
+  const mVeinObjective = mEngine.getActiveStage()!.objectives[0];
+  const mVeinPos = mVeinObjective.targetPosition!;
+  mSuit.teleport(mVeinPos.x, mVeinPos.y);
+  nowMs += 300;
+  mApp.update(nowMs);
+  const mTarget = mApp.getNearestVein();
+  check('E4-1 scanner locks the quest vein underfoot', mTarget !== null && mTarget.rangeM <= 25);
+  // Survey bookkeeping: harvest() resolves the vein by containment, and the
+  // seeded world layers overlapping regolith bodies — the mutation may land
+  // on a different vein id than the scanner pin. Snapshot ALL veins and
+  // assert exactly one dropped by exactly the credited amount.
+  const genRef = mApp.world.getWorldGenerator();
+  const veinIdsAll = mApp.world.getSnapshot()!.veins.map((v) => v.id);
+  const remainingBeforeAll = new Map<string, number>(
+    veinIdsAll.map((id) => [id, genRef.getVein(id)!.remaining]),
+  );
+
+  // E4-1 — OFFLINE mining succeeds (Spec 19 §2.2.1): link closed, no MINE
+  // frame leaves the client, yet survey, backpack, ledger and quest all move.
+  e4.setState('closed');
+  (mApp as unknown as { lastMineAt: number }).lastMineAt = -Infinity;
+  const regolithLedgerBefore = mApp.getLocalInventory()['REGOLITH'];
+  const mineFrames = (): number => e4.sent.filter((f) => f['type'] === 'MINE').length;
+  const sentBefore = mineFrames();
+  check('E4-1 offline pull returns true (no more silent abort)', mApp.mineNearestVein(20) === true);
+  check('E4-1 offline pull sends no MINE frame', mineFrames() === sentBefore);
+  const mOutcome = mApp.getLastMiningOutcome();
+  check(
+    'E4-1 outcome carries online=false + 20 kg regolith',
+    mOutcome !== null && mOutcome.online === false && mOutcome.amount === 20 &&
+      mOutcome.resource === 'regolith' && mOutcome.carrier === 'suit',
+    JSON.stringify(mOutcome),
+  );
+  const deltas = veinIdsAll
+    .map((id) => ({ id, delta: remainingBeforeAll.get(id)! - genRef.getVein(id)!.remaining }))
+    .filter((d) => d.delta !== 0);
+  check(
+    'E4-1 local survey mutated: exactly one vein −20',
+    deltas.length === 1 && deltas[0].delta === 20,
+    JSON.stringify(deltas),
+  );
+  check('E4-1 suit backpack credited 20 kg', Math.abs(mSuit.getCargoMass() - 20) < 1e-9,
+    `${mSuit.getCargoMass()}`);
+  // (shared layer-C app: earlier layers already mined, so assert the DELTA.)
+  check(
+    'E4-1 local inventory ledger credited +20 REGOLITH',
+    (mApp.getLocalInventory()['REGOLITH'] ?? 0) === (regolithLedgerBefore ?? 0) + 20,
+    `before=${regolithLedgerBefore ?? 0} after=${mApp.getLocalInventory()['REGOLITH'] ?? 0}`,
+  );
+  // The extract objective consumed the pull (the stage machine may already
+  // have advanced past stage 3 — in which case the objective completed).
+  check(
+    'E4-1 quest extract objective advanced by the offline pull',
+    mEngine.getActiveStage()!.stageNumber > 3 ||
+      (mVeinObjective.completed && mVeinObjective.currentCount >= 20),
+    `stage=${mEngine.getActiveStage()!.stageNumber} obj=${mVeinObjective.currentCount}/${mVeinObjective.targetCount}`,
+  );
+
+  // E4-2 — visible toast (Spec 19 §2.2.2 / ADR-3): the drilling banner lands
+  // on the floating #lunar-hud-toast pill, not hidden inside the trade dialog.
+  const toastEl = e4Doc.getElementById('lunar-hud-toast')!;
+  check(
+    'E4-2 toast shows "Drilling <vein> (+20 kg regolith)"',
+    (toastEl.getAttribute('data-toast') ?? '').startsWith(`Drilling ${mOutcome!.veinId} (+20 kg regolith)`),
+    toastEl.getAttribute('data-toast') ?? '',
+  );
+  check(
+    'E4-2 toast visible (not is-hidden) + success class',
+    !toastEl.classList.contains('is-hidden') && toastEl.classList.contains('toast-success'),
+  );
+  check(
+    'E4-2 toast mirrored to hud.toastText() readback',
+    mHud.toastText() === (toastEl.getAttribute('data-toast') ?? ''),
+  );
+
+  // E4-3 — 3D mining laser (Spec 19 §2.2.3): the latest burst spans rider →
+  // vein centre, beam + flare meshes exist, and it self-cleans after 600 ms.
+  const laser = mApp.getLastMiningLaser();
+  check('E4-3 mining laser payload returned', laser !== null);
+  check('E4-3 burst live in scene', mApp.world.getActiveMiningEffectCount() >= 1);
+  check('E4-3 laser duration 600 ms default', laser !== null && laser.durationMs === 600);
+  const laserMesh = mApp.world.getScene().getMeshByName('mining-laser-1');
+  const flareMesh = mApp.world.getScene().getMeshByName('mining-flare-1');
+  check('E4-3 beam + flare meshes exist', laserMesh !== null && flareMesh !== null);
+  check(
+    'E4-3 beam endpoints span rider to vein centre',
+    laser !== null &&
+      Math.abs(laser.endPos.x - mVeinPos.x) < 1e-9 &&
+      Math.abs(laser.endPos.y - mVeinPos.y) < 1e-9 &&
+      Math.abs(laser.endPos.z - mVeinPos.z) < 1e-9 &&
+      Math.hypot(laser.startPos.x - mSuit.getPosition().x, laser.startPos.y - mSuit.getPosition().y) < 0.5,
+    JSON.stringify(laser),
+  );
+  // Self-cleanup: the wall-clock retire timer (600 ms) tears every burst
+  // down even with no render loop running.
+  await new Promise((r) => setTimeout(r, 720));
+  check('E4-3 laser retired after its window', mApp.world.getActiveMiningEffectCount() === 0);
+  check(
+    'E4-3 laser meshes disposed',
+    laserMesh !== null && flareMesh !== null && laserMesh.isDisposed() && flareMesh.isDisposed(),
+  );
+
+  // E4-4 — ONLINE mining still sends the frame AND credits locally.
+  e4.setState('open');
+  (mApp as unknown as { lastMineAt: number }).lastMineAt = -Infinity;
+  check('E4-4 online pull returns true', mApp.mineNearestVein(20) === true);
+  const mf = e4.sent.filter((f) => f['type'] === 'MINE').pop();
+  check(
+    'E4-4 MINE frame sent online (amount 20)',
+    mf !== undefined && (mf['payload'] as Record<string, unknown>)['amount'] === 20,
+    JSON.stringify(mf),
+  );
+  const mOutcome2 = mApp.getLastMiningOutcome();
+  check(
+    'E4-4 online outcome flagged online=true, 20 kg to suit',
+    mOutcome2 !== null && mOutcome2.online === true && mOutcome2.amount === 20,
+    JSON.stringify(mOutcome2),
+  );
+  check('E4-4 backpack now 40 kg (20 + 20)', Math.abs(mSuit.getCargoMass() - 40) < 1e-9,
+    `${mSuit.getCargoMass()}`);
+
+  // E4-5 — tiered capacity (ADR-4): cap-pull to 50 kg, then reject when full.
+  (mApp as unknown as { lastMineAt: number }).lastMineAt = -Infinity;
+  check('E4-5 partial pull extracts only what fits (10 kg)', mApp.mineNearestVein(20) === true);
+  const mOutcome3 = mApp.getLastMiningOutcome();
+  check(
+    'E4-5 partial outcome amount 10 + carrier-full note',
+    mOutcome3 !== null && mOutcome3.amount === 10 && mOutcome3.toast.includes('backpack full (50/50 kg)'),
+    JSON.stringify(mOutcome3),
+  );
+  check('E4-5 backpack maxes at exactly 50 kg', Math.abs(mSuit.getCargoMass() - 50) < 1e-9,
+    `${mSuit.getCargoMass()}`);
+  (mApp as unknown as { lastMineAt: number }).lastMineAt = -Infinity;
+  check('E4-5 full backpack REJECTS mining', mApp.mineNearestVein(20) === false);
+  check(
+    'E4-5 rejection toast: "Suit backpack full (50/50 kg) — stow in buggy or sell"',
+    (toastEl.getAttribute('data-toast') ?? '') === 'Suit backpack full (50/50 kg) — stow in buggy or sell',
+    toastEl.getAttribute('data-toast') ?? '',
+  );
+  check('E4-5 rejection paints error class', toastEl.classList.contains('toast-error'));
+  nowMs += 16;
+  mApp.update(nowMs);
+  check('E4-5 suit telemetry paints 50 / 50 kg', mHud.textOf('suit-cargo-value') === '50 / 50 kg',
+    mHud.textOf('suit-cargo-value'));
+  const suitFill = e4Doc.getElementById('lunar-hud-suit-cargo-bar-fill')!;
+  check(
+    'E4-5 suit cargo bar rastered full width + is-full',
+    suitFill.style.width === '100.0%' && suitFill.classList.contains('is-full'),
+    suitFill.style.width,
+  );
+
+  // E4-6 — proximity prompt: beside the rover with a loaded pack the strip
+  // offers [E] Stow Cargo to Buggy; the stow action moves haul to flatbed.
+  const mBuggyPos = mBuggy.getPosition();
+  mSuit.teleport(mBuggyPos.x - 0.8, mBuggyPos.y);
+  nowMs += 300;
+  mApp.update(nowMs);
+  const mPromptStrip = e4Doc.getElementById('lunar-hud-prompts')!;
+  const visiblePrompts = (): string[] =>
+    mPromptStrip.children
+      .filter((c) => c.classList.contains('hud-prompt') && !c.classList.contains('is-hidden'))
+      .map((c) => c.text());
+  check(
+    'E4-6 [E] Stow Cargo to Buggy prompt renders with cargo aboard',
+    visiblePrompts().some((t) => t.includes('[E]') && t.includes('Stow Cargo to Buggy')),
+    JSON.stringify(visiblePrompts()),
+  );
+  check(
+    'E4-6 stow moves all 50 kg to flatbed',
+    mApp.stowCargoToBuggy() === 50 &&
+      Math.abs(mBuggy.getCargoMass() - 50) < 1e-9 &&
+      mSuit.getCargoMass() === 0,
+    `buggy=${mBuggy.getCargoMass()} suit=${mSuit.getCargoMass()}`,
+  );
+  check(
+    'E4-6 stow toast confirms flatbed load',
+    (toastEl.getAttribute('data-toast') ?? '').includes('Stowed 50 kg to buggy flatbed (50/500 kg)'),
+    toastEl.getAttribute('data-toast') ?? '',
+  );
+  nowMs += 300;
+  mApp.update(nowMs);
+  check(
+    'E4-6 prompt reverts to Drive Buggy when pack empties',
+    visiblePrompts().some((t) => t.includes('Drive Buggy')) &&
+      !visiblePrompts().some((t) => t.includes('Stow')),
+    JSON.stringify(visiblePrompts()),
+  );
+
+  // E4-7 — mounting auto-transfers the backpack haul (Spec 19 §2.3.3).
+  mSuit.setCargoMass(37);
+  check('E4-7 mount auto-stows 37 kg', mApp.toggleMount() === true && mApp.getMode() === 'buggy');
+  check(
+    'E4-7 flatbed carries prior 50 + auto-stowed 37',
+    Math.abs(mBuggy.getCargoMass() - 87) < 1e-9,
+    `${mBuggy.getCargoMass()}`,
+  );
+  check('E4-7 backpack empty after boarding', mSuit.getCargoMass() === 0);
+  check(
+    'E4-7 auto-stow toast',
+    (toastEl.getAttribute('data-toast') ?? '').includes('Auto-stowed 37 kg to flatbed (87/500 kg)'),
+    toastEl.getAttribute('data-toast') ?? '',
+  );
+
+  // E4-8 — buggy-mode capacity (500 kg flatbed): rig-teleport the rover onto
+  // the vein (same private-`state` access idiom the D3 layer uses for its
+  // vLong probe), then the pull caps at the free flatbed space and rejects
+  // at 500/500.
+  const bstate = (mBuggy.physics as unknown as { state: { x: number; y: number; z: number } }).state;
+  bstate.x = mVeinPos.x;
+  bstate.y = mVeinPos.y;
+  bstate.z = mVeinPos.z;
+  nowMs += 300;
+  mApp.update(nowMs);
+  const bTarget = mApp.getNearestVein();
+  check('E4-8 buggy rig-teleported within drill reach of the vein',
+    bTarget !== null && bTarget.rangeM <= 25 && mApp.getMode() === 'buggy');
+  mBuggy.setCargoMass(495);
+  (mApp as unknown as { lastMineAt: number }).lastMineAt = -Infinity;
+  check('E4-8 buggy pull returns true', mApp.mineNearestVein(20) === true);
+  const mOutcome4 = mApp.getLastMiningOutcome();
+  check(
+    'E4-8 buggy pull caps at 5 kg free flatbed space',
+    mOutcome4 !== null && mOutcome4.amount === 5 && mOutcome4.carrier === 'buggy' &&
+      mOutcome4.toast.includes('flatbed full (500/500 kg)'),
+    JSON.stringify(mOutcome4),
+  );
+  check('E4-8 flatbed maxes at 500 kg', Math.abs(mBuggy.getCargoMass() - 500) < 1e-9,
+    `${mBuggy.getCargoMass()}`);
+  (mApp as unknown as { lastMineAt: number }).lastMineAt = -Infinity;
+  check('E4-8 full flatbed rejects mining', mApp.mineNearestVein(20) === false);
+  check(
+    'E4-8 flatbed-full rejection toast',
+    (toastEl.getAttribute('data-toast') ?? '').includes('Buggy flatbed full (500/500 kg)'),
+    toastEl.getAttribute('data-toast') ?? '',
+  );
+  // (layer F owns `app.dispose()`; E4 deliberately leaves it alive.)
 }
 
 // ===========================================================================

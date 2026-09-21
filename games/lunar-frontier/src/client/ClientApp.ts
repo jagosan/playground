@@ -41,9 +41,9 @@ import { StandardMaterial } from '@babylonjs/core/Materials/standardMaterial.js'
 import { Color3 } from '@babylonjs/core/Maths/math.color.js';
 import type { Mesh } from '@babylonjs/core/Meshes/mesh.js';
 
-import { WorldScene, worldToBabylon, type CameraMode } from '../engine/index.ts';
+import { WorldScene, worldToBabylon, type CameraMode, type MiningBeamEffect } from '../engine/index.ts';
 import { ProvingGroundsScene, type LapTelemetry } from '../engine/ProvingGroundsScene.ts';
-import { EvaSuitAvatar } from '../entities/AstronautSuit.ts';
+import { EvaSuitAvatar, SUIT_MAX_CARGO_KG } from '../entities/AstronautSuit.ts';
 import { OpenBuggy, MOUNT_RADIUS_M, type BuggyDashTelemetry } from '../entities/OpenBuggy.ts';
 import { TraversalController } from './TraversalController.ts';
 import {
@@ -548,6 +548,23 @@ export interface RemoteAvatar {
   heading: number;
 }
 
+/**
+ * Spec 19 §2.2/§2.3: the full story of the last successful
+ * `mineNearestVein()` pull, kept for HUD follow-ups and the smoke harness.
+ */
+export interface MiningOutcome {
+  veinId: string;
+  resource: MiningResource;
+  /** Kilograms actually credited to the carrier (may be < requested). */
+  amount: number;
+  /** Which carrier took the haul. */
+  carrier: 'suit' | 'buggy';
+  /** True when a MINE frame went out (link open), false for offline pulls. */
+  online: boolean;
+  /** The toast banner text painted for this pull. */
+  toast: string;
+}
+
 // ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
@@ -713,6 +730,21 @@ export class ClientApp {
   private lastScanAt: number | null = null;
   private lastMineAt = -Infinity;
   private pendingTrades = 0;
+
+  /**
+   * Spec 19 §2.2: outcome of the most recent `mineNearestVein()` pull —
+   * harness readback for vein id, credited mass, carrier and online flag.
+   */
+  private lastMiningOutcome: MiningOutcome | null = null;
+  /** The most recent mining-laser burst payload (null before the first pull). */
+  private lastMiningLaser: MiningBeamEffect | null = null;
+  /**
+   * Spec 19 §2.2.1: local single-player inventory ledger (`REGOLITH`-style
+   * uppercase symbols, mirroring the server's `inventory` shape). Online the
+   * server's `mine_result`/`trade_confirmed` frames overwrite it authorita-
+   * tively; offline it IS the inventory the trade terminal reads.
+   */
+  private readonly localInventory = new Map<string, number>();
 
   private readonly remotes = new Map<string, RemoteAvatar>();
   private readonly claimMarkers = new Map<string, Mesh>();
@@ -1287,6 +1319,49 @@ export class ClientApp {
     return this.mode;
   }
 
+  /**
+   * Spec 19 §2.2: the last successful mining pull (vein, credited kg,
+   * carrier, online flag, toast text) — null before the first pull.
+   */
+  getLastMiningOutcome(): MiningOutcome | null {
+    return this.lastMiningOutcome;
+  }
+
+  /** The most recent mining-laser burst payload (null before the first pull). */
+  getLastMiningLaser(): MiningBeamEffect | null {
+    return this.lastMiningLaser;
+  }
+
+  /**
+   * Spec 19 §2.2.1: the local inventory ledger as a plain object keyed by
+   * uppercase commodity symbol (server-vocabulary shape). Offline this IS
+   * the player's inventory; online `mine_result`/`trade_confirmed` frames
+   * overwrite entries authoritatively as they land.
+   */
+  getLocalInventory(): Record<string, number> {
+    return Object.fromEntries(this.localInventory);
+  }
+
+  /** Credit `amountKg` of `resource` into the local ledger + HUD holdings. */
+  private creditLocalInventory(resource: string, amountKg: number): void {
+    if (!Number.isFinite(amountKg) || amountKg <= 0) return;
+    const symbol = resource.toUpperCase();
+    this.localInventory.set(symbol, (this.localInventory.get(symbol) ?? 0) + amountKg);
+    this.hud?.updateInventory({ [symbol]: this.localInventory.get(symbol) ?? 0 });
+  }
+
+  /**
+   * Overwrite local ledger entries from an authoritative server inventory
+   * (welcome / mine_result / trade_confirmed payloads) — the server wins.
+   */
+  private syncLocalInventory(inventory: Record<string, number>): void {
+    for (const [symbol, amount] of Object.entries(inventory)) {
+      if (typeof amount === 'number' && Number.isFinite(amount)) {
+        this.localInventory.set(String(symbol).toUpperCase(), amount);
+      }
+    }
+  }
+
   isRunning(): boolean {
     return this.started;
   }
@@ -1745,7 +1820,21 @@ export class ClientApp {
           rising(GAMEPAD_BUTTONS.camera) ||
           rising(GAMEPAD_BUTTONS.comms);
         if (padAction) this.inputSource = 'gamepad';
-        if (rising(GAMEPAD_BUTTONS.mount)) this.toggleMount();
+        if (rising(GAMEPAD_BUTTONS.mount)) {
+          // Spec 19 §2.1.5/§2.3.3: (X) stows a loaded backpack into a nearby
+          // rover first; with an empty pack (or no rover) it mounts.
+          const padSuit = this.suit;
+          if (
+            this.mode === 'suit' &&
+            padSuit !== null &&
+            padSuit.getCargoMass() > 0 &&
+            this.stowCargoToBuggy() > 0
+          ) {
+            // stow handled — no mount this press
+          } else {
+            this.toggleMount();
+          }
+        }
         if (rising(GAMEPAD_BUTTONS.headlight)) this.toggleHeadlights();
         if (rising(GAMEPAD_BUTTONS.trade)) this.toggleTradeTerminal();
         if (rising(GAMEPAD_BUTTONS.mine)) this.mineNearestVein();
@@ -1763,6 +1852,13 @@ export class ClientApp {
     this.inputSource = 'keyboard';
     switch (action) {
       case 'mount':
+        // Spec 19 §2.3.3: `[E]` doubles as the stow action — on foot with a
+        // haul beside the parked rover it moves the backpack cargo to the
+        // flatbed first; a second press (empty pack) boards the buggy.
+        if (this.mode === 'suit' && this.requireSuit().getCargoMass() > 0) {
+          const stowed = this.stowCargoToBuggy();
+          if (stowed > 0) break;
+        }
         this.toggleMount();
         break;
       case 'headlight':
@@ -1812,6 +1908,14 @@ export class ClientApp {
       }
       if (!buggy.mount(suit)) return false;
       this.mode = 'buggy';
+      // Spec 19 §2.3.3 / ADR-4: boarding auto-transfers the backpack haul to
+      // the flatbed (what will not physically fit stays on the suit).
+      const haul = suit.getCargoMass();
+      let stowed = 0;
+      if (haul > 0) {
+        stowed = buggy.addCargo(haul);
+        if (stowed > 0) suit.setCargoMass(haul - stowed);
+      }
       this.lastEvaCamera = this.world.getCameraRig().getMode();
       // Spec 18 §7: the board event feeds `board_buggy` objectives, and the
       // dash lights up with the current quest telemetry the instant the
@@ -1826,7 +1930,15 @@ export class ClientApp {
       this.world.getCameraRig().setMode('vehicle_chase');
       // Onboarding: boarding the rover completes the vehicle step.
       this.tutorialTrigger('buggy');
-      this.hudSay('buggy engaged');
+      if (stowed > 0) {
+        this.hudSay('buggy engaged');
+        this.hudFeedback(
+          `Auto-stowed ${Math.round(stowed)} kg to flatbed (${Math.round(buggy.getCargoMass())}/${BUGGY_MAX_CARGO} kg)`,
+          'success',
+        );
+      } else {
+        this.hudSay('buggy engaged');
+      }
       return true;
     }
 
@@ -1850,6 +1962,42 @@ export class ClientApp {
     return this.requireSuit().setHeadlight();
   }
 
+  /**
+   * Spec 19 §2.3.3 / ADR-4 — transfer the backpack haul into the parked
+   * rover's flatbed. Requires: on foot, within mount radius, backpack non-
+   * empty, flatbed with room. Returns the kilograms moved (0 = nothing
+   * happened, with a reason on the HUD toast when the transfer was asked
+   * for and refused).
+   */
+  stowCargoToBuggy(): number {
+    if (this.disposed) return 0;
+    const suit = this.requireSuit();
+    const buggy = this.requireBuggy();
+    if (this.mode !== 'suit') return 0;
+    const haul = suit.getCargoMass();
+    if (haul <= 0) return 0;
+    if (this.suitBuggyDistance() > MOUNT_RADIUS_M) {
+      this.hudFeedback(`buggy is out of reach (>${MOUNT_RADIUS_M} m)`, 'error');
+      return 0;
+    }
+    const moved = buggy.addCargo(haul);
+    if (moved <= 0) {
+      this.hudFeedback(
+        `Buggy flatbed full (${Math.round(buggy.getCargoMass())}/${BUGGY_MAX_CARGO} kg) — sell at the exchange`,
+        'error',
+      );
+      return 0;
+    }
+    suit.setCargoMass(suit.getCargoMass() - moved);
+    this.hudFeedback(
+      moved >= haul
+        ? `Stowed ${Math.round(moved)} kg to buggy flatbed (${Math.round(buggy.getCargoMass())}/${BUGGY_MAX_CARGO} kg)`
+        : `Partial stow ${Math.round(moved)} kg — flatbed full (${Math.round(buggy.getCargoMass())}/${BUGGY_MAX_CARGO} kg)`,
+      'success',
+    );
+    return moved;
+  }
+
   /** `[V]` — first person → third person → chase → first person. */
   cycleCamera(): CameraMode {
     if (this.disposed) return 'eva_first_person';
@@ -1861,52 +2009,155 @@ export class ClientApp {
     return next;
   }
 
-  /** `[M]` — fire a MINE frame at the closest vein the drill can reach. */
+  /** `[M]` — fire a MINE frame at the closest vein the drill can reach.
+   *
+   * Spec 19 §2.2: the drill never aborts on a dead link again. When the
+   * network is open the pull rides a `MINE` frame (server stays
+   * authoritative); offline single-player extracts straight against the
+   * local `LunarWorldGenerator` survey. Either way the haul lands in the
+   * carrier the player is riding — suit backpack (50 kg cap, ADR-4) or
+   * buggy flatbed (500 kg) — feeds the quest engine, paints the floating
+   * HUD toast (ADR-3), and fires the 3D mining-laser burst (§2.2.3).
+   *
+   * Returns true when ore was pulled. {@link getLastMiningOutcome} carries
+   * the details (vein, resource, credited kg, carrier, online flag).
+   */
   mineNearestVein(amount: number = MINE_AMOUNT): boolean {
     if (this.disposed) return false;
+    const requested = Math.max(1, Math.floor(Number.isFinite(amount) ? amount : MINE_AMOUNT));
     const now = this.nowMs();
-    if (now - this.lastMineAt < MINE_COOLDOWN_MS) return false;
+    if (now - this.lastMineAt < MINE_COOLDOWN_MS) {
+      this.hudFeedback('Drill cooling down...', 'info');
+      return false;
+    }
 
     const target = this.getNearestVein();
     if (target === null) {
-      this.hudFeedback('no vein in scanner range', 'error');
+      this.hudFeedback('No mineral signatures in drill range', 'error');
       return false;
     }
     if (target.rangeM > MINE_RANGE_M) {
-      this.hudFeedback(`vein out of drill reach (${Math.round(target.rangeM)} m)`, 'error');
+      this.hudFeedback(`Vein out of drill reach (${Math.round(target.rangeM)} m)`, 'error');
       return false;
     }
 
-    const net = this.network;
-    if (net === null || net.state !== 'open') {
-      this.hudFeedback('offline — cannot mine', 'error');
-      return false;
+    // -- capacity gate (spec 19 §2.3.2 / ADR-4): foot 50 kg, flatbed 500 kg.
+    const onFoot = this.mode === 'suit';
+    const suit = this.requireSuit();
+    const buggy = this.requireBuggy();
+    const suitCargo = onFoot ? suit.getCargoMass() : 0;
+    const buggyCargo = buggy.getCargoMass();
+    let extract = requested;
+    let cappedByBackpack = false;
+    let cappedByFlatbed = false;
+    if (onFoot) {
+      const room = SUIT_MAX_CARGO_KG - suitCargo;
+      if (room < 1) {
+        this.hudFeedback(
+          `Suit backpack full (${Math.round(suitCargo)}/${SUIT_MAX_CARGO_KG} kg) — stow in buggy or sell`,
+          'error',
+        );
+        return false;
+      }
+      if (room < extract) {
+        extract = Math.floor(room);
+        cappedByBackpack = true;
+      }
+    } else {
+      const room = BUGGY_MAX_CARGO - buggyCargo;
+      if (room < 1) {
+        this.hudFeedback(
+          `Buggy flatbed full (${Math.round(buggyCargo)}/${BUGGY_MAX_CARGO} kg) — sell at the exchange`,
+          'error',
+        );
+        return false;
+      }
+      if (room < extract) {
+        extract = Math.floor(room);
+        cappedByFlatbed = true;
+      }
     }
 
     const resource = VEIN_KIND_TO_RESOURCE[target.vein.kind] ?? 'regolith';
-    try {
-      net.mine(target.vein.id, amount, resource);
-    } catch (err) {
-      this.hudFeedback(`mine failed: ${(err as Error).message}`, 'error');
-      return false;
+
+    // -- online leg (server authoritative when the link is open); either
+    // way the pull below also lands locally for instant feedback.
+    const net = this.network;
+    const online = net !== null && net.state === 'open';
+    if (online && net !== null) {
+      try {
+        net.mine(target.vein.id, extract, resource);
+      } catch (err) {
+        this.hudFeedback(`mine failed: ${(err as Error).message}`, 'error');
+        return false;
+      }
     }
     this.lastMineAt = now;
+
+    // -- local extraction (spec 19 §2.2.1): survey mutation + inventory +
+    // quest bookkeeping run on EVERY pull, online or offline. Online the
+    // server remains authoritative and its `mine_result` replaces the
+    // terminal ledger wholesale; the local credit just makes the moment
+    // feel instant (optimistic feedback) and keeps single-player honest.
+    let harvested = 0;
+    try {
+      const result = this.world
+        .getWorldGenerator()
+        .harvest(
+          target.vein.kind,
+          target.vein.center.x,
+          target.vein.center.y,
+          target.vein.center.z,
+          extract,
+          onFoot ? 'suit' : 'buggy',
+        );
+      harvested = result.harvested;
+    } catch {
+      /* survey model may reject the rig/kind pair — carry the request anyway */
+    }
+    const credited = harvested > 0 ? Math.min(harvested, extract) : extract;
+
+    if (onFoot) suit.addCargo(credited);
+    else buggy.addCargo(credited);
+    this.creditLocalInventory(resource, credited);
 
     // Spec 18 §7: extraction success feeds the quest engine's
     // `extract_mineral` objectives (kind-matched; the tutorial vein is
     // regolith-grade by construction).
-    this.questEngine?.recordMineralMined(resource, amount);
+    this.questEngine?.recordMineralMined(resource, credited);
 
     // Onboarding: a fired drill frame completes the extraction step.
     this.tutorialTrigger('mine');
 
-    // Local survey bookkeeping only — the server remains authoritative and
-    // the next `mine_result` replaces inventory/credits wholesale.
+    // -- 3D mining laser (spec 19 §2.2.3): emitter on the rider's chest,
+    // target at the vein centre. NullEngine-safe / no-ops without a scene.
     try {
-      this.world.getWorldGenerator().harvest(target.vein.kind, target.vein.center.x, target.vein.center.y, target.vein.center.z, amount, this.mode === 'buggy' ? 'buggy' : 'suit');
+      const emitter = this.activePosition();
+      this.lastMiningLaser = this.world.spawnMiningLaser(
+        { x: emitter.x, y: emitter.y, z: emitter.z + 1.0 },
+        { x: target.vein.center.x, y: target.vein.center.y, z: target.vein.center.z },
+      );
     } catch {
-      /* survey model may reject the rig/kind pair; server result still rules */
+      this.lastMiningLaser = null;
     }
+
+    const carrierLabel = onFoot ? 'backpack' : 'flatbed';
+    const carrierNow = onFoot ? suit.getCargoMass() : buggy.getCargoMass();
+    const capped = cappedByBackpack || cappedByFlatbed;
+    const toast =
+      `Drilling ${target.vein.id} (+${credited} kg ${resource})` +
+      (capped
+        ? ` · ${carrierLabel} full (${Math.round(carrierNow)}/${onFoot ? SUIT_MAX_CARGO_KG : BUGGY_MAX_CARGO} kg)`
+        : '');
+    this.lastMiningOutcome = {
+      veinId: target.vein.id,
+      resource,
+      amount: credited,
+      carrier: onFoot ? 'suit' : 'buggy',
+      online,
+      toast,
+    };
+    this.hudFeedback(toast, 'success');
     this.hudSay(`drilling ${target.vein.id} …`);
     return true;
   }
@@ -2309,7 +2560,13 @@ export class ClientApp {
       prompts.push({ key: 'E', kind: 'dismount' });
     } else {
       const d = this.suitBuggyDistance();
-      if (d <= MOUNT_RADIUS_M) prompts.push({ key: 'E', kind: 'drive' });
+      if (d <= MOUNT_RADIUS_M) {
+        prompts.push({ key: 'E', kind: 'drive' });
+        // Spec 19 §2.3.3: a loaded backpack beside the rover adds the stow
+        // action on the same key — the first [E]/(X) press moves the haul to
+        // the flatbed, the next one boards (see runAction('mount')).
+        if (suit.getCargoMass() > 0) prompts.push({ key: 'E', kind: 'stow' });
+      }
     }
     const target = this.getNearestVein();
     if (target !== null && target.rangeM <= MINE_RANGE_M) {
@@ -2824,6 +3081,7 @@ export class ClientApp {
       this.hudSay(`drew ${amount} u · +${earned} cr`);
       const inventory = frame['inventory'];
       if (typeof inventory === 'object' && inventory !== null) {
+        this.syncLocalInventory(inventory as Record<string, number>);
         this.hud?.updateInventory(inventory as Record<string, number>);
       }
     });
@@ -2843,6 +3101,7 @@ export class ClientApp {
   private onWelcome(ev: WelcomeEvent): void {
     this.hud?.setUsername(ev.player.username, ev.player.faction);
     this.hud?.setCredits(ev.player.credits);
+    this.syncLocalInventory(ev.inventory);
     this.hud?.updateInventory(ev.inventory);
     const market = ev.market as
       | { prices?: Record<string, number>; sellPrices?: Record<string, number>; basePrices?: Record<string, number>; reserves?: Record<string, number> }
@@ -2964,6 +3223,10 @@ export class ClientApp {
   }
 
   private hudFeedback(message: string, kind: 'info' | 'success' | 'error'): void {
+    // Spec 19 §2.2.2 / ADR-3: operational feedback surfaces on the floating
+    // top-centre toast (always visible). The terminal feedback line keeps a
+    // copy so an open trade dialog still reads the same story.
+    this.hud?.showToast(message, kind);
     this.hud?.showFeedback(message, kind);
   }
 
