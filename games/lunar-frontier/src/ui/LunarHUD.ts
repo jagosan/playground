@@ -109,6 +109,25 @@ export const HUD_PROMPT_KINDS = {
 
 export type HudPromptKind = keyof typeof HUD_PROMPT_KINDS;
 
+/**
+ * Spec 19 §2.1.6: which device produced the last input. The prompt strip
+ * re-glyphs itself — `[E]`/`[M]`/`[T]` on keyboard, `(X)`/`(RB)`/`(B)` on a
+ * live gamepad — so a controller driver never chases keys they cannot press.
+ */
+export type HudInputSource = 'keyboard' | 'gamepad';
+
+/**
+ * Canonical gamepad glyphs per prompt kind (Spec 19 §2.1.5 action sheet).
+ * Kinds without a pad binding (claim) keep their keyboard glyph in either
+ * source mode.
+ */
+export const HUD_GAMEPAD_GLYPHS: Readonly<Partial<Record<HudPromptKind, string>>> = {
+  drive: 'X',
+  dismount: 'X',
+  mine: 'RB',
+  trade: 'B',
+};
+
 export interface HudPrompt {
   /** Hotkey glyph shown in brackets, e.g. `E`. */
   key: string;
@@ -431,6 +450,16 @@ export class LunarHUD {
   private feedbackTimer: ReturnType<typeof setTimeout> | null = null;
   private disposed = false;
 
+  /**
+   * Spec 19 §2.1.6 — last-active input device. `setInputSource()` repaints
+   * the prompt strip (and the key-sheet legend) when it flips.
+   */
+  private inputSource: HudInputSource = 'keyboard';
+  /** Last prompts handed to `setPrompts` (re-rendered on source flip). */
+  private lastPrompts: readonly HudPrompt[] = [];
+  /** The key-sheet whisper under the prompts (source-dependent text). */
+  private legendEl: Elementish | null = null;
+
   /** Spec 18 §6.2 — comms terminal state. */
   private commsVisible = false;
   private commsDismissTimer: ReturnType<typeof setTimeout> | null = null;
@@ -701,9 +730,14 @@ export class LunarHUD {
   /**
    * Replace the prompt strip. Prompts sort by `order` (falling back to the
    * canonical kind order) and cap at `promptSlots`; spare slots hide.
+   * Glyphs render per the active input source (Spec 19 §2.1.6): keyboard
+   * shows `[E]`-style brackets, gamepad shows the console-style `(X)`/`(RB)`
+   * binding for that prompt kind (falling back to brackets for kinds with
+   * no pad binding, e.g. claim).
    */
   setPrompts(prompts: readonly HudPrompt[]): void {
     if (this.disposed) return;
+    this.lastPrompts = prompts;
     const sorted = [...prompts].sort((a, b) => this.orderOf(a) - this.orderOf(b));
     for (let i = 0; i < this.promptEls.length; i++) {
       const slot = this.promptEls[i];
@@ -712,10 +746,14 @@ export class LunarHUD {
         this.setClassEl(slot, 'is-hidden', true);
         continue;
       }
-      const label = prompt.label ?? HUD_PROMPT_KINDS[(prompt.kind ?? 'trade') as HudPromptKind]?.label ?? 'Interact';
+      const kind = (prompt.kind ?? 'trade') as HudPromptKind;
+      const label = prompt.label ?? HUD_PROMPT_KINDS[kind]?.label ?? 'Interact';
+      // Gamepad source swaps in the console glyph when the kind has one;
+      // kinds without a pad binding (claim) keep their keyboard bracket.
+      const padGlyph = this.inputSource === 'gamepad' ? HUD_GAMEPAD_GLYPHS[kind] : undefined;
       slot.textContent = '';
       const key = this.make('span', undefined, 'hud-key');
-      key.textContent = `[${prompt.key}]`;
+      key.textContent = padGlyph !== undefined ? `(${padGlyph})` : `[${prompt.key}]`;
       const text = this.make('span', undefined, 'hud-prompt-label');
       text.textContent = label;
       slot.appendChild(key);
@@ -728,6 +766,34 @@ export class LunarHUD {
   /** Clear every prompt slot. */
   clearPrompts(): void {
     this.setPrompts([]);
+  }
+
+  /**
+   * Spec 19 §2.1.6 — declare which device produced the last input. Flipping
+   * the source repaints the live prompt strip and swaps the key-sheet
+   * legend to the pad sheet. Idempotent for repeats of the same source.
+   */
+  setInputSource(source: HudInputSource): void {
+    if (this.disposed) return;
+    if (this.inputSource === source) return;
+    this.inputSource = source;
+    this.setPrompts(this.lastPrompts);
+    this.paintLegend();
+  }
+
+  /** Currently-active input source for the prompt glyphs. */
+  getInputSource(): HudInputSource {
+    return this.inputSource;
+  }
+
+  private paintLegend(): void {
+    if (this.legendEl === null) return;
+    this.legendEl.textContent =
+      this.inputSource === 'gamepad'
+        ? '(L-Stick) move · (A) hop / handbrake · (LB) sprint · (X) buggy · (Y) lamps · ' +
+          '(R3) camera · (RB) mine · (C) claim · (B) trade · (D-Up) comms · (LT) brake / reverse'
+        : '[WASD] move · [Space] hop · [Shift] sprint · [E] buggy · [F] lamps · ' +
+          '[V] camera · [M] mine · [C] claim · [T] trade · [Esc] close UI';
   }
 
   private orderOf(prompt: HudPrompt): number {
@@ -1415,11 +1481,11 @@ export class LunarHUD {
       strip.appendChild(slot);
       this.promptEls.push(slot);
     }
-    // The full key sheet always sits under the prompts as a whisper.
+    // The full key sheet always sits under the prompts as a whisper
+    // (re-painted by `setInputSource` when the gamepad takes over).
     const legend = this.make('div', 'lunar-hud-legend', 'hud-legend', 'key-legend');
-    legend.textContent =
-      '[WASD] move · [Space] hop · [Shift] sprint · [E] buggy · [F] lamps · ' +
-      '[V] camera · [M] mine · [C] claim · [T] trade · [Esc] close UI';
+    this.legendEl = legend;
+    this.paintLegend();
     strip.appendChild(legend);
   }
 

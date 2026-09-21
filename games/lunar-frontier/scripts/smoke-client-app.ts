@@ -45,14 +45,18 @@ import {
 
 import {
   ClientApp,
+  GAMEPAD_LOOK_DEADZONE,
+  GAMEPAD_LOOK_GAMMA,
   GAMEPAD_STEER_DEADZONE,
   GAMEPAD_STEER_GAMMA,
   GAMEPAD_THROTTLE_GAMMA,
   NAV_SCAN_RANGE_M,
+  PAD_RAIL_REST_FRAMES,
   RUMBLE_MIN_INTERVAL_MS,
   SCAN_RANGE_M,
   computeBuggyRumble,
   gamepadBrakeCurve,
+  gamepadLookCurve,
   gamepadSteerCurve,
   gamepadThrottleCurve,
 } from '../src/client/ClientApp.ts';
@@ -124,10 +128,25 @@ function makeFakeElement(tagName: string, registry: Map<string, FakeElement>): F
   const listeners = new Map<string, Array<(event: unknown) => void>>();
   const classes = new Set<string>();
   const attributes = new Map<string, string>();
+  // Real-DOM semantics: assigning `textContent` REPLACES the subtree — every
+  // child is dropped (and un-registered). The HUD repaints prompt/comms/
+  // hint spans with exactly this idiom, so a fake that keeps the children
+  // would grow them unboundedly on re-paints (spec 19 input-source flips).
+  let ownText = '';
   const el: FakeElement = {
     id: '',
     className: tagName,
-    textContent: '',
+    get textContent(): string {
+      return ownText;
+    },
+    set textContent(value: string | null) {
+      ownText = value ?? '';
+      for (const child of el.children) {
+        if (child.id.length > 0 && registry.get(child.id) === child) registry.delete(child.id);
+        child.parent = null;
+      }
+      el.children.length = 0;
+    },
     style: { width: '' },
     classList: {
       add: (name: string) => classes.add(name),
@@ -1284,6 +1303,37 @@ section('D. input routing & hotkeys');
     hPad.buttons[index]!.pressed = v > 0;
     hPad.buttons[index]!.value = v;
   };
+  /**
+   * Bring the buggy to a dead stop: release R2, hold L2 until FORWARD motion
+   * ends. Spec 19 §2.1.3 changed the held-LT-at-standstill law (it is now
+   * proportional REVERSE throttle, not a pin), so the drain must exit at the
+   * b2r hand-off point — vLong ≤ 0 — instead of waiting on |v| ≤ 0.05, which
+   * a creeping reverse would never satisfy. A few settle frames then bleed
+   * the reverse creep so every launch below starts from standstill.
+   */
+  const stopBuggy = (): void => {
+    setTrigger(7, 0);
+    setTrigger(6, 1);
+    for (
+      let i = 0;
+      i < 600 &&
+      (hApp.getBuggy().physics as unknown as { state: { vLong: number } }).state.vLong > 0;
+      i++
+    ) {
+      hFrame(1);
+    }
+    setTrigger(6, 0);
+    // Spec 19 §2.1.3: a held LT at standstill is REVERSE throttle, so the
+    // hand-off leaves a motor spooling backwards. Pin the wheels with the
+    // park brake while the torque spool bleeds (≈150 ms at the 12.5/s anti-
+    // jerk rate), then release — vLong lands dead zero and the launch below
+    // measures the anti-jerk ramp from a true standstill.
+    hApp.handleKeyInput('Space', 'down');
+    for (let i = 0; i < 60 && hApp.getBuggy().getSpeed() > 0.001; i++) hFrame(1);
+    hFrame(10);
+    hApp.handleKeyInput('Space', 'up');
+    hFrame(2);
+  };
 
   const hBuggyPos = hApp.getBuggy().getPosition();
   hApp.getSuit().teleport(hBuggyPos.x - 0.5, hBuggyPos.y - 0.5);
@@ -1413,14 +1463,13 @@ section('D. input routing & hotkeys');
   (hApp.getBuggy().physics as unknown as { state: { batteryKwh: number } }).state.batteryKwh = 2.2;
   // Spec 17 Phase 6: the drain is trigger-state INDEPENDENT (release R2, hold
   // the service brake to a dead stop) so the anti-jerk launch always starts
-  // from standstill. Post-Fy-sign (TraversalPhysics Spec 17 §2.2.3) the D2-c
-  // vLat kick recovers cleanly and the buggy could otherwise arrive here still
-  // cruising on the R2 left down from D2-d — an accidental coast, not a launch.
-  setTrigger(7, 0);
-  setTrigger(6, 1);
-  for (let i = 0; i < 600 && hApp.getBuggy().getSpeed() > 0.05; i++) hFrame(1);
-  setTrigger(6, 0);
-  hFrame(5); // park-settle
+  // from standstill. Post-Spec-19 §2.1.3 a held LT at standstill is REVERSE
+  // throttle, not a pin — `stopBuggy` exits at the b2r hand-off (vLong ≤ 0)
+  // and settles the reverse creep. Post-Fy-sign (TraversalPhysics Spec 17
+  // §2.2.3) the D2-c vLat kick recovers cleanly and the buggy could otherwise
+  // arrive here still cruising on the R2 left down from D2-d — an accidental
+  // coast, not a launch.
+  stopBuggy();
   const ramped: number[] = [];
   hApp.handleKeyInput('KeyW', 'down');
   for (let i = 0; i < 3; i++) {
@@ -1441,6 +1490,263 @@ section('D. input routing & hotkeys');
     writable: true,
     value: navRestore,
   });
+}
+
+// ===========================================================================
+// LAYER D3 — TASK-PLAY-065: Spec 19 gamepad subsystem (active scan, Linux
+// trigger axes, brake-to-reverse, look pitch, action sheet, adaptive glyphs).
+// ===========================================================================
+
+section('D3. spec 19 gamepad subsystem & driving rectification');
+{
+  const realNav = (globalThis as { navigator?: unknown }).navigator;
+  const mkPad = (axes: number[] = [0, 0, 0, 0, 0, 0], buttonCount = 16) => ({
+    axes: [...axes],
+    buttons: Array.from({ length: buttonCount }, () => ({ value: 0, pressed: false })),
+  });
+  type MkPad = ReturnType<typeof mkPad>;
+  const setBtn = (pad: MkPad, i: number, pressed = true, value = pressed ? 1 : 0): void => {
+    pad.buttons[i]!.pressed = pressed;
+    pad.buttons[i]!.value = value;
+  };
+  const idlePad = (pad: MkPad): void => {
+    pad.axes.fill(0);
+    for (const b of pad.buttons) {
+      b.pressed = false;
+      b.value = 0;
+    }
+  };
+  const usePads = (...pads: Array<MkPad | null>): void => {
+    Object.defineProperty(globalThis, 'navigator', {
+      configurable: true,
+      writable: true,
+      value: { getGamepads: () => pads },
+    });
+  };
+  const step = (n = 1): void => {
+    for (let i = 0; i < n; i++) {
+      nowMs += 16;
+      app.update(nowMs);
+    }
+  };
+  const promptStrip = bootDoc.getElementById('lunar-hud-prompts')!;
+  const prompts = () =>
+    promptStrip
+      .children.filter(
+        (c) => c.classList.contains('hud-prompt') && !c.classList.contains('is-hidden'),
+      )
+      .map((c) => c.text());
+
+  // D3-1 — multi-gamepad active scan (spec 19 §2.1.1 / ADR-1): a dormant
+  // device at index 0 must never block the live controller behind it.
+  const phantom = mkPad();
+  const live = mkPad();
+  usePads(phantom, live);
+  step(2);
+  live.axes[0] = 0.7;
+  const slot1Strafe = app.sampleInput().strafe;
+  check(
+    'active pad at slot 1 wins over dormant slot 0',
+    app.getActiveGamepadIndex() === 1 && Math.abs(slot1Strafe - gamepadSteerCurve(0.7)) < 1e-12,
+    `index=${app.getActiveGamepadIndex()} strafe=${slot1Strafe}`,
+  );
+  check('gamepad activity claims the HUD input source', app.getInputSource() === 'gamepad');
+  idlePad(live);
+  setBtn(phantom, 3); // phantom button press re-locks the scan (side effect: lamp)
+  step(1);
+  check('later activity re-locks onto the demonstrative slot', app.getActiveGamepadIndex() === 0);
+  idlePad(phantom);
+  step(1);
+  check('all-neutral keeps the previous lock', app.getActiveGamepadIndex() === 0);
+
+  // D3-2 — Linux xpad trigger axes (spec 19 §2.1.2): axes[4]/axes[5] rest at
+  // −1 and map [−1,+1] → [0,1] once the rail-rest calibration window closes.
+  const linuxPad = mkPad([0, 0, 0, 0, -1, -1]);
+  usePads(linuxPad);
+  step(PAD_RAIL_REST_FRAMES + 2); // rail-rest calibration frames
+  linuxPad.axes[5] = 0; // mid-travel from the −1 rest
+  check(
+    'linux axes[5] mid-travel → gamma throttle ((0.5)^1.4)',
+    Math.abs(app.sampleInput().forward - Math.pow(0.5, 1.4)) < 1e-12,
+    `f=${app.sampleInput().forward}`,
+  );
+  linuxPad.axes[5] = 1;
+  check('linux axes[5] full pull → 1.0', app.sampleInput().forward === 1);
+  linuxPad.axes[5] = -1;
+  linuxPad.axes[4] = 0;
+  check(
+    'linux axes[4] mid-travel → brake curve ((0.5)^0.8)',
+    Math.abs(app.sampleInput().brake - Math.pow(0.5, 0.8)) < 1e-12,
+    `b=${app.sampleInput().brake}`,
+  );
+  linuxPad.axes[4] = -1;
+  step(1);
+
+  // D3-3 — right-stick look pitch (spec 2.1.4): axes[3] behind the 0.15
+  // deadband with exponential ease; stick-back (negative) looks up (+pitch).
+  const lookPad = mkPad([0, 0, 0, -0.6, 0, 0]);
+  usePads(lookPad);
+  check(
+    'right stick Y → pitch curve ((0.45/0.85)^1.5, pull-back = +)',
+    Math.abs(app.sampleInput().pitch - Math.pow((0.6 - 0.15) / 0.85, 1.5)) < 1e-12,
+    `p=${app.sampleInput().pitch}`,
+  );
+  lookPad.axes[3] = 0.6;
+  check('right stick Y forward → negative pitch', app.sampleInput().pitch < 0);
+  lookPad.axes[3] = 0.1;
+  check('look deadzone: 0.1 reads centred', app.sampleInput().pitch === 0);
+  check(
+    'look curve constants: dz 0.15, γ 1.5 (spec 19 §2.1.4)',
+    GAMEPAD_LOOK_DEADZONE === 0.15 &&
+      GAMEPAD_LOOK_GAMMA === 1.5 &&
+      gamepadLookCurve(0.15) === 0 &&
+      Math.abs(gamepadLookCurve(1) - 1) < 1e-12 &&
+      Math.abs(gamepadLookCurve(-0.5) + Math.pow((0.5 - 0.15) / 0.85, 1.5)) < 1e-12,
+  );
+  idlePad(lookPad);
+
+  // D3-4 — brake-to-reverse (spec 19 §2.1.3 / ADR-2): stopped rover routes
+  // held LT into proportional reverse throttle; RT vetoes; release returns.
+  const drivePad = mkPad();
+  usePads(drivePad);
+  const buggyHome = app.getBuggy().getPosition();
+  app.getSuit().teleport(buggyHome.x - 0.5, buggyHome.y - 0.5);
+  check('D3 rig mounts the buggy', app.toggleMount() === true && app.getMode() === 'buggy');
+  step(4);
+  const vState = () => (app.getBuggy().physics as unknown as { state: { vLong: number } }).state;
+  app.handleKeyInput('Space', 'down'); // handbrake: dead standstill baseline
+  step(6);
+  app.handleKeyInput('Space', 'up');
+  step(1);
+  setBtn(drivePad, 6, true, 0.5);
+  const revFrame = app.sampleInput();
+  check(
+    'LT held at standstill engages brake-to-reverse',
+    revFrame.reverse === true &&
+      revFrame.brake === 0 &&
+      Math.abs(revFrame.forward + Math.pow(0.5, 0.8)) < 1e-12 &&
+      app.isReverseEngaged() === true,
+    JSON.stringify(revFrame),
+  );
+  step(40);
+  check(
+    'reverse throttle backs the rover up (vLong < −0.05)',
+    vState().vLong < -0.05,
+    `vLong=${vState().vLong.toFixed(3)}`,
+  );
+  setBtn(drivePad, 7, true, 1); // RT veto while LT still holds
+  const vetoFrame = app.sampleInput();
+  check(
+    'RT veto snaps back to forward drive the same frame',
+    vetoFrame.reverse === false && vetoFrame.forward > 0.5 && app.isReverseEngaged() === false,
+    JSON.stringify(vetoFrame),
+  );
+  setBtn(drivePad, 7, false, 0);
+  idlePad(drivePad);
+  const relFrame = app.sampleInput();
+  check(
+    'LT release returns to forward / idle',
+    relFrame.reverse === false && relFrame.brake === 0 && relFrame.forward === 0,
+  );
+  app.handleKeyInput('Space', 'down'); // re-pin before dismount
+  step(4);
+  app.handleKeyInput('Space', 'up');
+  check('D3 dismounts after the reverse test', app.toggleMount() === true && app.getMode() === 'suit');
+
+  // D3-5 — gamepad action sheet (spec 19 §2.1.5): RB mine, R3 camera,
+  // D-Pad Up comms. Two update() frames per press: snapshot, then edge.
+  usePads(live);
+  const d3snapshot = app.world.getSnapshot();
+  assert.ok(d3snapshot !== null);
+  app.getSuit().teleport(d3snapshot.veins[0].center.x, d3snapshot.veins[0].center.y);
+  nowMs += 300;
+  app.update(nowMs); // force a scanner refresh at the new position
+  const mineFrames = () => boot.sent.filter((f) => f['type'] === 'MINE').length;
+  const mineBefore = mineFrames();
+  setBtn(live, 5); // RB
+  step(2);
+  check(
+    'RB edge fires a MINE frame in range',
+    mineFrames() === mineBefore + 1,
+    `before=${mineBefore} after=${mineFrames()}`,
+  );
+  // E7 mines later in this harness; the 350 ms trigger-discipline cooldown
+  // would eat it — rewind the stamp (harness bookkeeping only).
+  (app as unknown as { lastMineAt: number }).lastMineAt = -Infinity;
+  setBtn(live, 5, false, 0);
+
+  app.world.getCameraRig().setMode('eva_first_person');
+  setBtn(live, 11); // R3
+  step(2);
+  const r3cam = app.world.getCameraRig().getMode();
+  setBtn(live, 11, false, 0);
+  step(1);
+  setBtn(live, 11);
+  step(2);
+  const r3cam2 = app.world.getCameraRig().getMode();
+  setBtn(live, 11, false, 0);
+  check(
+    'R3 edge cycles the camera once per press',
+    r3cam === 'eva_third_person' && r3cam2 === 'vehicle_chase',
+    `${r3cam}/${r3cam2}`,
+  );
+
+  const commsWasVisible = app.getHud()!.isCommsVisible();
+  setBtn(live, 12); // D-Pad Up
+  step(2);
+  check('D-Pad Up toggles the comms log', app.getHud()!.isCommsVisible() !== commsWasVisible);
+  setBtn(live, 12, false, 0);
+  step(1);
+  setBtn(live, 12);
+  step(2);
+  check('second D-Pad Up press restores it', app.getHud()!.isCommsVisible() === commsWasVisible);
+  setBtn(live, 12, false, 0);
+
+  // D3-6 — adaptive HUD glyphs (spec 19 §2.1.6): gamepad source paints
+  // (X)/(B) console glyphs beside the same labels; a keyboard action claims
+  // the [E]/[T] brackets back.
+  const buggyNow = app.getBuggy().getPosition();
+  app.getSuit().teleport(buggyNow.x - 0.5, buggyNow.y - 0.5); // drive prompt in range
+  idlePad(live);
+  live.axes[1] = -0.2; // a whiff of stick activity claims the pad
+  step(1);
+  const padPromptTexts = prompts();
+  check(
+    'gamepad prompts render (X) Drive Buggy / (B) Trade',
+    padPromptTexts.some((t) => t.includes('(X)') && t.includes('Drive Buggy')) &&
+      padPromptTexts.some((t) => t.includes('(B)') && t.includes('Trade')) &&
+      padPromptTexts.every((t) => !/\[E\]|\[T\]/.test(t)),
+    JSON.stringify(padPromptTexts),
+  );
+  check(
+    'pad legend swaps to the console key sheet',
+    (bootDoc.getElementById('lunar-hud-legend')!.textContent ?? '').includes('(RB) mine'),
+  );
+  idlePad(live); // park the stick or it re-claims the source every sample
+  app.handleKeyInput('KeyV', 'down'); // keyboard action re-claims the glyphs
+  step(1);
+  const kbPromptTexts = prompts();
+  check(
+    'keyboard action restores [E] / [T] brackets',
+    kbPromptTexts.some((t) => t.includes('[E]') && t.includes('Drive Buggy')) &&
+      kbPromptTexts.some((t) => t.includes('[T]') && t.includes('Trade')) &&
+      kbPromptTexts.every((t) => !/\(X\)|\(B\)/.test(t)),
+    JSON.stringify(kbPromptTexts),
+  );
+  check(
+    'keyboard legend restores the WASD sheet',
+    (bootDoc.getElementById('lunar-hud-legend')!.textContent ?? '').includes('[WASD]'),
+  );
+
+  idlePad(live);
+  usePads();
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    writable: true,
+    value: realNav,
+  });
+  step(1);
+  check('pad teardown returns the app to keyboard-only', app.getActiveGamepadIndex() === -1);
 }
 
 // ===========================================================================

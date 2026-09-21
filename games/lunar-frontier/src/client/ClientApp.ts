@@ -136,6 +136,15 @@ export const GAMEPAD_STEER_DEADZONE = 0.12;
 export const GAMEPAD_STEER_GAMMA = 1.6;
 
 /**
+ * Right-stick look-pitch deadband (Spec 19 §2.1.4): |axes[3]| at or below
+ * this reads as centred so a drifting stick never creeps the view.
+ */
+export const GAMEPAD_LOOK_DEADZONE = 0.15;
+
+/** Look-pitch exponent γ_look (Spec 19 §2.1.4 "exponential smoothing"). */
+export const GAMEPAD_LOOK_GAMMA = 1.5;
+
+/**
  * Throttle trigger exponent γ_throttle (Spec 17 §2.3.1):
  * `T_throttle = R2^1.4 · T_max`. The γ > 1 shape spends less travel near
  * zero (0.5 pull → 0.379 torque) killing launch wheelspin, while the last
@@ -159,6 +168,34 @@ export const GAMEPAD_BRAKE_GAMMA = 0.8;
  */
 export const GAMEPAD_TRIGGER_FILTER_RATE = 12.5;
 
+/**
+ * Brake-to-reverse stationary threshold (Spec 19 §2.1.3 / ADR-2): with the
+ * rover's longitudinal speed at or below this many m/s, a held brake trigger
+ * routes LT pressure into proportional REVERSE throttle instead of the
+ * service brake. Releasing LT (or pressing RT) returns to forward instantly.
+ */
+export const B2R_STATIONARY_V_MPS = 0.3;
+
+/**
+ * Raw LT demand (0..1, pre-gamma) at or above which brake-to-reverse engages
+ * while stationary (Spec 19 §2.1.3: LT ≥ 0.15).
+ */
+export const B2R_ENGAGE_LT = 0.15;
+
+/**
+ * RT demand (0..1, pre-gamma) that vetoes brake-to-reverse while it is
+ * engaged: a competing right-foot command means the driver wants forward.
+ */
+export const B2R_VETO_RT = 0.15;
+
+/**
+ * Consecutive idle frames a trigger axis must rest on its negative rail
+ * (≤ −0.9 with buttons up and the left stick centred) before the client
+ * latches it as a bipolar Linux/DirectInput trigger slider rather than a
+ * misbehaving stick (Spec 19 §2.1.2).
+ */
+export const PAD_RAIL_REST_FRAMES = 8;
+
 /** Emergency-brake haptic threshold: L2 demand at/above this reads as a panic stop. */
 export const RUMBLE_EMERGENCY_BRAKE = 0.85;
 /** Lateral slip haptic threshold (m/s of body-frame lateral velocity). */
@@ -177,37 +214,63 @@ export const RUMBLE_MIN_INTERVAL_MS = 40;
 
 /**
  * Standard-mapping axis slots (spec 14 §3.1): left stick X → strafe/steer,
- * left stick Y → throttle (inverted: raw up is negative), right stick X → yaw.
+ * left stick Y → throttle (inverted: raw up is negative), right stick X → yaw,
+ * right stick Y → look pitch (Spec 19 §2.1.4).
+ *
+ * Spec 19 §2.1.2 adds the Linux/XInput/DirectInput trigger slots: on Linux
+ * (xpad) and DirectInput pads the analog triggers report on `axes[4]` (LT)
+ * and `axes[5]` (RT) — and some DirectInput pads double-map RT to `axes[2]`,
+ * the standard right-stick-X slot. Axis 2 is therefore only trusted as a
+ * trigger once rest-calibration has seen it parked off-centre.
  */
-export const GAMEPAD_AXES: Readonly<{ strafe: number; throttle: number; yaw: number }> = {
+export const GAMEPAD_AXES: Readonly<{
+  strafe: number;
+  throttle: number;
+  yaw: number;
+  pitch: number;
+  linuxLtTrigger: number;
+  linuxRtTrigger: number;
+  altTrigger: number;
+}> = {
   strafe: 0,
   throttle: 1,
   yaw: 2,
+  pitch: 3,
+  linuxLtTrigger: 4,
+  linuxRtTrigger: 5,
+  altTrigger: 2,
 };
 
 /**
  * Standard-mapping button slots. `sprintLeft`/`sprintRight` are LB and L3 —
  * either thumb-spare button runs, since handhelds (GPD Win Max 2, Steam Deck)
- * differ on which is most reachable.
+ * differ on which is most reachable. Spec 19 §2.1.5 completes the action
+ * sheet: RB mines, R3 cycles the camera, D-Pad Up toggles the comms log.
  */
 export const GAMEPAD_BUTTONS: Readonly<{
   jump: number;
   trade: number;
   mount: number;
   headlight: number;
+  mine: number;
+  camera: number;
   brake: number;
   throttle: number;
   sprintLeft: number;
   sprintLeftAlt: number;
+  comms: number;
 }> = {
-  jump: 0, // A
+  jump: 0, // A (jump on foot / handbrake in the buggy)
   trade: 1, // B
   mount: 2, // X
   headlight: 3, // Y
+  mine: 5, // RB (spec 19)
   brake: 6, // LT (analog value)
   throttle: 7, // RT (analog value)
   sprintLeft: 4, // LB
   sprintLeftAlt: 10, // L3
+  camera: 11, // R3 (spec 19)
+  comms: 12, // D-Pad Up (spec 19)
 };
 
 /** Buggy parks this far from the spawn collar, metres. */
@@ -339,7 +402,7 @@ export interface ClientInputFrame {
    * `heading`, i.e. turns clockwise / to the right as rendered.
    */
   yaw: number;
-  /** -1..1 look pitch (Arrow up/down). */
+  /** -1..1 look pitch (Arrow up/down, gamepad right stick Y). */
   pitch: number;
   /** Shift held — run instead of walk on foot. */
   sprint: boolean;
@@ -347,6 +410,12 @@ export interface ClientInputFrame {
   jump: boolean;
   /** 0..1 analog service brake (gamepad left trigger); 0 from the keyboard. */
   brake: number;
+  /**
+   * Spec 19 §2.1.3 brake-to-reverse: true while the rover is stopped/reversing
+   * on a held LT — the LT pressure has been routed into `forward` as negative
+   * demand and `brake` reads 0.
+   */
+  reverse: boolean;
 }
 
 /**
@@ -417,6 +486,21 @@ export function gamepadSteerCurve(raw: number): number {
   if (abs <= GAMEPAD_STEER_DEADZONE) return 0;
   const norm = (abs - GAMEPAD_STEER_DEADZONE) / (1 - GAMEPAD_STEER_DEADZONE);
   return sign * Math.pow(norm, GAMEPAD_STEER_GAMMA);
+}
+
+/**
+ * Right-stick look curve (Spec 19 §2.1.4):
+ * `u = sign(x) · ((|x| − 0.15) / (1 − 0.15))^1.5` — dead-band, re-normalise,
+ * exponential ease so the neutral band never creeps the camera and full
+ * deflection still reaches full pitch rate.
+ */
+export function gamepadLookCurve(raw: number): number {
+  if (!Number.isFinite(raw)) return 0;
+  const sign = Math.sign(raw);
+  const abs = clamp(Math.abs(raw), 0, 1);
+  if (abs <= GAMEPAD_LOOK_DEADZONE) return 0;
+  const norm = (abs - GAMEPAD_LOOK_DEADZONE) / (1 - GAMEPAD_LOOK_DEADZONE);
+  return sign * Math.pow(norm, GAMEPAD_LOOK_GAMMA);
 }
 
 /**
@@ -554,6 +638,54 @@ export class ClientApp {
    */
   private prevGamepadButtons: boolean[] = [];
   private lastGamepadButtons: boolean[] = [];
+
+  /**
+   * Spec 19 §2.1.1 / ADR-1 active-pad slot: the pad demonstrator of the most
+   * recent above-deadband activity. `pollGamepad()` scans every connected
+   * device each frame and re-locks onto whichever one is moving, so phantom
+   * or virtual devices parked at index 0 never swallow the real controller's
+   * input. Falls back to this slot while every pad reads neutral.
+   */
+  private activeGamepadIndex = -1;
+
+  /**
+   * Per-pad trigger rest calibration (Spec 19 §2.1.2): Linux xpad and
+   * DirectInput report analog triggers on bipolar axes resting at −1
+   * (xpad's axes[4]/axes[5]; some DirectInput pads park RT on axes[2]).
+   * An axis observed parked on its negative rail is flagged and remapped
+   * [−1, +1] → [0, 1]; unflagged axes read standard unipolar (negative
+   * travel = released). `altRt` additionally suppresses the right-stick-yaw
+   * reading of axes[2] — it is a trigger slider on that pad, not a stick —
+   * and `pitchRail` suppresses look-pitch on axes[3]. Keyed by pad OBJECT
+   * (WeakMap), not slot index: a driver hot-swapping controllers mid-run
+   * keeps calibration on the device that earned it, and a phantom device
+   * re-appearing in a slot never inherits its predecessor's profile.
+   */
+  private readonly padProfiles = new WeakMap<
+    object,
+    { ltBipolar: boolean; rtBipolar: boolean; altRt: boolean; pitchRail: boolean }
+  >();
+
+  /**
+   * Per-pad, per-axis consecutive idle-rail frames driving the latch above
+   * (slot order: axes 2, 3, 4, 5). {@link PAD_RAIL_REST_FRAMES} frames of
+   * rail rest (with buttons up and the left stick centred) confirm a slider.
+   */
+  private readonly padRailStreaks = new WeakMap<object, number[]>();
+
+  /**
+   * Spec 19 §2.1.6: which device last produced input. `sampleInput()` flips
+   * this to `'gamepad'` on any above-deadband pad activity and `'keyboard'`
+   * on any latched key; the HUD prompt glyphs follow it.
+   */
+  private inputSource: 'keyboard' | 'gamepad' = 'keyboard';
+
+  /**
+   * Spec 19 §2.1.3 / ADR-2 brake-to-reverse latched state (buggy only).
+   * Engaged at |v| ≤ {@link B2R_STATIONARY_V_MPS} with LT ≥
+   * {@link B2R_ENGAGE_LT}; released the moment LT falls away or RT competes.
+   */
+  private reverseEngaged = false;
 
   /**
    * Spec 17 Phase 2 anti-jerk trigger filter: the gamma-shaped R2/L2 demand
@@ -1198,6 +1330,24 @@ export class ClientApp {
     return this.buildMoveState();
   }
 
+  /**
+   * Spec 19 §2.1.6: the device that produced the most recent input — drives
+   * the HUD's `[E]` vs `(X)` prompt glyph choice.
+   */
+  getInputSource(): 'keyboard' | 'gamepad' {
+    return this.inputSource;
+  }
+
+  /** Active gamepad slot from the last scan (−1 = none). */
+  getActiveGamepadIndex(): number {
+    return this.activeGamepadIndex;
+  }
+
+  /** Spec 19 §2.1.3: whether brake-to-reverse currently drives the buggy. */
+  isReverseEngaged(): boolean {
+    return this.reverseEngaged;
+  }
+
   // -- input ------------------------------------------------------------------------
 
   /**
@@ -1257,8 +1407,13 @@ export class ClientApp {
    * Keyboard is digital; the gamepad adds analog axes on top (a stick inside
    * {@link GAMEPAD_DEADZONE} reads as centred, so the two never fight). The
    * pad's raw button snapshot is stashed for {@link pumpGamepadActions},
-   * which owns rising-edge detection — `sampleInput()` itself stays a pure
-   * query the harness can call twice a frame.
+   * which owns rising-edge detection.
+   *
+   * Spec 19 additions (all idempotent — calling twice in a frame with the
+   * same pad state yields the same result, so the harness may still sample
+   * freely): active-pad re-locking + trigger rest-calibration (per-pad),
+   * right-stick look pitch, brake-to-reverse latch (buggy), and the
+   * keyboard-vs-gamepad input-source flip.
    */
   sampleInput(): ClientInputFrame {
     const p = this.pressed;
@@ -1274,16 +1429,18 @@ export class ClientApp {
       : (p.has('KeyD') ? 1 : 0) - (p.has('KeyA') ? 1 : 0);
     // Right/ArrowRight increases heading = clockwise turn (spec 14 §3.1).
     const keyYaw = (p.has('ArrowRight') ? 1 : 0) - (p.has('ArrowLeft') ? 1 : 0);
-    const pitch = (p.has('ArrowUp') ? 1 : 0) - (p.has('ArrowDown') ? 1 : 0);
+    const keyPitch = (p.has('ArrowUp') ? 1 : 0) - (p.has('ArrowDown') ? 1 : 0);
+    if (p.size > 0) this.inputSource = 'keyboard';
 
     const frame: ClientInputFrame = {
       forward: keyForward,
       strafe: keyStrafe,
       yaw: keyYaw,
-      pitch,
+      pitch: keyPitch,
       sprint: p.has('ShiftLeft') || p.has('ShiftRight'),
       jump: p.has('Space'),
       brake: 0,
+      reverse: false,
     };
 
     // Poll the pad unconditionally so `pumpGamepadActions()` always has this
@@ -1292,53 +1449,131 @@ export class ClientApp {
     const pad = this.pollGamepad();
     this.lastGamepadButtons = pad === null ? [] : pad.buttons.map((b) => b.pressed);
     if (pad === null || (this.hud?.isTradeDialogOpen() ?? false)) {
-      // Pad asleep (or absent): no driver demand, no haptic cue.
+      // Pad asleep (or absent): no driver demand, no haptic cue, no reverse.
       this.lastThrottleDemand = 0;
       this.lastBrakeDemand = 0;
+      this.reverseEngaged = false;
       return frame;
     }
+    // Spec 19 §2.1.2 rest-calibration runs before this frame's profile read
+    // so a slider that completed its rail streak on the previous frame takes
+    // effect immediately.
+    this.calibratePadTriggers(pad);
+    const profile = this.padProfiles.get(pad);
 
-    const axis = (index: number): number => {
-      const v = pad.axes[index];
-      if (typeof v !== 'number' || !Number.isFinite(v) || Math.abs(v) <= GAMEPAD_DEADZONE) return 0;
-      return clamp(v, -1, 1);
-    };
-    // Spec 17 §2.3.1 progressive trigger curves: T = R2^1.4, L2^0.8. The
-    // shaped demand is stashed for the haptic pump (driver-intent threshold,
-    // e.g. L2 ≥ 0.85 = emergency stop) while stepEntities() runs it through
-    // the anti-jerk filter before the physics sees it.
-    const rawTrigger = (index: number): number => {
-      const v = pad.buttons[index]?.value;
-      if (typeof v !== 'number' || !Number.isFinite(v)) return 0;
-      return clamp(v, 0, 1);
-    };
-    const trigger = (index: number): number => gamepadThrottleCurve(rawTrigger(index));
-    const brakeTrigger = (): number => gamepadBrakeCurve(rawTrigger(GAMEPAD_BUTTONS.brake));
-    this.lastThrottleDemand = trigger(GAMEPAD_BUTTONS.throttle);
-    this.lastBrakeDemand = brakeTrigger();
-
-    frame.forward = clamp(
-      frame.forward + axis(GAMEPAD_AXES.throttle) * -1 + this.lastThrottleDemand,
-      -1,
-      1,
-    );
-    // Spec 17 §2.2.2: exponential steering curve (dz 0.12, γ 1.6) on the
-    // left stick — dead-band, re-normalise, ease. The curve carries its OWN
-    // (tighter) deadzone, so it reads the raw clamped axis rather than the
-    // 0.15-cut generic one; keyboard steering is digital and never passes
-    // through it.
     const rawAxis = (index: number): number => {
       const v = pad.axes[index];
       if (typeof v !== 'number' || !Number.isFinite(v)) return 0;
       return clamp(v, -1, 1);
     };
+    const axis = (index: number): number => {
+      const v = rawAxis(index);
+      return Math.abs(v) <= GAMEPAD_DEADZONE ? 0 : v;
+    };
+    const buttonValue = (index: number): number => {
+      const v = pad.buttons[index]?.value;
+      if (typeof v !== 'number' || !Number.isFinite(v)) return 0;
+      return clamp(v, 0, 1);
+    };
+    // Spec 19 §2.1.2 normalisation: a trigger axis whose rest was calibrated
+    // on the negative rail (Linux xpad parks LT/RT at −1 when released) is
+    // remapped [−1, +1] → [0, 1]; otherwise standard unipolar travel applies.
+    const triggerFromAxis = (index: number, bipolar: boolean | undefined): number => {
+      const v = rawAxis(index);
+      return bipolar ? clamp((v + 1) / 2, 0, 1) : clamp(v, 0, 1);
+    };
+
+    // Spec 19 §2.1.2: RT spans buttons[7].value, axes[5] AND (calibrated
+    // DirectInput pads) axes[2]; LT spans buttons[6].value and axes[4].
+    const rawThrottleTrigger = Math.max(
+      buttonValue(GAMEPAD_BUTTONS.throttle),
+      triggerFromAxis(GAMEPAD_AXES.linuxRtTrigger, profile?.rtBipolar),
+      profile?.altRt === true ? triggerFromAxis(GAMEPAD_AXES.altTrigger, true) : 0,
+    );
+    const rawBrakeTrigger = Math.max(
+      buttonValue(GAMEPAD_BUTTONS.brake),
+      triggerFromAxis(GAMEPAD_AXES.linuxLtTrigger, profile?.ltBipolar),
+    );
+
+    // Spec 19 §2.1.6: any above-deadband pad command claims the HUD glyphs.
+    // Rail-parked pseudo-axes (calibrated sliders) never count as activity.
+    const stickActivity =
+      Math.abs(rawAxis(GAMEPAD_AXES.strafe)) > GAMEPAD_DEADZONE ||
+      Math.abs(rawAxis(GAMEPAD_AXES.throttle)) > GAMEPAD_DEADZONE ||
+      (profile?.altRt !== true && Math.abs(rawAxis(GAMEPAD_AXES.yaw)) > GAMEPAD_DEADZONE) ||
+      (profile?.pitchRail !== true && Math.abs(rawAxis(GAMEPAD_AXES.pitch)) > GAMEPAD_DEADZONE);
+    const anyButton = pad.buttons.some((b) => b.pressed === true || b.value > GAMEPAD_DEADZONE);
+    if (stickActivity || anyButton) this.inputSource = 'gamepad';
+
+    // Spec 17 §2.3.1 progressive trigger curves: T = R2^1.4, L2^0.8. The
+    // shaped demand is stashed for the haptic pump (driver-intent threshold,
+    // e.g. L2 ≥ 0.85 = emergency stop) while stepEntities() runs it through
+    // the anti-jerk filter before the physics sees it.
+    this.lastThrottleDemand = gamepadThrottleCurve(rawThrottleTrigger);
+    this.lastBrakeDemand = gamepadBrakeCurve(rawBrakeTrigger);
+
+    const baseForward = frame.forward + axis(GAMEPAD_AXES.throttle) * -1;
+
+    // Spec 19 §2.1.3 / ADR-2 — brake-to-reverse (buggy only): stopped with a
+    // held LT, LT pressure becomes proportional REVERSE throttle instead of
+    // the service brake. It latches while LT is held (a rolling-back rover
+    // keeps its throttle); LT release or a competing RT snaps back forward.
+    if (this.mode === 'buggy') {
+      const speed = this.buggy !== null ? this.buggy.getSpeed() : Number.POSITIVE_INFINITY;
+      if (this.reverseEngaged) {
+        if (rawBrakeTrigger < B2R_ENGAGE_LT || rawThrottleTrigger >= B2R_VETO_RT) {
+          this.reverseEngaged = false;
+        }
+      } else if (
+        rawBrakeTrigger >= B2R_ENGAGE_LT &&
+        rawThrottleTrigger < B2R_VETO_RT &&
+        speed <= B2R_STATIONARY_V_MPS
+      ) {
+        this.reverseEngaged = true;
+      }
+    } else {
+      this.reverseEngaged = false;
+    }
+
+    if (this.reverseEngaged) {
+      // The service brake reads 0 (physics would otherwise brake-veto the
+      // drive torque at demand ≥ 0.5) and the haptic pump stops reading the
+      // reverse pressure as an emergency stop.
+      frame.forward = clamp(baseForward - gamepadBrakeCurve(rawBrakeTrigger), -1, 1);
+      frame.brake = 0;
+      frame.reverse = true;
+      this.lastBrakeDemand = 0;
+    } else {
+      frame.forward = clamp(baseForward + this.lastThrottleDemand, -1, 1);
+      frame.brake = this.lastBrakeDemand;
+    }
+
+    // Spec 17 §2.2.2: exponential steering curve (dz 0.12, γ 1.6) on the
+    // left stick — dead-band, re-normalise, ease. The curve carries its OWN
+    // (tighter) deadzone, so it reads the raw clamped axis rather than the
+    // 0.15-cut generic one; keyboard steering is digital and never passes
+    // through it.
     frame.strafe = clamp(
       frame.strafe + (keyStrafe === 0 ? gamepadSteerCurve(rawAxis(GAMEPAD_AXES.strafe)) : 0),
       -1,
       1,
     );
-    frame.yaw = clamp(frame.yaw + axis(GAMEPAD_AXES.yaw), -1, 1);
-    frame.brake = this.lastBrakeDemand;
+    // On a calibrated DirectInput pad axes[2] is the RT slider, not the
+    // right-stick X — its yaw reading would be pure trigger leakage.
+    frame.yaw = clamp(
+      frame.yaw + (profile?.altRt === true ? 0 : axis(GAMEPAD_AXES.yaw)),
+      -1,
+      1,
+    );
+    // Spec 19 §2.1.4 — right-stick look pitch: exponential curve behind a
+    // 0.15 deadband; stick-back (axes[3] negative) looks UP (+pitch), the
+    // same sign ArrowUp produces. A rail-parked axes[3] (calibrated slider)
+    // never contributes.
+    frame.pitch = clamp(
+      frame.pitch + (profile?.pitchRail === true ? 0 : -gamepadLookCurve(rawAxis(GAMEPAD_AXES.pitch))),
+      -1,
+      1,
+    );
     frame.sprint =
       frame.sprint ||
       (pad.buttons[GAMEPAD_BUTTONS.sprintLeft]?.pressed ?? false) ||
@@ -1348,36 +1583,146 @@ export class ClientApp {
   }
 
   /**
-   * First connected standard pad, or null. Defensive against Node (navigator
-   * without `getGamepads`), locked-down browsers (getter throws), and null
-   * holes in the pads array.
+   * Active gamepad (Spec 19 §2.1.1 / ADR-1): scans every connected device
+   * each frame and locks onto whichever one demonstrates above-deadband
+   * stick or button activity, so phantom/virtual devices parked at index 0
+   * never swallow the real controller. While everything reads neutral the
+   * lock sticks to its slot (and degrades to the first valid pad when the
+   * locked device vanished). Defensive against Node (navigator without
+   * `getGamepads`), locked-down browsers (getter throws), and null holes.
    */
   private pollGamepad(): GamepadLike | null {
     const nav = (globalThis as {
       navigator?: { getGamepads?: () => (GamepadLike | null)[] | undefined };
     }).navigator;
-    if (nav === undefined || typeof nav.getGamepads !== 'function') return null;
+    if (nav === undefined || typeof nav.getGamepads !== 'function') {
+      this.activeGamepadIndex = -1;
+      return null;
+    }
     let pads: (GamepadLike | null)[] | undefined;
     try {
       pads = nav.getGamepads();
     } catch {
+      this.activeGamepadIndex = -1;
       return null;
     }
-    if (!Array.isArray(pads)) return null;
-    for (const pad of pads) {
-      if (pad !== null && pad !== undefined && Array.isArray(pad.axes) && Array.isArray(pad.buttons)) {
-        return pad;
+    if (!Array.isArray(pads)) {
+      this.activeGamepadIndex = -1;
+      return null;
+    }
+    const valid = (pad: GamepadLike | null | undefined): pad is GamepadLike =>
+      pad !== null && pad !== undefined && Array.isArray(pad.axes) && Array.isArray(pad.buttons);
+
+    let firstValid: GamepadLike | null = null;
+    let firstValidIndex = -1;
+    let activeIndex = -1;
+    for (let i = 0; i < pads.length; i++) {
+      const pad = pads[i];
+      if (!valid(pad)) continue;
+      if (firstValid === null) {
+        firstValid = pad;
+        firstValidIndex = i;
+      }
+      if (this.gamepadHasActivity(pad)) {
+        activeIndex = i;
+        break;
       }
     }
-    return null;
+    if (activeIndex >= 0) {
+      this.activeGamepadIndex = activeIndex;
+      return pads[activeIndex];
+    }
+    // Everything neutral: keep the lock if its device is still present.
+    if (
+      this.activeGamepadIndex >= 0 &&
+      this.activeGamepadIndex < pads.length &&
+      valid(pads[this.activeGamepadIndex])
+    ) {
+      return pads[this.activeGamepadIndex];
+    }
+    this.activeGamepadIndex = firstValidIndex;
+    return firstValid;
   }
 
   /**
-   * Rising-edge gamepad actions (spec 14 §3.1): X mounts, Y toggles lamps,
-   * B toggles the trade terminal. Runs once per `update()` frame against the
-   * snapshot stashed by `sampleInput()`. While the terminal is open only B
-   * responds (it closes) — the console "back" convention, mirroring how the
-   * keyboard parks every key except Escape.
+   * Above-deadband activity on a pad (Spec 19 §2.1.1). Only the four stick
+   * axes are magnitude-checked — bipolar trigger rails (xpad rests at −1)
+   * would read as permanent activity, so an axis already calibrated to a
+   * slider (alt-RT on axes[2], rail-pitch on axes[3]) is skipped: a parked
+   * Linux pad must never out-shout a genuinely moving controller for the
+   * active-slot lock. Trigger pulls still surface through `buttons[6/7]`
+   * pressed/value on the same frame.
+   */
+  private gamepadHasActivity(pad: GamepadLike): boolean {
+    const profile = this.padProfiles.get(pad);
+    for (let i = 0; i <= GAMEPAD_AXES.pitch; i++) {
+      if (i === GAMEPAD_AXES.yaw && profile?.altRt === true) continue;
+      if (i === GAMEPAD_AXES.pitch && profile?.pitchRail === true) continue;
+      const v = pad.axes[i];
+      if (typeof v === 'number' && Number.isFinite(v) && Math.abs(v) > GAMEPAD_DEADZONE) {
+        return true;
+      }
+    }
+    return pad.buttons.some((b) => b.pressed === true || b.value > GAMEPAD_DEADZONE);
+  }
+
+  /**
+   * Trigger rest rest-calibration (Spec 19 §2.1.2). On a frame with no
+   * button presses and the left stick centred, any of axes[2..5] parked on
+   * its negative rail for {@link PAD_RAIL_REST_FRAMES} consecutive idle
+   * frames is a bipolar trigger slider, not a stick: axes[4]→LT, axes[5]→RT,
+   * axes[2]→alt-RT (DirectInput) and axes[3]→rail (suppress look pitch).
+   * Left stick only — it is the one axis guaranteed to rest centred on every
+   * pad class, so a slider at −1 can never block its own detection.
+   */
+  private calibratePadTriggers(pad: GamepadLike): void {
+    const buttonsUp = pad.buttons.every((b) => !b.pressed && b.value <= 0.2);
+    const leftStickCentred =
+      Math.abs(this.rawAxisAt(pad, GAMEPAD_AXES.strafe)) <= 0.2 &&
+      Math.abs(this.rawAxisAt(pad, GAMEPAD_AXES.throttle)) <= 0.2;
+    const entry = this.padProfiles.get(pad) ?? {
+      ltBipolar: false,
+      rtBipolar: false,
+      altRt: false,
+      pitchRail: false,
+    };
+    const railStreak = (this.padRailStreaks.get(pad) ?? [0, 0, 0, 0]).slice();
+    if (buttonsUp && leftStickCentred) {
+      const checks = [
+        { axis: GAMEPAD_AXES.yaw, latch: (): void => { entry.altRt = true; } },
+        { axis: GAMEPAD_AXES.pitch, latch: (): void => { entry.pitchRail = true; } },
+        { axis: GAMEPAD_AXES.linuxLtTrigger, latch: (): void => { entry.ltBipolar = true; } },
+        { axis: GAMEPAD_AXES.linuxRtTrigger, latch: (): void => { entry.rtBipolar = true; } },
+      ];
+      for (let i = 0; i < checks.length; i++) {
+        const v = this.rawAxisAt(pad, checks[i].axis);
+        if (v <= -0.9) {
+          railStreak[i] += 1;
+          if (railStreak[i] >= PAD_RAIL_REST_FRAMES) checks[i].latch();
+        } else {
+          railStreak[i] = 0;
+        }
+      }
+    } else {
+      railStreak.fill(0);
+    }
+    this.padRailStreaks.set(pad, railStreak);
+    this.padProfiles.set(pad, entry);
+  }
+
+  private rawAxisAt(pad: GamepadLike, index: number): number {
+    const v = pad.axes[index];
+    if (typeof v !== 'number' || !Number.isFinite(v)) return 0;
+    return clamp(v, -1, 1);
+  }
+
+  /**
+   * Rising-edge gamepad actions (spec 14 §3.1 + spec 19 §2.1.5): X mounts,
+   * Y toggles lamps, B toggles the trade terminal, RB mines, R3 cycles the
+   * camera, D-Pad Up toggles the comms log. Runs once per `update()` frame
+   * against the snapshot stashed by `sampleInput()`. While the terminal is
+   * open only B responds (it closes) — the console "back" convention,
+   * mirroring how the keyboard parks every key except Escape.
    */
   private pumpGamepadActions(): void {
     const now = this.lastGamepadButtons;
@@ -1387,13 +1732,25 @@ export class ClientApp {
     const tradeOpen = this.hud?.isTradeDialogOpen() ?? false;
     try {
       if (tradeOpen) {
+        if (rising(GAMEPAD_BUTTONS.trade)) {
+          this.inputSource = 'gamepad';
+          this.toggleTradeTerminal();
+        }
+      } else {
+        const padAction =
+          rising(GAMEPAD_BUTTONS.mount) ||
+          rising(GAMEPAD_BUTTONS.headlight) ||
+          rising(GAMEPAD_BUTTONS.trade) ||
+          rising(GAMEPAD_BUTTONS.mine) ||
+          rising(GAMEPAD_BUTTONS.camera) ||
+          rising(GAMEPAD_BUTTONS.comms);
+        if (padAction) this.inputSource = 'gamepad';
+        if (rising(GAMEPAD_BUTTONS.mount)) this.toggleMount();
+        if (rising(GAMEPAD_BUTTONS.headlight)) this.toggleHeadlights();
         if (rising(GAMEPAD_BUTTONS.trade)) this.toggleTradeTerminal();
-      } else if (rising(GAMEPAD_BUTTONS.mount)) {
-        this.toggleMount();
-      } else if (rising(GAMEPAD_BUTTONS.headlight)) {
-        this.toggleHeadlights();
-      } else if (rising(GAMEPAD_BUTTONS.trade)) {
-        this.toggleTradeTerminal();
+        if (rising(GAMEPAD_BUTTONS.mine)) this.mineNearestVein();
+        if (rising(GAMEPAD_BUTTONS.camera)) this.cycleCamera();
+        if (rising(GAMEPAD_BUTTONS.comms)) this.toggleCommsLog();
       }
     } finally {
       this.prevGamepadButtons = now.slice();
@@ -1401,6 +1758,9 @@ export class ClientApp {
   }
 
   private runAction(action: string): void {
+    // Spec 19 §2.1.6: a hotkey press claims the prompt-glyph domain for the
+    // keyboard (pad actions flip it back to the controller).
+    this.inputSource = 'keyboard';
     switch (action) {
       case 'mount':
         this.toggleMount();
@@ -1645,7 +2005,10 @@ export class ClientApp {
       const input: BuggyInput = {
         throttle: physicsThrottle,
         brake: clamp(this.filteredBrake, 0, 1),
-        regen: physicsThrottle < 0 && buggy.getSpeed() > 0.5 ? 1 : 0,
+        // Regen bleeds speed when the driver lifts off — but NOT while
+        // brake-to-reverse is driving the pack backwards (Spec 19 §2.1.3):
+        // regen would point against the intentional reverse torque.
+        regen: physicsThrottle < 0 && buggy.getSpeed() > 0.5 && !frame.reverse ? 1 : 0,
         steer: clamp(steerInput, -1, 1),
         parkBrake: handbrake,
       };
@@ -1915,6 +2278,9 @@ export class ClientApp {
   private refreshHud(): void {
     const hud = this.hud;
     if (hud === null || this.disposed) return;
+
+    // Spec 19 §2.1.6: prompt glyphs follow the last-active device.
+    hud.setInputSource(this.inputSource);
 
     const suit = this.requireSuit();
     const buggy = this.requireBuggy();
