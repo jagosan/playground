@@ -280,6 +280,12 @@ export function metabolicMultiplier(
 export class LunarEvaSuit {
   private state: SuitState;
   private jumpWasHeld = false;
+  /**
+   * Spec 21 §2.4 vault loot ("Advanced Prospector EVA Suit"): an instance
+   * rebreather ceiling, at or above the base {@link SUIT_MAX_OXYGEN}. The
+   * step() clamp reads this, so an upgrade persists across frames.
+   */
+  private oxygenCap: number = SUIT_MAX_OXYGEN;
   /** Accumulated RCS valve-open time across the whole session (s). */
   public rcsPulseSeconds = 0;
 
@@ -311,6 +317,21 @@ export class LunarEvaSuit {
 
   public setState(patch: Partial<SuitState>): void {
     this.state = { ...this.state, ...patch };
+  }
+
+  /** Current rebreather ceiling (base {@link SUIT_MAX_OXYGEN} units). */
+  public getOxygenCapacity(): number {
+    return this.oxygenCap;
+  }
+
+  /**
+   * Spec 21 §2.4 vault upgrade: multiply the rebreather ceiling (duration
+   * scales 1:1 with capacity) and top the tank back up. Returns the new cap.
+   */
+  public upgradeOxygen(multiplier = 2): number {
+    this.oxygenCap = Math.max(this.oxygenCap, this.oxygenCap * Math.max(1, multiplier));
+    this.state.oxygen = this.oxygenCap;
+    return this.oxygenCap;
   }
 
   /** Advance the suit one timestep. `ground` is surface elevation underfoot. */
@@ -446,7 +467,7 @@ export class LunarEvaSuit {
     s.oxygen = clamp(
       s.oxygen - (SUIT_O2_BASE * metabolic + SUIT_O2_EXERTION * exertion + SUIT_O2_RCS * rcsUsage) * step,
       0,
-      SUIT_MAX_OXYGEN,
+      this.oxygenCap,
     );
     s.battery = clamp(
       s.battery - (SUIT_BAT_LIFE_SUPPORT + SUIT_BAT_EXERTION * exertion + SUIT_BAT_RCS * rcsUsage) * step,
@@ -703,6 +724,12 @@ export class LunarBuggy {
   private readonly chassisMass: number;
   private readonly ground: GroundElevationFn;
   private readonly state: BuggyState;
+  /**
+   * Spec 21 §2.4 vault loot ("Auxiliary Buggy Fuel Cell"): instance traction
+   * pack ceiling, at or above base {@link BUGGY_BATTERY_KWH}. step() clamps
+   * against this, so the +kWh upgrade persists.
+   */
+  private batteryCapKwh: number = BUGGY_BATTERY_KWH;
   /** Active gravity/surface environment (Spec 17 §2.1); never null. */
   private env: EnvironmentProfile;
   /**
@@ -797,6 +824,24 @@ export class LunarBuggy {
   /** Quasi-static lateral rollover threshold in units of g (lower = tippier). */
   public get rolloverThresholdG(): number {
     return BUGGY_TRACK / (2 * this.cogHeight);
+  }
+
+  /** Traction pack ceiling, kWh (base {@link BUGGY_BATTERY_KWH}). */
+  public getBatteryCapacity(): number {
+    return this.batteryCapKwh;
+  }
+
+  /**
+   * Spec 21 §2.4 vault loot: bolt in an auxiliary fuel cell — the pack
+   * ceiling grows by `extraKwh` and the battery is restored to 100 %.
+   * Returns the new capacity.
+   */
+  public upgradeBatteryCapacity(extraKwh: number): number {
+    if (Number.isFinite(extraKwh) && extraKwh > 0) {
+      this.batteryCapKwh += extraKwh;
+    }
+    this.state.batteryKwh = this.batteryCapKwh;
+    return this.batteryCapKwh;
   }
 
   /** Load the flatbed (clamped to `BUGGY_MAX_CARGO`). Returns cargo on board. */
@@ -970,7 +1015,7 @@ export class LunarBuggy {
     const regenDemand = clamp(input.regen, 0, 1) * BUGGY_REGEN_FORCE
       + serviceBrakeDemand * BUGGY_REGEN_FORCE * 0.7;
     let regenForce = speedRef > 0.1 ? -Math.sign(s.vLong) * Math.min(regenDemand, BUGGY_REGEN_FORCE) : 0;
-    if (this.state.rolled || this.state.batteryKwh >= BUGGY_BATTERY_KWH) regenForce = 0;
+    if (this.state.rolled || this.state.batteryKwh >= this.batteryCapKwh) regenForce = 0;
 
     // Friction brake effort follows the same Spec 17 §5 Step C surface law as
     // the grouser cap: BUGGY_BRAKE_FORCE is the regolith-calibrated (μ 0.68)
@@ -1435,12 +1480,12 @@ export class LunarBuggy {
     s.batteryKwh = clamp(
       s.batteryKwh - (mech / 0.87 + 55 * dt) / 3_600_000,
       0,
-      BUGGY_BATTERY_KWH,
+      this.batteryCapKwh,
     );
     const regenW = Math.max(0, -regenForce * s.vLong);
     const recovered = regenW * dt * BUGGY_REGEN_EFFICIENCY;
     s.regenEnergyJ += recovered;
-    s.batteryKwh = clamp(s.batteryKwh + recovered / 3_600_000, 0, BUGGY_BATTERY_KWH);
+    s.batteryKwh = clamp(s.batteryKwh + recovered / 3_600_000, 0, this.batteryCapKwh);
   }
 }
 
@@ -1463,6 +1508,8 @@ export const RAIL_DAVIS_B = 41;
 export const RAIL_DAVIS_C = 0.88;
 
 export interface RailCarSpec {
+  /** Spec 21 §2.3: consist role — locomotive or ore hopper. */
+  kind?: 'locomotive' | 'hopper';
   /** Locomotive + empty consist mass (kg). */
   mass?: number;
   /** Mineral load aboard (kg). */
@@ -1480,6 +1527,7 @@ export interface RailCarSpec {
 }
 
 export const DEFAULT_RAIL_CAR: Required<RailCarSpec> = {
+  kind: 'hopper',
   mass: 8_600,
   load: 0,
   tractiveEffort: 42_000,
@@ -1612,6 +1660,18 @@ export class RailCar {
   public setLoad(kg: number): number {
     this.spec.load = clamp(kg, 0, 20_000);
     return this.spec.load;
+  }
+
+  /** Explicitly set track distance, speed and direction (Spec 21 §2.3). */
+  public setDistance(dist: number, speed?: number, direction?: 1 | -1): void {
+    this.state.distance = clamp(dist, 0, this.routeLength);
+    if (speed !== undefined) this.state.speed = speed;
+    if (direction !== undefined) this.state.direction = direction;
+    if (this.state.distance >= this.routeLength - 1e-4 || this.state.distance <= 1e-4) {
+      this.state.terminalReached = true;
+    } else {
+      this.state.terminalReached = false;
+    }
   }
 
   /** Grade (dz/ds) at the car's current position. */

@@ -47,6 +47,8 @@ import {
   ClientApp,
   GAMEPAD_LOOK_DEADZONE,
   GAMEPAD_LOOK_GAMMA,
+  GAMEPAD_MIN_AXES,
+  GAMEPAD_MIN_BUTTONS,
   GAMEPAD_STEER_DEADZONE,
   GAMEPAD_STEER_GAMMA,
   GAMEPAD_THROTTLE_GAMMA,
@@ -54,6 +56,7 @@ import {
   PAD_RAIL_REST_FRAMES,
   RUMBLE_MIN_INTERVAL_MS,
   SCAN_RANGE_M,
+  VAULT_TERMINAL_RANGE_M,
   computeBuggyRumble,
   gamepadBrakeCurve,
   gamepadLookCurve,
@@ -67,9 +70,11 @@ import LunarHUD, {
   HUD_COMMS_ID,
   HUD_HINT_ARROW_ID,
   HUD_ROOT_ID,
+  HUD_TOPO_CANVAS_PX,
   HUD_TRADE_ID,
   HUD_TUTORIAL_ID,
 } from '../src/ui/LunarHUD.ts';
+import { TunnelNetwork } from '../src/infrastructure/TunnelNetwork.ts';
 
 // ---------------------------------------------------------------------------
 // Harness clock — shared by the client frames AND the scripted network so
@@ -200,13 +205,60 @@ interface FakeDocument {
   dispatchEvent(type: string, event: unknown): void;
 }
 
+/** Recording stand-in for CanvasRenderingContext2D (Spec 21 §2.5 canvas). */
+function makeFakeContext2D(): Record<string, unknown> {
+  const calls: string[] = [];
+  const rec = (name: string) => (..._args: unknown[]): void => {
+    calls.push(name);
+  };
+  return {
+    calls,
+    fillStyle: '',
+    strokeStyle: '',
+    lineWidth: 1,
+    font: '',
+    clearRect: rec('clearRect'),
+    fillRect: rec('fillRect'),
+    strokeRect: rec('strokeRect'),
+    beginPath: rec('beginPath'),
+    moveTo: rec('moveTo'),
+    lineTo: rec('lineTo'),
+    arc: rec('arc'),
+    closePath: rec('closePath'),
+    fill: rec('fill'),
+    stroke: rec('stroke'),
+    save: rec('save'),
+    restore: rec('restore'),
+    translate: rec('translate'),
+    rotate: rec('rotate'),
+    fillText: rec('fillText'),
+    drawImage: rec('drawImage'),
+    createImageData: (w: number, h: number) => ({
+      data: new Uint8ClampedArray(w * h * 4),
+      width: w,
+      height: h,
+    }),
+    putImageData: rec('putImageData'),
+  };
+}
+
 function makeFakeDocument(): FakeDocument {
   const registry = new Map<string, FakeElement>();
   const docListeners = new Map<string, Array<(event: unknown) => void>>();
   const body = makeFakeElement('body', registry);
   return {
     body,
-    createElement: (tag: string) => makeFakeElement(tag, registry),
+    createElement: (tag: string) => {
+      const el = makeFakeElement(tag, registry);
+      if (tag === 'canvas') {
+        // Minimal 2D context recorder for the Spec 21 §2.5 topo canvas.
+        (el as Record<string, unknown>)['width'] = 0;
+        (el as Record<string, unknown>)['height'] = 0;
+        (el as Record<string, unknown>)['getContext'] = (kind: string) =>
+          kind === '2d' ? makeFakeContext2D() : null;
+      }
+      return el;
+    },
     getElementById: (id: string) => registry.get(id) ?? null,
     addEventListener(type, listener) {
       const list = docListeners.get(type) ?? [];
@@ -2592,6 +2644,368 @@ section('E4. Spec 19 mining UX, offline fallback, laser VFX & tiered cargo');
 // ===========================================================================
 // LAYER F — teardown & TraversalController units
 // ===========================================================================
+
+// ===========================================================================
+// LAYER E5 — Spec 21 Phase 4/5/6: tunnel facilities, vault state machine,
+// holographic topo map, resilient gamepad latch. Runs on a dedicated
+// ClientApp + fake window (the shared `app` stays untouched for layer F).
+// ===========================================================================
+
+section('E5. spec 21 facilities, vaults, map & gamepad latch');
+{
+  const e5Doc = makeFakeDocument();
+  const e5WinListeners = new Map<string, Array<(ev: unknown) => void>>();
+  (globalThis as { document?: unknown }).document = e5Doc;
+  (globalThis as { window?: unknown }).window = {
+    addEventListener: (type: string, fn: (ev: unknown) => void) => {
+      const list = e5WinListeners.get(type) ?? [];
+      list.push(fn);
+      e5WinListeners.set(type, list);
+    },
+    removeEventListener: (type: string, fn: (ev: unknown) => void) => {
+      const list = (e5WinListeners.get(type) ?? []).filter((f) => f !== fn);
+      e5WinListeners.set(type, list);
+    },
+  };
+  const realNavE5 = (globalThis as { navigator?: unknown }).navigator;
+  const e5Pads: Array<{
+    id: string;
+    axes: number[];
+    buttons: Array<{ value: number; pressed: boolean }>;
+  } | null> = [];
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    writable: true,
+    value: { getGamepads: () => e5Pads },
+  });
+  const e5App = new ClientApp({
+    seed: 'mala-voyage-2431',
+    username: 'vaulthunter',
+    faction: 'ARTEMIS',
+    createHud: true,
+    connectNetwork: false,
+    moveIntervalMs: 50,
+    silent: true,
+  });
+  await e5App.init(new NullEngine());
+  const e5Hud = e5App.getHud()!;
+  const e5Toast = e5Doc.getElementById('lunar-hud-toast')!;
+
+  // E5-0 — surface shaft portals (blueprint rule: mouths at z >= -2 m).
+  const network = e5App.getTunnelNetwork()!;
+  const portals = network.getSurfacePortals();
+  check('E5-0 shaft-head portal built for every surface mouth', portals.length >= 1, `count=${portals.length}`);
+  check(
+    'E5-0 beacon label carries the SHAFT ID + tunnel kind',
+    /^SHAFT \d+ \/\/.+/.test(portals[0]!.label),
+    portals[0]!.label,
+  );
+  check(
+    'E5-0 portal mouth matches a z >= -2 tunnel endpoint',
+    (() => {
+      // Mirror TunnelNetwork.ensureFacilityRecords: a mouth is a SEGMENT
+      // endpoint (fromId/toId) whose z >= SURFACE_PORTAL_MIN_Z_M, keyed by
+      // the node id co-located with that endpoint.
+      const snap = e5App.world.getSnapshot()!;
+      const mouths = new Set<string>();
+      for (const seg of snap.tunnels) {
+        if (seg.start.z >= -2) mouths.add(seg.fromId);
+        if (seg.end.z >= -2) mouths.add(seg.toId);
+      }
+      return portals.every((p) => mouths.has(p.nodeId)) && portals.length === mouths.size;
+    })(),
+    `portals=${portals.length}`,
+  );
+
+  // E5-0b — underground bunkers: one per cavern, locked with loot aboard.
+  const bunkers = network.getBunkers();
+  check('E5-0b one bunker per terminal cavern', bunkers.length === 5, `count=${bunkers.length}`);
+  check('E5-0b bunkers ship locked, loot unclaimed', bunkers.every((b) => b.doorState === 'locked' && !b.lootClaimed));
+  const doors = network.getVaultDoors();
+  const terminals = network.getVaultTerminals();
+  check('E5-0b one door + one terminal per bunker', doors.length === 5 && terminals.length === 5);
+  check(
+    'E5-0b terminal hugs its door (<= 8 m, 3D)',
+    terminals.every((t) => {
+      const d = doors.find((x) => x.vaultId === t.vaultId)!;
+      return (
+        Math.hypot(
+          t.position.x - d.position.x,
+          t.position.y - d.position.y,
+          t.position.z - d.position.z,
+        ) <= 8
+      );
+    }),
+  );
+
+  // E5-1 — vault door state machine + loot grants (direct drive).
+  const vid = bunkers[0]!.nodeId;
+  check('E5-1 vault starts locked', network.getVaultDoorState(vid) === 'locked');
+  check('E5-1 open refused while locked', network.openVault(vid) === 'locked');
+  check('E5-1 unlock -> unlocked', network.unlockVault(vid) === 'unlocked');
+  check('E5-1 unlock is idempotent', network.unlockVault(vid) === 'unlocked');
+  check('E5-1 open -> open', network.openVault(vid) === 'open');
+  const lootA = network.claimVaultLoot(vid);
+  check('E5-1 loot granted exactly once', lootA !== null && lootA.length === 3);
+  check('E5-1 second claim is empty', network.claimVaultLoot(vid) === null);
+  const fuelCell = lootA!.find((l) => l.kind === 'fuel_cell')!;
+  const evaSuit = lootA!.find((l) => l.kind === 'suit_upgrade')!;
+  const cryo = lootA!.find((l) => l.kind === 'cryo_canister')!;
+  check(
+    'E5-1 loot table: +15 kWh cell / EVA suit / 1200 cr cryo',
+    fuelCell.batteryKwhBonus === 15 &&
+      evaSuit.cargoCapacityBonusKg !== undefined &&
+      cryo.creditValue === 1200,
+  );
+  // Client-side effects of the grant.
+  const capBefore = e5App.getBuggy().getBatteryCapacity();
+  const cargoCapBefore = e5App.getSuit().getCargoCapacity();
+  const cryoBefore = e5App.getLocalInventory()['CRYO_FUEL'] ?? 0;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (e5App as any).grantVaultLoot(lootA);
+  check(
+    'E5-1 fuel cell grows pack +15 kWh & recharges',
+    e5App.getBuggy().getBatteryCapacity() === capBefore + 15 &&
+      e5App.getBuggy().getBattery() === capBefore + 15,
+    `cap ${capBefore} -> ${e5App.getBuggy().getBatteryCapacity()}`,
+  );
+  check(
+    'E5-1 prospector suit backpack -> 160 kg, oxygen doubled',
+    e5App.getSuit().getCargoCapacity() === 160 &&
+      cargoCapBefore === 50 &&
+      e5App.getSuit().getOxygenCapacity() === 200,
+    `cargo ${cargoCapBefore}->${e5App.getSuit().getCargoCapacity()} o2cap=${e5App.getSuit().getOxygenCapacity()}`,
+  );
+  check(
+    'E5-1 cryo canister books into local ledger',
+    (e5App.getLocalInventory()['CRYO_FUEL'] ?? 0) === cryoBefore + 1,
+  );
+
+  // E5-2 — proximity prompt + [E] interface via the real input path.
+  const vid2 = bunkers[1]!.nodeId;
+  const term2 = terminals.find((t) => t.vaultId === vid2)!;
+  e5App.getSuit().setState({ x: term2.position.x + 1, y: term2.position.y, z: term2.position.z });
+  nowMs += 16;
+  e5App.update(nowMs);
+  const e5PromptStrip = e5Doc.getElementById('lunar-hud-prompts')!;
+  const e5Prompts = () =>
+    e5PromptStrip.children
+      .filter((c) => c.classList.contains('hud-prompt') && !c.classList.contains('is-hidden'))
+      .map((c) => c.text());
+  check(
+    'E5-2 [E] Interface Security Terminal prompt inside 3.5 m',
+    e5Prompts().some((p) => p.includes('Interface Security Terminal')),
+    JSON.stringify(e5Prompts()),
+  );
+  check(
+    'E5-2 [E] walks locked -> unlocked',
+    e5App.handleKeyInput('KeyE', 'down') === true && network.getVaultDoorState(vid2) === 'unlocked',
+  );
+  check(
+    'E5-2 unlock toast names the disarm',
+    (e5Toast.getAttribute('data-toast') ?? '').includes('beacon GREEN'),
+    e5Toast.getAttribute('data-toast') ?? '',
+  );
+  check(
+    'E5-2 [E] walks unlocked -> open + loot',
+    e5App.handleKeyInput('KeyE', 'down') === true && network.getVaultDoorState(vid2) === 'open',
+  );
+  check(
+    'E5-2 breach toast lists the haul',
+    (e5Toast.getAttribute('data-toast') ?? '').includes('Vault breached'),
+    e5Toast.getAttribute('data-toast') ?? '',
+  );
+  // out of reach: prompt gone
+  e5App.getSuit().teleport(0, 0);
+  nowMs += 16;
+  e5App.update(nowMs);
+  check(
+    'E5-2 prompt clears beyond reach',
+    !e5Prompts().some((p) => p.includes('Interface Security Terminal')),
+  );
+  check('E5-2 range constant is 3.5 m', VAULT_TERMINAL_RANGE_M === 3.5);
+
+  // E5-3 — holographic topo map: toggle API, canvas raster, dismissal.
+  check('E5-3 map starts hidden', e5Hud.isMapVisible() === false);
+  const mapOverlay = e5Doc.getElementById('lunar-map-overlay')!;
+  check('E5-3 #lunar-map-overlay exists + is-hidden', mapOverlay.classList.contains('is-hidden'));
+  check('E5-3 canvas is 512x512', (() => {
+    const c = e5Doc.getElementById('lunar-map-canvas') as unknown as { width?: number; height?: number };
+    return c.width === HUD_TOPO_CANVAS_PX && c.height === HUD_TOPO_CANVAS_PX && HUD_TOPO_CANVAS_PX === 512;
+  })());
+  const t0 = Date.now();
+  e5App.toggleMap();
+  const toggleMs = Date.now() - t0;
+  check('E5-3 map open via toggleMap()', e5Hud.isMapVisible() === true && !mapOverlay.classList.contains('is-hidden'));
+  check(`E5-3 toggle latency < 50 ms (${toggleMs} ms)`, toggleMs < 50);
+  nowMs += 16;
+  e5App.update(nowMs);
+  const mapState = e5Hud.getMapState();
+  check('E5-3 map frame carries POIs + rails + craters + elevation fn', (() => {
+    if (mapState === null) return false;
+    return (
+      mapState.pois.some((p) => p.kind === 'player') &&
+      mapState.pois.some((p) => p.kind === 'base') &&
+      mapState.pois.some((p) => p.kind === 'mining_vein') &&
+      mapState.pois.some((p) => p.kind === 'portal') &&
+      mapState.pois.some((p) => p.kind === 'train') &&
+      (mapState.railLines?.length ?? 0) > 0 &&
+      (mapState.craters?.length ?? 0) > 0 &&
+      typeof mapState.elevationAt === 'function'
+    );
+  })(), JSON.stringify(mapState?.pois.map((p) => p.kind).slice(0, 8)));
+  check(
+    'E5-3 elevation sampler matches the generator',
+    mapState !== null &&
+      Math.abs(mapState.elevationAt!(120, -34) - e5App.world.getWorldGenerator().elevationAt(120, -34)) < 1e-9,
+  );
+  check(
+    'E5-3 train pip tracks the consist',
+    (() => {
+      if (mapState === null) return false;
+      const loco = e5App.railSystem?.getCart('ore-loco-1');
+      if (loco === null || loco === undefined) return false;
+      const pip = mapState.train;
+      if (pip === null || pip === undefined) return false;
+      const p = loco.getPosition();
+      return Math.hypot(pip.x - p.x, pip.y - p.y) < 60;
+    })(),
+  );
+  check('E5-3 contour raster sampled from elevationAt', e5Hud.isMapTerrainRendered() === true);
+  e5App.toggleMap();
+  check('E5-3 toggle again closes the map', e5Hud.isMapVisible() === false && mapOverlay.classList.contains('is-hidden'));
+  check('E5-3 Escape dismisses the map', (() => {
+    e5App.toggleMap();
+    e5App.handleKeyInput('Escape', 'down');
+    return e5Hud.isMapVisible() === false;
+  })());
+  check('E5-3 [CLOSE MAP] button dismisses', (() => {
+    e5App.toggleMap();
+    const closeBtn = e5Doc.getElementById('lunar-map-close')!;
+    closeBtn.dispatchEvent('click', {});
+    return e5Hud.isMapVisible() === false;
+  })());
+  check('E5-3 [MAP] status-bar button toggles', (() => {
+    // The HUD builds the button as make('button', 'lunar-hud-map-button') —
+    // the fake DOM registry keys by id (no querySelector shim needed).
+    const btn = e5Doc.getElementById('lunar-hud-map-button');
+    if (btn === null) return false;
+    btn.dispatchEvent('click', {});
+    const opened = e5Hud.isMapVisible();
+    btn.dispatchEvent('click', {});
+    return opened && !e5Hud.isMapVisible();
+  })());
+
+  // E5-4 — resilient gamepad latch (Spec 21 §2.6).
+  check(
+    'E5-4 hotplug listeners attached',
+    (e5WinListeners.get('gamepadconnected') ?? []).length === 1 &&
+      (e5WinListeners.get('gamepaddisconnected') ?? []).length === 1,
+  );
+  check('E5-4 latch thresholds: 6 buttons / 2 axes', GAMEPAD_MIN_BUTTONS === 6 && GAMEPAD_MIN_AXES === 2);
+  e5Pads.length = 0;
+  e5Pads.push({
+    id: 'sensor-node',
+    axes: [],
+    buttons: [{ value: 0, pressed: false }, { value: 1, pressed: true }],
+  });
+  nowMs += 16;
+  e5App.update(nowMs);
+  check('E5-4 phantom device never latches', e5App.isGamepadLatched() === false);
+  e5Pads.length = 0;
+  e5Pads.push({
+    id: 'Xbox Wireless Controller',
+    axes: [0, 0, 0, 0],
+    buttons: Array.from({ length: 16 }, () => ({ value: 0, pressed: false })),
+  });
+  nowMs += 16;
+  e5App.update(nowMs);
+  check(
+    'E5-4 dormant prompt shows PRESS ANY BUTTON',
+    (e5Toast.getAttribute('data-toast') ?? '').includes('PRESS ANY BUTTON ON CONTROLLER TO ACTIVATE'),
+    e5Toast.getAttribute('data-toast') ?? '',
+  );
+  e5Pads[0]!.buttons[0]!.pressed = true;
+  e5Pads[0]!.buttons[0]!.value = 1;
+  nowMs += 16;
+  e5App.update(nowMs);
+  check('E5-4 button press latches the pad', e5App.isGamepadLatched() === true);
+  check(
+    'E5-4 latch toast carries the device id',
+    (e5Toast.getAttribute('data-toast') ?? '').includes('GAMEPAD ACTIVE: Xbox Wireless Controller'),
+    e5Toast.getAttribute('data-toast') ?? '',
+  );
+  // decoupled drive-right / look-left on the latched pad (buggy seat)
+  const e5BuggyPos = e5App.getBuggy().getPosition();
+  e5App.getSuit().teleport(e5BuggyPos.x, e5BuggyPos.y);
+  nowMs += 16;
+  e5App.update(nowMs);
+  check(
+    'E5-4 rig mounts buggy for decoupled-drive probe',
+    e5App.toggleMount() === true && e5App.getMode() === 'buggy',
+  );
+  e5Pads[0]!.buttons[0]!.pressed = false;
+  e5Pads[0]!.buttons[0]!.value = 0;
+  e5Pads[0]!.axes[0] = 0.8; // left stick: drive right
+  e5Pads[0]!.axes[2] = -0.9; // right stick: look left
+  const e5Frame = e5App.sampleInput();
+  check(
+    'E5-4 decoupled: right-drive + left-look in the SAME frame',
+    e5Frame.strafe > 0.4 && e5Frame.yaw < -0.4,
+    JSON.stringify({ strafe: e5Frame.strafe, yaw: e5Frame.yaw }),
+  );
+  // trigger brake-to-reverse: stopped + full LT -> reverse, RT veto
+  e5Pads[0]!.axes[0] = 0;
+  e5Pads[0]!.axes[2] = 0;
+  e5Pads[0]!.buttons[6]!.pressed = true;
+  e5Pads[0]!.buttons[6]!.value = 1;
+  const e5RevFrame = e5App.sampleInput();
+  check(
+    'E5-4 brake-to-reverse: LT at standstill commands reverse',
+    e5RevFrame.reverse === true && e5RevFrame.brake === 0 && e5RevFrame.forward < 0,
+    JSON.stringify(e5RevFrame),
+  );
+  e5Pads[0]!.buttons[7]!.pressed = true;
+  e5Pads[0]!.buttons[7]!.value = 1;
+  const e5VetoFrame = e5App.sampleInput();
+  check('E5-4 RT vetoes the reverse latch', e5VetoFrame.reverse === false);
+  // gamepad map buttons: View raises, (B) dismisses, D-Pad Down raises
+  e5Pads[0]!.buttons[6]!.pressed = false;
+  e5Pads[0]!.buttons[6]!.value = 0;
+  e5Pads[0]!.buttons[7]!.pressed = false;
+  e5Pads[0]!.buttons[7]!.value = 0;
+  e5Hud.hideMap();
+  e5Pads[0]!.buttons[8]!.pressed = true; // View
+  nowMs += 16;
+  e5App.update(nowMs);
+  check('E5-4 gamepad View raises the map', e5Hud.isMapVisible() === true);
+  e5Pads[0]!.buttons[8]!.pressed = false;
+  e5Pads[0]!.buttons[1]!.pressed = true; // B
+  nowMs += 16;
+  e5App.update(nowMs);
+  check('E5-4 gamepad (B) dismisses the map', e5Hud.isMapVisible() === false);
+  e5Pads[0]!.buttons[1]!.pressed = false;
+  e5Pads[0]!.buttons[13]!.pressed = true; // D-Pad Down
+  nowMs += 16;
+  e5App.update(nowMs);
+  check('E5-4 D-Pad Down raises the map', e5Hud.isMapVisible() === true);
+  e5Hud.hideMap();
+  e5Pads.length = 0;
+  (e5WinListeners.get('gamepaddisconnected') ?? []).forEach((fn) => fn({}));
+  check('E5-4 disconnect drops the latch', e5App.isGamepadLatched() === false);
+  e5App.dispose();
+  check(
+    'E5-4 hotplug listeners detached on dispose',
+    (e5WinListeners.get('gamepadconnected') ?? []).length === 0,
+  );
+
+  (globalThis as { document?: unknown }).document = bootDoc;
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    writable: true,
+    value: realNavE5,
+  });
+}
 
 section('F. lifecycle teardown & traversal units');
 {

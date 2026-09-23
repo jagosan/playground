@@ -54,6 +54,8 @@ import { Quaternion, Vector3 } from '@babylonjs/core/Maths/math.vector.js';
 import { NullEngine } from '@babylonjs/core/Engines/nullEngine.js';
 import type { AbstractEngine } from '@babylonjs/core/Engines/abstractEngine.js';
 import { PBRMaterial } from '@babylonjs/core/Materials/PBR/pbrMaterial.js';
+import { StandardMaterial } from '@babylonjs/core/Materials/standardMaterial.js';
+import { SpotLight } from '@babylonjs/core/Lights/spotLight.js';
 import { MeshBuilder } from '@babylonjs/core/Meshes/meshBuilder.js';
 import type { AbstractMesh } from '@babylonjs/core/Meshes/abstractMesh.js';
 import { Mesh } from '@babylonjs/core/Meshes/mesh.js';
@@ -259,6 +261,7 @@ export class OreCartEntity {
   readonly physics: RailCar;
   readonly cartId: string;
   readonly routeId: string;
+  readonly kind: 'locomotive' | 'hopper';
   /** Drawing gauge in use (route gauge, floored to the narrow-gauge spec). */
   readonly gauge: number;
 
@@ -266,20 +269,38 @@ export class OreCartEntity {
   private payload: Mesh | null = null;
   private meshes: Mesh[] = [];
   private wheels: Mesh[] = [];
+  private headlight: SpotLight | null = null;
+  private beaconMat: StandardMaterial | null = null;
 
   private cargoMass = 0;
   private wheelPhase = 0;
   private attached = false;
   private detached = false;
+  private alarmActive = false;
   private forward: Vec3 = { x: 1, y: 0, z: 0 };
 
-  constructor(sequence: number, route: RailRoute, stops: Vec3[], spec?: RailCarSpec) {
-    this.cartId = `ore-cart-${sequence}`;
+  constructor(sequence: number | string, route: RailRoute, stops: Vec3[], spec?: RailCarSpec) {
+    this.kind = spec?.kind ?? 'hopper';
+    this.cartId = typeof sequence === 'string' ? sequence : (this.kind === 'locomotive' ? `ore-loco-${sequence}` : `ore-cart-${sequence}`);
     this.routeId = route.id;
     this.gauge = Number.isFinite(route.gauge) && route.gauge > 0 ? route.gauge : RAIL_GAUGE;
     this.physics = new RailCar(route, stops.map((p) => ({ ...p })), spec ?? {});
     this.cargoMass = clamp(spec?.load ?? 0, 0, RAIL_CAR_MAX_PAYLOAD_KG);
     this.physics.setLoad(this.cargoMass); // ledger and physics never disagree
+  }
+
+  // -- alarm & styling -------------------------------------------------------------
+
+  /** Trigger or clear the security alarm on a locomotive (Spec 21 §2.3). */
+  triggerAlarm(active: boolean = true): void {
+    this.alarmActive = active;
+    if (this.beaconMat !== null) {
+      this.beaconMat.emissiveColor = active ? new Color3(1.0, 0.1, 0.1) : new Color3(1.0, 0.6, 0.1);
+    }
+  }
+
+  isAlarmActive(): boolean {
+    return this.alarmActive;
   }
 
   // -- physics-facing API --------------------------------------------------------
@@ -369,25 +390,66 @@ export class OreCartEntity {
     frame.position.set(0, floorY, 0);
     frame.material = mats.composite;
 
-    const hopper = MeshBuilder.CreateBox(`${this.cartId}-hopper`, {
-      width: CART.hopper.width,
-      height: CART.hopper.height,
-      depth: CART.hopper.length,
-    }, scene);
-    hopper.position.set(0, floorY + CART.hopper.height / 2, 0);
-    hopper.material = mats.hopper;
+    const parts: Mesh[] = [frame];
 
-    // Payload box with its ORIGIN baked at the bottom face, so scaling.y
-    // grows the ore column upward from the hopper floor.
-    const payload = MeshBuilder.CreateBox(`${this.cartId}-payload`, {
-      width: CART.hopper.width - CART.payloadInsetX,
-      height: CART.hopper.height - CART.payloadInsetZ,
-      depth: CART.hopper.length - CART.payloadInsetZ,
-    }, scene);
-    payload.position.set(0, (CART.hopper.height - CART.payloadInsetZ) / 2, 0);
-    payload.bakeCurrentTransformIntoVertices();
-    payload.position.set(0, floorY + CART.payloadFloor, 0);
-    payload.material = mats.ore;
+    if (this.kind === 'locomotive') {
+      const cab = MeshBuilder.CreateBox(`${this.cartId}-cab`, {
+        width: CART.hopper.width * 1.1,
+        height: CART.hopper.height * 1.4,
+        depth: CART.hopper.length * 1.05,
+      }, scene);
+      cab.position.set(0, floorY + CART.hopper.height * 0.7, 0);
+      cab.material = mats.composite; // Heavy dark chassis for locomotive
+      parts.push(cab);
+
+      // Forward headlight
+      const headlight = new SpotLight(
+        `${this.cartId}-headlight`,
+        new Vector3(0, floorY + CART.hopper.height * 0.9, CART.frame.length / 2),
+        new Vector3(0, -0.05, 1).normalize(),
+        (45 * Math.PI) / 180,
+        2,
+        scene,
+      );
+      headlight.range = 60;
+      headlight.intensity = 3.5;
+      headlight.diffuse = new Color3(1.0, 0.98, 0.92);
+      headlight.parent = root;
+      this.headlight = headlight;
+
+      // Amber roof beacon
+      const beaconMat = new StandardMaterial(`${this.cartId}-beacon-mat`, scene);
+      beaconMat.emissiveColor = new Color3(1.0, 0.6, 0.1);
+      beaconMat.disableLighting = true;
+      const beacon = MeshBuilder.CreateSphere(`${this.cartId}-beacon`, { diameter: 0.35 }, scene);
+      beacon.material = beaconMat;
+      beacon.position.set(0, floorY + CART.hopper.height * 1.45, 0);
+      beacon.parent = root;
+      parts.push(beacon);
+      this.beaconMat = beaconMat;
+    } else {
+      const hopper = MeshBuilder.CreateBox(`${this.cartId}-hopper`, {
+        width: CART.hopper.width,
+        height: CART.hopper.height,
+        depth: CART.hopper.length,
+      }, scene);
+      hopper.position.set(0, floorY + CART.hopper.height / 2, 0);
+      hopper.material = mats.hopper;
+      parts.push(hopper);
+
+      // Payload box with its ORIGIN baked at the bottom face
+      const payload = MeshBuilder.CreateBox(`${this.cartId}-payload`, {
+        width: CART.hopper.width - CART.payloadInsetX,
+        height: CART.hopper.height - CART.payloadInsetZ,
+        depth: CART.hopper.length - CART.payloadInsetZ,
+      }, scene);
+      payload.position.set(0, (CART.hopper.height - CART.payloadInsetZ) / 2, 0);
+      payload.bakeCurrentTransformIntoVertices();
+      payload.position.set(0, floorY + CART.payloadFloor, 0);
+      payload.material = mats.ore;
+      parts.push(payload);
+      this.payload = payload;
+    }
 
     const wheels: Mesh[] = [];
     for (let i = 0; i < 4; i++) {
@@ -397,12 +459,12 @@ export class OreCartEntity {
       wheel.position.set((side * this.gauge) / 2, CART.wheelRadius, along);
       wheel.material = mats.steel;
       wheels.push(wheel);
+      parts.push(wheel);
     }
 
-    for (const part of [hopper, frame, payload, ...wheels]) part.parent = root;
-    this.meshes = [hopper, frame, payload, ...wheels];
+    for (const part of parts) part.parent = root;
+    this.meshes = parts;
     this.wheels = wheels;
-    this.payload = payload;
     this.attached = true;
     this.applyPayloadScale();
     // Sit the cart on the polyline immediately — the mesh is truthful from
@@ -422,6 +484,10 @@ export class OreCartEntity {
     for (const mesh of this.meshes) disposeQuietly(mesh);
     this.meshes = [];
     this.wheels = [];
+    disposeQuietly(this.headlight);
+    this.headlight = null;
+    disposeQuietly(this.beaconMat);
+    this.beaconMat = null;
     disposeQuietly(this.root);
     this.root = null;
     this.payload = null;

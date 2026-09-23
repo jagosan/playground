@@ -32,7 +32,8 @@ import { PBRMaterial } from '@babylonjs/core/Materials/PBR/pbrMaterial.js';
 
 import {
   OpenBuggy,
-  HEADLIGHT_INTENSITY,
+  LOW_BEAM_INTENSITY,
+  HIGH_BEAM_INTENSITY,
   MOUNT_RADIUS_M,
   COIL_SCALE_BUMP,
   coilScaleFor,
@@ -112,7 +113,7 @@ check('init() is idempotent', rover.init().isBuilt() === true);
 check('69 procedural meshes (Spec 17 §4 realism hierarchy)', rover.getMeshes().length === 69, `got ${rover.getMeshes().length}`);
 check('all meshes named buggy-*', rover.getMeshes().every((m) => m.name.startsWith('buggy-')));
 check('root transform node present', rover.getRootNode() !== null);
-check('2 spotlight headlights', rover.getHeadlights().length === 2);
+check('4 spotlight headlights (2 per side: low flood + high spot, Spec 21 §2.2)', rover.getHeadlights().length === 4);
 check('headlights lit at spawn by default', rover.isHeadlightsOn() === true);
 
 const materials = new Set(rover.getMeshes().map((m) => m.material));
@@ -449,12 +450,17 @@ check(
 section('7. headlights toggle');
 
 const lamps = rover.getHeadlights();
-check('both beams lit at HEADLIGHT_INTENSITY', lamps.every((l) => Math.abs(l.intensity - HEADLIGHT_INTENSITY) < 1e-9));
+// Spec 21 §2.2 dual-stage beams: pairs of (low flood 2.8, high spot 4.5).
+const stageOk = (ls: typeof lamps): boolean =>
+  ls.length === 4 &&
+  ls.every((l, i) => Math.abs(l.intensity - (i % 2 === 1 ? HIGH_BEAM_INTENSITY : LOW_BEAM_INTENSITY)) < 1e-9);
+check('dual-stage beams lit (low 2.8 / high 4.5, Spec 21 §2.2)', stageOk(lamps),
+  lamps.map((l) => l.intensity).join(','));
 check('setHeadlights(false) returns false', rover.setHeadlights(false) === false);
 check('both beams drop to 0', lamps.every((l) => l.intensity === 0));
 check('isHeadlightsOn() false', rover.isHeadlightsOn() === false);
 check('bare setHeadlights() toggles back on', rover.setHeadlights() === true);
-check('beam intensity restored', lamps.every((l) => Math.abs(l.intensity - HEADLIGHT_INTENSITY) < 1e-9));
+check('beam intensity restored', stageOk(lamps), lamps.map((l) => l.intensity).join(','));
 check('force-on twice is idempotent', rover.setHeadlights(true) === true && rover.setHeadlights(true) === true);
 check('beams aim along heading (finite unit dirs)', lamps.every((l) => Number.isFinite(l.direction.x) && l.direction.lengthSquared() > 0));
 check('beams sit ahead of the chassis datum', lamps.every((l) => Number.isFinite(l.position.x) && Number.isFinite(l.position.z)));

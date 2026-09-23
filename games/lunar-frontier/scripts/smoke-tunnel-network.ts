@@ -374,6 +374,193 @@ check('depleted vein stays depleted across instances', rebuilt.getVein(hostVein.
 rebuilt.dispose();
 
 // ---------------------------------------------------------------------------
+// 7. Spec 21 §2.4 — surface shaft portals
+// ---------------------------------------------------------------------------
+section('7. surface shaft portals (collar, gantry, neon beacon, bore rings)');
+
+const fac = new TunnelNetwork(world).init();
+const portals = fac.getSurfacePortals();
+check('portals derived from snapshot', portals.length > 0, `${portals.length} portals`);
+check(
+  'every portal mouth sits at z >= -2',
+  portals.every((p) => p.position.z >= -2),
+);
+check(
+  'portal count == unique surface tunnel mouths',
+  (() => {
+    const mouths = new Set<string>();
+    for (const t of world.tunnels) {
+      for (const p of [t.start, t.end]) if (p.z >= -2) mouths.add(`${p.x.toFixed(2)},${p.y.toFixed(2)},${p.z.toFixed(2)}`);
+    }
+    return portals.length === mouths.size;
+  })(),
+  `portals=${portals.length}`,
+);
+check(
+  'beacon labels follow the SHAFT NN // KIND convention',
+  portals.every((p) => /^SHAFT \d{2} \/\/ [A-Z ]+$/.test(p.label)),
+  portals[0]?.label ?? 'none',
+);
+{
+  const p0 = portals[0]!;
+  const root = fac.getRootNode();
+  const portalMeshes = fac
+    .getMeshes()
+    .concat()
+    .filter(() => false); // facility meshes are separate from tubes/veins
+  void portalMeshes;
+  const scene = (fac as unknown as { scene: import('@babylonjs/core/scene.js').Scene }).scene;
+  const collar = scene.getMeshByName(`${p0.id}-collar-l-0`);
+  const beacon = scene.getMeshByName(`${p0.id}-beacon`);
+  const ring1 = scene.getMeshByName(`${p0.id}-bore-ring-1`);
+  const ring2 = scene.getMeshByName(`${p0.id}-bore-ring-2`);
+  const gantry = scene.getMeshByName(`${p0.id}-gantry-beam`);
+  check('portal has hazard collar pillars', collar !== null && collar.parent?.name === p0.id);
+  check('portal has overhead gantry beam', gantry !== null);
+  check('portal has neon identification beacon', beacon !== null);
+  check(
+    'beacon carries the identification text',
+    (beacon?.metadata as { label?: string } | undefined)?.label === p0.label,
+  );
+  check(
+    'twin steel bore rings line the first 12 m into the rock',
+    ring1 !== null &&
+      ring2 !== null &&
+      (ring1.metadata as { depthIntoRockM?: number }).depthIntoRockM === 2.5 &&
+      (ring2.metadata as { depthIntoRockM?: number }).depthIntoRockM === 8.5,
+  );
+  check('portal meshes hang under the network root', collar?.parent?.parent === root);
+  // World-frame truth: the beacon hangs above the recorded mouth position
+  // (absolute position — facility meshes live under a placed parent root).
+  const abs = beacon!.getAbsolutePosition();
+  // Babylon (x, z↑, −y) back to world (x, y, z):
+  const beaconWorld = { x: abs.x, y: -abs.z, z: abs.y };
+  check(
+    'beacon hovers above the mouth in world coords',
+    Math.abs(beaconWorld.x - p0.position.x) < 12 &&
+      Math.abs(beaconWorld.y - p0.position.y) < 12 &&
+      beaconWorld.z > p0.position.z,
+    JSON.stringify(beaconWorld) + ' vs ' + JSON.stringify(p0.position),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 8. Spec 21 §2.4 — underground bunkers, vault doors & security terminals
+// ---------------------------------------------------------------------------
+section('8. underground bunkers, locked vault doors & security terminals');
+
+const cavernNodes = world.nodes.filter((n) => n.kind === 'cavern');
+const bunkers = fac.getBunkers();
+check('one bunker per terminal cavern node', bunkers.length === cavernNodes.length, `${bunkers.length}/${cavernNodes.length}`);
+check('bunker chambers are 30 x 20 x 8 m', bunkers.every((b) => b.dimensions.width === 30 && b.dimensions.length === 20 && b.dimensions.height === 8));
+check('bunker centres are the cavern node positions', bunkers.every((b) => {
+  const n = cavernNodes.find((c) => c.id === b.nodeId)!;
+  return Math.hypot(b.center.x - n.position.x, b.center.y - n.position.y, b.center.z - n.position.z) < 1e-9;
+}));
+check('every bunker ships the 3-item vault loot table', bunkers.every((b) => b.lootItems.length === 3));
+{
+  const lootIds = bunkers[0]!.lootItems.map((l) => l.kind).join(',');
+  check(
+    'loot kinds = fuel_cell + suit_upgrade + cryo_canister',
+    lootIds === 'fuel_cell,suit_upgrade,cryo_canister',
+    lootIds,
+  );
+  const fuel = bunkers[0]!.lootItems.find((l) => l.kind === 'fuel_cell')!;
+  const suit = bunkers[0]!.lootItems.find((l) => l.kind === 'suit_upgrade')!;
+  const cryo = bunkers[0]!.lootItems.find((l) => l.kind === 'cryo_canister')!;
+  check('fuel cell grants +15 kWh', fuel.batteryKwhBonus === 15);
+  check('prospector suit grants 160 kg backpack', suit.name === 'Advanced Prospector EVA Suit' && (suit.cargoCapacityBonusKg ?? 0) > 0);
+  check('cryo canister is worth 1200 cr', cryo.creditValue === 1200);
+}
+
+const doors = fac.getVaultDoors();
+check('one vault door per bunker', doors.length === bunkers.length);
+check(
+  'door ids follow vault-door-NN',
+  doors.every((d) => /^vault-door-\d{2}$/.test(d.id)),
+  doors.map((d) => d.id).join(','),
+);
+check('all doors start LOCKED', doors.every((d) => d.state === 'locked'));
+
+const terminals = fac.getVaultTerminals();
+check('one security terminal per bunker', terminals.length === bunkers.length);
+check('terminal meshes exist after init', terminals.every((t) => t.mesh !== null));
+
+{
+  const scene = (fac as unknown as { scene: import('@babylonjs/core/scene.js').Scene }).scene;
+  const b0 = bunkers[0]!;
+  const rib = scene.getMeshByName(`${b0.doorId}-rib-0-0`);
+  const tray = scene.getMeshByName(`${b0.doorId}-tray-l`);
+  const amber = scene.getMeshByName(`${b0.doorId}-amber-l-0`);
+  const console1 = scene.getMeshByName(`${b0.doorId}-console-l`);
+  const crt = scene.getMeshByName(`${b0.doorId}-crt-l`);
+  const doorFrame = scene.getMeshByName(b0.doorId);
+  const doorLeaf = scene.getMeshByName(`${b0.doorId}-leaf-l`);
+  check('bunker has arched ceiling rib trusses', rib !== null);
+  check('bunker has wall cable trays', tray !== null);
+  check('bunker has amber emergency strip lights', amber !== null);
+  check('bunker has modular consoles with green vector CRTs', console1 !== null && crt !== null);
+  check('vault door frame is named vault-door-01 (first sanctum)', b0.doorId === 'vault-door-01' && doorFrame !== null);
+  check('vault door has twin sliding leaves', doorLeaf !== null);
+  check(
+    'terminal console sits beside the vault door (world distance < 8 m)',
+    (() => {
+      const t = terminals.find((x) => x.vaultId === b0.nodeId)!;
+      const d = doors.find((x) => x.vaultId === b0.nodeId)!;
+      return Math.hypot(t.position.x - d.position.x, t.position.y - d.position.y, t.position.z - d.position.z) < 8;
+    })(),
+  );
+  check(
+    'terminal sits inside the bunker footprint (dist to centre < 20 m)',
+    (() => {
+      const t = terminals.find((x) => x.vaultId === b0.nodeId)!;
+      return Math.hypot(t.position.x - b0.center.x, t.position.y - b0.center.y, t.position.z - b0.center.z) < 20;
+    })(),
+  );
+}
+
+// -- state machine: locked -> unlocked -> open --------------------------------
+{
+  const target = bunkers[0]!;
+  check('locked door refuses to open', fac.openVault(target.nodeId) === 'locked');
+  check('unlockVault flips locked -> unlocked', fac.unlockVault(target.nodeId) === 'unlocked');
+  check('door record mirrors unlocked state', fac.getVaultDoors().find((d) => d.id === target.doorId)?.state === 'unlocked');
+  check('unlock is idempotent', fac.unlockVault(target.doorId) === 'unlocked');
+  check('claim before opening returns null', fac.claimVaultLoot(target.nodeId) === null);
+  check('openVault flips unlocked -> open', fac.openVault(target.nodeId) === 'open');
+  const scene = (fac as unknown as { scene: import('@babylonjs/core/scene.js').Scene }).scene;
+  const leafL = scene.getMeshByName(`${target.doorId}-leaf-l`)!;
+  const leafR = scene.getMeshByName(`${target.doorId}-leaf-r`)!;
+  check(
+    'open door leaves slid into the wall recess',
+    Math.abs(leafL.position.x) > 4 && leafL.position.x < 0 && leafR.position.x > 4,
+    `l=${leafL.position.x.toFixed(2)} r=${leafR.position.x.toFixed(2)}`,
+  );
+  const loot = fac.claimVaultLoot(target.nodeId);
+  check('claim after opening hands out loot', loot !== null && loot.length === 3);
+  check('second claim grants nothing (single pick)', fac.claimVaultLoot(target.nodeId) === null);
+  check('unknown vault returns null', fac.unlockVault('vault-nope') === null);
+  check('state survives an unknown-door lookup', fac.getVaultDoorState(target.nodeId) === 'open');
+}
+
+// -- proximity: 3.5 m terminal reach -------------------------------------------
+{
+  const t = terminals[0]!;
+  const inReach = fac.getNearestVaultTerminal({ x: t.position.x + 1, y: t.position.y, z: t.position.z }, 3.5);
+  check('terminal answers within 3.5 m', inReach !== null && inReach.id === t.id);
+  const outOfReach = fac.getNearestVaultTerminal({ x: t.position.x + 30, y: t.position.y, z: t.position.z }, 3.5);
+  check('terminal silent beyond 3.5 m', outOfReach === null);
+}
+
+// -- facility records survive dispose ------------------------------------------
+{
+  const portalCount = fac.getSurfacePortals().length;
+  fac.dispose();
+  check('facility records survive dispose', fac.getBunkers().length === bunkers.length && fac.getSurfacePortals().length === portalCount);
+  check('vault state survives dispose', fac.getVaultDoorState(bunkers[0]!.nodeId) === 'open');
+}
+
+// ---------------------------------------------------------------------------
 // Verdict
 // ---------------------------------------------------------------------------
 console.log(`\n${'='.repeat(60)}`);

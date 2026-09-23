@@ -64,7 +64,13 @@ import { TransformNode } from '@babylonjs/core/Meshes/transformNode.js';
 import { VertexData } from '@babylonjs/core/Meshes/mesh.vertexData.js';
 import type { AbstractMesh } from '@babylonjs/core/Meshes/abstractMesh.js';
 
-import { LunarWorldGenerator, type WorldSnapshot } from '../world/LunarWorldGenerator.ts';
+import {
+  LunarWorldGenerator,
+  type WorldSnapshot,
+  type ScrapSite,
+  type ScrapComponent,
+  type Vec3,
+} from '../world/LunarWorldGenerator.ts';
 import { CameraRig, worldToBabylon, type CameraMode } from './CameraRig.ts';
 
 // ---------------------------------------------------------------------------
@@ -88,9 +94,9 @@ export interface WorldSceneOptions {
   microRelief?: number;
   /** Sun shadow map size (default 1024; 0 disables shadows entirely). */
   shadowMapSize?: number;
-  /** Sun light intensity (default 3.1 — overexposed against 0.08 fill). */
+  /** Sun light intensity (default 2.2 — balanced natural sunlight per Spec 21 §2.2). */
   sunIntensity?: number;
-  /** Earthshine fill intensity (default 0.08). */
+  /** Earthshine fill intensity (default 0.24 — enhanced lunar dust bounce per Spec 21 §2.2). */
   earthshineIntensity?: number;
   /** Star dome radius in metres (default 6000; keep < camera maxZ). */
   starDomeRadius?: number;
@@ -242,6 +248,8 @@ export class WorldScene {
    * self-destructs on its own wall-clock timer and fades via `render()`.
    */
   private miningEffects: MiningEffectRecord[] = [];
+  /** Procedural scrap sites (Spec 21 §2.1). */
+  private scrapRoots = new Map<string, { root: TransformNode; beacon?: Mesh; meshes: Mesh[] }>();
 
   constructor(options: WorldSceneOptions = {}) {
     this.options = {
@@ -250,8 +258,8 @@ export class WorldScene {
       terrainResolution: Math.max(9, Math.min(1025, options.terrainResolution ?? 193)),
       microRelief: options.microRelief ?? 0.22,
       shadowMapSize: options.shadowMapSize ?? 1024,
-      sunIntensity: options.sunIntensity ?? 3.1,
-      earthshineIntensity: options.earthshineIntensity ?? 0.08,
+      sunIntensity: options.sunIntensity ?? 2.2,
+      earthshineIntensity: options.earthshineIntensity ?? 0.24,
       starDomeRadius: options.starDomeRadius ?? 6000,
       starCount: options.starCount ?? 900,
       spawnClearance: options.spawnClearance ?? 1.7,
@@ -285,6 +293,7 @@ export class WorldScene {
     this.buildLighting();
     this.buildStarfield();
     this.buildTerrain();
+    this.buildScrapSites();
 
     this.rig = new CameraRig(this.scene, {
       initialMode: this.options.cameraMode ?? 'eva_first_person',
@@ -533,6 +542,229 @@ export class WorldScene {
     return this.worldGen;
   }
 
+  // -- surface detritus & salvage (Spec 21 §2.1) -------------------------------
+
+  /** Get all scrap sites from the world snapshot. */
+  getScrapSites(): ScrapSite[] {
+    return this.snapshot?.scrapSites ?? [];
+  }
+
+  /** Harvest a scrap site by id, updating visual appearance and returning components. */
+  salvageScrapSite(siteId: string): ScrapComponent[] | null {
+    const res = this.worldGen.salvageScrapSite(siteId);
+    if (res !== null) {
+      this.markScrapHarvested(siteId);
+      const site = this.snapshot?.scrapSites.find((s) => s.id === siteId);
+      if (site) {
+        site.harvested = true;
+        this.spawnSalvageSparks(site.position);
+      }
+    }
+    return res;
+  }
+
+  /** Visually mark a scrap site as harvested (shrink frame and disable beacon). */
+  markScrapHarvested(siteId: string): void {
+    const entry = this.scrapRoots.get(siteId);
+    if (!entry) return;
+    if (entry.beacon) {
+      entry.beacon.setEnabled(false);
+    }
+    entry.root.scaling.set(0.7, 0.35, 0.7);
+  }
+
+  /** Spawn procedural spark/dust effect at salvage position (headless safe). */
+  spawnSalvageSparks(pos: Vec3): void {
+    if (this.disposed || this.scene === null) return;
+    const bPos = worldToBabylon(pos);
+    const scene = this.scene;
+    const sparkRoot = new TransformNode(`sparks-${Date.now()}`, scene);
+    sparkRoot.position.copyFrom(bPos);
+    sparkRoot.position.y += 0.8;
+
+    const sparkMat = new StandardMaterial(`spark-mat-${Date.now()}`, scene);
+    sparkMat.emissiveColor = new Color3(1.0, 0.9, 0.4);
+    sparkMat.disableLighting = true;
+
+    const sparks: Mesh[] = [];
+    for (let i = 0; i < 6; i++) {
+      const sp = MeshBuilder.CreateSphere(`sp-${i}`, { diameter: 0.12 }, scene);
+      sp.material = sparkMat;
+      sp.parent = sparkRoot;
+      const ang = (i / 6) * Math.PI * 2;
+      sp.position.set(Math.cos(ang) * 0.4, (i % 2) * 0.3, Math.sin(ang) * 0.4);
+      sparks.push(sp);
+    }
+
+    setTimeout(() => {
+      try {
+        for (const sp of sparks) sp.dispose();
+        sparkMat.dispose();
+        sparkRoot.dispose();
+      } catch {
+        // safe ignore
+      }
+    }, 500);
+  }
+
+  /** Procedural composite scrap geometry (Spec 21 §2.1 / ADR-021-1). */
+  private buildScrapSites(): void {
+    const scene = this.requireScene();
+    const sites = this.snapshot?.scrapSites ?? [];
+
+    for (const site of sites) {
+      const root = new TransformNode(`scrap-root-${site.id}`, scene);
+      const bPos = worldToBabylon(site.position);
+      root.position.copyFrom(bPos);
+      const meshes: Mesh[] = [];
+      let beacon: Mesh | undefined;
+
+      switch (site.archetype) {
+        case 'lander_wreck': {
+          const foilMat = new PBRMaterial(`foil-${site.id}`, scene);
+          foilMat.albedoColor = new Color3(0.92, 0.78, 0.25);
+          foilMat.metallic = 0.85;
+          foilMat.roughness = 0.25;
+
+          const frame = MeshBuilder.CreateCylinder(
+            `lander-frame-${site.id}`,
+            { diameter: 3.2, height: 1.0, tessellation: 8 },
+            scene,
+          );
+          frame.material = foilMat;
+          frame.parent = root;
+          frame.position.y = 0.5;
+          meshes.push(frame);
+
+          const tankMat = new PBRMaterial(`tank-${site.id}`, scene);
+          tankMat.albedoColor = new Color3(0.8, 0.82, 0.85);
+          tankMat.metallic = 0.9;
+          tankMat.roughness = 0.2;
+
+          const tank1 = MeshBuilder.CreateSphere(`tank1-${site.id}`, { diameter: 1.1 }, scene);
+          tank1.material = tankMat;
+          tank1.parent = root;
+          tank1.position.set(0.9, 0.9, 0);
+          meshes.push(tank1);
+
+          const tank2 = MeshBuilder.CreateSphere(`tank2-${site.id}`, { diameter: 0.9 }, scene);
+          tank2.material = tankMat;
+          tank2.parent = root;
+          tank2.position.set(-0.8, 0.8, 0.4);
+          meshes.push(tank2);
+
+          const strut = MeshBuilder.CreateCylinder(`strut-${site.id}`, { diameter: 0.15, height: 2.2 }, scene);
+          strut.parent = root;
+          strut.position.set(1.4, 0.4, 1.2);
+          strut.rotation.z = 0.7;
+          strut.material = foilMat;
+          meshes.push(strut);
+
+          const beaconMat = new StandardMaterial(`beacon-mat-${site.id}`, scene);
+          beaconMat.emissiveColor = new Color3(1.0, 0.6, 0.1);
+          beaconMat.disableLighting = true;
+          beacon = MeshBuilder.CreateSphere(`beacon-${site.id}`, { diameter: 0.3 }, scene);
+          beacon.material = beaconMat;
+          beacon.parent = root;
+          beacon.position.set(0, 1.3, 0);
+          meshes.push(beacon);
+          break;
+        }
+        case 'mining_rig': {
+          const rustMat = new PBRMaterial(`rust-${site.id}`, scene);
+          rustMat.albedoColor = new Color3(0.72, 0.35, 0.15);
+          rustMat.metallic = 0.1;
+          rustMat.roughness = 0.9;
+
+          const derrickL = MeshBuilder.CreateBox(
+            `derrick-l-${site.id}`,
+            { width: 0.3, height: 3.5, depth: 0.3 },
+            scene,
+          );
+          derrickL.material = rustMat;
+          derrickL.parent = root;
+          derrickL.position.set(-0.9, 1.7, 0);
+          derrickL.rotation.z = -0.22;
+          meshes.push(derrickL);
+
+          const derrickR = MeshBuilder.CreateBox(
+            `derrick-r-${site.id}`,
+            { width: 0.3, height: 3.5, depth: 0.3 },
+            scene,
+          );
+          derrickR.material = rustMat;
+          derrickR.parent = root;
+          derrickR.position.set(0.9, 1.7, 0);
+          derrickR.rotation.z = 0.22;
+          meshes.push(derrickR);
+
+          const motor = MeshBuilder.CreateCylinder(`motor-${site.id}`, { diameter: 0.9, height: 1.4 }, scene);
+          motor.material = rustMat;
+          motor.parent = root;
+          motor.position.set(0, 1.8, 0);
+          meshes.push(motor);
+
+          const hopper = MeshBuilder.CreateBox(`hopper-${site.id}`, { width: 1.8, height: 0.8, depth: 1.4 }, scene);
+          hopper.material = rustMat;
+          hopper.parent = root;
+          hopper.position.set(0, 0.4, 0);
+          meshes.push(hopper);
+
+          const beaconMat = new StandardMaterial(`beacon-mat-${site.id}`, scene);
+          beaconMat.emissiveColor = new Color3(1.0, 0.7, 0.2);
+          beaconMat.disableLighting = true;
+          beacon = MeshBuilder.CreateSphere(`beacon-${site.id}`, { diameter: 0.35 }, scene);
+          beacon.material = beaconMat;
+          beacon.parent = root;
+          beacon.position.set(0, 3.4, 0);
+          meshes.push(beacon);
+          break;
+        }
+        case 'junk_pile': {
+          const junkMat = new PBRMaterial(`junk-${site.id}`, scene);
+          junkMat.albedoColor = new Color3(0.5, 0.52, 0.55);
+          junkMat.metallic = 0.75;
+          junkMat.roughness = 0.45;
+
+          const girder = MeshBuilder.CreateBox(`girder-${site.id}`, { width: 0.4, height: 2.8, depth: 0.4 }, scene);
+          girder.material = junkMat;
+          girder.parent = root;
+          girder.position.set(0.3, 0.5, 0);
+          girder.rotation.set(0.3, 0.5, 0.9);
+          meshes.push(girder);
+
+          const cyl = MeshBuilder.CreateCylinder(`cyl-${site.id}`, { diameter: 0.7, height: 1.5 }, scene);
+          cyl.material = junkMat;
+          cyl.parent = root;
+          cyl.position.set(-0.5, 0.4, 0.3);
+          cyl.rotation.z = 1.2;
+          meshes.push(cyl);
+
+          const box = MeshBuilder.CreateBox(`box-${site.id}`, { width: 0.9, height: 0.6, depth: 0.9 }, scene);
+          box.material = junkMat;
+          box.parent = root;
+          box.position.set(0.2, 0.3, -0.4);
+          meshes.push(box);
+
+          const beaconMat = new StandardMaterial(`beacon-mat-${site.id}`, scene);
+          beaconMat.emissiveColor = new Color3(0.8, 0.4, 1.0);
+          beaconMat.disableLighting = true;
+          beacon = MeshBuilder.CreateSphere(`beacon-${site.id}`, { diameter: 0.25 }, scene);
+          beacon.material = beaconMat;
+          beacon.parent = root;
+          beacon.position.set(0, 1.1, 0);
+          meshes.push(beacon);
+          break;
+        }
+      }
+
+      this.scrapRoots.set(site.id, { root, beacon, meshes });
+      for (const m of meshes) {
+        this.addEntity(m);
+      }
+    }
+  }
+
   /** Default spawn point (flat datum spot) in the physics frame. */
   getSpawnPoint(): { x: number; y: number; z: number } {
     const origin = this.options.terrainOrigin ?? { x: 0, y: 0 };
@@ -779,7 +1011,7 @@ export class WorldScene {
       scene,
     );
     sun.intensity = this.options.sunIntensity;
-    sun.diffuse = new Color3(1.0, 0.985, 0.95); // unfiltered F0-ish sunlight
+    sun.diffuse = new Color3(1.0, 0.98, 0.92); // balanced natural sunlight (Spec 21 §2.2)
     sun.specular = new Color3(1, 1, 1);
     this.sun = sun;
 
@@ -802,7 +1034,7 @@ export class WorldScene {
     const hemi = new HemisphericLight('earthshine', new Vector3(0, 1, 0), scene);
     hemi.intensity = this.options.earthshineIntensity;
     hemi.diffuse = new Color3(0.45, 0.6, 0.85); // earth-lit blue cast
-    hemi.groundColor = new Color3(0.03, 0.032, 0.04); // barely-there bounce
+    hemi.groundColor = new Color3(0.08, 0.08, 0.09); // deep lunar dust bounce (Spec 21 §2.2)
     this.earthshine = hemi;
   }
 
@@ -974,10 +1206,9 @@ export class WorldScene {
     const scene = this.requireScene();
     const mat = new PBRMaterial('regolith', scene);
     mat.albedoColor = new Color3(0.20, 0.19, 0.18); // low-albedo grey-tan regolith (spec 14 §3.2)
-    // Bare-minimum non-zero lift so pure-vacuum shadowed texels don't crush to
-    // 0/NaN — the sun/earthshine contrast does the real work (spec 14 §3.2
-    // removes the old flat 0.12 ambient emissive).
-    mat.emissiveColor = new Color3(0.015, 0.015, 0.018);
+    // Elevated minimum emissive floor so crater floors facing away from the
+    // sun retain discernible relief (Spec 21 §2.2).
+    mat.emissiveColor = new Color3(0.035, 0.035, 0.038);
     mat.metallic = 0.0;
     mat.roughness = 0.94;
     mat.environmentIntensity = 0.02; // vacuum: nothing to reflect

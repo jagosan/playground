@@ -37,6 +37,10 @@ export const HUD_ROOT_ID = 'lunar-hud';
 export const HUD_TRADE_ID = 'lunar-hud-trade';
 export const HUD_COMPASS_ID = 'lunar-hud-compass';
 export const HUD_TUTORIAL_ID = 'lunar-hud-tutorial';
+
+// Spec 21 §4.1: Topographic map overlay
+export const HUD_MAP_ROOT_ID = 'lunar-map-overlay';
+export const HUD_MAP_ID = 'lunar-topo-canvas';
 export const HUD_LAP_ID = 'lunar-hud-lap';
 /** Spec 18 §6.2 — narrative comms terminal (glassmorphic CRT panel). */
 export const HUD_COMMS_ID = 'lunar-hud-comms';
@@ -115,6 +119,8 @@ export const HUD_PROMPT_KINDS = {
   mine: { label: 'Mine Vein', order: 20 },
   claim: { label: 'Stake Claim', order: 30 },
   trade: { label: 'Trade', order: 40 },
+  /** Spec 21 §2.4: security terminal beside a locked vault bulkhead. */
+  vault: { label: 'Interface Security Terminal', order: 25 },
 } as const;
 
 export type HudPromptKind = keyof typeof HUD_PROMPT_KINDS;
@@ -137,6 +143,7 @@ export const HUD_GAMEPAD_GLYPHS: Readonly<Partial<Record<HudPromptKind, string>>
   stow: 'X',
   mine: 'RB',
   trade: 'B',
+  vault: 'X',
 };
 
 export interface HudPrompt {
@@ -298,6 +305,98 @@ export interface HudQuestStageDisplay {
   }[];
 }
 
+
+/**
+ * Spec 21 §2.5 — one point of interest on the holographic tactical map.
+ * Declared locally (zero-import contract): structurally compatible with the
+ * blueprint's `TopoMapPOI` (kind union widened with the extra hud-only
+ * kinds the client feeds directly).
+ */
+export interface TopoMapPOI {
+  id: string;
+  label: string;
+  kind: 'base' | 'mining_vein' | 'portal' | 'train' | 'scrap' | 'player' | 'vault';
+  /** World metres (x lateral, y north). */
+  x: number;
+  y: number;
+  /** Radians; used by the player arrowhead and train pip. */
+  heading?: number;
+  color?: string;
+  /** Resource kind colouring for `mining_vein` pips. */
+  resourceKind?: string;
+}
+
+/** Spec 21 §2.5 — a rail polyline in world metres. */
+export interface TopoMapRailLine {
+  id: string;
+  points: { x: number; y: number }[];
+}
+
+/** Spec 21 §2.5 — full frame handed to `updateMap()` every map tick. */
+export interface TopoMapState {
+  visible: boolean;
+  canvasWidth: number;
+  canvasHeight: number;
+  /** Lateral world extent covered by the canvas (metres, both axes). */
+  worldSizeM: number;
+  center: { x: number; y: number };
+  zoom: number;
+  pois: TopoMapPOI[];
+  /** Optional infrastructure layers (ClientApp feeds these). */
+  railLines?: TopoMapRailLine[];
+  /** Live train position pip (world metres). */
+  train?: { x: number; y: number } | null;
+  /** Terrain sampler — the client hands `LunarWorldGenerator.elevationAt`. */
+  elevationAt?: (x: number, y: number) => number;
+  /** Crater rings { x, y, radius } in world metres. */
+  craters?: { id: string; x: number; y: number; radius: number }[];
+}
+
+/** Minimal canvas element shape (zero-import contract). */
+type MapCanvasHost = Elementish & {
+  width?: number;
+  height?: number;
+  getContext?: (kind: string) => unknown;
+};
+
+/** Minimal CanvasRenderingContext2D shape used by the map painter. */
+interface MapCanvas2D {
+  fillStyle: string;
+  strokeStyle: string;
+  lineWidth: number;
+  font: string;
+  clearRect(x: number, y: number, w: number, h: number): void;
+  fillRect(x: number, y: number, w: number, h: number): void;
+  strokeRect(x: number, y: number, w: number, h: number): void;
+  beginPath(): void;
+  moveTo(x: number, y: number): void;
+  lineTo(x: number, y: number): void;
+  arc(x: number, y: number, r: number, a0: number, a1: number): void;
+  closePath(): void;
+  fill(): void;
+  stroke(): void;
+  save(): void;
+  restore(): void;
+  translate(x: number, y: number): void;
+  rotate(rad: number): void;
+  fillText(text: string, x: number, y: number): void;
+  drawImage(img: unknown, x: number, y: number, w: number, h: number): void;
+  createImageData(w: number, h: number): { data: Uint8ClampedArray; width: number; height: number };
+  putImageData(img: { data: Uint8ClampedArray; width: number; height: number }, x: number, y: number): void;
+}
+
+/** Canvas size of the topographic relief raster (Spec 21 §2.5: 512×512). */
+export const HUD_TOPO_CANVAS_PX = 512;
+/** Elevation contour interval (metres) drawn on the relief canvas. */
+export const HUD_TOPO_CONTOUR_STEP_M = 10;
+/** Colour per resource kind (Spec 21 §2.5 icon legend). */
+export const HUD_TOPO_RESOURCE_COLORS: Readonly<Record<string, string>> = {
+  water_ice: '#38e1ff', // cyan
+  helium_3: '#ff9a2e', // orange
+  titanium: '#d7dde6', // silver
+  rare_earth: '#b46bff', // violet
+  regolith: '#9a9a9a', // grey
+};
 
 export interface LunarHUDOptions {
   /** Document to build into (injected by headless harnesses). */
@@ -486,6 +585,21 @@ export class LunarHUD {
   /** Last hint-arrow payload painted (harness / integration readback). */
   private hintArrowData: HudHintArrowData | null = null;
 
+  /** Spec 21 §2.5 — holographic topographic map overlay state. */
+  private mapVisible = false;
+  /** Last map frame handed to `updateMap` (harness readback). */
+  private lastMapState: TopoMapState | null = null;
+  /** Contour-raster cache: re-rendered only when centre/zoom/elevation move. */
+  private mapTerrainRendered = false;
+  /** The 512×512 tactical canvas element. */
+  private mapCanvasEl: MapCanvasHost | null = null;
+  /** Scratch canvas used to sample the elevation raster. */
+  private mapRasterScratch: MapCanvasHost | null = null;
+  /** Raster image last blitted into the visible canvas. */
+  private mapTerrainImage: unknown = null;
+  private mapRasterCenter = { x: 0, y: 0 };
+  private mapRasterZoom = 1;
+
   constructor(options: LunarHUDOptions = {}) {
     const doc = (options.document ?? (globalThis as { document?: unknown }).document) as
       | Documentish
@@ -523,6 +637,7 @@ export class LunarHUD {
     this.buildTutorial();
     this.buildCommsPanel();
     this.buildHintArrow();
+    this.buildMapOverlay();
     this.buildTradeTerminal(options.commodities ?? HUD_DEFAULT_COMMODITIES);
 
     // Escape closes the terminal even if ClientApp's own listener is absent.
@@ -1382,6 +1497,21 @@ export class LunarHUD {
     strip.appendChild(this.labeledField('credits', 'CREDITS', '0'));
     strip.appendChild(this.labeledField('net', 'LINK', 'OFFLINE'));
     strip.appendChild(this.labeledField('status', 'STATUS', 'booting'));
+    // Spec 21 §2.5 — clickable [MAP] toggle in the status bar (the on-foot /
+    // in-vehicle keyboard binding is [M]; the pad uses View/Back or D-Down).
+    const mapButton = this.make(
+      'button',
+      'lunar-hud-map-button',
+      'hud-map-button',
+      'map-button',
+    );
+    mapButton.textContent = '[MAP]';
+    mapButton.setAttribute('type', 'button');
+    mapButton.setAttribute('aria-label', 'Toggle tactical topographic map');
+    if (typeof mapButton.addEventListener === 'function') {
+      mapButton.addEventListener('click', () => this.toggleMap());
+    }
+    strip.appendChild(mapButton);
   }
 
   /**
@@ -1829,6 +1959,379 @@ export class LunarHUD {
   }
 
   // -- element helpers ---------------------------------------------------------------
+
+  // --------------------------------------------------------------- map
+  /**
+   * Spec 21 §2.5 — build the fullscreen glassmorphic tactical map overlay.
+   * The 512×512 canvas hosts the shaded-relief/contour raster plus the icon
+   * layer; a DOM legend sits under it. Hidden until `toggleMap()`/`showMap()`.
+   */
+  private buildMapOverlay(): void {
+    const overlay = this.make(
+      'div',
+      'lunar-map-overlay',
+      'lunar-map-overlay is-hidden',
+      'map-overlay',
+    );
+    const frame = this.make('div', undefined, 'hud-map-frame', 'map-frame');
+    const title = this.make('div', undefined, 'hud-map-title', 'map-title');
+    title.textContent = 'Lunar Surface — Tactical Topo';
+    frame.appendChild(title);
+
+    const canvasEl = this.doc.createElement('canvas') as Elementish & {
+      width?: number;
+      height?: number;
+      getContext?: (kind: string) => unknown;
+    };
+    canvasEl.setAttribute('class', 'hud-map-canvas');
+    canvasEl.setAttribute('id', 'lunar-map-canvas');
+    canvasEl.width = HUD_TOPO_CANVAS_PX;
+    canvasEl.height = HUD_TOPO_CANVAS_PX;
+    this.mapCanvasEl = canvasEl;
+    frame.appendChild(canvasEl as Elementish);
+
+    const legend = this.make('div', undefined, 'hud-map-legend', 'map-legend');
+    legend.textContent =
+      '■ BASE  ○ SHAFT  ▲ YOU  ● vein: ' +
+      'ice/he3/ti/ree/regolith  ─ rail  ▮ train';
+    frame.appendChild(legend);
+
+    const controlsRow = this.make('div', undefined, 'hud-map-controls', 'map-controls');
+    const closeButton = this.make(
+      'button',
+      'lunar-map-close',
+      'hud-map-close',
+      'map-close-button',
+    );
+    closeButton.textContent = '[CLOSE MAP]';
+    closeButton.setAttribute('type', 'button');
+    if (typeof closeButton.addEventListener === 'function') {
+      closeButton.addEventListener('click', () => this.hideMap());
+    }
+    controlsRow.appendChild(closeButton);
+    const hint = this.make('div', undefined, 'hud-map-hint', 'map-hint');
+    hint.textContent = '[M] / View / D-Pad ▼ — close map';
+    controlsRow.appendChild(hint);
+    frame.appendChild(controlsRow);
+
+    overlay.appendChild(frame);
+    this.root.appendChild(overlay);
+  }
+
+  /** Spec 21 §2.5 — flip the map visibility; returns the new visible flag. */
+  toggleMap(): boolean {
+    if (this.mapVisible) {
+      this.hideMap();
+    } else {
+      this.showMap();
+    }
+    return this.mapVisible;
+  }
+
+  /** Spec 21 §2.5 — show the map overlay (repaints the last frame if any). */
+  showMap(): void {
+    this.mapVisible = true;
+    this.setClass('map-overlay', 'is-hidden', false);
+    if (this.lastMapState) this.renderMap(this.lastMapState);
+  }
+
+  /** Spec 21 §2.5 — hide the map overlay. */
+  hideMap(): void {
+    this.mapVisible = false;
+    this.setClass('map-overlay', 'is-hidden', true);
+  }
+
+  /** Spec 21 §2.5 — current visibility of the overlay. */
+  isMapVisible(): boolean {
+    return this.mapVisible;
+  }
+
+  /**
+   * Spec 21 §2.5 — paint one tactical frame. The heavy 512×512 elevation
+   * raster (contours + shaded relief from `elevationAt`) is cached and only
+   * re-sampled when the centre/zoom move past a threshold; POIs, rails, the
+   * train pip and the player arrowhead repaint every call. Safe on the
+   * headless harness: with no 2D context available it records state only.
+   */
+  updateMap(data: TopoMapState): void {
+    this.lastMapState = data;
+    if (this.mapVisible) this.renderMap(data);
+  }
+
+  /** Last frame handed to `updateMap` (harness readback). */
+  getMapState(): TopoMapState | null {
+    return this.lastMapState;
+  }
+
+  /** True once the elevation raster has been sampled at least once. */
+  isMapTerrainRendered(): boolean {
+    return this.mapTerrainRendered;
+  }
+
+  /** Resolve the 2D context of the map canvas (null on headless harness). */
+  private mapContext2D(): MapCanvas2D | null {
+    const el = this.mapCanvasEl;
+    if (!el || typeof el.getContext !== 'function') return null;
+    const ctx = el.getContext('2d') as MapCanvas2D | null;
+    return ctx && typeof ctx.fillRect === 'function' ? ctx : null;
+  }
+
+  /** Re-sample elevation when centre/zoom drifted beyond this (world m). */
+  private static readonly MAP_RASTER_DRIFT_M = 6;
+
+  private renderMap(data: TopoMapState): void {
+    const ctx = this.mapContext2D();
+    const el = this.mapCanvasEl;
+    if (!ctx || !el) return;
+    const px = typeof el.width === 'number' && el.width > 0 ? el.width : HUD_TOPO_CANVAS_PX;
+    const half = px / 2;
+    const scale = (px * data.zoom) / data.worldSizeM; // world m → canvas px
+    const toCanvas = (wx: number, wy: number): [number, number] => [
+      half + (wx - data.center.x) * scale,
+      half - (wy - data.center.y) * scale,
+    ];
+
+    // ---- background + cached terrain raster ------------------------------
+    ctx.clearRect(0, 0, px, px);
+    ctx.fillStyle = '#04121a';
+    ctx.fillRect(0, 0, px, px);
+
+    const drift =
+      Math.hypot(
+        data.center.x - this.mapRasterCenter.x,
+        data.center.y - this.mapRasterCenter.y,
+      ) + Math.abs(data.zoom - this.mapRasterZoom) * 200;
+    if (!this.mapTerrainRendered || drift > LunarHUD.MAP_RASTER_DRIFT_M) {
+      this.rasterizeTerrain(data, px);
+      this.mapRasterCenter = { x: data.center.x, y: data.center.y };
+      this.mapRasterZoom = data.zoom;
+    }
+    if (this.mapTerrainImage) {
+      try {
+        ctx.drawImage(this.mapTerrainImage as never, 0, 0, px, px);
+      } catch {
+        /* harness without Image support — vector layers still draw */
+      }
+    }
+
+    // ---- crater relief rings ---------------------------------------------
+    ctx.strokeStyle = 'rgba(96, 220, 255, 0.55)';
+    ctx.lineWidth = 1;
+    for (const crater of data.craters ?? []) {
+      const [cx, cy] = toCanvas(crater.x, crater.y);
+      for (const ring of [1, 0.72, 0.45]) {
+        ctx.beginPath();
+        ctx.arc(cx, cy, Math.max(1, crater.radius * scale * ring), 0, Math.PI * 2);
+        ctx.stroke();
+      }
+    }
+
+    // ---- rail polylines ----------------------------------------------------
+    ctx.strokeStyle = 'rgba(255, 196, 88, 0.8)';
+    ctx.lineWidth = 1.6;
+    for (const line of data.railLines ?? []) {
+      if (line.points.length < 2) continue;
+      ctx.beginPath();
+      const [x0, y0] = toCanvas(line.points[0]!.x, line.points[0]!.y);
+      ctx.moveTo(x0, y0);
+      for (let k = 1; k < line.points.length; k++) {
+        const [xk, yk] = toCanvas(line.points[k]!.x, line.points[k]!.y);
+        ctx.lineTo(xk, yk);
+      }
+      ctx.stroke();
+    }
+
+    // ---- POIs ---------------------------------------------------------------
+    for (const poi of data.pois) {
+      const [x, y] = toCanvas(poi.x, poi.y);
+      if (x < -24 || y < -24 || x > px + 24 || y > px + 24) continue;
+      const color =
+        poi.color ??
+        (poi.resourceKind
+          ? HUD_TOPO_RESOURCE_COLORS[poi.resourceKind] ?? '#9a9a9a'
+          : '#38e1ff');
+      switch (poi.kind) {
+        case 'base': {
+          ctx.fillStyle = color;
+          ctx.fillRect(x - 5, y - 5, 10, 10);
+          ctx.strokeStyle = '#0affc0';
+          ctx.lineWidth = 1;
+          ctx.strokeRect(x - 7, y - 7, 14, 7);
+          break;
+        }
+        case 'portal': {
+          ctx.strokeStyle = '#ffd23f';
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.arc(x, y, 5, 0, Math.PI * 2);
+          ctx.stroke();
+          ctx.beginPath();
+          ctx.arc(x, y, 1.6, 0, Math.PI * 2);
+          ctx.fillStyle = '#ffd23f';
+          ctx.fill();
+          break;
+        }
+        case 'vault': {
+          ctx.strokeStyle = '#ff4d5e';
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.arc(x, y, 4.5, 0, Math.PI * 2);
+          ctx.stroke();
+          ctx.fillStyle = '#ff4d5e';
+          ctx.fillRect(x - 1.5, y - 8, 3, 4);
+          break;
+        }
+        case 'mining_vein': {
+          ctx.fillStyle = color;
+          ctx.beginPath();
+          ctx.arc(x, y, 3.2, 0, Math.PI * 2);
+          ctx.fill();
+          break;
+        }
+        case 'train': {
+          ctx.fillStyle = '#ffb347';
+          ctx.fillRect(x - 3, y - 2, 6, 4);
+          break;
+        }
+        case 'scrap': {
+          ctx.fillStyle = 'rgba(200,200,200,0.8)';
+          ctx.fillRect(x - 1.5, y - 1.5, 3, 3);
+          break;
+        }
+        default:
+          break;
+      }
+    }
+
+    // ---- live train pip ------------------------------------------------------
+    if (data.train) {
+      const [tx, ty] = toCanvas(data.train.x, data.train.y);
+      ctx.fillStyle = '#ff8c1a';
+      ctx.strokeStyle = '#fff2d6';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.arc(tx, ty, 4, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+    }
+
+    // ---- player arrowhead (yaw) ----------------------------------------------
+    const pl = data.pois.find((p) => p.kind === 'player');
+    if (pl) {
+      const [pxp, pyp] = toCanvas(pl.x, pl.y);
+      // world heading (rad, +y north) → canvas rotation (canvas y-down)
+      const rot = (pl.heading ?? 0) - Math.PI / 2;
+      ctx.save();
+      ctx.translate(pxp, pyp);
+      ctx.rotate(rot + Math.PI); // arrow glyph drawn pointing +x ⇒ align it
+      ctx.fillStyle = '#0affc0';
+      ctx.strokeStyle = '#04121a';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(9, 0);
+      ctx.lineTo(-6, 6);
+      ctx.lineTo(-3, 0);
+      ctx.lineTo(-6, -6);
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    // ---- reticle + frame ------------------------------------------------------
+    ctx.strokeStyle = 'rgba(56, 225, 255, 0.35)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.arc(half, half, half - 2, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.fillStyle = '#38e1ff';
+    ctx.font = '12px monospace';
+    ctx.fillText('N', half - 4, 14);
+    ctx.fillText(
+      `${Math.round(data.worldSizeM / Math.max(data.zoom, 0.001))} m across`,
+      10,
+      px - 10,
+    );
+  }
+
+  /**
+   * Sample `elevationAt` on a coarse grid and paint shaded relief + contour
+   * lines into the offscreen raster cache. Cheap 128×128 sampling keeps the
+   * per-frame cost negligible; the raster is upscaled via drawImage.
+   */
+  private rasterizeTerrain(data: TopoMapState, outPx: number): void {
+    const SAMPLES = 128;
+    if (typeof data.elevationAt !== 'function') {
+      this.mapTerrainRendered = true;
+      this.mapTerrainImage = null;
+      return;
+    }
+    if (!this.mapRasterScratch) {
+      const c = this.doc.createElement('canvas') as Elementish & {
+        width?: number;
+        height?: number;
+        getContext?: (kind: string) => unknown;
+      };
+      c.width = SAMPLES;
+      c.height = SAMPLES;
+      this.mapRasterScratch = c;
+    }
+    const scratch = this.mapRasterScratch;
+    const sctx = (scratch.getContext as (k: string) => MapCanvas2D | null)?.call(
+      scratch,
+      '2d',
+    );
+    if (!sctx || typeof sctx.createImageData !== 'function') {
+      this.mapTerrainRendered = true;
+      return;
+    }
+    const span = data.worldSizeM / Math.max(data.zoom, 0.001);
+    const x0 = data.center.x - span / 2;
+    const y1 = data.center.y + span / 2;
+    const step = span / (SAMPLES - 1);
+
+    // elevations first (reused for gradient shading)
+    const elev = new Float32Array(SAMPLES * SAMPLES);
+    for (let j = 0; j < SAMPLES; j++) {
+      for (let i = 0; i < SAMPLES; i++) {
+        elev[j * SAMPLES + i] = data.elevationAt(x0 + i * step, y1 - j * step);
+      }
+    }
+    const img = sctx.createImageData(SAMPLES, SAMPLES);
+    const d = img.data as Uint8ClampedArray;
+    for (let j = 0; j < SAMPLES; j++) {
+      for (let i = 0; i < SAMPLES; i++) {
+        const e = elev[j * SAMPLES + i]!;
+        const eR = elev[j * SAMPLES + Math.min(i + 1, SAMPLES - 1)]!;
+        const eD = elev[Math.min(j + 1, SAMPLES - 1) * SAMPLES + i]!;
+        // shaded relief: light from north-west
+        const shade = Math.max(-1, Math.min(1, ((eR - e) + (eD - e)) * 0.09));
+        const base = 14 + Math.max(0, Math.min(48, e * 0.5));
+        const lum = Math.max(0, Math.min(90, base + shade * 46));
+        // contour lines where the 10 m band index changes
+        const band = Math.floor(e / HUD_TOPO_CONTOUR_STEP_M);
+        const bandR = Math.floor(eR / HUD_TOPO_CONTOUR_STEP_M);
+        const bandD = Math.floor(eD / HUD_TOPO_CONTOUR_STEP_M);
+        const isContour = band !== bandR || band !== bandD;
+        const idx = (j * SAMPLES + i) * 4;
+        if (isContour) {
+          d[idx] = 64;
+          d[idx + 1] = 200;
+          d[idx + 2] = 235;
+          d[idx + 3] = 235;
+        } else {
+          d[idx] = 4 + lum * 0.25;
+          d[idx + 1] = 18 + lum * 0.7;
+          d[idx + 2] = 26 + lum;
+          d[idx + 3] = 215;
+        }
+      }
+    }
+    sctx.putImageData(img, 0, 0);
+    this.mapTerrainImage = scratch;
+    this.mapTerrainRendered = true;
+    void outPx;
+  }
 
   /**
    * Create an element. `id` becomes the DOM id (styled by hud.css); `key` is

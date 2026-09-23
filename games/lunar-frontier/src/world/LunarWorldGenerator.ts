@@ -75,6 +75,37 @@ export const RESOURCE_KINDS: readonly ResourceKind[] = [
   'rare_earth',
 ];
 
+// ---------------------------------------------------------------------------
+// Surface detritus & scrap components (Spec 21 §2.1)
+// ---------------------------------------------------------------------------
+
+export type ScrapArchetype = 'lander_wreck' | 'mining_rig' | 'junk_pile';
+
+export interface ScrapComponent {
+  id: string;
+  name: string;
+  massKg: number;
+  valueCredits: number;
+  icon: string;
+}
+
+export interface ScrapSite {
+  id: string;
+  archetype: ScrapArchetype;
+  position: Vec3;
+  harvested: boolean;
+  components: ScrapComponent[];
+  boundingRadiusM: number;
+}
+
+export const SCRAP_CATALOG: readonly ScrapComponent[] = [
+  { id: 'titanium_strut', name: 'Titanium Structural Strut', massKg: 12, valueCredits: 150, icon: '🔩' },
+  { id: 'fluid_coupler', name: 'Jury-Rigged Fluid Coupler', massKg: 5, valueCredits: 220, icon: '🧰' },
+  { id: 'solar_wafer', name: 'Auxiliary Solar Wafer', massKg: 2, valueCredits: 340, icon: '☀️' },
+  { id: 'fuel_cell', name: 'Depleted Fuel Cell Core', massKg: 18, valueCredits: 450, icon: '🔋' },
+  { id: 'pcb', name: 'Scrap Avionics PCB', massKg: 1, valueCredits: 500, icon: '📟' },
+];
+
 /** Extraction rigs: EVA hand-drill, buggy-mounted loader, rail freight hopper. */
 export type ExtractionMode = 'suit' | 'buggy' | 'freight';
 
@@ -166,6 +197,7 @@ export interface WorldStats {
   veins: Record<ResourceKind, number>;
   unitsInGround: Record<ResourceKind, number>;
   deepestTunnelZ: number;
+  scrapSites: number;
 }
 
 export interface WorldSnapshot {
@@ -180,6 +212,7 @@ export interface WorldSnapshot {
   tunnels: TunnelSegment[];
   veins: ResourceVein[];
   railRoutes: RailRoute[];
+  scrapSites: ScrapSite[];
   stats: WorldStats;
 }
 
@@ -825,6 +858,9 @@ export class LunarWorldGenerator {
     let deepest = 0;
     for (const t of tunnels) deepest = Math.min(deepest, t.start.z, t.end.z);
 
+    const scrapRng = new Random(`${this.seed}#scrap`);
+    const scrapSites = this.buildScrapSites(scrapRng, sectors, craters, nodes, elev, width, height);
+
     const stats: WorldStats = {
       sectors: sectors.length,
       craters: craters.length,
@@ -836,6 +872,7 @@ export class LunarWorldGenerator {
       veins: veinsByKind(),
       unitsInGround: unitsByKind(),
       deepestTunnelZ: deepest,
+      scrapSites: scrapSites.length,
     };
 
     this.snapshot = {
@@ -849,6 +886,7 @@ export class LunarWorldGenerator {
       tunnels,
       veins,
       railRoutes,
+      scrapSites,
       stats,
     };
 
@@ -1783,6 +1821,105 @@ export class LunarWorldGenerator {
 
   private sectorLabel(col: number): string {
     return String.fromCharCode(65 + (col % 26));
+  }
+
+  /**
+   * Build scrap sites on the lunar surface (Spec 21 §2.1).
+   * Generates 16..22 scrap sites placed within 500m of surface nodes, crater rims,
+   * or sector centers.
+   */
+  private buildScrapSites(
+    rng: Random,
+    sectors: WorldSector[],
+    craters: Crater[],
+    nodes: LunarNode[],
+    elev: (x: number, y: number) => number,
+    width: number,
+    height: number,
+  ): ScrapSite[] {
+    const sites: ScrapSite[] = [];
+    const count = rng.int(16, 22);
+    const archetypes: ScrapArchetype[] = ['lander_wreck', 'mining_rig', 'junk_pile'];
+
+    const anchors: { x: number; y: number }[] = [];
+    for (const n of nodes) {
+      if (n.position.z >= -2) {
+        anchors.push({ x: n.position.x, y: n.position.y });
+      }
+    }
+    for (const c of craters) {
+      anchors.push({ x: c.center.x + c.radius, y: c.center.y });
+      anchors.push({ x: c.center.x - c.radius, y: c.center.y });
+    }
+    for (const s of sectors) {
+      anchors.push({ x: s.center.x, y: s.center.y });
+    }
+    if (anchors.length === 0) {
+      anchors.push({ x: width / 2, y: height / 2 });
+    }
+
+    for (let i = 0; i < count; i++) {
+      const anchor = anchors[rng.int(0, anchors.length - 1)];
+      const dist = rng.range(40, 480);
+      const angle = rng.range(0, Math.PI * 2);
+      const sx = Math.max(30, Math.min(width - 30, anchor.x + Math.cos(angle) * dist));
+      const sy = Math.max(30, Math.min(height - 30, anchor.y + Math.sin(angle) * dist));
+      const sz = elev(sx, sy);
+
+      const archetype = archetypes[i % archetypes.length];
+      const compCount = rng.int(1, 4);
+      const components: ScrapComponent[] = [];
+      for (let c = 0; c < compCount; c++) {
+        let catIdx = 0;
+        if (archetype === 'lander_wreck') {
+          catIdx = rng.int(1, 4);
+        } else if (archetype === 'mining_rig') {
+          catIdx = rng.int(0, 3);
+        } else {
+          catIdx = rng.int(0, SCRAP_CATALOG.length - 1);
+        }
+        const base = SCRAP_CATALOG[catIdx];
+        const valMult = 0.85 + rng.range(0, 0.3);
+        components.push({
+          id: `${base.id}-${i + 1}-${c + 1}`,
+          name: base.name,
+          massKg: base.massKg,
+          valueCredits: Math.round(base.valueCredits * valMult),
+          icon: base.icon,
+        });
+      }
+
+      sites.push({
+        id: `scrap-site-${(i + 1).toString().padStart(3, '0')}`,
+        archetype,
+        position: { x: sx, y: sy, z: sz },
+        harvested: false,
+        components,
+        boundingRadiusM: 3.5 + compCount * 0.5,
+      });
+    }
+
+    return sites;
+  }
+
+  /** Get nearby scrap sites within radius (default 500m). */
+  getNearbyScrapSites(pos: Vec3, radiusM: number = 500): ScrapSite[] {
+    const snap = this.world();
+    return snap.scrapSites.filter((site) => {
+      const dx = site.position.x - pos.x;
+      const dy = site.position.y - pos.y;
+      const dz = site.position.z - pos.z;
+      return Math.sqrt(dx * dx + dy * dy + dz * dz) <= radiusM;
+    });
+  }
+
+  /** Harvest a scrap site and return its components. Marks site as harvested. */
+  salvageScrapSite(siteId: string): ScrapComponent[] | null {
+    const snap = this.world();
+    const site = snap.scrapSites.find((s) => s.id === siteId);
+    if (!site || site.harvested) return null;
+    site.harvested = true;
+    return structuredClone(site.components);
   }
 }
 

@@ -75,6 +75,17 @@ export const HEADLIGHT_ANGLE_DEG = 58;
 /** Headlight beam range, metres. */
 export const HEADLIGHT_RANGE_M = 65;
 
+// -- Dual-stage floodlights (Spec 21 §2.2) -----------------------------------
+/** Low-beam flood: wide 85° cone, 45m throw, 2.8 intensity. */
+export const LOW_BEAM_INTENSITY = 2.8;
+export const LOW_BEAM_ANGLE_DEG = 85;
+export const LOW_BEAM_RANGE_M = 45;
+
+/** High-beam spot: narrow 42° piercing beam, 120m throw, 4.5 intensity. */
+export const HIGH_BEAM_INTENSITY = 4.5;
+export const HIGH_BEAM_ANGLE_DEG = 42;
+export const HIGH_BEAM_RANGE_M = 120;
+
 /** Coilover spring body length scale at full droop (compression = 0). */
 export const COIL_SCALE_DROOP = 1.15;
 /** Coilover spring body length scale at the bump stop (compression = 1). */
@@ -576,6 +587,24 @@ export class OpenBuggy {
     return this.last.batteryKwh;
   }
 
+  /** Traction pack ceiling, kWh (grows with the Spec 21 §2.4 fuel cell). */
+  getBatteryCapacity(): number {
+    return this.physics.getBatteryCapacity();
+  }
+
+  /**
+   * Spec 21 §2.4 vault loot: fit an auxiliary fuel cell (+`extraKwh` to the
+   * pack ceiling, charge restored to 100 %). Returns the new capacity.
+   */
+  upgradeFuelCell(extraKwh = 15): number {
+    const cap = this.physics.upgradeBatteryCapacity(extraKwh);
+    // The physics pack was mutated in place (capacity + full charge) — pull
+    // the mirror so `getBattery()`/telemetry read the restored pack NOW,
+    // not the stale pre-upgrade frame (Spec 21 §2.4).
+    this.last = this.physics.getState();
+    return cap;
+  }
+
   /** Full physics state copy. */
   getState(): BuggyState {
     return this.physics.getState();
@@ -605,7 +634,7 @@ export class OpenBuggy {
       pitch: s.pitch,
       roll: s.roll,
       battery: s.batteryKwh,
-      batteryFraction: clamp(s.batteryKwh / BUGGY_BATTERY_KWH, 0, 1),
+      batteryFraction: clamp(s.batteryKwh / this.physics.getBatteryCapacity(), 0, 1),
       cargoMass: s.cargoMass,
       cargoFraction: this.getCargoMassFraction(),
       totalMass: this.physics.totalMass,
@@ -1391,22 +1420,40 @@ export class OpenBuggy {
       mesh.receiveShadows = false;
     }
 
-    // Headlights stay UNPARENTED and get their world position recomputed from
-    // the root matrix every frame (see applyLamps), so both beams remain
-    // truthful under NullEngine where no render loop propagates parenting.
-    this.lamps = LAMP_POINTS.map((_, index) => {
-      const lamp = new SpotLight(
-        `${p}-headlight-${index === 0 ? 'l' : 'r'}`,
+    // Dual-stage headlights (Spec 21 §2.2):
+    // For each mount point (L/R), create:
+    // 1. Low-beam flood (wide 85° cone, 45m throw, 2.8 intensity)
+    // 2. High-beam spot (narrow 42° cone, 120m throw, 4.5 intensity)
+    // Headlights stay UNPARENTED and get their world position and chassis-matrix
+    // beam direction recomputed every frame (see applyLamps).
+    const lamps: SpotLight[] = [];
+    for (let index = 0; index < LAMP_POINTS.length; index++) {
+      const side = index === 0 ? 'l' : 'r';
+      const lowLamp = new SpotLight(
+        `${p}-headlight-${side}-low`,
         LAMP_POINTS[index].clone(),
-        new Vector3(0, 0, 1),
-        (HEADLIGHT_ANGLE_DEG * Math.PI) / 180,
+        new Vector3(0, -0.07, 1).normalize(),
+        (LOW_BEAM_ANGLE_DEG * Math.PI) / 180,
         2,
         scene,
       );
-      lamp.range = HEADLIGHT_RANGE_M;
-      lamp.diffuse = new Color3(1, 0.96, 0.86);
-      return lamp;
-    });
+      lowLamp.range = LOW_BEAM_RANGE_M;
+      lowLamp.diffuse = new Color3(1, 0.96, 0.88);
+      lamps.push(lowLamp);
+
+      const highLamp = new SpotLight(
+        `${p}-headlight-${side}-high`,
+        LAMP_POINTS[index].clone(),
+        new Vector3(0, -0.07, 1).normalize(),
+        (HIGH_BEAM_ANGLE_DEG * Math.PI) / 180,
+        2,
+        scene,
+      );
+      highLamp.range = HIGH_BEAM_RANGE_M;
+      highLamp.diffuse = new Color3(1, 0.98, 0.92);
+      lamps.push(highLamp);
+    }
+    this.lamps = lamps;
   }
 
   /**
@@ -1711,16 +1758,23 @@ export class OpenBuggy {
     const root = this.root;
     if (root === null) return;
 
-    // Physics-forward (cos h, sin h, 0) → Babylon (cos h, 0, -sin h).
-    this.scratchAim.set(Math.cos(state.heading), 0, -Math.sin(state.heading));
+    // Spec 21 §2.2 / ADR-021-2: Recompute spotlight beam directions dynamically from the
+    // buggy chassis orientation matrix, incorporating true pitch and roll:
+    // d_beam = R_chassis * (0, -0.07, 1) normalized (-4° downward depression to illuminate dips)
     const matrix = root.getWorldMatrix();
-    const intensity = this.lampOn ? HEADLIGHT_INTENSITY : 0;
+    const localAim = new Vector3(0, -0.07, 1).normalize();
+    Vector3.TransformNormalToRef(localAim, matrix, this.scratchAim);
+    this.scratchAim.normalize();
 
     for (let i = 0; i < this.lamps.length; i++) {
-      Vector3.TransformCoordinatesToRef(LAMP_POINTS[i], matrix, this.scratchPoint);
+      const lampPointIdx = Math.floor(i / 2);
+      const isHighBeam = (i % 2) === 1;
+      Vector3.TransformCoordinatesToRef(LAMP_POINTS[lampPointIdx], matrix, this.scratchPoint);
       this.lamps[i].position.copyFrom(this.scratchPoint);
       this.lamps[i].direction.copyFrom(this.scratchAim);
-      this.lamps[i].intensity = intensity;
+      this.lamps[i].intensity = this.lampOn
+        ? (isHighBeam ? HIGH_BEAM_INTENSITY : LOW_BEAM_INTENSITY)
+        : 0;
     }
   }
 

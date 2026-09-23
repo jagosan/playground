@@ -94,7 +94,11 @@ const earthshine = scene.lights.find((l) => l.name === 'earthshine');
 check('stark sun DirectionalLight present', sun !== undefined && sun.getClassName() === 'DirectionalLight');
 check('sun intensity is harsh (> 2)', sun !== undefined && sun.intensity > 2);
 check('earthshine hemispheric fill present', earthshine !== undefined && earthshine.getClassName() === 'HemisphericLight');
-check('earthshine intensity ~0.08', earthshine !== undefined && Math.abs(earthshine.intensity - 0.08) < 1e-6);
+check(
+  'earthshine intensity 0.24 (Spec 21 §2.2 rebalance)',
+  earthshine !== undefined && Math.abs(earthshine.intensity - 0.24) < 1e-6,
+);
+check('sun intensity 2.2 (Spec 21 §2.2 rebalance)', sun !== undefined && Math.abs(sun.intensity - 2.2) < 1e-6);
 check('earthshine hue is blue-dominant', (() => {
   if (earthshine === undefined) return false;
   const d = earthshine.diffuse;
@@ -115,11 +119,12 @@ check('regolith roughness 0.94', (() => {
   if (regolith === undefined || regolith === null) return false;
   return Math.abs((regolith as { roughness?: number }).roughness! - 0.94) < 1e-6;
 })());
-check('regolith emissive is minimal shadow lift (no flat ambient)', (() => {
+check('regolith emissive floor lifts shadow faces (Spec 21 §2.2)', (() => {
   if (regolith === undefined || regolith === null) return false;
   const e = (regolith as { emissiveColor?: { r: number; g: number; b: number } }).emissiveColor;
+  // Spec 21 §2.2 mandates the elevated minimum emissive floor exactly.
   return e !== undefined
-    && Math.abs(e.r - 0.015) < 1e-6 && Math.abs(e.g - 0.015) < 1e-6 && Math.abs(e.b - 0.018) < 1e-6
+    && Math.abs(e.r - 0.035) < 1e-6 && Math.abs(e.g - 0.035) < 1e-6 && Math.abs(e.b - 0.038) < 1e-6
     && e.r < 0.05;
 })());
 check('normal map UV-tiled 64× with level 2.4', (() => {
@@ -471,11 +476,16 @@ section('3b. dynamic shadow focus tracking');
 section('4. entity add / remove');
 
 const crate = MeshBuilder.CreateBox('ore-crate', { size: 1.2 }, scene);
+const entitiesBeforeAdd = world.getEntities().length; // Spec 21 §2.1 scrap sites pre-register
 world.addEntity(crate);
 check('entity registered', world.getEntities().includes(crate));
 check('entity parented to world root', crate.parent?.name === 'world-root');
 world.addEntity(crate); // idempotent
-check('double-add does not duplicate', world.getEntities().length === 1);
+check(
+  'double-add does not duplicate',
+  world.getEntities().length === entitiesBeforeAdd + 1,
+  `${entitiesBeforeAdd} -> ${world.getEntities().length}`,
+);
 check('removeEntity returns true', world.removeEntity(crate) === true);
 check('entity unregistered', !world.getEntities().includes(crate));
 check('orphan remove returns false', world.removeEntity(crate) === false);

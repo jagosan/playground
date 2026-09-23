@@ -55,8 +55,14 @@ import {
 } from './QuestEngine.ts';
 import { HintArrowSystem, type HintArrowTarget } from './HintArrowSystem.ts';
 import { FactionBases } from '../infrastructure/Factions.ts';
-import { TunnelNetwork } from '../infrastructure/TunnelNetwork.ts';
+import {
+  TunnelNetwork,
+  type VaultDoorRecord,
+  type VaultLootItem,
+  type VaultTerminalRecord,
+} from '../infrastructure/TunnelNetwork.ts';
 import { RailSystem } from '../infrastructure/RailSystem.ts';
+import type { OreCartEntity } from '../infrastructure/RailSystem.ts';
 import {
   BUGGY_MAX_CARGO,
   BUGGY_SPEED_LIMIT,
@@ -84,7 +90,8 @@ import LunarHUD, {
   type HudScannerReadout,
   type HudTradeRequest,
 } from '../ui/LunarHUD.ts';
-import type { ResourceVein } from '../world/LunarWorldGenerator.ts';
+import type { ResourceVein, ScrapSite } from '../world/LunarWorldGenerator.ts';
+import type { TopoMapPOI, TopoMapState } from '../ui/LunarHUD.ts';
 
 // ---------------------------------------------------------------------------
 // Tunables
@@ -105,6 +112,23 @@ export const NAV_SCAN_RANGE_M = 1200;
 
 /** Vein surface distance within which the geo-drill reaches, metres. */
 export const MINE_RANGE_M = 25;
+
+/**
+ * Spec 21 §2.4: how close the prospectors must stand to a vault security
+ * terminal before the `[E] / (X) Interface Security Terminal` prompt fires.
+ */
+export const VAULT_TERMINAL_RANGE_M = 3.5;
+
+/**
+ * Spec 21 §2.6: a candidate device needs at least this many buttons and
+ * axes before the latch will honour it — kills dead virtual/sensor nodes
+ * GPD Win / Steam Deck enumerations park at index 0.
+ */
+export const GAMEPAD_MIN_BUTTONS = 6;
+export const GAMEPAD_MIN_AXES = 2;
+
+/** Spec 21 §2.5: tactical map refresh cadence (seconds between POI rebuilds). */
+export const MAP_REFRESH_INTERVAL_S = 0.5;
 
 /** Units pulled from the vein per trigger pull. */
 export const MINE_AMOUNT = 20;
@@ -259,6 +283,12 @@ export const GAMEPAD_BUTTONS: Readonly<{
   sprintLeft: number;
   sprintLeftAlt: number;
   comms: number;
+  /** Spec 21 §2.5: View/Back raises the tactical map. */
+  map: number;
+  /** Spec 21 §2.5: Select also raises the map (handheld reach). */
+  mapAlt: number;
+  /** Spec 21 §2.5: D-Pad Down raises the map (D-Pad Up is comms). */
+  mapDown: number;
 }> = {
   jump: 0, // A (jump on foot / handbrake in the buggy)
   trade: 1, // B
@@ -271,6 +301,9 @@ export const GAMEPAD_BUTTONS: Readonly<{
   sprintLeftAlt: 10, // L3
   camera: 11, // R3 (spec 19)
   comms: 12, // D-Pad Up (spec 19)
+  map: 8, // View / Back (spec 21 §2.5)
+  mapAlt: 9, // Select (spec 21 §2.5)
+  mapDown: 13, // D-Pad Down (spec 21 §2.5)
 };
 
 /** Buggy parks this far from the spawn collar, metres. */
@@ -305,7 +338,9 @@ export const ACTION_KEYS: Readonly<Record<string, string>> = {
   KeyE: 'mount',
   KeyF: 'headlight',
   KeyV: 'camera',
-  KeyM: 'mine',
+  // Spec 21 §2.5: [M] raises the holographic topographic map. The geo-drill
+  // keeps (RB)/RB, the proximity prompt, and `mineNearestVein()` (public API).
+  KeyM: 'map',
   KeyC: 'claim',
   KeyT: 'trade',
   // Spec 17 Phase 4: environment toggle — Earth Proving Grounds ⇄ Lunar.
@@ -655,6 +690,8 @@ export class ClientApp {
    */
   private prevGamepadButtons: boolean[] = [];
   private lastGamepadButtons: boolean[] = [];
+  /** Spec 21 §2.6: hot-plug listener attach flag (attach/detach guard). */
+  private gamepadHotplugAttached = false;
 
   /**
    * Spec 19 §2.1.1 / ADR-1 active-pad slot: the pad demonstrator of the most
@@ -746,11 +783,36 @@ export class ClientApp {
    */
   private readonly localInventory = new Map<string, number>();
 
+  /**
+   * Spec 21 §2.4: nearest vault security terminal inside
+   * {@link VAULT_TERMINAL_RANGE_M}, refreshed every HUD tick.
+   */
+  private nearestVaultTerminal: VaultTerminalRecord | null = null;
+  /** Vault doors whose state we've already announced (toasts once per door). */
+  private readonly announcedVaults = new Set<string>();
+
+  /**
+   * Spec 21 §2.6: has any qualified gamepad produced above-deadband input
+   * since boot? Drives the dormant `PRESS ANY BUTTON ON CONTROLLER TO
+   * ACTIVATE` prompt and the one-shot `GAMEPAD ACTIVE: <id>` toast.
+   */
+  private gamepadLatched = false;
+  /** Id of the pad currently latched ('' before the first latch). */
+  private gamepadLatchedId = '';
+  /** Cooldown so the dormant prompt re-shows at most every few seconds. */
+  private gamepadPromptCooldown = 0;
+  /** Static POI layer cache (bases/portals/veins/craters — built once). */
+  private mapStaticPois: TopoMapPOI[] | null = null;
+  /** Seconds since the last full tactical-map POI rebuild. */
+  private mapRefreshTimer = 0;
+
   private readonly remotes = new Map<string, RemoteAvatar>();
   private readonly claimMarkers = new Map<string, Mesh>();
   private factionBases: FactionBases | null = null;
   private tunnelNetwork: TunnelNetwork | null = null;
   private railSystem: RailSystem | null = null;
+  private trainState = { mode: 'cruising' as 'cruising' | 'dwelling', timer: 0 };
+  private cargoSiphonCooldown = 0;
   /** Spec 17 Phase 4: Earth track environment (built on first enable). */
   private provingGrounds: ProvingGroundsScene | null = null;
   /** Active environment: lunar surface vs. Earth proving grounds. */
@@ -856,6 +918,17 @@ export class ClientApp {
       this.factionBases = new FactionBases(snapshot).init(scene);
       this.tunnelNetwork = new TunnelNetwork(snapshot).init(scene);
       this.railSystem = new RailSystem(snapshot).init(scene);
+      
+      // Spec 21 §2.3: automated freight train consist on primary line
+      if (snapshot.railRoutes.length > 0) {
+        const routeId = snapshot.railRoutes[0].id;
+        const loco = this.railSystem.spawnCart(routeId, { kind: 'locomotive', mass: 12000 });
+        if (loco) loco.physics.setDistance(20);
+        const h1 = this.railSystem.spawnCart(routeId, { kind: 'hopper', load: 3000 });
+        if (h1) h1.physics.setDistance(16.5);
+        const h2 = this.railSystem.spawnCart(routeId, { kind: 'hopper', load: 3000 });
+        if (h2) h2.physics.setDistance(13);
+      }
     }
     this.traversal =
       snapshot !== null
@@ -962,6 +1035,7 @@ export class ClientApp {
 
     this.wireNetwork();
     this.attachDomInput();
+    this.attachGamepadHotplug();
 
     if (this.ownsNetwork && this.network !== null) {
       // Fire-and-forget: the `connected` handler performs the JOIN. A failed
@@ -997,8 +1071,10 @@ export class ClientApp {
     // Gamepad hotkey edges run before the physics step so an X-press mounts
     // this frame rather than the next (stepEntities → sampleInput refreshes
     // the button snapshot for the following frame).
+    this.pumpGamepadLatch(dt);
     this.pumpGamepadActions();
     this.stepEntities(dt);
+    this.stepRailSystem(dt);
     // Spec 17 Phase 4: step the circuit lap-timing state machine with the
     // freshly stepped buggy pose and repaint the lap HUD panel.
     this.pumpLapTiming(dt);
@@ -1012,6 +1088,8 @@ export class ClientApp {
     this.network?.update();
     this.syncRemoteAvatars();
     this.refreshScanner(timestamp);
+    this.pumpVaultProximity();
+    this.pumpTopoMap(dt);
     this.updateTutorialSensors();
     // Spec 18 §7 — quest sensors (foot/drive odometers + reach probes) run
     // after physics & camera sync so positions, positions-of-record and the
@@ -1193,7 +1271,29 @@ export class ClientApp {
     if (this.envMode === 'earth_proving_grounds' && this.provingGrounds !== null) {
       return this.provingGrounds.getTrackElevation(x, y);
     }
-    return this.world.getGroundHeightAt(x, y);
+    const surface = this.world.getGroundHeightAt(x, y);
+    // Spec 21 §2.4: once a body has descended into the tunnel/bunker
+    // interior, the walkable floor is the bore/chamber interior, not the
+    // surface heightfield overhead — otherwise one physics frame pops the
+    // suit back into the sky and the vault terminal (3.5 m reach) can never
+    // latch. The query body is the one horizontally closest to (x, y); a
+    // surface body never sees the interior floor of the column beneath it.
+    const network = this.tunnelNetwork;
+    if (network === null) return surface;
+    let z: number | null = null;
+    const suit = this.suit;
+    const buggy = this.buggy;
+    if (suit !== null && buggy !== null) {
+      const sp = suit.getPosition();
+      const bp = buggy.getPosition();
+      z = Math.hypot(sp.x - x, sp.y - y) <= Math.hypot(bp.x - x, bp.y - y) ? sp.z : bp.z;
+    } else if (suit !== null) z = suit.getPosition().z;
+    else if (buggy !== null) z = buggy.getPosition().z;
+    if (z !== null && z < surface - 0.5) {
+      const interior = network.getInteriorFloor({ x, y, z });
+      if (interior !== null) return interior;
+    }
+    return surface;
   }
 
   /**
@@ -1214,6 +1314,7 @@ export class ClientApp {
     this.disposed = true;
     this.stop();
     this.detachDomInput();
+    this.detachGamepadHotplug();
 
     for (const remote of this.remotes.values()) remote.entity.dispose();
     this.remotes.clear();
@@ -1438,6 +1539,8 @@ export class ClientApp {
     if (code === 'Escape') {
       if (phase === 'down') {
         if (tradeOpen) this.hud?.hideTradeDialog();
+        // Spec 21 §2.5: Escape dismisses the tactical map first.
+        else if (this.hud?.isMapVisible() ?? false) this.hud?.hideMap();
         else this.hud?.clearPrompts();
       }
       return true;
@@ -1804,14 +1907,44 @@ export class ClientApp {
     const prev = this.prevGamepadButtons;
     const rising = (index: number): boolean =>
       now[index] === true && prev[index] !== true;
+    // Spec 21 §2.5: the tactical map answers its buttons ON the press
+    // frame (the legacy sheet keeps its Spec 19 sample-then-fire frame).
+    // Poll a raw snapshot for the map edges only — `sampleInput()` stays
+    // the single shaping/stash point for everything else.
+    const mapPad = this.pollGamepad();
+    const mapNow = mapPad === null ? [] : mapPad.buttons.map((b) => b.pressed);
+    const risingMap = (index: number): boolean =>
+      mapNow[index] === true && now[index] !== true;
     const tradeOpen = this.hud?.isTradeDialogOpen() ?? false;
     try {
+      // Spec 21 §2.6: button edges belong to QUALIFIED devices only. A dead
+      // virtual/sensor node (< 6 buttons / < 2 axes) that enumerates live
+      // must never fire the action sheet — its phantom presses used to open
+      // the trade dialog behind the player's back before any real pad latch.
+      if (!this.gamepadLatched || !ClientApp.qualifiesAsGamepad(mapPad)) {
+        return;
+      }
       if (tradeOpen) {
         if (rising(GAMEPAD_BUTTONS.trade)) {
           this.inputSource = 'gamepad';
           this.toggleTradeTerminal();
         }
       } else {
+        // Spec 21 §2.5: while the map is up, View/Back/Select/D-Down and (B)
+        // all dismiss it; the rest of the sheet stays parked (the map owns
+        // the screen, mirroring the trade-terminal convention).
+        if (this.hud?.isMapVisible() ?? false) {
+          if (
+            risingMap(GAMEPAD_BUTTONS.map) ||
+            risingMap(GAMEPAD_BUTTONS.mapAlt) ||
+            risingMap(GAMEPAD_BUTTONS.mapDown) ||
+            risingMap(GAMEPAD_BUTTONS.trade)
+          ) {
+            this.inputSource = 'gamepad';
+            this.hud?.hideMap();
+          }
+          return;
+        }
         const padAction =
           rising(GAMEPAD_BUTTONS.mount) ||
           rising(GAMEPAD_BUTTONS.headlight) ||
@@ -1820,11 +1953,26 @@ export class ClientApp {
           rising(GAMEPAD_BUTTONS.camera) ||
           rising(GAMEPAD_BUTTONS.comms);
         if (padAction) this.inputSource = 'gamepad';
+        // Spec 21 §2.5: View/Back/Select/D-Pad Down RAISE the tactical map
+        // while the world owns the screen (the hide direction lives in the
+        // map-visible branch above). Fresh-edge so a press answers on its
+        // own frame; `rising` on the stash would double-fire next frame.
+        if (
+          risingMap(GAMEPAD_BUTTONS.map) ||
+          risingMap(GAMEPAD_BUTTONS.mapAlt) ||
+          risingMap(GAMEPAD_BUTTONS.mapDown)
+        ) {
+          this.inputSource = 'gamepad';
+          this.toggleMap();
+        }
         if (rising(GAMEPAD_BUTTONS.mount)) {
-          // Spec 19 §2.1.5/§2.3.3: (X) stows a loaded backpack into a nearby
-          // rover first; with an empty pack (or no rover) it mounts.
+          // Spec 21 §2.4: a security terminal under the thumb outranks all.
+          // Spec 19 §2.1.5/§2.3.3: otherwise (X) stows a loaded backpack into
+          // a nearby rover first; with an empty pack (or no rover) it mounts.
           const padSuit = this.suit;
-          if (
+          if (this.mode === 'suit' && this.nearestVaultTerminal !== null) {
+            this.interfaceVaultTerminal(this.nearestVaultTerminal.vaultId);
+          } else if (
             this.mode === 'suit' &&
             padSuit !== null &&
             padSuit.getCargoMass() > 0 &&
@@ -1852,12 +2000,27 @@ export class ClientApp {
     this.inputSource = 'keyboard';
     switch (action) {
       case 'mount':
-        // Spec 19 §2.3.3: `[E]` doubles as the stow action — on foot with a
-        // haul beside the parked rover it moves the backpack cargo to the
-        // flatbed first; a second press (empty pack) boards the buggy.
-        if (this.mode === 'suit' && this.requireSuit().getCargoMass() > 0) {
-          const stowed = this.stowCargoToBuggy();
-          if (stowed > 0) break;
+        if (this.mode === 'buggy') {
+          const cart = this.getSiphonableCart();
+          if (cart) {
+            this.siphonFreight(cart);
+            break;
+          }
+        } else {
+          const terminal = this.mode === 'suit' ? this.nearestVaultTerminal : null;
+          if (terminal !== null) {
+            this.interfaceVaultTerminal(terminal.vaultId);
+            break;
+          }
+          const scrap = this.getSalvageableScrap();
+          if (scrap) {
+            this.salvageScrap(scrap);
+            break;
+          }
+          if (this.requireSuit().getCargoMass() > 0) {
+            const stowed = this.stowCargoToBuggy();
+            if (stowed > 0) break;
+          }
         }
         this.toggleMount();
         break;
@@ -1869,6 +2032,10 @@ export class ClientApp {
         break;
       case 'mine':
         this.mineNearestVein();
+        break;
+      case 'map':
+        // Spec 21 §2.5: [M] raises/lower the holographic topo overlay.
+        this.toggleMap();
         break;
       case 'claim':
         this.stakeClaimAtCurrentPosition();
@@ -2051,7 +2218,7 @@ export class ClientApp {
     let cappedByBackpack = false;
     let cappedByFlatbed = false;
     if (onFoot) {
-      const room = SUIT_MAX_CARGO_KG - suitCargo;
+      const room = suit.getCargoCapacity() - suitCargo;
       if (room < 1) {
         this.hudFeedback(
           `Suit backpack full (${Math.round(suitCargo)}/${SUIT_MAX_CARGO_KG} kg) — stow in buggy or sell`,
@@ -2147,7 +2314,7 @@ export class ClientApp {
     const toast =
       `Drilling ${target.vein.id} (+${credited} kg ${resource})` +
       (capped
-        ? ` · ${carrierLabel} full (${Math.round(carrierNow)}/${onFoot ? SUIT_MAX_CARGO_KG : BUGGY_MAX_CARGO} kg)`
+        ? ` · ${carrierLabel} full (${Math.round(carrierNow)}/${onFoot ? suit.getCargoCapacity() : BUGGY_MAX_CARGO} kg)`
         : '');
     this.lastMiningOutcome = {
       veinId: target.vein.id,
@@ -2558,6 +2725,10 @@ export class ClientApp {
     const prompts: HudPrompt[] = [];
     if (this.mode === 'buggy') {
       prompts.push({ key: 'E', kind: 'dismount' });
+      const targetCart = this.getSiphonableCart();
+      if (targetCart !== null) {
+        prompts.push({ key: 'E', label: 'Intercept Freight Cargo' });
+      }
     } else {
       const d = this.suitBuggyDistance();
       if (d <= MOUNT_RADIUS_M) {
@@ -2566,6 +2737,15 @@ export class ClientApp {
         // action on the same key — the first [E]/(X) press moves the haul to
         // the flatbed, the next one boards (see runAction('mount')).
         if (suit.getCargoMass() > 0) prompts.push({ key: 'E', kind: 'stow' });
+      }
+      
+      const targetScrap = this.getSalvageableScrap();
+      if (targetScrap !== null) {
+        prompts.push({ key: 'E', label: 'Salvage Scrap Component' });
+      }
+      // Spec 21 §2.4: security terminal beside a vault bulkhead.
+      if (this.nearestVaultTerminal !== null) {
+        prompts.push({ key: 'E', kind: 'vault' });
       }
     }
     const target = this.getNearestVein();
@@ -2647,6 +2827,145 @@ export class ClientApp {
       }
     }
     return best;
+  }
+
+  private stepRailSystem(dt: number): void {
+    if (this.railSystem === null || !this.railSystem.isBuilt()) return;
+    
+    const carts = this.railSystem.getCarts();
+    if (carts.length >= 3) {
+      const loco = carts[0];
+      const h1 = carts[1];
+      const h2 = carts[2];
+      const L = loco.physics.routeLength;
+      const state = loco.physics.getState();
+
+      let speed = state.speed;
+      let direction = state.direction;
+      let dist = state.distance;
+
+      if (this.trainState.mode === 'cruising') {
+        speed = Math.min(12, speed + 1.5 * dt);
+        dist += speed * dt * direction;
+
+        const buffer = 48; // deceleration zone for 12 m/s @ 1.5 m/s^2
+        if (direction === 1 && dist > L - buffer) {
+           speed = Math.max(0, 12 * ((L - dist) / buffer));
+           if (dist >= L - 2) {
+             speed = 0;
+             this.trainState.mode = 'dwelling';
+             this.trainState.timer = 15.0;
+           }
+        } else if (direction === -1 && dist < buffer) {
+           speed = Math.max(0, 12 * (dist / buffer));
+           if (dist <= 2) {
+             speed = 0;
+             this.trainState.mode = 'dwelling';
+             this.trainState.timer = 15.0;
+           }
+        }
+      } else if (this.trainState.mode === 'dwelling') {
+        speed = 0;
+        this.trainState.timer -= dt;
+        if (this.trainState.timer <= 0) {
+          this.trainState.mode = 'cruising';
+          direction = direction === 1 ? -1 : 1;
+          loco.triggerAlarm(false); // clear alarm on departure
+        }
+      }
+
+      loco.physics.setDistance(dist, speed, direction);
+      h1.physics.setDistance(Math.max(0, Math.min(L, dist - direction * 3.5)), speed, direction);
+      h2.physics.setDistance(Math.max(0, Math.min(L, dist - direction * 7.0)), speed, direction);
+    }
+    
+    // Cargo Siphoning cooldown update
+    if (this.cargoSiphonCooldown > 0) {
+      this.cargoSiphonCooldown -= dt;
+    }
+
+    this.railSystem.update(dt);
+  }
+
+  private getSiphonableCart(): OreCartEntity | null {
+    if (!this.railSystem) return null;
+    const buggy = this.requireBuggy();
+    const bp = buggy.getPosition();
+    const bv = buggy.getSpeed(); 
+    
+    for (const cart of this.railSystem.getCarts()) {
+      if (cart.kind !== 'hopper') continue;
+      const cp = cart.getPosition();
+      const cv = cart.getSpeed();
+      
+      const dx = bp.x - cp.x;
+      const dy = bp.y - cp.y;
+      const dz = bp.z - cp.z;
+      const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      
+      if (dist <= 4.0 && Math.abs(bv - cv) < 3.0) {
+        return cart;
+      }
+    }
+    return null;
+  }
+
+  private siphonFreight(cart: OreCartEntity): void {
+    if (this.cargoSiphonCooldown > 0) return;
+    const amount = Math.min(250, 500 - this.requireBuggy().getCargoMass());
+    if (amount <= 0) {
+      this.hudFeedback('Flatbed full (500/500 kg) — sell before siphoning!', 'error');
+      return;
+    }
+    
+    cart.setCargoMass(Math.max(0, cart.getCargoMass() - amount));
+    this.requireBuggy().addCargo(amount);
+    
+    // Auto-credit titanium (simulating high-value refined ore)
+    this.localInventory.set('TITANIUM', (this.localInventory.get('TITANIUM') ?? 0) + amount);
+    
+    this.cargoSiphonCooldown = 5.0; // 5 seconds cooldown
+
+    // Trigger locomotive alarm
+    const loco = this.railSystem?.getCart('ore-loco-1');
+    if (loco) loco.triggerAlarm(true);
+    
+    this.hudFeedback(`Intercepted ${amount} kg freight! Security alarm active.`, 'info');
+  }
+
+  private getSalvageableScrap(): ScrapSite | null {
+    const pos = this.mode === 'buggy' ? this.requireBuggy().getPosition() : this.requireSuit().getPosition();
+    const reach = this.mode === 'buggy' ? 4.5 : 3.5;
+    
+    const sites = this.world.getScrapSites();
+    for (const site of sites) {
+      if (site.harvested) continue;
+      const dx = pos.x - site.position.x;
+      const dy = pos.y - site.position.y;
+      const dz = pos.z - site.position.z;
+      const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      
+      if (dist - site.boundingRadiusM <= reach) {
+        return site;
+      }
+    }
+    return null;
+  }
+
+  private salvageScrap(site: ScrapSite): void {
+    const comps = this.world.salvageScrapSite(site.id);
+    if (!comps) return;
+    
+    const compNames: string[] = [];
+    let totalValue = 0;
+    for (const c of comps) {
+      compNames.push(c.name);
+      totalValue += c.valueCredits;
+      // Add one unit to inventory per component
+      const cur = this.localInventory.get(c.name) ?? 0;
+      this.localInventory.set(c.name, cur + 1);
+    }
+    this.hudFeedback(`Salvaged from ${site.archetype.replace('_', ' ')}: ${compNames.join(', ')} (${totalValue} cr)`, 'info');
   }
 
   /**
@@ -3149,6 +3468,393 @@ export class ClientApp {
     marker.position.copyFrom(b);
     this.world.addEntity(marker);
     this.claimMarkers.set(ev.claimId, marker);
+  }
+
+  // -- vault terminals (Spec 21 §2.4) --------------------------------------------------
+
+  /**
+   * Per-frame proximity scan: nearest vault security terminal inside
+   * {@link VAULT_TERMINAL_RANGE_M} of the active body (works on foot and
+   * from the seat — the bunker chambers are readable through the bulkhead).
+   */
+  private pumpVaultProximity(): void {
+    const network = this.tunnelNetwork;
+    if (network === null) {
+      this.nearestVaultTerminal = null;
+      return;
+    }
+    let best: VaultTerminalRecord | null = null;
+    let bestRange = Number.POSITIVE_INFINITY;
+    try {
+      // Terminals only answer to the prospector on foot (the sanctum keypad
+      // is waist height beside the bulkhead — the rover seat never reads it).
+      const pos = this.mode === 'suit' && this.suit !== null ? this.suit.getPosition() : null;
+      if (pos === null) {
+        const changed0 = this.nearestVaultTerminal !== null;
+        this.nearestVaultTerminal = null;
+        if (changed0) this.refreshHudIfIdle();
+        return;
+      }
+      for (const terminal of network.getVaultTerminals()) {
+        const d = Math.hypot(
+          pos.x - terminal.position.x,
+          pos.y - terminal.position.y,
+          pos.z - terminal.position.z,
+        );
+        if (d < bestRange) {
+          bestRange = d;
+          best = terminal;
+        }
+      }
+    } catch {
+      best = null;
+    }
+    // Spec 21 §2.4: only terminals INSIDE the interaction reach count.
+    if (bestRange > VAULT_TERMINAL_RANGE_M) best = null;
+    const changed =
+      (best?.id ?? '') !== (this.nearestVaultTerminal?.id ?? '');
+    this.nearestVaultTerminal = best;
+    if (changed) {
+      // Prompt strip repaints next refreshHud; nothing else needed here.
+      this.refreshHudIfIdle();
+    }
+  }
+
+  /** Refresh HUD prompts unless a modal owns the screen. */
+  private refreshHudIfIdle(): void {
+    if ((this.hud?.isTradeDialogOpen() ?? false) || (this.hud?.isMapVisible() ?? false)) return;
+    try {
+      this.refreshHud();
+    } catch {
+      /* pre-init refresh — nothing to paint yet */
+    }
+  }
+
+  /**
+   * `[E]` / `(X)` at a security terminal (Spec 21 §2.4). The bulkhead state
+   * machine walks locked → unlocked → open: the first press cuts power to
+   * the red beacon (unlock), the second cycles the door motors and slides
+   * both leaves into the recess, granting the sanctum loot exactly once.
+   */
+  interfaceVaultTerminal(vaultId: string): boolean {
+    const network = this.tunnelNetwork;
+    const hud = this.hud;
+    if (network === null) return false;
+    const stateBefore = network.getVaultDoorState(vaultId);
+    if (stateBefore === null) return false;
+    const bunker = network.getBunkers().find((b) => b.nodeId === vaultId) ?? null;
+    const name = bunker?.name ?? vaultId;
+
+    if (stateBefore === 'locked') {
+      const state = network.unlockVault(vaultId);
+      this.hudFeedback(
+        `Security bulkhead disarmed — ${name} beacon GREEN. Press again to cycle the door.`,
+        'success',
+      );
+      void state;
+      this.announceVault(vaultId);
+      return true;
+    }
+    if (stateBefore === 'unlocked') {
+      const state = network.openVault(vaultId);
+      if (state === 'open') {
+        const loot = network.claimVaultLoot(vaultId);
+        const granted = this.grantVaultLoot(loot);
+        this.hudFeedback(
+          granted.length > 0
+            ? `Vault breached — ${name}: ${granted.map((l) => l.name).join(', ')}`
+            : `Vault breached — ${name} (sanctum already stripped)`,
+          'success',
+        );
+      }
+      this.announceVault(vaultId);
+      return true;
+    }
+    // 'open': sanctum already stripped.
+    this.hudSay(`${name} vault open — sanctum empty`);
+    return true;
+  }
+
+  /**
+   * Apply high-value loot (Spec 21 §2.4): fuel cell grows + recharges the
+   * traction pack, prospector suit doubles the rebreather and expands the
+   * backpack to 160 kg, cryo canister books 1 200 cr of trade value into
+   * the local ledger (and credits when online).
+   */
+  private grantVaultLoot(loot: readonly VaultLootItem[] | null): VaultLootItem[] {
+    if (loot === null || loot.length === 0) return [];
+    const buggy = this.buggy;
+    const suit = this.suit;
+    for (const item of loot) {
+      if (item.kind === 'fuel_cell') {
+        if (buggy !== null) buggy.upgradeFuelCell(item.batteryKwhBonus ?? 15);
+      } else if (item.kind === 'suit_upgrade') {
+        if (suit !== null) suit.upgradeProspectorSuit(160);
+      } else if (item.kind === 'cryo_canister') {
+        // Book the canister as a high-value commodity holding (1 kg unit)
+        // plus its credit value. Offline this is the ledger; online the
+        // server reconciles on the next market sync.
+        this.creditLocalInventory('CRYO_FUEL', 1);
+        const identity = this.network?.credits;
+        if (identity !== undefined) {
+          this.hud?.setCredits(identity + item.creditValue);
+        }
+      }
+      // drill_bit and future kinds: ledger entry only.
+      this.hudFeedback(`LOOT: ${item.name} — ${item.description}`, 'success');
+    }
+    return [...loot];
+  }
+
+  /** Toast the door announcement once per vault, then refresh prompts. */
+  private announceVault(vaultId: string): void {
+    if (!this.announcedVaults.has(vaultId)) this.announcedVaults.add(vaultId);
+    this.refreshHudIfIdle();
+  }
+
+  // -- holographic tactical map (Spec 21 §2.5) ----------------------------------------
+
+  /** `[M]` — toggle the holographic topographic overlay. */
+  toggleMap(): boolean {
+    const hud = this.hud;
+    if (hud === null) return false;
+    if (hud.isTradeDialogOpen()) hud.hideTradeDialog();
+    const nowVisible = hud.toggleMap();
+    if (nowVisible) {
+      // Paint immediately so the frame lands inside the 50 ms budget even
+      // between map pumps.
+      hud.updateMap(this.buildTopoMapState());
+    }
+    return nowVisible;
+  }
+
+  /** Per-frame map pump: refresh POIs on a cadence while the map is up. */
+  private pumpTopoMap(dt: number): void {
+    const hud = this.hud;
+    if (hud === null || !hud.isMapVisible()) return;
+    this.mapRefreshTimer -= dt;
+    hud.updateMap(this.buildTopoMapState());
+    if (this.mapRefreshTimer <= 0) {
+      this.mapRefreshTimer = MAP_REFRESH_INTERVAL_S;
+      this.mapStaticPois = null; // rebuild the static layer periodically
+    }
+  }
+
+  /**
+   * Assemble one tactical frame: static layer (bases, shaft portals, vein
+   * pips, crater rings, rail polylines — cached) plus live pips (player
+   * arrowhead with yaw, locomotive). The elevation sampler is the world
+   * generator's own `elevationAt`, per Spec 21 §2.5.
+   */
+  buildTopoMapState(): TopoMapState {
+    const pos = this.activePosition();
+    const heading =
+      this.mode === 'buggy' && this.buggy !== null
+        ? this.buggy.getHeading()
+        : this.suit !== null
+          ? this.suit.getHeading()
+          : 0;
+
+    if (this.mapStaticPois === null) this.mapStaticPois = this.buildStaticTopoPois();
+    const pois: TopoMapPOI[] = [...this.mapStaticPois];
+
+    // live pips
+    pois.push({ id: 'player', label: 'YOU', kind: 'player', x: pos.x, y: pos.y, heading });
+    const loco = this.railSystem?.getCart('ore-loco-1') ?? this.railSystem?.getCarts()[0] ?? null;
+    if (loco !== null && loco !== undefined) {
+      const lp = loco.getPosition();
+      pois.push({ id: loco.cartId, label: 'TRAIN', kind: 'train', x: lp.x, y: lp.y });
+    }
+
+    const snapshot = this.world.getSnapshot();
+    return {
+      visible: true,
+      canvasWidth: 512,
+      canvasHeight: 512,
+      worldSizeM: Math.max(snapshot?.width ?? 1024, snapshot?.height ?? 1024),
+      center: { x: pos.x, y: pos.y },
+      zoom: 1,
+      pois,
+      railLines: (this.railSystem?.getRoutes() ?? []).map((route) => ({
+        id: route.id,
+        points: (this.railSystem?.getRouteStops(route.id) ?? []).map((p) => ({ x: p.x, y: p.y })),
+      })),
+      train: loco !== null && loco !== undefined ? (() => { const p = loco.getPosition(); return { x: p.x, y: p.y }; })() : null,
+      elevationAt: (x: number, y: number) => this.world.getWorldGenerator().elevationAt(x, y),
+      craters: (snapshot?.craters ?? []).map((c) => ({ id: c.id, x: c.center.x, y: c.center.y, radius: c.radius })),
+    };
+  }
+
+  /** Bases / portals / veins / vaults — the cached, slow-changing layer. */
+  private buildStaticTopoPois(): TopoMapPOI[] {
+    const pois: TopoMapPOI[] = [];
+    const snapshot = this.world.getSnapshot();
+    for (const vein of snapshot?.veins ?? []) {
+      pois.push({
+        id: vein.id,
+        label: vein.kind.replace(/_/g, ' '),
+        kind: 'mining_vein',
+        x: vein.center.x,
+        y: vein.center.y,
+        resourceKind: vein.kind,
+      });
+    }
+    try {
+      for (const base of this.factionBases?.getBases() ?? []) {
+        pois.push({
+          id: `base-${base.factionId}`,
+          label: base.factionName,
+          kind: 'base',
+          x: base.position.x,
+          y: base.position.y,
+          color: '#ffd23f',
+        });
+      }
+      for (const portal of this.tunnelNetwork?.getSurfacePortals() ?? []) {
+        pois.push({
+          id: portal.id,
+          label: portal.label,
+          kind: 'portal',
+          x: portal.position.x,
+          y: portal.position.y,
+        });
+      }
+      for (const door of this.tunnelNetwork?.getVaultDoors() ?? []) {
+        pois.push({
+          id: `vault-${door.vaultId}`,
+          label: door.bunkerName,
+          kind: 'vault',
+          x: door.position.x,
+          y: door.position.y,
+        });
+      }
+    } catch {
+      /* facilities not built yet — static layer fills in next rebuild */
+    }
+    return pois;
+  }
+
+  // -- resilient gamepad latch (Spec 21 §2.6) ------------------------------------------
+
+  /**
+   * Device-quality gate: ≥6 buttons and ≥2 axes (blueprint §2.6) — kills the
+   * dead virtual/sensor nodes handhelds enumerate at index 0.
+   */
+  static qualifiesAsGamepad(pad: GamepadLike | null | undefined): boolean {
+    if (pad === null || pad === undefined) return false;
+    if (!Array.isArray(pad.axes) || !Array.isArray(pad.buttons)) return false;
+    return pad.buttons.length >= GAMEPAD_MIN_BUTTONS && pad.axes.length >= GAMEPAD_MIN_AXES;
+  }
+
+  /** Attach the hot-plug listeners (`gamepadconnected` / `disconnected`). */
+  private attachGamepadHotplug(): void {
+    if (this.gamepadHotplugAttached) return;
+    const win = (globalThis as { window?: { addEventListener?: unknown } }).window;
+    if (win === undefined || typeof win.addEventListener !== 'function') return;
+    const target = win as unknown as {
+      addEventListener: (type: string, fn: (ev: unknown) => void) => void;
+    };
+    this.domGamepadConnected = () => {
+      // Re-arm the latch scan; the frame pump latches on actual activity.
+      this.gamepadPromptCooldown = 0;
+      this.pumpGamepadLatch(0);
+    };
+    this.domGamepadDisconnected = () => {
+      const pads = this.readGamepadList();
+      const still = pads.find(
+        (p) =>
+          ClientApp.qualifiesAsGamepad(p) &&
+          this.gamepadLatchedId === ((p as { id?: string }).id ?? ''),
+      );
+      if (still === undefined) {
+        this.gamepadLatched = false;
+        this.gamepadLatchedId = '';
+        this.gamepadPromptCooldown = 0;
+      }
+    };
+    target.addEventListener('gamepadconnected', this.domGamepadConnected);
+    target.addEventListener('gamepaddisconnected', this.domGamepadDisconnected);
+    this.gamepadHotplugAttached = true;
+  }
+
+  private detachGamepadHotplug(): void {
+    if (!this.gamepadHotplugAttached) return;
+    const win = (globalThis as {
+      window?: { removeEventListener?: (t: string, fn: unknown) => void } | undefined;
+    }).window;
+    try {
+      win?.removeEventListener?.('gamepadconnected', this.domGamepadConnected);
+      win?.removeEventListener?.('gamepaddisconnected', this.domGamepadDisconnected);
+    } catch {
+      /* headless teardown */
+    }
+    this.gamepadHotplugAttached = false;
+  }
+
+  private domGamepadConnected: (ev: unknown) => void = () => {};
+  private domGamepadDisconnected: (ev: unknown) => void = () => {};
+
+  /** Safe `navigator.getGamepads()` read ([] on Node / locked-down browsers). */
+  private readGamepadList(): GamepadLike[] {
+    const nav = (globalThis as {
+      navigator?: { getGamepads?: () => (GamepadLike | null)[] | undefined };
+    }).navigator;
+    if (nav === undefined || typeof nav.getGamepads !== 'function') return [];
+    try {
+      const pads = nav.getGamepads();
+      if (!Array.isArray(pads)) return [];
+      // Browsers enumerate unplug holes as null slots — filter them out.
+      return pads.filter((p): p is GamepadLike => p !== null && p !== undefined);
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Spec 21 §2.6 activation latch (runs every frame, before the action
+   * edges): the first qualified device that shows above-deadband life latches
+   * control and announces itself once (`GAMEPAD ACTIVE: <id>`). While every
+   * pad reads neutral or only phantom devices exist, the dormant prompt
+   * `PRESS ANY BUTTON ON CONTROLLER TO ACTIVATE` surfaces (re-armed every
+   * few seconds, suppressed once latched). Decoupled drive-right/look-left
+   * axes and brake-to-reverse ride on the latched pad via `sampleInput()`.
+   */
+  private pumpGamepadLatch(dt: number): void {
+    const hud = this.hud;
+    if (hud === null) return;
+    this.gamepadPromptCooldown = Math.max(0, this.gamepadPromptCooldown - dt);
+
+    if (this.gamepadLatched) return; // one latch per session unless pads swap
+
+    const pads = this.readGamepadList();
+    let qualified = false;
+    for (const pad of pads) {
+      if (!ClientApp.qualifiesAsGamepad(pad)) continue; // phantom/sensor filter
+      qualified = true;
+      if (this.gamepadHasActivity(pad)) {
+        this.gamepadLatched = true;
+        this.gamepadLatchedId = (pad as { id?: string }).id ?? 'controller';
+        hud.showToast(`GAMEPAD ACTIVE: ${this.gamepadLatchedId}`, 'success');
+        return;
+      }
+    }
+    // Dormant: nobody qualified, or qualified pads sit idle. Prompt anyway —
+    // the spec wants it on screen until a real button press lands.
+    if (!qualified && pads.length === 0) return; // no devices at all: stay quiet
+    if (this.gamepadPromptCooldown === 0) {
+      hud.showToast('PRESS ANY BUTTON ON CONTROLLER TO ACTIVATE', 'info');
+      this.gamepadPromptCooldown = 4;
+    }
+  }
+
+  /** True once a qualified gamepad has demonstrated life (harness readback). */
+  isGamepadLatched(): boolean {
+    return this.gamepadLatched;
+  }
+
+  /** Id of the latched pad ('' before latch). */
+  getLatchedGamepadId(): string {
+    return this.gamepadLatchedId;
   }
 
   // -- DOM input ---------------------------------------------------------------------------

@@ -44,12 +44,12 @@ import { worldToBabylon } from '../engine/CameraRig.ts';
 
 /** Helmet eye height above boot soles, metres. */
 export const DEFAULT_HEAD_HEIGHT = 1.62;
-/** Helmet lamp intensity while lit. */
-export const HEADLIGHT_INTENSITY = 2.4;
-/** Helmet lamp cone full angle, degrees. */
-export const HEADLIGHT_ANGLE_DEG = 50;
-/** Helmet lamp beam range, metres. */
-export const HEADLIGHT_RANGE_M = 45;
+/** Helmet lamp intensity while lit (Spec 21 §2.2). */
+export const HEADLIGHT_INTENSITY = 2.0;
+/** Helmet lamp cone full angle, degrees (Spec 21 §2.2). */
+export const HEADLIGHT_ANGLE_DEG = 70;
+/** Helmet lamp beam range, metres (Spec 21 §2.2). */
+export const HEADLIGHT_RANGE_M = 30;
 /** Fraction of look-pitch the stiff torso copies. */
 export const PITCH_LEAN_SCALE = 0.4;
 
@@ -158,6 +158,11 @@ export class EvaSuitAvatar {
    * physics module never consumes it (the buggy's flatbed load does).
    */
   private cargoMass: number;
+  /**
+   * Spec 21 §2.4 vault loot ("Advanced Prospector EVA Suit"): instance
+   * backpack ceiling, at or above {@link SUIT_MAX_CARGO_KG} once upgraded.
+   */
+  private cargoCapKg = SUIT_MAX_CARGO_KG;
   private built = false;
   private disposed = false;
   /** Most recently stepped state — keeps getters honest across scene life. */
@@ -334,9 +339,9 @@ export class EvaSuitAvatar {
     return this.cargoMass;
   }
 
-  /** Backpack ceiling, kg (spec 19: 50). */
+  /** Backpack ceiling, kg (spec 19: 50; 160 with the vault suit upgrade). */
   getCargoCapacity(): number {
-    return SUIT_MAX_CARGO_KG;
+    return this.cargoCapKg;
   }
 
   /**
@@ -345,14 +350,14 @@ export class EvaSuitAvatar {
    */
   setCargoMass(kg: number): number {
     if (!Number.isFinite(kg)) return this.cargoMass;
-    this.cargoMass = clamp(kg, 0, SUIT_MAX_CARGO_KG);
+    this.cargoMass = clamp(kg, 0, this.cargoCapKg);
     return this.cargoMass;
   }
 
   /** True when `amountKg` more would still fit in the backpack. */
   canAcceptCargo(amountKg: number): boolean {
     if (!Number.isFinite(amountKg) || amountKg <= 0) return false;
-    return this.cargoMass + amountKg <= SUIT_MAX_CARGO_KG + 1e-9;
+    return this.cargoMass + amountKg <= this.cargoCapKg + 1e-9;
   }
 
   /**
@@ -363,8 +368,23 @@ export class EvaSuitAvatar {
   addCargo(amountKg: number): number {
     if (this.disposed || !Number.isFinite(amountKg) || amountKg <= 0) return 0;
     const before = this.cargoMass;
-    this.cargoMass = clamp(before + amountKg, 0, SUIT_MAX_CARGO_KG);
+    this.cargoMass = clamp(before + amountKg, 0, this.cargoCapKg);
     return this.cargoMass - before;
+  }
+
+  /**
+   * Spec 21 §2.4 vault upgrade: expand the backpack to `capacityKg` and
+   * double the rebreather ceiling via the suit physics. Returns the new cap.
+   */
+  upgradeProspectorSuit(capacityKg = 160): number {
+    this.cargoCapKg = Math.max(this.cargoCapKg, capacityKg);
+    this.suit.upgradeOxygen(2);
+    return this.cargoCapKg;
+  }
+
+  /** Rebreather ceiling (suit units; 200 with the vault upgrade). */
+  getOxygenCapacity(): number {
+    return this.suit.getOxygenCapacity();
   }
 
   /** Horizontal speed over the regolith, m/s. */
@@ -394,7 +414,7 @@ export class EvaSuitAvatar {
       headlightOn: this.lampOn,
       operational: s.oxygen > 0 && s.battery > 0,
       cargoMass: this.cargoMass,
-      cargoCapacity: SUIT_MAX_CARGO_KG,
+      cargoCapacity: this.cargoCapKg,
     };
   }
 
@@ -613,8 +633,13 @@ export class EvaSuitAvatar {
       z: state.z + this.headHeight,
     });
     lamp.position.copyFrom(eye);
-    // Physics-forward (cos h, sin h, 0) → Babylon (cos h, 0, -sin h).
-    lamp.direction.set(Math.cos(state.heading), 0, -Math.sin(state.heading));
+    // Physics-forward (cos h, sin h, 0) + look pitch → Babylon (cos p cos h, sin p, -cos p sin h).
+    const pitch = state.pitch ?? 0;
+    lamp.direction.set(
+      Math.cos(pitch) * Math.cos(state.heading),
+      Math.sin(pitch),
+      -Math.cos(pitch) * Math.sin(state.heading),
+    );
     const alive = state.oxygen > 0 && state.battery > 0 ? 1 : 0.15;
     lamp.intensity = this.lampOn ? HEADLIGHT_INTENSITY * alive : 0;
   }
