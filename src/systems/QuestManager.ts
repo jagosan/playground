@@ -4,6 +4,7 @@ export interface QuestState {
   level: number;
   objective: string;
   completedQuests: string[];
+  total: number;
 }
 
 const STORAGE_KEY = 'playground_quests';
@@ -22,18 +23,19 @@ export class QuestManager {
 
   private loadState(): QuestState {
     try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (raw) {
-        return JSON.parse(raw);
+      const saved = localStorage.getItem(STORAGE_KEY);
+      if (saved) {
+        return JSON.parse(saved);
       }
     } catch {
-      // LocalStorage fallback
+      // ignore
     }
 
     return {
       level: 1,
       objective: 'Explore the playground and inspect the Moon Buggy ride',
       completedQuests: [],
+      total: 6, // 6 total equipment pieces (including Lunar Frontier)
     };
   }
 
@@ -62,7 +64,7 @@ export class QuestManager {
       objective: this.state.objective,
       level: this.state.level,
       completed: this.state.completedQuests.length,
-      total: 4, // 4 total equipment pieces
+      total: 6, // 6 total equipment pieces (including Lunar Frontier)
     });
   }
 

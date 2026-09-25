@@ -9,7 +9,8 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "lunar:server": "cd games/lunar-frontier && npm run server",
-    "lunar:client": "cd games/lunar-frontier && npm run client"
+    "lunar:client": "cd games/lunar-frontier && npm run client",
+    "lunar:all": "concurrently \"npm run lunar:server\" \"npm run lunar:client\""
   },
   "dependencies": {
     "three": "^0.160.0"

@@ -256,7 +256,7 @@ export class HUD {
     });
 
     eventBus.on('TRANSITION_TO_MINIGAME', ({ name, minigameId }) => {
-      if (minigameId === 'moon-buggy') {
+      if (minigameId === 'moon-buggy' || minigameId === 'moonbuggy2' || minigameId === 'lunar-frontier') {
         // Direct launch, do not show mock modal
         return;
       }

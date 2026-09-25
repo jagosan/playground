@@ -155,25 +155,6 @@ export function createDefaultPlaygroundEquipment(): EquipmentConfig[] {
   const wheelMat = new THREE.MeshLambertMaterial({ color: 0x0f172a }); // Dark tires
   const goldMat = new THREE.MeshLambertMaterial({ color: 0xf59e0b });  // Gold foil
 
-  // Pedestal
-  const pedestal = new THREE.Mesh(new THREE.CylinderGeometry(2.2, 2.5, 0.4, 8), new THREE.MeshLambertMaterial({ color: 0x475569 }));
-  pedestal.position.y = 0.2;
-  pedestal.receiveShadow = true;
-  buggyGroup.add(pedestal);
-
-  // Rover chassis
-  const chassis = new THREE.Mesh(new THREE.BoxGeometry(1.6, 0.5, 2.4), roverMat);
-  chassis.position.y = 1.0;
-  chassis.castShadow = true;
-  buggyGroup.add(chassis);
-
-  // Dish Antenna (Gold)
-  const dish = new THREE.Mesh(new THREE.ConeGeometry(0.4, 0.3, 8), goldMat);
-  dish.position.set(0.4, 1.6, -0.6);
-  dish.rotation.x = 0.5;
-  dish.castShadow = true;
-  buggyGroup.add(dish);
-
   // Wheels
   const wheelGeom = new THREE.CylinderGeometry(0.35, 0.35, 0.25, 12);
   const wheelOffsets = [
@@ -190,6 +171,27 @@ export function createDefaultPlaygroundEquipment(): EquipmentConfig[] {
     buggyGroup.add(wheel);
   });
 
+  // Chassis
+  const chassis = new THREE.Mesh(new THREE.BoxGeometry(1.6, 0.4, 2.4), roverMat);
+  chassis.position.y = 0.9;
+  chassis.castShadow = true;
+  buggyGroup.add(chassis);
+
+  // Gold foil detail
+  const goldDetail = new THREE.Mesh(new THREE.BoxGeometry(1.5, 0.1, 2.3), goldMat);
+  goldDetail.position.y = 0.9;
+  buggyGroup.add(goldDetail);
+
+  // Dish Antenna (Gold)
+  const dish = new THREE.Mesh(
+    new THREE.ConeGeometry(0.4, 0.3, 8),
+    new THREE.MeshLambertMaterial({ color: 0xf59e0b })
+  );
+  dish.position.set(0.4, 1.6, -0.6);
+  dish.rotation.x = 0.5;
+  dish.castShadow = true;
+  buggyGroup.add(dish);
+
   buggyGroup.position.set(8, 0, 8);
   equipment.push({
     id: 'eq_moon_buggy',
@@ -203,48 +205,46 @@ export function createDefaultPlaygroundEquipment(): EquipmentConfig[] {
 
   // 5. Moonbuggy 2 (Spec 03 High-Fidelity Simulator Portal)
   const buggy2Group = new THREE.Group();
-  const pedestal2 = new THREE.Mesh(
-    new THREE.CylinderGeometry(2.4, 2.7, 0.4, 12),
-    new THREE.MeshLambertMaterial({ color: 0x0284c7 }) // Apollo blue ring
-  );
-  pedestal2.position.y = 0.2;
-  pedestal2.receiveShadow = true;
-  buggy2Group.add(pedestal2);
+  const buggy2Mat = new THREE.MeshLambertMaterial({ color: 0xe5e7eb });
+  const wheel2Geom = new THREE.CylinderGeometry(0.4, 0.4, 0.3, 16);
+  const wheel2Mat = new THREE.MeshLambertMaterial({ color: 0x1f2937 });
+  const gold2Mat = new THREE.MeshLambertMaterial({ color: 0xf59e0b });
 
-  // High-fidelity gold Kapton foil chassis marker
-  const pbrChassis = new THREE.Mesh(
-    new THREE.BoxGeometry(1.6, 0.45, 2.5),
-    new THREE.MeshStandardMaterial({
-      color: 0xf59e0b,
-      metalness: 0.85,
-      roughness: 0.3,
-    })
-  );
-  pbrChassis.position.y = 0.9;
-  pbrChassis.castShadow = true;
-  buggy2Group.add(pbrChassis);
-
-  // Parabolic high-gain antenna
-  const dish2 = new THREE.Mesh(
-    new THREE.ConeGeometry(0.5, 0.35, 12),
-    new THREE.MeshStandardMaterial({ color: 0xf59e0b, metalness: 0.9, roughness: 0.2 })
-  );
-  dish2.position.set(0.4, 1.6, -0.6);
-  dish2.rotation.x = 0.5;
-  dish2.castShadow = true;
-  buggy2Group.add(dish2);
-
-  // 4 Wheels
-  wheelOffsets.forEach(([x, y, z]) => {
-    const wheel = new THREE.Mesh(
-      wheelGeom,
-      new THREE.MeshStandardMaterial({ color: 0x27272a, roughness: 0.8, metalness: 0.5 })
-    );
+  // Wheels
+  const wheel2Offsets = [
+    [-1.0, 0.8, 1.0],
+    [1.0, 0.8, 1.0],
+    [-1.0, 0.8, -1.0],
+    [1.0, 0.8, -1.0],
+  ];
+  wheel2Offsets.forEach(([x, y, z]) => {
+    const wheel = new THREE.Mesh(wheel2Geom, wheel2Mat);
     wheel.rotation.z = Math.PI / 2;
-    wheel.position.set(x, y + 0.1, z);
+    wheel.position.set(x, y, z);
     wheel.castShadow = true;
     buggy2Group.add(wheel);
   });
+
+  // Chassis
+  const chassis2 = new THREE.Mesh(new THREE.BoxGeometry(1.8, 0.5, 2.6), buggy2Mat);
+  chassis2.position.y = 1.0;
+  chassis2.castShadow = true;
+  buggy2Group.add(chassis2);
+
+  // Gold Kapton foil detail
+  const goldDetail2 = new THREE.Mesh(new THREE.BoxGeometry(1.7, 0.15, 2.5), gold2Mat);
+  goldDetail2.position.y = 1.0;
+  buggy2Group.add(goldDetail2);
+
+  // Dish Antenna (Gold)
+  const dish2 = new THREE.Mesh(
+    new THREE.ConeGeometry(0.5, 0.35, 12),
+    new THREE.MeshLambertMaterial({ color: 0xf59e0b })
+  );
+  dish2.position.set(0.4, 1.8, -0.6);
+  dish2.rotation.x = 0.5;
+  dish2.castShadow = true;
+  buggy2Group.add(dish2);
 
   buggy2Group.position.set(-8, 0, 14);
   equipment.push({
@@ -257,6 +257,130 @@ export function createDefaultPlaygroundEquipment(): EquipmentConfig[] {
     mesh: buggy2Group,
   });
 
+  // 6. Lunar Frontier (Spec 22 Persistent Sim)
+  const lunarFrontierGroup = new THREE.Group();
+
+  // Hexagonal launch pedestal (THREE.CylinderGeometry(2.5, 2.8, 0.4, 6))
+  const pedestal = new THREE.Mesh(
+    new THREE.CylinderGeometry(2.5, 2.8, 0.4, 6),
+    new THREE.MeshLambertMaterial({ color: 0x334155 }) // Dark slate
+  );
+  pedestal.position.y = 0.2;
+  pedestal.castShadow = true;
+  lunarFrontierGroup.add(pedestal);
+
+  // Lander fuselage / ascent stage cylinder (THREE.CylinderGeometry(1.2, 1.4, 2.0, 8))
+  const fuselage = new THREE.Mesh(
+    new THREE.CylinderGeometry(1.2, 1.4, 2.0, 8),
+    new THREE.MeshStandardMaterial({ color: 0x94a3b8, metalness: 0.8, roughness: 0.3 })
+  ); // Titanium
+  fuselage.position.y = 1.6;
+  fuselage.castShadow = true;
+  lunarFrontierGroup.add(fuselage);
+
+  // Gold Kapton foil service collar / fuel tanks (color: 0xf59e0b, metalness: 0.9, roughness: 0.2)
+  const kaptonCollar = new THREE.Mesh(
+    new THREE.CylinderGeometry(1.3, 1.3, 0.2, 8),
+    new THREE.MeshStandardMaterial({ color: 0xf59e0b, metalness: 0.9, roughness: 0.2 })
+  );
+  kaptonCollar.position.y = 1.4;
+  kaptonCollar.castShadow = true;
+  lunarFrontierGroup.add(kaptonCollar);
+
+  // 4 angled landing legs with footpads extending outward and down
+  const lfLegGeom = new THREE.CylinderGeometry(0.1, 0.2, 1.5);
+  const legMat = new THREE.MeshStandardMaterial({ color: 0x94a3b8, metalness: 0.7, roughness: 0.4 });
+
+  const legOffsets = [
+    [1.0, 0.6, 0.8],
+    [-1.0, 0.6, 0.8],
+    [0.8, 0.6, -1.0],
+    [-0.8, 0.6, -1.0]
+  ];
+
+  legOffsets.forEach(([x, y, z]) => {
+    const leg = new THREE.Mesh(lfLegGeom, legMat);
+    leg.position.set(x, y, z);
+    leg.rotation.x = Math.PI / 4;
+    leg.castShadow = true;
+    lunarFrontierGroup.add(leg);
+
+    // Footpad
+    const footpad = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.35, 0.35, 0.1, 8),
+      new THREE.MeshLambertMaterial({ color: 0x1f2937 })
+    );
+    footpad.position.set(x, y - 0.8, z);
+    footpad.castShadow = true;
+    lunarFrontierGroup.add(footpad);
+  });
+
+  // Cyan glowing airlock door
+  const airlockDoor = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.7, 0.7, 0.1, 16),
+    new THREE.MeshLambertMaterial({ color: 0x06b6d4, emissive: 0x0891b2 })
+  );
+  airlockDoor.position.y = 1.6;
+  lunarFrontierGroup.add(airlockDoor);
+
+  // Communication antenna dish tilted up
+  const lfDish = new THREE.Mesh(
+    new THREE.ConeGeometry(0.3, 0.4, 16),
+    new THREE.MeshStandardMaterial({ color: 0x94a3b8, metalness: 0.8, roughness: 0.3 })
+  );
+  lfDish.position.set(0, 2.5, 0);
+  lfDish.rotation.x = 0.6;
+  lfDish.castShadow = true;
+  lunarFrontierGroup.add(lfDish);
+
+  // RCS thruster quads
+  const rcsGroup = new THREE.Group();
+  for (let i = 0; i < 4; i++) {
+    const angle = (i * Math.PI) / 2;
+    const rcs = new THREE.Mesh(
+      new THREE.BoxGeometry(0.2, 0.15, 0.1),
+      new THREE.MeshStandardMaterial({ color: 0xf59e0b, metalness: 0.6, roughness: 0.4 })
+    );
+    rcs.position.set(Math.cos(angle) * 0.8, 1.5, Math.sin(angle) * 0.8);
+    rcs.rotation.y = angle + Math.PI / 2;
+    rcsGroup.add(rcs);
+  }
+  lunarFrontierGroup.add(rcsGroup);
+
+  // Dual navigation beacon masts on top (port red 0xef4444, starboard green 0x10b981)
+  const beaconPort = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.05, 0.05, 0.6, 8),
+    new THREE.MeshLambertMaterial({ color: 0xef4444, emissive: 0x7f1d1d })
+  );
+  beaconPort.position.set(-0.4, 3.2, 0.3);
+  lunarFrontierGroup.add(beaconPort);
+
+  const beaconStarboard = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.05, 0.05, 0.6, 8),
+    new THREE.MeshLambertMaterial({ color: 0x10b981, emissive: 0x064e3b })
+  );
+  beaconStarboard.position.set(0.4, 3.2, -0.3);
+  lunarFrontierGroup.add(beaconStarboard);
+
+  // Holographic badge ring
+  const badgeRing = new THREE.Mesh(
+    new THREE.TorusGeometry(0.5, 0.03, 16, 100),
+    new THREE.MeshStandardMaterial({ color: 0x06b6d4, emissive: 0x0891b2, metalness: 0.9, roughness: 0.2 })
+  );
+  badgeRing.position.y = 3.5;
+  lunarFrontierGroup.add(badgeRing);
+
+  // Position and add to equipment
+  lunarFrontierGroup.position.set(8, 0, 14);
+  equipment.push({
+    id: 'eq_lunar_frontier',
+    name: 'Lunar Frontier (Persistent Sim)',
+    description: 'Persistent multiplayer lunar economy, subterranean rail lines, and 3D exploration simulation.',
+    minigameId: 'lunar-frontier',
+    position: [8, 0, 14],
+    interactionRadius: 4.5,
+    mesh: lunarFrontierGroup,
+  });
+
   return equipment;
 }
-

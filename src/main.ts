@@ -6,6 +6,7 @@ import { createDefaultPlaygroundEquipment, EquipmentConfig } from './entities/Eq
 import { ProximitySystem } from './systems/ProximitySystem';
 import { QuestManager } from './systems/QuestManager';
 import { HUD } from './ui/HUD';
+import { LunarFrontierOverlay } from './ui/LunarFrontierOverlay';
 import { MoonBuggyScene } from './minigames/moon-buggy/MoonBuggyScene';
 import { Moonbuggy2Scene } from './minigames/moonbuggy2/Moonbuggy2Scene';
 
@@ -91,6 +92,7 @@ function bootstrap(): void {
 
   let currentMinigame: MoonBuggyScene | Moonbuggy2Scene | null = null;
   let inMinigame = false;
+  let lunarOverlay: LunarFrontierOverlay | null = null;
 
   // Equipment interaction trigger ('E' key)
   window.addEventListener('keydown', (e) => {
@@ -134,16 +136,36 @@ function bootstrap(): void {
 
       currentMinigame = new Moonbuggy2Scene(sceneManager, eventBus);
       sceneManager.setScene(currentMinigame.scene);
+    } else if (minigameId === 'lunar-frontier') {
+      inMinigame = true;
+      if (hud) {
+        hud.destroy();
+        hud = null;
+      }
+      if (player) {
+        player.destroy();
+        player = null;
+      }
+      sceneManager.stop();
+      lunarOverlay = new LunarFrontierOverlay(eventBus);
     }
   });
 
-  eventBus.on('TRANSITION_TO_LOBBY', () => {
+  eventBus.on('TRANSITION_TO_LOBBY', ({ reason }) => {
+    console.log('🧪 [Lunar Triage] TRANSITION_TO_LOBBY triggered by:', reason);
+
     if (currentMinigame) {
       currentMinigame.dispose();
       currentMinigame = null;
     }
 
     inMinigame = false;
+
+    // Clean up lunar overlay
+    if (lunarOverlay) {
+      lunarOverlay.destroy();
+      lunarOverlay = null;
+    }
 
     // Restore lobby scene
     lobbyScene = new THREE.Scene();
@@ -153,6 +175,10 @@ function bootstrap(): void {
     }
 
     sceneManager.setScene(lobbyScene);
+
+    // Restart render loop
+    sceneManager.start();
+
     player = new Player(sceneManager, eventBus);
     hud = new HUD(eventBus, (code, isDown) => {
       player?.setVirtualKey(code, isDown);
@@ -180,11 +206,11 @@ function bootstrap(): void {
   // Auto-launch minigame if specified in URL query (e.g. ?game=moonbuggy2)
   const urlParams = new URLSearchParams(window.location.search);
   const targetGame = urlParams.get('game');
-  if (targetGame === 'moonbuggy2' || targetGame === 'moon-buggy') {
+  if (targetGame === 'moonbuggy2' || targetGame === 'moon-buggy' || targetGame === 'lunar-frontier') {
     eventBus.emit('TRANSITION_TO_MINIGAME', {
       minigameId: targetGame,
       equipmentId: 'direct_url',
-      name: targetGame === 'moonbuggy2' ? 'Moonbuggy 2' : 'Moon Buggy',
+      name: targetGame === 'moonbuggy2' ? 'Moonbuggy 2' : targetGame === 'lunar-frontier' ? 'Lunar Frontier' : 'Moon Buggy',
     });
   }
 }
