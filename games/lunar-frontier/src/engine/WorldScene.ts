@@ -13,10 +13,19 @@
  *  - **Regolith terrain** — a heightmap mesh whose macro relief comes from
  *    `LunarWorldGenerator.elevationAt()` (datum plain, crater bowls, rim
  *    bumps) with deterministic fbm micro-texturing on top, wearing a
- *    low-albedo (0.20, 0.19, 0.18), near-dielectric, Hapke-ish rough PBR
- *    material. The procedural micro-grit normal map is UV-tiled 64× across
- *    the patch (spec 14 §3.2) so texels stay ~12 cm instead of stretching to
- *    8 m and reading as uniform smoothness.
+ *    three-frequency procedural PBR material (Spec 23 §2.1, ADR-023-1):
+ *      • macro albedo (512²) — mare basalt lowlands vs highland anorthosite
+ *        & crater ejecta rays, tiled 1× across the patch;
+ *      • meso detail map (256²) — craterlet depressions & clasts,
+ *        `detailMap` at 16× tiling;
+ *      • micro-grit normal (256²) — multi-octave facets & craterlet ridges,
+ *        UV-tiled 64× (spec 14 §3.2) so texels stay ~6 cm.
+ *    All three are pure typed-array `RawTexture`s — NullEngine-safe, no DOM.
+ *  - **Active optical visor (Spec 23 §2.3, ADR-023-3)** — the shadow floor is
+ *    lifted to a washed-out slate grey (regolith emissive 0.12/0.12/0.14)
+ *    under 0.45-intensity earthshine, and a Hapke retroreflective opposition
+ *    surge raises `directIntensity`/`specularIntensity` when the camera view
+ *    aligns with the sun vector (zero phase angle).
  *  - **Camera rig** — the EVA/vehicle `CameraRig` (first person, third
  *    person, vehicle chase) wired to the scene.
  *
@@ -56,6 +65,7 @@ import { DirectionalLight } from '@babylonjs/core/Lights/directionalLight.js';
 import { HemisphericLight } from '@babylonjs/core/Lights/hemisphericLight.js';
 import { ShadowGenerator } from '@babylonjs/core/Lights/Shadows/shadowGenerator.js';
 import { PBRMaterial } from '@babylonjs/core/Materials/PBR/pbrMaterial.js';
+import { Material } from '@babylonjs/core/Materials/material.js';
 import { StandardMaterial } from '@babylonjs/core/Materials/standardMaterial.js';
 import { RawTexture } from '@babylonjs/core/Materials/Textures/rawTexture.js';
 import { Mesh } from '@babylonjs/core/Meshes/mesh.js';
@@ -96,7 +106,7 @@ export interface WorldSceneOptions {
   shadowMapSize?: number;
   /** Sun light intensity (default 2.2 — balanced natural sunlight per Spec 21 §2.2). */
   sunIntensity?: number;
-  /** Earthshine fill intensity (default 0.24 — enhanced lunar dust bounce per Spec 21 §2.2). */
+  /** Earthshine fill intensity (default 0.45 — active optical visor fill per Spec 23 §2.3). */
   earthshineIntensity?: number;
   /** Star dome radius in metres (default 6000; keep < camera maxZ). */
   starDomeRadius?: number;
@@ -197,6 +207,378 @@ function fbm2(x: number, y: number, seed: number): number {
 }
 
 // ---------------------------------------------------------------------------
+// Seamless periodic noise (Spec 23 §2.1 / ADR-023-1)
+// ---------------------------------------------------------------------------
+
+/**
+ * Value noise on a *wrapping* integer lattice of side `period`. Sampling
+ * `q ∈ [0, period)` covers exactly one lattice period, so any texture built
+ * from it tiles without seams; octave stacks may double the sample rate
+ * (`q·2^k`) and stay seamless because the doubled span is still an integer
+ * number of periods.
+ */
+function pnoisePeriodic(x: number, y: number, seed: number, period: number): number {
+  const xi = Math.floor(x);
+  const yi = Math.floor(y);
+  const xf = x - xi;
+  const yf = y - yi;
+  const u = xf * xf * (3 - 2 * xf);
+  const v = yf * yf * (3 - 2 * yf);
+  const w = (n: number): number => ((n % period) + period) % period;
+  const x0 = w(xi);
+  const x1 = w(xi + 1);
+  const y0 = w(yi);
+  const y1 = w(yi + 1);
+  const a = hash2i(x0, y0, seed);
+  const b = hash2i(x1, y0, seed);
+  const c = hash2i(x0, y1, seed);
+  const d = hash2i(x1, y1, seed);
+  return a * (1 - u) * (1 - v) + b * u * (1 - v) + c * (1 - u) * v + d * u * v;
+}
+
+/**
+ * Seamless multi-octave fBm over a tile whose noise-space side is `lattice`
+ * (`q ∈ [0, lattice)`). Octave k samples at `q·2^k` — still an exact whole
+ * number of lattice periods — so the tile wraps cleanly on all four edges.
+ * Returned range is ~[-1, 1].
+ */
+function fbmSeamless(
+  x: number,
+  y: number,
+  seed: number,
+  lattice: number,
+  octaves = 5,
+): number {
+  let sum = 0;
+  let amp = 1;
+  let norm = 0;
+  for (let o = 0; o < octaves; o++) {
+    const f = 1 << o;
+    sum += amp * pnoisePeriodic(x * f, y * f, seed + o * 101, lattice);
+    norm += amp;
+    amp *= 0.5;
+  }
+  return (sum / norm) * 2 - 1;
+}
+
+/** Gaussian falloff helper: exp(−((v−centre)/width)²). */
+function gaussian(v: number, centre: number, width: number): number {
+  const t = (v - centre) / width;
+  return Math.exp(-t * t);
+}
+
+/**
+ * Craterlet height contribution at tile-space point (x, y): a shallow bowl
+ * (`−(1−(d/r)²)`) ringed by a raised ejecta ridge (Gaussian at d = r). Used
+ * by the micro-grit normal and the meso detail map.
+ */
+function craterletField(
+  x: number,
+  y: number,
+  craters: ReadonlyArray<{ cx: number; cy: number; r: number }>,
+): number {
+  let h = 0;
+  for (const c of craters) {
+    const dx = x - c.cx;
+    const dy = y - c.cy;
+    const d = Math.sqrt(dx * dx + dy * dy);
+    if (d > c.r * 1.9) continue;
+    if (d < c.r) {
+      const t = d / c.r;
+      h -= 0.55 * (1 - t * t) * (1 - t * t);
+    }
+    h += 0.85 * gaussian(d, c.r, c.r * 0.32);
+  }
+  return h;
+}
+
+/** Deterministic interior craterlet layout for a `lattice`-sided tile. */
+function tileCraterlets(
+  seed: number,
+  lattice: number,
+  count: number,
+  rMin: number,
+  rMax: number,
+): { cx: number; cy: number; r: number }[] {
+  let s = (seed ^ 0x9651ee9) >>> 0;
+  const rnd = (): number => {
+    s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
+    return s / 4294967296;
+  };
+  const out: { cx: number; cy: number; r: number }[] = [];
+  for (let i = 0; i < count; i++) {
+    const r = rMin + rnd() * (rMax - rMin);
+    // Keep every craterlet (plus its ridge halo) fully inside the tile so
+    // the wrap never has to reproduce partial rims.
+    const m = r * 1.9 + lattice * 0.02;
+    out.push({
+      cx: m + rnd() * (lattice - 2 * m),
+      cy: m + rnd() * (lattice - 2 * m),
+      r,
+    });
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Spec 23 §2.3 / ADR-023-3 — visor & Hapke opposition-surge constants
+// ---------------------------------------------------------------------------
+
+/**
+ * Washed-out slate-grey emissive floor of the regolith under the active
+ * optical visor (Spec 23 §2.3): shadows never crush to black.
+ */
+export const VISOR_EMISSIVE_FLOOR = { r: 0.12, g: 0.12, b: 0.14 } as const;
+
+/** Earthshine ground-bounce tint under visor compensation (Spec 23 §2.3). */
+export const VISOR_GROUNDBOUNCE_COLOR = { r: 0.14, g: 0.14, b: 0.16 } as const;
+
+/**
+ * Hapke retroreflective opposition-surge model (Spec 23 §2.1.4). At zero
+ * phase angle (camera looking straight along the sun vector) the regolith's
+ * self-shadow-hiding backscatter brightens the surface; approximated as a
+ * `dot^exponent` lobe lifting `directIntensity` from `baseDirect` up to
+ * `baseDirect + directGain` and `specularIntensity` from `baseSpecular` up
+ * to `baseSpecular + specularGain`.
+ */
+export const OPPOSITION_SURGE = {
+  baseDirect: 1.0,
+  directGain: 0.35,
+  baseSpecular: 0.25,
+  specularGain: 0.45,
+  exponent: 6,
+} as const;
+
+/**
+ * Pure opposition-surge response for a dot product between the camera
+ * forward vector and the (normalised) sun direction. `dot = 1` is zero
+ * phase angle (backlit, surge peak); `dot ≤ 0` means the sun is behind the
+ * camera (no surge). Returns the normalised surge amount in [0, 1].
+ */
+export function hapkeOppositionSurge(dotForwardSun: number): number {
+  if (!Number.isFinite(dotForwardSun) || dotForwardSun <= 0) return 0;
+  const d = dotForwardSun > 1 ? 1 : dotForwardSun;
+  return Math.pow(d, OPPOSITION_SURGE.exponent);
+}
+
+// ---------------------------------------------------------------------------
+// Spec 23 §2.1 — procedural texture synthesis (pure typed arrays, no DOM)
+// ---------------------------------------------------------------------------
+
+/** Micro-grit grit normal map side (Spec 23 §2.1.3: 256², tiled 64×). */
+export const MICRO_GRIT_TEX_SIZE = 256;
+
+/** Meso craterlet/clast detail map side (Spec 23 §2.1.2: 256², tiled 16×). */
+export const MESO_DETAIL_TEX_SIZE = 256;
+
+/** Macro mare/highland albedo map side (Spec 23 §2.1.1 / ADR-023-1: 512², 1×). */
+export const MACRO_ALBEDO_TEX_SIZE = 512;
+
+/** Mare basalt lowland linear albedo (Spec 23 §2.1.1). */
+const MARE_BASALT_ALBEDO = { r: 0.13, g: 0.13, b: 0.14 } as const;
+
+/** Highland anorthosite & ejecta-ray linear albedo (Spec 23 §2.1.1). */
+const HIGHLAND_ANORTHITE_ALBEDO = { r: 0.28, g: 0.27, b: 0.26 } as const;
+
+/** Clamp helper for colour bytes. */
+function clamp0to1(v: number): number {
+  if (!Number.isFinite(v)) return 0;
+  return v < 0 ? 0 : v > 1 ? 1 : v;
+}
+
+/**
+ * sRGB transfer encode (IEC 61966-2-1). Babylon uploads `gammaSpace` RGBA8
+ * textures as `SRGB8_ALPHA8`, so colour textures must carry sRGB-encoded
+ * bytes for the *linear* albedos the spec quotes.
+ */
+function srgbEncode(v: number): number {
+  const c = clamp0to1(v);
+  return c <= 0.0031308 ? c * 12.92 : 1.055 * Math.pow(c, 1 / 2.4) - 0.055;
+}
+
+/**
+ * Macro albedo variegation map (Spec 23 §2.1.1): 512×512 RGBA, sampled once
+ * across the terrain patch (u,v ∈ [0,1) ↔ patch world extents). Mare basalt
+ * lowlands (0.13, 0.13, 0.14) transition to highland anorthosite
+ * (0.28, 0.27, 0.26) under a smooth FBM gate; every `LunarWorldGenerator`
+ * crater throws radial, angularly-noisy ejecta rays (brighter streaks
+ * decaying with rim distance) that lighten the terrain downrange. Alpha is
+ * opaque; bytes are sRGB-encoded. Deterministic in `seed`.
+ */
+export function buildMacroAlbedoData(
+  seed: number,
+  craters: ReadonlyArray<{ center: { x: number; y: number }; radius: number }>,
+  origin: { x: number; y: number },
+  terrainSize: number,
+): Uint8Array {
+  const size = MACRO_ALBEDO_TEX_SIZE;
+  const data = new Uint8Array(size * size * 4);
+  for (let iy = 0; iy < size; iy++) {
+    const wy = origin.y + ((iy + 0.5) / size) * terrainSize;
+    for (let ix = 0; ix < size; ix++) {
+      const wx = origin.x + ((ix + 0.5) / size) * terrainSize;
+
+      // Mare ↔ highland gate: ~550 m FBM blobs, smoothstepped to avoid hard
+      // albedo seams across the plains.
+      const mare = fbm2(wx * 0.0018, wy * 0.0018, seed);
+      const gate = mare * 0.5 + 0.5;
+      let highland = clamp0to1((gate - 0.34) / 0.32) * 0.85;
+
+      // Crater ejecta rays: `ARMS` broad streaks per crater, angularly
+      // wobbled by low-frequency noise, brightest just past the rim and
+      // fading as 1/sqrt(d) out to 6·R.
+      for (const c of craters) {
+        const dx = wx - c.center.x;
+        const dy = wy - c.center.y;
+        const d2 = dx * dx + dy * dy;
+        const R = c.radius;
+        if (d2 > 36 * R * R || d2 < 1e-6) continue;
+        const d = Math.sqrt(d2);
+        if (d < R * 0.55) continue; // rays start beyond the bowl floor
+        const ang = Math.atan2(dy, dx);
+        const wobble = fbm2(wx * 0.012, wy * 0.012, seed + 913) * 2.2;
+        const streak = Math.pow(Math.abs(Math.cos(2.5 * ang + wobble)), 3);
+        const near = clamp0to1((d / R - 0.55) / 0.6); // fade in across the rim
+        const decay = near / Math.sqrt(d / R);
+        highland += streak * decay * 0.42;
+      }
+
+      // Fine mottling so the units never read as flat paint.
+      highland = clamp0to1(highland + fbm2(wx * 0.02, wy * 0.02, seed + 31) * 0.08);
+
+      const t = highland;
+      const o = (iy * size + ix) * 4;
+      data[o] = Math.round(
+        srgbEncode(MARE_BASALT_ALBEDO.r + (HIGHLAND_ANORTHITE_ALBEDO.r - MARE_BASALT_ALBEDO.r) * t) * 255,
+      );
+      data[o + 1] = Math.round(
+        srgbEncode(MARE_BASALT_ALBEDO.g + (HIGHLAND_ANORTHITE_ALBEDO.g - MARE_BASALT_ALBEDO.g) * t) * 255,
+      );
+      data[o + 2] = Math.round(
+        srgbEncode(MARE_BASALT_ALBEDO.b + (HIGHLAND_ANORTHITE_ALBEDO.b - MARE_BASALT_ALBEDO.b) * t) * 255,
+      );
+      data[o + 3] = 255;
+    }
+  }
+  return data;
+}
+
+/**
+ * Micro-grit normal map (Spec 23 §2.1.3): 256×256 RGBA raw normal texels
+ * (RG = xy slope, B = z, A opaque) baked from a seamless 5-octave FBM base,
+ * interior craterlet depressions with raised ejecta ridges, and sharp
+ * angular agglutinate facets. Tiles 64× across the patch (16 m/tile →
+ * ~6.25 cm per texel). Deterministic in `seed`; no DOM/WebGL requirements.
+ */
+export function buildMicroGritNormalData(seed: number): Uint8Array {
+  const size = MICRO_GRIT_TEX_SIZE;
+  const lattice = 32; // noise-space tile side; wraps seamlessly
+  const step = lattice / size;
+  const data = new Uint8Array(size * size * 4);
+  const lets = tileCraterlets(seed, lattice, 14, lattice * 0.045, lattice * 0.16);
+
+  // Height field first (wrap-safe central differences need neighbours).
+  const heights = new Float32Array(size * size);
+  for (let iy = 0; iy < size; iy++) {
+    const y = (iy + 0.5) * step;
+    for (let ix = 0; ix < size; ix++) {
+      const x = (ix + 0.5) * step;
+      const base = fbmSeamless(x, y, seed, lattice, 5) * 0.55;
+      const craters = craterletField(x, y, lets) * 0.35;
+      // Sharp facet term: folded high-frequency band yields angular grains
+      // and powder micro-ridges (rake/bootprint-edge feel).
+      const fold = fbmSeamless(x, y, seed ^ 0xfa2, lattice, 4);
+      const facets = (1 - Math.abs(fold)) * 0.34;
+      heights[iy * size + ix] = base + craters + facets;
+    }
+  }
+
+  for (let iy = 0; iy < size; iy++) {
+    const ym = ((iy - 1 + size) % size) * size;
+    const yp = ((iy + 1) % size) * size;
+    for (let ix = 0; ix < size; ix++) {
+      const xm = (ix - 1 + size) % size;
+      const xp = (ix + 1) % size;
+      const row = iy * size;
+      // Height-field normal: n = normalize(−∂h/∂x, −∂h/∂y, nz). The
+      // exaggerated xy gain (raking vacuum sunlight) is applied downstream
+      // via `bump.level`, matching the spec-14 contract.
+      const nx = -(heights[row + xp] - heights[row + xm]) * 4.2;
+      const ny = -(heights[yp + ix] - heights[ym + ix]) * 4.2;
+      const nz = 1.6;
+      const len = Math.sqrt(nx * nx + ny * ny + nz * nz);
+      const o = (row + ix) * 4;
+      data[o] = Math.round((nx / len) * 0.5 * 255 + 127.5);
+      data[o + 1] = Math.round((ny / len) * 0.5 * 255 + 127.5);
+      data[o + 2] = Math.round((nz / len) * 255);
+      data[o + 3] = 255;
+    }
+  }
+  return data;
+}
+
+/**
+ * Meso detail map (Spec 23 §2.1.2): 256×256 RGBA packed for Babylon's PBR
+ * detail shader — `R` albedo detail (0.5 = neutral, clast mounds brighter),
+ * `G`/`A` normal xy (the shader reads `.wy`), `B` roughness (0.5 = keep
+ * base; craterlet dust rougher, glassy clast mounds smoother). Contains
+ * 0.5–3 m craterlet depressions, clast mounds and crumbly ejecta blankets;
+ * tiles 16× across the patch. Deterministic in `seed`; NullEngine-safe.
+ */
+export function buildMesoDetailData(seed: number): Uint8Array {
+  const size = MESO_DETAIL_TEX_SIZE;
+  const lattice = 16; // 64 m tile / 4 m per lattice unit
+  const step = lattice / size;
+  const data = new Uint8Array(size * size * 4);
+  const lets = tileCraterlets(seed, lattice, 10, 0.12, 0.75); // 0.5–3 m craters
+
+  const heights = new Float32Array(size * size);
+  const clast = new Float32Array(size * size);
+  for (let iy = 0; iy < size; iy++) {
+    const y = (iy + 0.5) * step;
+    for (let ix = 0; ix < size; ix++) {
+      const x = (ix + 0.5) * step;
+      const i = iy * size + ix;
+      heights[i] = craterletField(x, y, lets) + fbmSeamless(x, y, seed + 7, lattice, 4) * 0.22;
+      // Clast mounds: thresholded mid-frequency noise → crumbly boulder
+      // clusters & ejecta blankets (sharp edges, then softly feathered).
+      const n = fbmSeamless(x, y, seed ^ 0xc1a57, lattice, 4) * 0.5 + 0.5;
+      clast[i] = clamp0to1((n - 0.56) / 0.22);
+    }
+  }
+
+  for (let iy = 0; iy < size; iy++) {
+    const ym = ((iy - 1 + size) % size) * size;
+    const yp = ((iy + 1) % size) * size;
+    for (let ix = 0; ix < size; ix++) {
+      const xm = (ix - 1 + size) % size;
+      const xp = (ix + 1) % size;
+      const i = iy * size + ix;
+      // h + clast mounds lift the surface: steeper slopes on the mounds.
+      const h = (v: number) => v + clast[i] * 0.2;
+      const nx = -(h(heights[iy * size + xp]) - h(heights[iy * size + xm])) * 2.6;
+      const ny = -(h(heights[yp + ix]) - h(heights[ym + ix])) * 2.6;
+      const nz = 1.0;
+      const len = Math.sqrt(nx * nx + ny * ny + nz * nz);
+      // Channel packing per openpbr detail blend (see material.detailMap
+      // shader: detailNormalRG = detailColor.wy, roughness from .b, albedo
+      // from .r — 0.5 is the neutral value in every non-normal channel).
+      // Roughness stays neutral except where it matters: glassy clast
+      // mounds smooth (specular glitter under raking sun), craterlet-floor
+      // dust (negative heights) rougher.
+      const albedo = clamp0to1(0.5 + clast[i] * 0.22 + heights[i] * 0.06);
+      const dustRough = Math.min(0, heights[i]) * -0.5;
+      const roughness = clamp0to1(0.5 - clast[i] * 0.3 + dustRough);
+      data[i * 4] = Math.round(albedo * 255);
+      data[i * 4 + 1] = Math.round((nx / len) * 0.5 * 255 + 127.5);
+      data[i * 4 + 2] = Math.round(roughness * 255);
+      data[i * 4 + 3] = Math.round((ny / len) * 0.5 * 255 + 127.5);
+    }
+  }
+  return data;
+}
+
+// ---------------------------------------------------------------------------
 // WorldScene
 // ---------------------------------------------------------------------------
 
@@ -232,6 +614,10 @@ export class WorldScene {
   private regolithMaterial: PBRMaterial | null = null;
   private starMaterial: StandardMaterial | null = null;
   private bumpTexture: RawTexture | null = null;
+  /** Spec 23 §2.1.1 — 512² mare/highland macro albedo (1× across the patch). */
+  private albedoTexture: RawTexture | null = null;
+  /** Spec 23 §2.1.2 — 256² meso craterlet/clast detail map (16× tiling). */
+  private mesoDetailTexture: RawTexture | null = null;
 
   private terrainRoot: TransformNode | null = null;
   private terrainMesh: Mesh | null = null;
@@ -241,6 +627,8 @@ export class WorldScene {
   private heightCache: Float32Array | null = null;
 
   private rig: CameraRig | null = null;
+  /** Scratch vector for the opposition-surge dot product (no per-frame alloc). */
+  private readonly scratchSurge = new Vector3(0, 0, 0);
   private entities = new Set<AbstractMesh>();
   private renderLoopStarted = false;
   /**
@@ -259,7 +647,7 @@ export class WorldScene {
       microRelief: options.microRelief ?? 0.22,
       shadowMapSize: options.shadowMapSize ?? 1024,
       sunIntensity: options.sunIntensity ?? 2.2,
-      earthshineIntensity: options.earthshineIntensity ?? 0.24,
+      earthshineIntensity: options.earthshineIntensity ?? 0.45,
       starDomeRadius: options.starDomeRadius ?? 6000,
       starCount: options.starCount ?? 900,
       spawnClearance: options.spawnClearance ?? 1.7,
@@ -314,6 +702,9 @@ export class WorldScene {
   render(): this {
     if (this.scene === null || this.disposed) return this;
     this.updateMiningEffects();
+    // Spec 23 §2.1.4: re-evaluate the Hapke opposition surge against the
+    // current camera view before every frame is submitted.
+    this.updateOppositionSurge();
     this.scene.render();
     return this;
   }
@@ -477,6 +868,18 @@ export class WorldScene {
       /* noop */
     }
     this.bumpTexture = null;
+    try {
+      this.albedoTexture?.dispose();
+    } catch {
+      /* noop */
+    }
+    this.albedoTexture = null;
+    try {
+      this.mesoDetailTexture?.dispose();
+    } catch {
+      /* noop */
+    }
+    this.mesoDetailTexture = null;
     try {
       this.regolithMaterial?.dispose();
     } catch {
@@ -1031,10 +1434,18 @@ export class WorldScene {
     }
 
     // Earthshine: the only fill. Faint earth-blue from the "up" hemisphere.
+    // Spec 23 §2.3 (ADR-023-3): the active optical visor lifts the fill to
+    // 0.45 with a brighter dust-bounce ground colour so shadowed crater
+    // interiors read like an amplified high-gain camera image, never a
+    // pitch-black void.
     const hemi = new HemisphericLight('earthshine', new Vector3(0, 1, 0), scene);
     hemi.intensity = this.options.earthshineIntensity;
     hemi.diffuse = new Color3(0.45, 0.6, 0.85); // earth-lit blue cast
-    hemi.groundColor = new Color3(0.08, 0.08, 0.09); // deep lunar dust bounce (Spec 21 §2.2)
+    hemi.groundColor = new Color3(
+      VISOR_GROUNDBOUNCE_COLOR.r,
+      VISOR_GROUNDBOUNCE_COLOR.g,
+      VISOR_GROUNDBOUNCE_COLOR.b,
+    ); // deep lunar dust bounce, visor-compensated (Spec 23 §2.3)
     this.earthshine = hemi;
   }
 
@@ -1197,68 +1608,168 @@ export class WorldScene {
   }
 
   /**
-   * Regolith PBR: albedo ~0.12 (fresh mare dust is barely brighter than
-   * charcoal), dielectric (metallic 0), very high roughness — Hapke-like
-   * backscatter opposition surge is approximated by keeping specular low but
-   * present, and letting the procedural normal map do the angular scattering.
+   * Regolith PBR — Spec 23 §2.1 three-frequency procedural stack (ADR-023-1):
+   *
+   *  1. **Macro albedo (512², 1× across the patch)** — mare basalt lowlands
+   *     (0.13, 0.13, 0.14) blending into highland anorthosite & crater ejecta
+   *     rays (0.28, 0.27, 0.26), keyed to `LunarWorldGenerator` crater
+   *     coordinates with radial streak noise. `albedoColor` stays a white
+   *     multiplier so the texture carries the physical albedo.
+   *  2. **Meso detail map (256², 16× tiling)** — craterlet depressions,
+   *     clast mounds and roughness variation through
+   *     `PBRMaterial.detailMap` (RNM normal blend).
+   *  3. **Micro-grit normal (256², 64× tiling)** — seamless five-octave
+   *     multi-scale fbm with craterlet ridges and sharp angular facets;
+   *     1024 m / 64 tiles / 256 texels ≈ 6.25 cm per normal texel.
+   *
+   * Hapke-like backscatter is approximated by keeping base specular low but
+   * present (`specularIntensity` 0.25) and lifting it — together with
+   * `directIntensity` — toward the sun via `updateOppositionSurge()` at zero
+   * phase angle (Spec 23 §2.1.4). The shadow floor sits at the washed-out
+   * visor emissive (0.12, 0.12, 0.14) so night faces never crush to black
+   * (Spec 23 §2.3 / ADR-023-3).
    */
   private buildRegolithMaterial(): PBRMaterial {
     const scene = this.requireScene();
     const mat = new PBRMaterial('regolith', scene);
-    mat.albedoColor = new Color3(0.20, 0.19, 0.18); // low-albedo grey-tan regolith (spec 14 §3.2)
-    // Elevated minimum emissive floor so crater floors facing away from the
-    // sun retain discernible relief (Spec 21 §2.2).
-    mat.emissiveColor = new Color3(0.035, 0.035, 0.038);
+    // Physical albedo lives in `albedoTexture` (1× across the patch); the
+    // constant is a neutral multiplier — Spec 23 §2.1.1 supersedes the old
+    // flat (0.20, 0.19, 0.18) tint criticised in Spec 23 §1.
+    mat.albedoColor = new Color3(1, 1, 1);
     mat.metallic = 0.0;
     mat.roughness = 0.94;
     mat.environmentIntensity = 0.02; // vacuum: nothing to reflect
-    mat.directIntensity = 1.0;
 
-    // Deterministic grit normal map (RG = xy slope, B = z) baked from fbm.
-    const texSize = 128;
-    const data = new Uint8Array(texSize * texSize * 4);
-    const seedHash = seedStringToNumber(this.worldGen.seed) ^ 0x5eed;
-    for (let y = 0; y < texSize; y++) {
-      for (let x = 0; x < texSize; x++) {
-        const s = 0.35;
-        const hL = fbm2((x - 1) * s, y * s, seedHash);
-        const hR = fbm2((x + 1) * s, y * s, seedHash);
-        const hD = fbm2(x * s, (y - 1) * s, seedHash);
-        const hU = fbm2(x * s, (y + 1) * s, seedHash);
-        let nx = hL - hR;
-        let ny = hD - hU;
-        const nz = 1.6;
-        const len = Math.sqrt(nx * nx + ny * ny + nz * nz);
-        nx /= len;
-        ny /= len;
-        const o = (y * texSize + x) * 4;
-        data[o] = Math.round((nx * 0.5 + 0.5) * 255);
-        data[o + 1] = Math.round((ny * 0.5 + 0.5) * 255);
-        data[o + 2] = Math.round((nz / len) * 255);
-        data[o + 3] = 255;
-      }
-    }
-    const bump = new RawTexture(
-      data,
-      texSize,
-      texSize,
+    // --- Spec 23 §2.3 / ADR-023-3: active optical visor shadow lift -------
+    // Washed-out slate grey floor instead of the old (0.035, 0.035, 0.038):
+    // deep crater basins read like a high-gain camera image, not a void.
+    mat.emissiveColor = new Color3(
+      VISOR_EMISSIVE_FLOOR.r,
+      VISOR_EMISSIVE_FLOOR.g,
+      VISOR_EMISSIVE_FLOOR.b,
+    );
+
+    // --- Spec 23 §2.1.4: Hapke opposition surge base state ----------------
+    // Calibrated so zero-phase viewing peaks directIntensity at 1.35 and
+    // specularIntensity at 0.70: velvety ridge fringes without washing out
+    // the sunlit-to-shadow transition.
+    mat.directIntensity = OPPOSITION_SURGE.baseDirect;
+    mat.specularIntensity = OPPOSITION_SURGE.baseSpecular;
+
+    const seedHash = seedStringToNumber(this.worldGen.seed);
+
+    // --- Frequency 1: macro albedo variegation (512², mare vs highland) --
+    const albedo = new RawTexture(
+      buildMacroAlbedoData(seedHash, this.snapshot?.craters ?? [], this.options.terrainOrigin ?? { x: 0, y: 0 }, this.options.terrainSize),
+      MACRO_ALBEDO_TEX_SIZE,
+      MACRO_ALBEDO_TEX_SIZE,
       Constants.TEXTUREFORMAT_RGBA,
       scene,
       true,
       false,
       Constants.TEXTURE_TRILINEAR_SAMPLINGMODE,
     );
-    bump.wrapU = Constants.WRAP_ADDRESSMODE;
-    bump.wrapV = Constants.WRAP_ADDRESSMODE;
-    // Spec 14 §3.2 — tile the 128² grit map 64× across the patch. With mesh UVs
-    // spanning 0..1 this lands one tile on every 1024/64 = 16 m of ground
-    // (~12.5 cm per normal texel) instead of stretching the map to 8 m/texel.
+    albedo.wrapU = Constants.TEXTURE_CLAMP_ADDRESSMODE; // 1× across the patch — no wrap
+    albedo.wrapV = Constants.TEXTURE_CLAMP_ADDRESSMODE;
+    // Bytes are sRGB-encoded linear albedos → Babylon's default gammaSpace
+    // colour path (same convention as a PNG albedo map).
+    albedo.uScale = 1;
+    albedo.vScale = 1;
+    this.albedoTexture = albedo;
+    mat.albedoTexture = albedo;
+
+    // --- Frequency 2: meso craterlet/clast detail map (256², 16×) ---------
+    const meso = new RawTexture(
+      buildMesoDetailData(seedHash ^ 0x0de7),
+      MESO_DETAIL_TEX_SIZE,
+      MESO_DETAIL_TEX_SIZE,
+      Constants.TEXTUREFORMAT_RGBA,
+      scene,
+      true,
+      false,
+      Constants.TEXTURE_TRILINEAR_SAMPLINGMODE,
+    );
+    meso.wrapU = Constants.TEXTURE_WRAP_ADDRESSMODE;
+    meso.wrapV = Constants.TEXTURE_WRAP_ADDRESSMODE;
+    // Spec 23 §2.1.2: 16× across the patch UVs (0..1) → one detail tile per
+    // 64 m of ground; craterlet & clast features land at ~0.25–3 m.
+    meso.uScale = 16;
+    meso.vScale = 16;
+    // Data map (normals + packed masks) — linear upload, no sRGB decode on
+    // the normal channels in the browser.
+    meso.gammaSpace = false;
+    this.mesoDetailTexture = meso;
+    mat.detailMap.texture = meso;
+    mat.detailMap.isEnabled = true;
+    mat.detailMap.normalBlendMethod = Material.MATERIAL_NORMALBLENDMETHOD_RNM;
+    mat.detailMap.diffuseBlendLevel = 0.55; // clast mounds visibly mottle the albedo
+    mat.detailMap.roughnessBlendLevel = 0.35; // dust-vs-clast roughness variation
+    mat.detailMap.bumpLevel = 1.6; // crisp raking-light micro-relief from depressions
+
+    // --- Frequency 3: micro-grit normal (256², 64× tiling) ----------------
+    const bump = new RawTexture(
+      buildMicroGritNormalData(seedHash ^ 0x5eed),
+      MICRO_GRIT_TEX_SIZE,
+      MICRO_GRIT_TEX_SIZE,
+      Constants.TEXTUREFORMAT_RGBA,
+      scene,
+      true,
+      false,
+      Constants.TEXTURE_TRILINEAR_SAMPLINGMODE,
+    );
+    bump.wrapU = Constants.TEXTURE_WRAP_ADDRESSMODE;
+    bump.wrapV = Constants.TEXTURE_WRAP_ADDRESSMODE;
+    // Spec 14 §3.2 (kept) — tile the 256² grit map 64× across the patch.
+    // With mesh UVs spanning 0..1 this lands one tile on every 1024/64 = 16 m
+    // of ground (~6.25 cm per normal texel).
     bump.uScale = 64;
     bump.vScale = 64;
+    bump.gammaSpace = false; // raw normal texels — linear upload
     this.bumpTexture = bump;
     mat.bumpTexture = bump;
     bump.level = 2.4; // coarse, airless grit catches the sun harshly
+    // Store for `getRegolithMaterial()` readback, the opposition-surge
+    // per-frame update, and dispose teardown (Spec 23).
+    this.regolithMaterial = mat;
     return mat;
+  }
+
+  /**
+   * Spec 23 §2.1.4 — per-frame Hapke retroreflective opposition surge. The
+   * regolith brightens as the camera view aligns with the sun vector (zero
+   * phase angle: particles hide their own shadows). Lifts `directIntensity`
+   * and `specularIntensity` on the regolith material by
+   * `OPPOSITION_SURGE` gains scaled through `hapkeOppositionSurge()`. No-op
+   * before `init()`, after `dispose()`, or without a sun/active camera.
+   */
+  updateOppositionSurge(): void {
+    if (this.disposed || this.scene === null || this.sun === null) return;
+    if (this.regolithMaterial === null) return;
+    const cam = this.scene.activeCamera;
+    if (cam === null || cam === undefined) return;
+    const ref = this.scratchSurge;
+    // Duck-typed: UniversalCamera / ArcRotateCamera both ship it, but the
+    // bare Camera base type in Babylon v9's .d.ts drifts on the signature.
+    const getDir = (cam as unknown as {
+      getDirectionToRef?: (local: Vector3, result: Vector3) => Vector3;
+    }).getDirectionToRef;
+    if (typeof getDir !== 'function') return;
+    getDir.call(cam, Vector3.Forward(), ref);
+    const sunLen = this.sun.direction.length();
+    if (sunLen < 1e-9) return;
+    // Zero phase angle = looking *toward* the sun, i.e. forward ≈ −d̂_sun.
+    const dot =
+      -(ref.x * this.sun.direction.x + ref.y * this.sun.direction.y + ref.z * this.sun.direction.z) / sunLen;
+    const surge = hapkeOppositionSurge(dot);
+    this.regolithMaterial.directIntensity =
+      OPPOSITION_SURGE.baseDirect + OPPOSITION_SURGE.directGain * surge;
+    this.regolithMaterial.specularIntensity =
+      OPPOSITION_SURGE.baseSpecular + OPPOSITION_SURGE.specularGain * surge;
+  }
+
+  /** The regolith PBR material (harness readback; null before init). */
+  getRegolithMaterial(): PBRMaterial | null {
+    return this.regolithMaterial;
   }
 
   // -- helpers -----------------------------------------------------------------

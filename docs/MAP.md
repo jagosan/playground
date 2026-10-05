@@ -19,6 +19,7 @@
 - `docs/architecture/20-lunar-frontier-hill-hold-drift-fix-and-stick-layout.md`: Buggy hill-hold zero-drift braking, coast regen torque, slope gravity cancellation, decoupled dual-stick layout (drive-right / look-left).
 - `docs/architecture/21-lunar-frontier-world-building-and-navigation.md`: Surface detritus & salvage, balanced lighting & chassis floodlights, automated freight train, tunnel portals & locked vaults, holographic topo map, and gamepad activation.
 - `docs/architecture/22-playground-lunar-frontier-lobby-integration.md`: 3D launch complex equipment, full-viewport bridge overlay, dual-engine isolation, shard telemetry, and URL deep-linking.
+- `docs/architecture/23-lunar-frontier-surface-rendering-and-lighting.md`: Surface rendering overhaul, multi-scale regolith detail, stadium headlights, volumetric beam cones & visor exposure compensation.
 - `docs/architecture/15-subagent-context-pruning-and-turn-budgeting.md`: Subagent context pruning, N-3 turn-budget circuit breaker, AST extraction, and Beehive Neo4j symbol discovery.
 - `specs/`:
   - `specs/00-system-overview.md`: Project vision, minigame architecture, rendering stack.
@@ -39,6 +40,7 @@
   - `specs/20-lunar-frontier-hill-hold-drift-fix-and-stick-layout.md`: Buggy hill-hold zero-drift braking, coast regen torque, slope gravity cancellation, decoupled dual-stick layout (drive-right / look-left).
   - `specs/21-lunar-frontier-world-building-and-navigation.md`: Surface detritus & salvage, balanced lighting & chassis floodlights, automated freight train, tunnel portals & locked vaults, holographic topo map, and gamepad activation.
   - `specs/22-playground-lunar-frontier-lobby-integration.md`: 3D launch complex equipment, full-viewport bridge overlay, dual-engine isolation, shard telemetry, and URL deep-linking.
+  - `specs/23-lunar-frontier-surface-rendering-and-lighting.md`: Surface rendering overhaul, multi-scale regolith detail, stadium headlights, volumetric beam cones & visor exposure compensation.
 
 ## Lunar Frontier Multiplayer & Economy Subsystem (Spec 12)
 - `games/lunar-frontier/server/`: Fastify + `ws` server, SQLite schema, market pricing, 20Hz tick (`LunarServer.ts`, `Database.ts`).

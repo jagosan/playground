@@ -13,6 +13,18 @@ export {
   type WorldSceneOptions,
   // Spec 19 §2.2.3: mining-laser burst payload.
   type MiningBeamEffect,
+  // Spec 23 §2.1/§2.3: Hapke opposition surge, visor constants & procedural
+  // texture synthesis (exported for headless verification harnesses).
+  VISOR_EMISSIVE_FLOOR,
+  VISOR_GROUNDBOUNCE_COLOR,
+  OPPOSITION_SURGE,
+  hapkeOppositionSurge,
+  MICRO_GRIT_TEX_SIZE,
+  MESO_DETAIL_TEX_SIZE,
+  MACRO_ALBEDO_TEX_SIZE,
+  buildMacroAlbedoData,
+  buildMicroGritNormalData,
+  buildMesoDetailData,
 } from './WorldScene.ts';
 
 export {

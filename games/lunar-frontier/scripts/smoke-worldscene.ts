@@ -23,6 +23,7 @@
 
 import { NullEngine } from '@babylonjs/core/Engines/nullEngine.js';
 import '@babylonjs/core/Culling/ray.js'; // side-effect: Ray for getForwardRay
+import { FreeCamera } from '@babylonjs/core/Cameras/freeCamera.js';
 import { MeshBuilder } from '@babylonjs/core/Meshes/meshBuilder.js';
 import { Vector3 } from '@babylonjs/core/Maths/math.vector.js';
 import type { ArcRotateCamera } from '@babylonjs/core/Cameras/arcRotateCamera.js';
@@ -38,6 +39,12 @@ import {
   CHASE_FOV_MAX_DEG,
   CHASE_LOOKAHEAD_BETA,
   velocityLookaheadTheta,
+  // Spec 23: opposition-surge model & procedural texture synthesis.
+  hapkeOppositionSurge,
+  OPPOSITION_SURGE,
+  buildMicroGritNormalData,
+  buildMesoDetailData,
+  buildMacroAlbedoData,
   type CameraMode,
 } from '../src/engine/index.ts';
 import { LunarWorldGenerator } from '../src/world/LunarWorldGenerator.ts';
@@ -95,9 +102,17 @@ check('stark sun DirectionalLight present', sun !== undefined && sun.getClassNam
 check('sun intensity is harsh (> 2)', sun !== undefined && sun.intensity > 2);
 check('earthshine hemispheric fill present', earthshine !== undefined && earthshine.getClassName() === 'HemisphericLight');
 check(
-  'earthshine intensity 0.24 (Spec 21 §2.2 rebalance)',
-  earthshine !== undefined && Math.abs(earthshine.intensity - 0.24) < 1e-6,
+  'earthshine intensity 0.45 (Spec 23 §2.3 visor compensation)',
+  earthshine !== undefined && Math.abs(earthshine.intensity - 0.45) < 1e-6,
 );
+check('earthshine ground bounce (0.14, 0.14, 0.16) (Spec 23 §2.3)', (() => {
+  if (earthshine === undefined) return false;
+  const g = (earthshine as unknown as {
+    groundColor?: { r: number; g: number; b: number };
+  }).groundColor;
+  return g !== undefined
+    && Math.abs(g.r - 0.14) < 1e-6 && Math.abs(g.g - 0.14) < 1e-6 && Math.abs(g.b - 0.16) < 1e-6;
+})());
 check('sun intensity 2.2 (Spec 21 §2.2 rebalance)', sun !== undefined && Math.abs(sun.intensity - 2.2) < 1e-6);
 check('earthshine hue is blue-dominant', (() => {
   if (earthshine === undefined) return false;
@@ -109,23 +124,57 @@ const terrain = world.getTerrainMesh();
 check('terrain mesh built', terrain !== null && terrain.getTotalVertices() === 129 * 129);
 const regolith = terrain?.material;
 check('regolith PBR material bound', regolith !== null && regolith !== undefined && regolith.getClassName() === 'PBRMaterial');
-check('regolith albedo per spec 14 §3.2 (0.20/0.19/0.18)', (() => {
+check('regolith albedo texture-carried (Spec 23 §2.1.1 supersedes flat tint)', (() => {
   if (regolith === undefined || regolith === null) return false;
-  const c = (regolith as { albedoColor?: { r: number; g: number; b: number } }).albedoColor;
+  const r = regolith as {
+    albedoColor?: { r: number; g: number; b: number };
+    albedoTexture?: { getSize?: () => { width: number; height: number }; uScale?: number; vScale?: number };
+  };
+  const c = r.albedoColor;
+  const t = r.albedoTexture;
+  const s = t?.getSize?.();
+  // Physical albedo moved into a 512² macro map (1× across the patch); the
+  // constant is a neutral white multiplier (Spec 23 Phase 1, ADR-023-1).
   return c !== undefined
-    && Math.abs(c.r - 0.20) < 1e-6 && Math.abs(c.g - 0.19) < 1e-6 && Math.abs(c.b - 0.18) < 1e-6;
+    && Math.abs(c.r - 1) < 1e-6 && Math.abs(c.g - 1) < 1e-6 && Math.abs(c.b - 1) < 1e-6
+    && s !== undefined && s.width === 512 && s.height === 512
+    && t !== undefined && t.uScale === 1 && t.vScale === 1;
 })());
 check('regolith roughness 0.94', (() => {
   if (regolith === undefined || regolith === null) return false;
   return Math.abs((regolith as { roughness?: number }).roughness! - 0.94) < 1e-6;
 })());
-check('regolith emissive floor lifts shadow faces (Spec 21 §2.2)', (() => {
+check('regolith emissive floor lifts shadow faces (Spec 23 §2.3 visor)', (() => {
   if (regolith === undefined || regolith === null) return false;
   const e = (regolith as { emissiveColor?: { r: number; g: number; b: number } }).emissiveColor;
-  // Spec 21 §2.2 mandates the elevated minimum emissive floor exactly.
+  // Spec 23 §2.3 / ADR-023-3 supersedes the Spec 21 (0.035…) floor: the
+  // washed-out slate-grey visor floor is mandated exactly. Acceptance gate:
+  // floor ≥ 0.10 so shadow faces never crush to black.
   return e !== undefined
-    && Math.abs(e.r - 0.035) < 1e-6 && Math.abs(e.g - 0.035) < 1e-6 && Math.abs(e.b - 0.038) < 1e-6
-    && e.r < 0.05;
+    && Math.abs(e.r - 0.12) < 1e-6 && Math.abs(e.g - 0.12) < 1e-6 && Math.abs(e.b - 0.14) < 1e-6
+    && e.r >= 0.10;
+})());
+check('Hapke opposition surge base state (Spec 23 §2.1.4)', (() => {
+  if (regolith === undefined || regolith === null) return false;
+  const m = regolith as { directIntensity?: number; specularIntensity?: number };
+  return Math.abs((m.directIntensity ?? 0) - 1.0) < 1e-6 && Math.abs((m.specularIntensity ?? 0) - 0.25) < 1e-6;
+})());
+check('meso detail map wired 16× + enabled (Spec 23 §2.1.2)', (() => {
+  if (regolith === undefined || regolith === null) return false;
+  const d = (regolith as {
+    detailMap?: {
+      isEnabled?: boolean;
+      normalBlendMethod?: number;
+      texture?: { getSize?: () => { width: number; height: number }; uScale?: number; vScale?: number };
+    };
+  }).detailMap;
+  const s = d?.texture?.getSize?.();
+  return d !== undefined
+    && d.texture !== undefined
+    && d.isEnabled === true
+    && d.normalBlendMethod === 1 // MATERIAL_NORMALBLENDMETHOD_RNM
+    && s !== undefined && s.width === 256 && s.height === 256
+    && d.texture.uScale === 16 && d.texture.vScale === 16;
 })());
 check('normal map UV-tiled 64× with level 2.4', (() => {
   if (regolith === undefined || regolith === null) return false;
@@ -467,6 +516,97 @@ section('3b. dynamic shadow focus tracking');
     } catch {
       return false;
     }
+  })());
+}
+
+// ---------------------------------------------------------------------------
+// 3c. Spec 23 — Hapke opposition surge & procedural texture determinism
+// ---------------------------------------------------------------------------
+section('3c. Spec 23 opposition surge & texture synthesis');
+
+{
+  // Pure response curve: zero phase (dot=1) peaks at 1; side lighting (dot≈0)
+  // and behind-camera (dot<0) are surge-free; NaN is clamped to 0.
+  check('surge curve: zero-phase peak == 1', Math.abs(hapkeOppositionSurge(1) - 1) < 1e-12);
+  check('surge curve: side/backlight are surge-free',
+    hapkeOppositionSurge(0) === 0 && hapkeOppositionSurge(-0.5) === 0 && hapkeOppositionSurge(Number.NaN) === 0);
+  check('surge curve: monotone in dot',
+    hapkeOppositionSurge(0.4) < hapkeOppositionSurge(0.7) &&
+    hapkeOppositionSurge(0.7) < hapkeOppositionSurge(0.95));
+
+  // Behavioural: an active camera aiming *at the sun* must lift the regolith
+  // material to the surge peak; aiming away must rest it at base values.
+  const surgeMat = world.getRegolithMaterial();
+  check('regolith material readable via accessor', surgeMat !== null);
+  const sunDir = (sun as DirectionalLight).direction;
+  const sunLen = Math.hypot(sunDir.x, sunDir.y, sunDir.z);
+  // Looking toward the sun ⇒ forward ≈ −d̂. Babylon camera forward for
+  // rotation (rx, ry, 0) is (sin ry·cos rx, −sin rx, cos ry·cos rx), so the
+  // exact zero-phase pose needs pitch rx = asin(d̂y) as well as yaw.
+  const ryToSun = Math.atan2(-sunDir.x / sunLen, -sunDir.z / sunLen);
+  const rxToSun = Math.asin(Math.max(-1, Math.min(1, sunDir.y / sunLen)));
+  const sunCam = new FreeCamera('surge-probe-cam', new Vector3(0, 5, 0), scene);
+  sunCam.rotation.set(rxToSun, ryToSun, 0);
+  const prevCam = scene.activeCamera;
+  scene.activeCamera = sunCam;
+  world.updateOppositionSurge();
+  const m = surgeMat as unknown as { directIntensity: number; specularIntensity: number };
+  check('zero-phase view lifts directIntensity to surge peak',
+    Math.abs(m.directIntensity - (OPPOSITION_SURGE.baseDirect + OPPOSITION_SURGE.directGain)) < 1e-6,
+    `direct=${m.directIntensity}`);
+  check('zero-phase view lifts specularIntensity to surge peak',
+    Math.abs(m.specularIntensity - (OPPOSITION_SURGE.baseSpecular + OPPOSITION_SURGE.specularGain)) < 1e-6,
+    `spec=${m.specularIntensity}`);
+  sunCam.rotation.set(0, ryToSun + Math.PI, 0); // sun now behind the camera
+  world.updateOppositionSurge();
+  check('anti-phase view rests at base intensities',
+    Math.abs(m.directIntensity - OPPOSITION_SURGE.baseDirect) < 1e-6
+    && Math.abs(m.specularIntensity - OPPOSITION_SURGE.baseSpecular) < 1e-6);
+  scene.activeCamera = prevCam;
+  sunCam.dispose();
+
+  // Procedural texture determinism: same seed → identical bytes, different
+  // seed → different bytes (all pure typed arrays, NullEngine-safe).
+  const gritA = buildMicroGritNormalData(42);
+  const gritB = buildMicroGritNormalData(42);
+  check('micro-grit normal deterministic across calls',
+    gritA.every((v: number, i: number) => v === gritB[i]));
+  const a1 = buildMacroAlbedoData(42, [{ center: { x: 500, y: 500 }, radius: 200 }], { x: 0, y: 0 }, 1024);
+  const a2 = buildMacroAlbedoData(43, [{ center: { x: 500, y: 500 }, radius: 200 }], { x: 0, y: 0 }, 1024);
+  let differs = false;
+  for (let i = 0; i < a1.length; i++) if (a1[i] !== a2[i]) { differs = true; break; }
+  check('macro albedo seed-sensitive', differs);
+  check('macro albedo spans mare→highland albedo range', (() => {
+    let lo = 255;
+    let hi = 0;
+    for (let i = 0; i < a1.length; i += 4) {
+      if (a1[i] < lo) lo = a1[i];
+      if (a1[i] > hi) hi = a1[i];
+    }
+    // Bytes are sRGB-encoded (Babylon gammaSpace RGBA8): sRGB(0.13) ≈ 101,
+    // sRGB(0.28) ≈ 144 — the map must cover both the mare basalt floor and
+    // the highland/ejecta ceiling (Spec 23 §2.1.1).
+    return lo <= 104 && hi >= 142;
+  })());
+  check('meso detail map packs normal xy + neutral albedo/roughness', (() => {
+    const d = buildMesoDetailData(7);
+    if (d.length !== 256 * 256 * 4) return false;
+    // Babylon's detail blend reads: R = albedo detail, G/A = normal xy,
+    // B = roughness (gammaSpace=false so all channels are raw data).
+    let nonFlat = 0;
+    let rSum = 0;
+    let bSum = 0;
+    for (let i = 0; i < d.length; i += 4) {
+      if (d[i + 1] !== 128 || d[i + 3] !== 128) nonFlat++;
+      rSum += d[i];
+      bSum += d[i + 2];
+    }
+    const n = d.length / 4;
+    // The normal channels must actually carry baked relief (craterlets &
+    // clasts over the majority of texels), while albedo & roughness hover
+    // near their 0.5 neutral (128) with clast variation.
+    return nonFlat > n * 0.5
+      && Math.abs(rSum / n - 128) < 24 && Math.abs(bSum / n - 128) < 24;
   })());
 }
 
