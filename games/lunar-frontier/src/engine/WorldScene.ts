@@ -58,7 +58,7 @@ import { NullEngine } from '@babylonjs/core/Engines/nullEngine.js';
 import { Engine } from '@babylonjs/core/Engines/engine.js';
 import { AbstractEngine } from '@babylonjs/core/Engines/abstractEngine.js';
 import { Color3, Color4 } from '@babylonjs/core/Maths/math.color.js';
-import { Quaternion, Vector3 } from '@babylonjs/core/Maths/math.vector.js';
+import { Matrix, Quaternion, Vector3 } from '@babylonjs/core/Maths/math.vector.js';
 import { Constants } from '@babylonjs/core/Engines/constants.js';
 import { Scene } from '@babylonjs/core/scene.js';
 import { DirectionalLight } from '@babylonjs/core/Lights/directionalLight.js';
@@ -69,6 +69,10 @@ import { Material } from '@babylonjs/core/Materials/material.js';
 import { StandardMaterial } from '@babylonjs/core/Materials/standardMaterial.js';
 import { RawTexture } from '@babylonjs/core/Materials/Textures/rawTexture.js';
 import { Mesh } from '@babylonjs/core/Meshes/mesh.js';
+// Babylon v9 side-effect module: registers the thin-instance members
+// (thinInstanceSetBuffer / thinInstanceCount / thinInstanceRefreshBoundingInfo)
+// on Mesh.prototype. Without it the tree-shaken build leaves them missing.
+import '@babylonjs/core/Meshes/thinInstanceMesh.js';
 import { MeshBuilder } from '@babylonjs/core/Meshes/meshBuilder.js';
 import { TransformNode } from '@babylonjs/core/Meshes/transformNode.js';
 import { VertexData } from '@babylonjs/core/Meshes/mesh.vertexData.js';
@@ -76,10 +80,13 @@ import type { AbstractMesh } from '@babylonjs/core/Meshes/abstractMesh.js';
 
 import {
   LunarWorldGenerator,
+  ROCK_ARCHETYPE_SIZES,
   type WorldSnapshot,
   type ScrapSite,
   type ScrapComponent,
   type Vec3,
+  type RockArchetype,
+  type RockFieldSnapshot,
 } from '../world/LunarWorldGenerator.ts';
 import { CameraRig, worldToBabylon, type CameraMode } from './CameraRig.ts';
 
@@ -122,6 +129,26 @@ export interface WorldSceneOptions {
 
 /** Sun azimuth/elevation of the frontier site, radians (low, harsh light). */
 const SUN_DIRECTION = { azimuth: -2.4, elevation: 0.42 };
+
+/**
+ * Spec 23 §2.2 / ADR-023-2: vertical flattening per clast archetype applied
+ * to the base polyhedron (and mirrored by the instance placement so the
+ * clast straddles the terrain surface). Pebbles stay nearly spherical;
+ * boulders settle into wide talus blocks. Exported for harness assertions.
+ */
+export const ROCK_HEIGHT_FLATTEN: Record<RockArchetype, number> = {
+  pebble: 0.72,
+  rock: 0.78,
+  boulder: 0.85,
+};
+
+/**
+ * Spec 23 Phase 3: fraction of its own diameter a clast centre is pushed
+ * BELOW the local ground line, so every instance visibly straddles the
+ * surface — never floats on the heightmap, never sinks out of frame.
+ * Exported so headless harnesses can assert elevation clamping exactly.
+ */
+export const ROCK_SINK_RATIO = 0.3;
 
 /**
  * Spec 16 §2.3 / ADR-016-3: metres the sun's shadow origin is pulled *back*
@@ -639,6 +666,23 @@ export class WorldScene {
   /** Procedural scrap sites (Spec 21 §2.1). */
   private scrapRoots = new Map<string, { root: TransformNode; beacon?: Mesh; meshes: Mesh[] }>();
 
+  // -- Spec 23 §2.2 / ADR-023-2: thin-instance clast fields ------------------
+  /** Root container for all three rock archetype meshes (one TransformNode). */
+  private rockFieldRoot: TransformNode | null = null;
+  /**
+   * One Mesh per archetype (pebble / rock / boulder). Each carries all its
+   * instances via `thinInstanceSetBuffer("matrix", …)` → 3 draw calls total.
+   */
+  private rockMeshes: Partial<Record<RockArchetype, Mesh>> = {};
+  /** Raw float matrix buffers (kept alive so NullEngine never GC's them). */
+  private rockMatrixBuffers: Partial<Record<RockArchetype, Float32Array>> = {};
+  /** Shared faceted-clast PBR material for all three archetype meshes. */
+  private rockMaterial: PBRMaterial | null = null;
+  /** Generator snapshot used to build the current clast field (harness readback). */
+  private rockFieldSnapshot: RockFieldSnapshot | null = null;
+  /** Total thin instances spawned across all archetypes (harness readback). */
+  private rockTotalInstances = 0;
+
   constructor(options: WorldSceneOptions = {}) {
     this.options = {
       ...options,
@@ -681,6 +725,7 @@ export class WorldScene {
     this.buildLighting();
     this.buildStarfield();
     this.buildTerrain();
+    this.buildRockFields();
     this.buildScrapSites();
 
     this.rig = new CameraRig(this.scene, {
@@ -839,6 +884,9 @@ export class WorldScene {
     }
     this.terrainMesh = null;
     this.starDome = null;
+
+    // Spec 23 §2.2: clast meshes, shared material, root node & CPU matrices.
+    this.disposeRockFields();
 
     for (const mesh of this.entities) mesh.parent = null;
     this.entities.clear();
@@ -1605,6 +1653,253 @@ export class WorldScene {
     mesh.parent = this.terrainRoot;
     this.terrainMesh = mesh;
     this.heightCache = heights;
+  }
+
+  // -- Spec 23 §2.2 / ADR-023-2: thin-instance pebble & boulder fields --------
+
+  /**
+   * Build the surface clast fields (Spec 23 §2.2, ADR-023-2): three low-poly
+   * base meshes — pebble / medium rock / boulder clast — each with faceted
+   * (flat-shaded) displaced polyhedron geometry, carrying every scatter
+   * placement of its archetype as Babylon **thin instances** in one flat
+   * `Float32Array` matrix buffer (`thinInstanceSetBuffer("matrix", …, 16)`).
+   * Total draw-call cost: ≤ 3 (one per archetype), regardless of instance
+   * count.
+   *
+   * Placement comes from `LunarWorldGenerator.getRockInstances()` (fully
+   * deterministic from the world seed: grid-jitter base field + extra
+   * clusters in crater-lip/ejecta-blanket annuli). Each instance is elevated
+   * onto the terrain via `getGroundHeightAt(x, y)` and sunk by
+   * `ROCK_SINK_RATIO` of its own diameter so it straddles the surface —
+   * never floats, never buries — with random yaw, slight tilt, and scale
+   * variation.
+   *
+   * Medium rocks and boulders join the sun's shadow-map render list
+   * (receiver + caster); pebbles are receiver-only (too small to earn a
+   * shadow texel). Under `NullEngine` the matrices live purely in CPU typed
+   * arrays — Babylon's buffer calls are no-ops, so CI never touches WebGL.
+   */
+  private buildRockFields(): void {
+    const scene = this.requireScene();
+    const origin = this.options.terrainOrigin ?? { x: 0, y: 0 };
+    const size = this.options.terrainSize;
+    const seedHash = seedStringToNumber(this.worldGen.seed);
+
+    const field = this.worldGen.getRockInstances(origin.x, origin.y, size);
+    this.rockFieldSnapshot = field;
+
+    const root = new TransformNode('rock-fields', scene);
+    this.rockFieldRoot = root;
+
+    // One shared faceted-rock PBR: dark basalt clast, matte, non-metallic.
+    // Faceted normals from the base geometry carry the raking-sun shading,
+    // so no bump texture is needed (keeps the material lifecycle trivial).
+    const rockMat = new PBRMaterial('rock-clast', scene);
+    rockMat.albedoColor = new Color3(0.34, 0.30, 0.27); // darker than lit regolith highlight side
+    rockMat.metallic = 0.0;
+    rockMat.roughness = 0.9;
+    rockMat.environmentIntensity = 0.02; // vacuum: nothing to reflect
+    // Shadow faces of clasts get the same washed-out visor floor (ADR-023-3)
+    // so boulder silhouettes stay readable in crater darks.
+    rockMat.emissiveColor = new Color3(
+      VISOR_EMISSIVE_FLOOR.r * 0.6,
+      VISOR_EMISSIVE_FLOOR.g * 0.6,
+      VISOR_EMISSIVE_FLOOR.b * 0.6,
+    );
+    this.rockMaterial = rockMat;
+
+    // Base geometries (diameter 1, flattened to lunar clast proportions).
+    const pebbleBase = this.buildClastGeometry(scene, 'rock-base-pebble', 2, 0.06, 0.72, seedHash ^ 0x9e11);
+    const rockBase = this.buildClastGeometry(scene, 'rock-base-rock', 12, 0.16, 0.78, seedHash ^ 0x51a2);
+    const boulderBase = this.buildClastGeometry(scene, 'rock-base-boulder', 13, 0.22, 0.85, seedHash ^ 0xb0a2);
+
+    const scratchMatrix = new Matrix();
+    const scratchScale = new Vector3(1, 1, 1);
+    const scratchRot = new Quaternion();
+    const scratchPos = new Vector3(0, 0, 0);
+
+    const archetypeMeshes: Array<{
+      archetype: RockArchetype;
+      base: Mesh;
+      instances: typeof field.pebbles;
+      castsShadow: boolean;
+    }> = [
+      { archetype: 'pebble', base: pebbleBase, instances: field.pebbles, castsShadow: false },
+      { archetype: 'rock', base: rockBase, instances: field.rocks, castsShadow: true },
+      { archetype: 'boulder', base: boulderBase, instances: field.boulders, castsShadow: true },
+    ];
+
+    let total = 0;
+    for (const { archetype, base, instances, castsShadow } of archetypeMeshes) {
+      const buffer = new Float32Array(Math.max(1, instances.length) * 16);
+      let n = 0;
+      for (const inst of instances) {
+        // Ground elevation under the clast, in the physics frame; the centre
+        // sits at half the flattened clast height, sunk by SINK_RATIO of its
+        // diameter so it straddles the surface line.
+        const ground = this.getGroundHeightAt(inst.x, inst.y);
+        const s = inst.size * inst.scale; // diameter in metres
+        const centreZ = ground + s * (ROCK_HEIGHT_FLATTEN[archetype] * 0.5) - s * ROCK_SINK_RATIO;
+        const bPos = worldToBabylon({ x: inst.x, y: inst.y, z: centreZ });
+        scratchScale.setAll(s);
+        // Random yaw + a slight settle tilt so clasts don't stand at attention.
+        const tiltSeed = hash2i(Math.round(inst.x * 8), Math.round(inst.y * 8), seedHash);
+        Quaternion.FromEulerAnglesToRef(
+          (tiltSeed - 0.5) * 0.22,
+          inst.yaw,
+          (hash2i(Math.round(inst.y * 8), Math.round(inst.x * 8), seedHash) - 0.5) * 0.22,
+          scratchRot,
+        );
+        scratchPos.copyFrom(bPos);
+        Matrix.ComposeToRef(scratchScale, scratchRot, scratchPos, scratchMatrix);
+        scratchMatrix.copyToArray(buffer, n * 16);
+        n++;
+      }
+      total += n;
+
+      base.material = rockMat;
+      base.isPickable = false;
+      base.receiveShadows = this.shadowGen !== null;
+      base.parent = root;
+      // One flat matrix buffer → one draw call for the whole archetype.
+      base.thinInstanceSetBuffer('matrix', buffer, 16, true);
+      // Bounding boxes must enclose the instances for frustum culling;
+      // `alwaysSelectAsActiveMesh` additionally sidesteps NullEngine culling
+      // edge cases so CI renders always include the fields.
+      base.thinInstanceRefreshBoundingInfo(true);
+      base.alwaysSelectAsActiveMesh = true;
+      if (castsShadow && this.shadowGen !== null) {
+        this.shadowGen.addShadowCaster(base);
+      }
+      this.rockMeshes[archetype] = base;
+      this.rockMatrixBuffers[archetype] = buffer;
+    }
+    this.rockTotalInstances = total;
+  }
+
+  /**
+   * Low-poly faceted clast geometry (Spec 23 Phase 3): a `CreatePolyhedron`
+   * shell (unit diameter) whose vertices are displaced radially by a
+   * hash-noise fracture field, flattened on the vertical axis to lunar
+   * talus proportions, then re-cut with flat per-facet normals so each face
+   * catches the raking sun as a distinct plane. Deterministic in `seedHash`
+   * (polyhedron vertex order is stable); NullEngine-safe (CPU vertex data).
+   */
+  private buildClastGeometry(
+    scene: Scene,
+    name: string,
+    polyType: number,
+    fractureAmp: number,
+    heightFlatten: number,
+    seedHash: number,
+  ): Mesh {
+    const mesh = MeshBuilder.CreatePolyhedron(name, { type: polyType, size: 0.5 }, scene);
+    const positions = mesh.getVerticesData('position');
+    if (positions !== undefined && positions !== null) {
+      for (let i = 0; i < positions.length; i += 3) {
+        const vx = positions[i];
+        const vy = positions[i + 1];
+        const vz = positions[i + 2];
+        // Radial fracture displacement keyed to the vertex direction, so the
+        // two duplicated verts of a shared corner move identically (no tears).
+        const n = hash2i(
+          Math.round(vx * 37) + 64,
+          Math.round(vy * 37) + Math.round(vz * 53) * 7 + 64,
+          seedHash,
+        );
+        const f = 1 + (n - 0.5) * 2 * fractureAmp;
+        positions[i] = vx * f;
+        positions[i + 1] = vy * f;
+        positions[i + 2] = vz * f;
+      }
+      // Flatten to a settled-clast profile (wider than tall, like Apollo talus).
+      for (let i = 0; i < positions.length; i += 3) {
+        positions[i + 1] *= heightFlatten;
+      }
+      mesh.updateVerticesData('position', positions);
+    }
+    // Faceted normals: duplicate verts per face with per-face normals.
+    mesh.convertToFlatShadedMesh();
+    mesh.refreshBoundingInfo();
+    return mesh;
+  }
+
+  /** The three clast archetype meshes built by `buildRockFields()`. */
+  getRockFieldMeshes(): Mesh[] {
+    return Object.values(this.rockMeshes).filter((m): m is Mesh => m !== undefined);
+  }
+
+  /**
+   * Thin-instance clast field summary (harness readback, Spec 23 §5 gate 5):
+   * per-archetype instance counts, total count, and base geometry vertex
+   * counts. Zeros before `init()` / after `dispose()`.
+   */
+  getRockFieldInfo(): {
+    pebbles: number;
+    rocks: number;
+    boulders: number;
+    total: number;
+    meshCount: number;
+    thinInstanceMatrixStride: number;
+  } {
+    const countOf = (a: RockArchetype): number => {
+      const mesh = this.rockMeshes[a];
+      return mesh !== undefined ? (mesh.thinInstanceCount ?? 0) : 0;
+    };
+    return {
+      pebbles: countOf('pebble'),
+      rocks: countOf('rock'),
+      boulders: countOf('boulder'),
+      total: this.rockTotalInstances,
+      meshCount: this.getRockFieldMeshes().length,
+      thinInstanceMatrixStride: 16,
+    };
+  }
+
+  /**
+   * The live CPU-side thin-instance matrix buffer for one archetype (16
+   * floats, column-major, per instance; translation at offsets 12–14).
+   * Exposed for headless verification — under NullEngine this typed array
+   * *is* the instance storage. Null before init / after dispose.
+   */
+  getRockMatrixBuffer(archetype: RockArchetype): Float32Array | null {
+    if (this.disposed) return null;
+    return this.rockMatrixBuffers[archetype] ?? null;
+  }
+
+  /** The generator clast snapshot backing the current fields (harness readback). */
+  getRockFieldSnapshot(): RockFieldSnapshot | null {
+    return this.rockFieldSnapshot;
+  }
+
+  /** Tear down clast meshes, materials, root node, and matrix buffers. */
+  private disposeRockFields(): void {
+    for (const key of Object.keys(this.rockMeshes) as RockArchetype[]) {
+      const mesh = this.rockMeshes[key];
+      if (mesh !== undefined) {
+        try {
+          mesh.dispose();
+        } catch {
+          /* scene torn down first */
+        }
+      }
+      delete this.rockMeshes[key];
+      delete this.rockMatrixBuffers[key];
+    }
+    try {
+      this.rockMaterial?.dispose();
+    } catch {
+      /* noop */
+    }
+    this.rockMaterial = null;
+    try {
+      this.rockFieldRoot?.dispose();
+    } catch {
+      /* noop */
+    }
+    this.rockFieldRoot = null;
+    this.rockFieldSnapshot = null;
+    this.rockTotalInstances = 0;
   }
 
   /**

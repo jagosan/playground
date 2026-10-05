@@ -45,6 +45,9 @@ import {
   buildMicroGritNormalData,
   buildMesoDetailData,
   buildMacroAlbedoData,
+  // Spec 23 §2.2 / ADR-023-2: clast-field placement constants.
+  ROCK_HEIGHT_FLATTEN,
+  ROCK_SINK_RATIO,
   type CameraMode,
 } from '../src/engine/index.ts';
 import { LunarWorldGenerator } from '../src/world/LunarWorldGenerator.ts';
@@ -611,6 +614,144 @@ section('3c. Spec 23 opposition surge & texture synthesis');
 }
 
 // ---------------------------------------------------------------------------
+// 3d. Spec 23 — thin-instance pebble & boulder clast fields (ADR-023-2)
+// ---------------------------------------------------------------------------
+section('3d. Spec 23 rock & pebble thin-instance fields');
+
+{
+  // -- Generator: deterministic clast tables ---------------------------------
+  const rockField = gen.getRockInstances(0, 0, 1024);
+  check('generator rock field totals > 1000 instances', rockField.total > 1000, `total=${rockField.total}`);
+  check('pebbles > 1000 across active sector', rockField.pebbles.length > 1000, `pebbles=${rockField.pebbles.length}`);
+  check('medium rocks > 300 across plains & slopes', rockField.rocks.length > 300, `rocks=${rockField.rocks.length}`);
+  check('boulder clasts scattered', rockField.boulders.length >= 10, `boulders=${rockField.boulders.length}`);
+
+  const inBand = (v: number, min: number, max: number): boolean => v >= min && v <= max;
+  check('pebble sizes in 5–20 cm band', rockField.pebbles.every((p) => inBand(p.size, 0.05, 0.2)));
+  check('rock sizes in 25–80 cm band', rockField.rocks.every((r) => inBand(r.size, 0.25, 0.8)));
+  check('boulder sizes in 1.0–3.0 m band', rockField.boulders.every((b) => inBand(b.size, 1.0, 3.0)));
+  check('yaw & scale variation present', (() => {
+    const yaws = new Set(rockField.pebbles.slice(0, 200).map((p) => p.yaw.toFixed(6)));
+    const scales = new Set(rockField.pebbles.slice(0, 200).map((p) => p.scale.toFixed(4)));
+    return yaws.size > 150 && scales.size > 20;
+  })());
+  check('crater-lip / ejecta concentration flagged', (() => {
+    const near =
+      rockField.pebbles.filter((p) => p.nearCrater).length +
+      rockField.rocks.filter((r) => r.nearCrater).length +
+      rockField.boulders.filter((b) => b.nearCrater).length;
+    if (near === 0) return false;
+    // Every flagged clast must sit inside an ejecta-blanket annulus (d ≥ R)
+    // of some crater — higher density near lips than the flat base field.
+    return snapshot.craters.every(() => true) && rockField
+      .pebbles.filter((p) => p.nearCrater)
+      .every((p) =>
+        snapshot.craters.some((c) => {
+          const d = Math.hypot(p.x - c.center.x, p.y - c.center.y);
+          return d >= c.radius * 0.999 && d <= c.radius * (1 + 0.35 + 0.55) + 1e-6;
+        }));
+  })());
+
+  // Determinism: memoised, and identical across generator instances.
+  check('rock field memoised (same object)', gen.getRockInstances(0, 0, 1024) === rockField);
+  const genR = new LunarWorldGenerator(SEED);
+  genR.generate();
+  const fieldR = genR.getRockInstances(0, 0, 1024);
+  check('rock field deterministic across generator instances',
+    JSON.stringify(rockField.pebbles.slice(0, 8)) === JSON.stringify(fieldR.pebbles.slice(0, 8))
+    && rockField.total === fieldR.total);
+
+  // -- Scene: thin-instance meshes --------------------------------------------
+  const rockMeshes = world.getRockFieldMeshes();
+  check('3 archetype base meshes (≤ 3 draw-call budget)', rockMeshes.length === 3, `meshes=${rockMeshes.length}`);
+  const rockInfo = world.getRockFieldInfo();
+  check('scene thin-instance total ≥ 1000 (Spec 23 §5 gate 5)', rockInfo.total >= 1000, `total=${rockInfo.total}`);
+  check('scene counts match generator snapshot',
+    rockInfo.pebbles === rockField.pebbles.length
+    && rockInfo.rocks === rockField.rocks.length
+    && rockInfo.boulders === rockField.boulders.length);
+  check('matrix stride == 16', rockInfo.thinInstanceMatrixStride === 16);
+  check('each mesh carries thinInstanceCount > 0', rockMeshes.every((m) => (m.thinInstanceCount ?? 0) > 0));
+  check('base geometries are low-poly', rockMeshes.every((m) => m.getTotalVertices() > 0 && m.getTotalVertices() < 256),
+    rockMeshes.map((m) => m.getTotalVertices()).join('/'));
+  check('faceted normals on clast geometry', rockMeshes.every((m) => {
+    const n = m.getVerticesData('normal');
+    return n !== undefined && n !== null && n.length === m.getTotalVertices() * 3;
+  }));
+  check('matrix buffers stored cleanly in memory (NullEngine)', (() => {
+    const countByArchetype: Record<'pebble' | 'rock' | 'boulder', number> = {
+      pebble: rockInfo.pebbles,
+      rock: rockInfo.rocks,
+      boulder: rockInfo.boulders,
+    };
+    for (const a of ['pebble', 'rock', 'boulder'] as const) {
+      const buf = world.getRockMatrixBuffer(a);
+      if (buf === null || !(buf instanceof Float32Array)) return false;
+      if (buf.length !== countByArchetype[a] * 16) return false;
+      for (let i = 0; i < buf.length; i++) {
+        if (!Number.isFinite(buf[i])) return false;
+      }
+    }
+    return true;
+  })());
+
+  // -- Elevation clamping: every instance sits on getGroundHeightAt -----------
+  check('rock instances elevated to terrain via getGroundHeightAt', (() => {
+    for (const a of ['pebble', 'rock', 'boulder'] as const) {
+      const buf = world.getRockMatrixBuffer(a);
+      if (buf === null) return false;
+      const n = buf.length / 16;
+      if (n === 0) return false;
+      for (let i = 0; i < n; i++) {
+        const o = i * 16;
+        // Column-major: translation at 12..14 (Babylon frame: x, y↑, -y_w).
+        const wx = buf[o + 12];
+        const wyWorld = -buf[o + 14];
+        // Uniform scale = row-vector length of the first basis column.
+        const s = Math.hypot(buf[o], buf[o + 1], buf[o + 2]);
+        const ground = world.getGroundHeightAt(wx, wyWorld);
+        const expectedY = ground + s * (ROCK_HEIGHT_FLATTEN[a] * 0.5) - s * ROCK_SINK_RATIO;
+        if (Math.abs(buf[o + 13] - expectedY) > 1e-3) return false;
+        // Straddle contract: centre within ±1 diameter of the ground line.
+        if (Math.abs(buf[o + 13] - ground) > s) return false;
+      }
+    }
+    return true;
+  })());
+
+  // -- Shadows: medium rocks + boulders cast, pebbles do not -------------------
+  const rockShadowList = (() => {
+    if (sun === undefined) return [] as unknown[];
+    const maps = sun.getShadowGenerators();
+    if (maps === null || maps.size === 0) return [] as unknown[];
+    const sg = maps.entries().next().value?.[1] as { getShadowMap?: () => { renderList?: unknown[] } };
+    return sg.getShadowMap?.()?.renderList ?? [];
+  })();
+  const meshByName = (name: string) => scene.meshes.find((m) => m.name === name);
+  check('medium rocks registered as shadow casters', rockShadowList.includes(meshByName('rock-base-rock')));
+  check('boulders registered as shadow casters', rockShadowList.includes(meshByName('rock-base-boulder')));
+  check('pebbles stay receiver-only', !rockShadowList.includes(meshByName('rock-base-pebble')));
+  check('rock meshes parented to rock-fields root under scene', (() => {
+    const root = rockMeshes[0]?.parent;
+    return root !== undefined && root !== null && root.name === 'rock-fields';
+  })());
+  check('rock clasts excluded from entity bookkeeping', (() => {
+    const ents = new Set(world.getEntities());
+    return rockMeshes.every((m) => !ents.has(m));
+  })());
+
+  // Render with the fields active must not throw (NullEngine thin pass).
+  check('render with thin-instance fields is error-free', (() => {
+    try {
+      world.render();
+      return true;
+    } catch {
+      return false;
+    }
+  })());
+}
+
+// ---------------------------------------------------------------------------
 // 4. Entity bookkeeping
 // ---------------------------------------------------------------------------
 section('4. entity add / remove');
@@ -668,6 +809,16 @@ check('render() advances frames', scene.getFrameId() > frame0);
 check('render() is chainable', world.render() === world);
 
 world.dispose();
+check('post-dispose rock fields torn down (meshes + root + buffers)', (() => {
+  const info = world.getRockFieldInfo();
+  return info.total === 0
+    && info.meshCount === 0
+    && world.getRockFieldMeshes().length === 0
+    && world.getRockMatrixBuffer('pebble') === null
+    && world.getRockMatrixBuffer('rock') === null
+    && world.getRockMatrixBuffer('boulder') === null
+    && world.getRockFieldSnapshot() === null;
+})());
 check('post-dispose getGroundHeightAt falls back to generator',
   Math.abs(world.getGroundHeightAt(deepest.center.x, deepest.center.y) - gen.elevationAt(deepest.center.x, deepest.center.y)) < 2.5);
 check('post-dispose render is a no-op', (() => {

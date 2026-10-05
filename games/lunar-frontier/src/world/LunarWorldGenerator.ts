@@ -352,6 +352,72 @@ export const SURFACE_LINK_MAX_M = 1500;
 /** Rail freight is unloaded within this radius of a dock/refinery for value. */
 /** Chance a non-polar sector is mare basalt (vs. highland terrane). */
 export const MARE_PROBABILITY = 0.55;
+
+// ---------------------------------------------------------------------------
+// Surface rock & pebble clast fields (Spec 23 §2.2 / ADR-023-2)
+// ---------------------------------------------------------------------------
+
+/** The three procedurally scattered surface clast archetypes. */
+export type RockArchetype = 'pebble' | 'rock' | 'boulder';
+
+/**
+ * Nominal diameter bands per archetype in metres (Spec 23 §2.2.1):
+ * pebbles 5–20 cm, medium rocks 25–80 cm, boulder clasts 1.0–3.0 m.
+ */
+export const ROCK_ARCHETYPE_SIZES: Record<RockArchetype, { min: number; max: number }> = {
+  pebble: { min: 0.05, max: 0.2 },
+  rock: { min: 0.25, max: 0.8 },
+  boulder: { min: 1.0, max: 3.0 },
+};
+
+/** One deterministic surface clast placement (physics frame, ground-relative). */
+export interface RockInstance {
+  /** World x in metres. */
+  x: number;
+  /** World y in metres. */
+  y: number;
+  /** Nominal diameter in metres (always inside the archetype band). */
+  size: number;
+  /** Random yaw in radians (render-time rotation about the up axis). */
+  yaw: number;
+  /** Per-instance scale multiplier applied on top of `size` (~0.85–1.2). */
+  scale: number;
+  archetype: RockArchetype;
+  /** True when the clast sits in a crater-lip / ejecta-blanket concentration. */
+  nearCrater: boolean;
+}
+
+/** Deterministic clast field covering one square world region. */
+export interface RockFieldSnapshot {
+  originX: number;
+  originY: number;
+  size: number;
+  pebbles: RockInstance[];
+  rocks: RockInstance[];
+  boulders: RockInstance[];
+  /** Total clast count across all three archetypes. */
+  total: number;
+}
+
+/**
+ * Per-archetype scatter tuning (Spec 23 §2.2.1): grid-jitter cell size in
+ * metres, base accept probability for boulders, per-cell crater-lip bonus
+ * clasts, and the lip-proximity width as a fraction of crater radius.
+ */
+const ROCK_FIELD_TUNING: Record<
+  RockArchetype,
+  { cell: number; baseAccept: number; extra: number; lipWidth: number }
+> = {
+  // >1200 pebbles guaranteed by a one-per-cell floor across a 1024 m patch
+  // (28 m cells → floor(1024/28)² = 36² = 1296 cells), plus ejecta-blanket
+  // cluster draws (Spec 23 §2.2.1: >1200 per active sector).
+  pebble: { cell: 28, baseAccept: 1, extra: 4, lipWidth: 0.35 },
+  // >300 medium rocks guaranteed (56 m cells → 18² = 324 cells).
+  rock: { cell: 56, baseAccept: 1, extra: 3, lipWidth: 0.35 },
+  // Boulder clasts: sparse fracture blocks, denser near crater lips (140 m
+  // cells → up to 64 base draws on a 1024 m patch, lip-biased accept).
+  boulder: { cell: 140, baseAccept: 0.5, extra: 2, lipWidth: 0.5 },
+};
 const DEEP_ICE_MIN_Z = -65; // tubes deeper than this host cold-trapped ice
 const KREEP_POOL_COUNT = 2;
 
@@ -417,6 +483,28 @@ function fnv1a(text: string): string {
     h = Math.imul(h, 0x01000193);
   }
   return (h >>> 0).toString(16).padStart(8, '0');
+}
+
+/**
+ * Deterministic per-cell / per-instance RNG for the Spec 23 clast-field
+ * scatter: mixes the field base seed with the cell (or coordinate) pair and
+ * the archetype tag, then runs mulberry32. Position-keyed so every consumer
+ * that knows `(seed, origin, size)` derives identical streams — no global
+ * draw-order coupling.
+ */
+function fieldRandom(base: number, ix: number, iy: number, tag: string): Random {
+  let h = (base ^ 0x51ed2701) >>> 0;
+  const mix = (v: number): void => {
+    h = Math.imul(h ^ (v | 0), 0x27d4eb2d) >>> 0;
+    h = ((h << 15) | (h >>> 17)) >>> 0;
+  };
+  // Quantise float coords so cache-key granularity matches draw identity.
+  mix(Math.round(ix * 8));
+  mix(Math.round(iy * 8));
+  for (let i = 0; i < tag.length; i++) mix(tag.charCodeAt(i));
+  // h is already a well-avalanched uint32 — pass it straight to Random.
+  // (Never seed with a `mulberry32()()` float: `Random` floors it to 0.)
+  return new Random(h >>> 0);
 }
 
 class Random {
@@ -616,6 +704,8 @@ export class LunarWorldGenerator {
   private nameCounter = 0;
   private idCounter = 0;
   private deepDiveDone = false;
+  /** Memoised clast fields keyed by `originX|originY|size|craterCount`. */
+  private rockFieldCache = new Map<string, RockFieldSnapshot>();
 
   constructor(seed: string | number, options: LunarWorldOptions = {}) {
     this.seed = String(seed);
@@ -912,6 +1002,7 @@ export class LunarWorldGenerator {
     this.sectorIndex.clear();
     this.craterIndex.clear();
     this.routeIndex.clear();
+    this.rockFieldCache.clear();
     this.transport = new Graph();
     this.tunnelGraph = new Graph();
     this.railGraph = new Graph();
@@ -1920,6 +2011,110 @@ export class LunarWorldGenerator {
     if (!site || site.harvested) return null;
     site.harvested = true;
     return structuredClone(site.components);
+  }
+
+  // -- surface rock & pebble clast fields (Spec 23 §2.2 / ADR-023-2) ----------
+
+  /**
+   * Deterministic surface clast field for the square region
+   * `[originX, originX + size) × [originY, originY + size)`.
+   *
+   * Distribution (Spec 23 §2.2.1): a grid-jitter scatter per archetype —
+   * one base draw per cell (pebbles/rocks) or a lip-biased accept draw
+   * (boulders) — plus extra cluster draws concentrated in crater-lip and
+   * ejecta-blanket annuli (r ∈ [R, 1.9R], wider for boulders). The scatter
+   * is keyed *only* to `(seed, origin, size, craters)`, never to world
+   * generation state, so it is reproducible across generator instances and
+   * stable before/after `harvest()` mutations (craters are immutable).
+   *
+   * Returned instances carry world (x, y), nominal diameter inside the
+   * archetype band, random yaw and scale variation; the renderer elevates
+   * them via `WorldScene.getGroundHeightAt(x, y)`.
+   */
+  getRockInstances(originX: number, originY: number, size: number): RockFieldSnapshot {
+    this.world();
+    const craters = this.snapshot?.craters ?? [];
+    const cacheKey = `${originX}|${originY}|${size}|${craters.length}`;
+    const cached = this.rockFieldCache.get(cacheKey);
+    if (cached !== undefined) return cached;
+
+    const base = xmur3(`${this.seed}::rockfield::${originX}::${originY}::${size}`)();
+    const pebbles: RockInstance[] = [];
+    const rocks: RockInstance[] = [];
+    const boulders: RockInstance[] = [];
+
+    const push = (a: RockArchetype, x: number, y: number, nearCrater: boolean): void => {
+      // Per-instance rng advanced deterministically from the field seed.
+      const rng = fieldRandom(base, x, y, a);
+      const band = ROCK_ARCHETYPE_SIZES[a];
+      // Log-uniform-ish bias toward the small end of the band reads more
+      // natural than a flat uniform (Apollo clast size-frequency curves).
+      const t = rng.next();
+      const sizeM = band.min + (band.max - band.min) * (t * t * 0.6 + t * 0.4);
+      const inst: RockInstance = {
+        x,
+        y,
+        size: sizeM,
+        yaw: rng.range(0, Math.PI * 2),
+        scale: rng.range(0.85, 1.2),
+        archetype: a,
+        nearCrater,
+      };
+      if (a === 'pebble') pebbles.push(inst);
+      else if (a === 'rock') rocks.push(inst);
+      else boulders.push(inst);
+    };
+
+    for (const archetype of ['pebble', 'rock', 'boulder'] as const) {
+      const tune = ROCK_FIELD_TUNING[archetype];
+      const cellsX = Math.max(0, Math.floor(size / tune.cell));
+      const cellsY = Math.max(0, Math.floor(size / tune.cell));
+      // Base field: grid-jitter one draw per cell.
+      for (let cy = 0; cy < cellsY; cy++) {
+        for (let cx = 0; cx < cellsX; cx++) {
+          const rng = fieldRandom(base, cx, cy, archetype);
+          const x = originX + (cx + rng.next()) * tune.cell;
+          const y = originY + (cy + rng.next()) * tune.cell;
+          // Boulders are sparse: keep only lip-proximal draws at base rate.
+          if (archetype === 'boulder' && !rng.chance(tune.baseAccept)) continue;
+          push(archetype, x, y, false);
+        }
+      }
+      // Ejecta-blanket concentration: extra cluster draws around every
+      // crater lip (Spec 23: "higher density near crater lips and ejecta
+      // blankets").
+      for (let ci = 0; ci < craters.length; ci++) {
+        const c = craters[ci];
+        const rInner = c.radius;
+        const rOuter = c.radius * (1 + tune.lipWidth + 0.55);
+        if (rOuter <= rInner) continue;
+        for (let e = 0; e < tune.extra; e++) {
+          const rng = fieldRandom(base, e, ci * 17 + 3, archetype);
+          const ang = rng.range(0, Math.PI * 2);
+          const rad = Math.sqrt(rng.range(rInner * rInner, rOuter * rOuter));
+          const x = c.center.x + Math.cos(ang) * rad;
+          const y = c.center.y + Math.sin(ang) * rad;
+          if (
+            x >= originX && x < originX + size &&
+            y >= originY && y < originY + size
+          ) {
+            push(archetype, x, y, true);
+          }
+        }
+      }
+    }
+
+    const field: RockFieldSnapshot = {
+      originX,
+      originY,
+      size,
+      pebbles,
+      rocks,
+      boulders,
+      total: pebbles.length + rocks.length + boulders.length,
+    };
+    this.rockFieldCache.set(cacheKey, field);
+    return field;
   }
 }
 

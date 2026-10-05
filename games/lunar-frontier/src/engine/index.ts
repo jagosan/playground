@@ -27,6 +27,15 @@ export {
   buildMesoDetailData,
 } from './WorldScene.ts';
 
+// Spec 23 §2.2 / ADR-023-2: clast-field archetypes (re-exported for harnesses).
+export {
+  ROCK_ARCHETYPE_SIZES,
+  type RockArchetype,
+  type RockInstance,
+  type RockFieldSnapshot,
+} from '../world/LunarWorldGenerator.ts';
+export { ROCK_HEIGHT_FLATTEN, ROCK_SINK_RATIO } from './WorldScene.ts';
+
 export {
   CameraRig,
   CAMERA_MODES,
