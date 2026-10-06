@@ -42,6 +42,7 @@ import { NullEngine } from '@babylonjs/core/Engines/nullEngine.js';
 import { Engine } from '@babylonjs/core/Engines/engine.js';
 import type { AbstractEngine } from '@babylonjs/core/Engines/abstractEngine.js';
 import { SpotLight } from '@babylonjs/core/Lights/spotLight.js';
+import { StandardMaterial } from '@babylonjs/core/Materials/standardMaterial.js';
 import { PBRMaterial } from '@babylonjs/core/Materials/PBR/pbrMaterial.js';
 import { RawTexture } from '@babylonjs/core/Materials/Textures/rawTexture.js';
 import { MeshBuilder } from '@babylonjs/core/Meshes/meshBuilder.js';
@@ -75,16 +76,37 @@ export const HEADLIGHT_ANGLE_DEG = 58;
 /** Headlight beam range, metres. */
 export const HEADLIGHT_RANGE_M = 65;
 
-// -- Dual-stage floodlights (Spec 21 §2.2) -----------------------------------
-/** Low-beam flood: wide 85° cone, 45m throw, 2.8 intensity. */
-export const LOW_BEAM_INTENSITY = 2.8;
-export const LOW_BEAM_ANGLE_DEG = 85;
-export const LOW_BEAM_RANGE_M = 45;
+// -- Dual-stage stadium projector rig (Spec 23 §2.4 / ADR-023-4) --------------
+/**
+ * Low-beam mega-flood: perimeter work wash.
+ * Spec 23 §2.4.1 Stage 1 re-cut the Spec 21 values (85°/45 m/2.8) up to
+ * stadium grade: 110° cone, 85 m throw, 8.5 intensity.
+ */
+export const LOW_BEAM_INTENSITY = 8.5;
+export const LOW_BEAM_ANGLE_DEG = 110;
+export const LOW_BEAM_RANGE_M = 85;
 
-/** High-beam spot: narrow 42° piercing beam, 120m throw, 4.5 intensity. */
-export const HIGH_BEAM_INTENSITY = 4.5;
-export const HIGH_BEAM_ANGLE_DEG = 42;
-export const HIGH_BEAM_RANGE_M = 120;
+/**
+ * High-beam hyper-piercing projector: long-range navigation spot.
+ * Spec 23 §2.4.1 Stage 2 re-cut the Spec 21 values (42°/120 m/4.5) to
+ * 30° cone, 250 m throw, 16.0 intensity, crisp daylight-white.
+ */
+export const HIGH_BEAM_INTENSITY = 16.0;
+export const HIGH_BEAM_ANGLE_DEG = 30;
+export const HIGH_BEAM_RANGE_M = 250;
+/** Stage 2 projector colour temperature: crisp daylight white (Spec 23 §2.4.1). */
+export const HIGH_BEAM_COLOR = { r: 1.0, g: 0.98, b: 0.95 };
+
+/**
+ * Visual length (m) of the additive dust-scattering cone shells (Spec 23
+ * §2.4.2). Deliberately shorter than the SpotLight throw: a full 250 m
+ * translucent shell would wash out the whole scene; a short dense shell at
+ * the lightbar reads as forward scatter against the levitating dust layer
+ * while the invisible SpotLight does the actual 250 m illumination. Cone
+ * mouths keep the true beam angles: d = 2·L·tan(θ/2).
+ */
+export const BEAM_CONE_FLOOD_M = 12;
+export const BEAM_CONE_HIGH_M = 30;
 
 /** Coilover spring body length scale at full droop (compression = 0). */
 export const COIL_SCALE_DROOP = 1.15;
@@ -323,6 +345,20 @@ export class OpenBuggy {
   private taillights: Mesh | null = null;
   private taillightMaterial: PBRMaterial | null = null;
   private lamps: SpotLight[] = [];
+  /**
+   * Spec 23 §2.4.2 / ADR-023-4: procedural translucent light cones drifting
+   * from each headlight lightbar, simulating forward scattering against
+   * photoelectrically-charged levitating lunar dust. Additive-blend
+   * StandardMaterial shells; parented to the chassis body so they ride the
+   * pitch/yaw/roll kinematics, with their per-frame aim recomputed alongside
+   * the SpotLights in `applyLamps()`. NullEngine-safe (no DOM, no GPU-only
+   * effects) and disposed with the entity.
+   */
+  private beamCones: Mesh[] = [];
+  /** Stage-2 hyper-piercing projector cones (index = lamp point 0/1). */
+  private beamConesHigh: Mesh[] = [];
+  private beamConeMaterial: StandardMaterial | null = null;
+  private beamConeHighMaterial: StandardMaterial | null = null;
   private materials: PBRMaterial[] = [];
   /** Procedural textures owned by the entity (dash, carbon weave). */
   private ownedTextures: RawTexture[] = [];
@@ -364,6 +400,8 @@ export class OpenBuggy {
   /** Scratch objects for the per-frame lamp maths (no GC churn). */
   private readonly scratchAim = new Vector3(1, 0, 0);
   private readonly scratchPoint = new Vector3();
+  /** Half-length beam offset for the Spec 23 volumetric cone shells. */
+  private readonly scratchBeamOffset = new Vector3();
   private readonly scratchSpin = new Quaternion();
   /** Scratch for coilover/tie-rod articulation (no GC churn). */
   private readonly scratchDir = new Vector3();
@@ -448,6 +486,16 @@ export class OpenBuggy {
 
     for (const lamp of this.lamps) OpenBuggy.disposeQuietly(lamp);
     this.lamps = [];
+    // Spec 23 §2.4.2: volumetric cone shells ride their own bookkeeping —
+    // dispose them with the entity so a re-init starts from a clean scene.
+    for (const cone of this.beamCones) OpenBuggy.disposeQuietly(cone);
+    this.beamCones = [];
+    for (const cone of this.beamConesHigh) OpenBuggy.disposeQuietly(cone);
+    this.beamConesHigh = [];
+    OpenBuggy.disposeQuietly(this.beamConeMaterial);
+    this.beamConeMaterial = null;
+    OpenBuggy.disposeQuietly(this.beamConeHighMaterial);
+    this.beamConeHighMaterial = null;
     for (const mesh of this.parts) OpenBuggy.disposeQuietly(mesh);
     this.parts = [];
     this.wheels = [];
@@ -500,6 +548,16 @@ export class OpenBuggy {
   /** The two headlight SpotLights (empty before init / after dispose). */
   getHeadlights(): SpotLight[] {
     return [...this.lamps];
+  }
+
+  /**
+   * All volumetric dust-scattering beam shells — `[lowL, lowR, highL, highR]`
+   * (empty before init / after dispose). Spec 23 §2.4.2 readback for headless
+   * harnesses: assert additive blend (`alphaMode === Engine.ALPHA_ADD`),
+   * non-zero alpha, and that the shells track the chassis pose frame to frame.
+   */
+  getBeamCones(): Mesh[] {
+    return [...this.beamCones, ...this.beamConesHigh];
   }
 
   /**
@@ -1420,10 +1478,10 @@ export class OpenBuggy {
       mesh.receiveShadows = false;
     }
 
-    // Dual-stage headlights (Spec 21 §2.2):
+    // Dual-stage stadium projector rig (Spec 23 §2.4 / ADR-023-4):
     // For each mount point (L/R), create:
-    // 1. Low-beam flood (wide 85° cone, 45m throw, 2.8 intensity)
-    // 2. High-beam spot (narrow 42° cone, 120m throw, 4.5 intensity)
+    // 1. Low-beam mega-flood (wide 110° cone, 85m throw, 8.5 intensity)
+    // 2. High-beam hyper-piercing projector (30° cone, 250m throw, 16.0)
     // Headlights stay UNPARENTED and get their world position and chassis-matrix
     // beam direction recomputed every frame (see applyLamps).
     const lamps: SpotLight[] = [];
@@ -1450,10 +1508,78 @@ export class OpenBuggy {
         scene,
       );
       highLamp.range = HIGH_BEAM_RANGE_M;
-      highLamp.diffuse = new Color3(1, 0.98, 0.92);
+      // Spec 23 §2.4.1 Stage 2: crisp daylight-white projector colour.
+      highLamp.diffuse = new Color3(HIGH_BEAM_COLOR.r, HIGH_BEAM_COLOR.g, HIGH_BEAM_COLOR.b);
       lamps.push(highLamp);
     }
     this.lamps = lamps;
+
+    this.buildBeamCones(scene);
+  }
+
+  /**
+   * Spec 23 §2.4.2 / ADR-023-4: procedural translucent light cones drifting
+   * from the headlight lightbars. Each cone is an open cylinder (apex at the
+   * lamp, mouth down-range) with an additive-blend unlit material, faking
+   * forward scattering against the photoelectrically-charged levitating dust
+   * layer over the regolith. Cones are deliberately kept OUT of `this.parts`
+   * (own bookkeeping + own dispose) so shadow-caster registration, picking
+   * and mesh-count contracts of the physical buggy stay untouched. They are
+   * NOT parented — like the SpotLights, their world pose is recomputed from
+   * the chassis matrix every frame (`applyLamps`), which is what makes them
+   * track pitch/yaw/roll smoothly and truthfully under NullEngine too.
+   */
+  private buildBeamCones(scene: Scene): void {
+    const p = this.prefix;
+
+    // Stage-1 mega-flood scatter shell: wide, very faint.
+    const floodMat = new StandardMaterial(`${p}-beamcone-flood`, scene);
+    floodMat.disableLighting = true;
+    floodMat.emissiveColor = new Color3(1.0, 0.96, 0.88);
+    floodMat.diffuseColor = new Color3(0, 0, 0);
+    floodMat.specularColor = new Color3(0, 0, 0);
+    floodMat.alpha = 0.045;
+    floodMat.alphaMode = Engine.ALPHA_ADD;
+    floodMat.backFaceCulling = false;
+    this.beamConeMaterial = floodMat;
+
+    // Stage-2 piercing projector core: narrower, brighter dust core.
+    const highMat = new StandardMaterial(`${p}-beamcone-high`, scene);
+    highMat.disableLighting = true;
+    highMat.emissiveColor = new Color3(HIGH_BEAM_COLOR.r, HIGH_BEAM_COLOR.g, HIGH_BEAM_COLOR.b);
+    highMat.diffuseColor = new Color3(0, 0, 0);
+    highMat.specularColor = new Color3(0, 0, 0);
+    highMat.alpha = 0.07;
+    highMat.alphaMode = Engine.ALPHA_ADD;
+    highMat.backFaceCulling = false;
+    this.beamConeHighMaterial = highMat;
+
+    // Cone mouth diameters follow the beam geometry: d = 2·L·tan(θ/2).
+    const floodDiameter = 2 * BEAM_CONE_FLOOD_M * Math.tan(((LOW_BEAM_ANGLE_DEG * Math.PI) / 180) / 2);
+    const highDiameter = 2 * BEAM_CONE_HIGH_M * Math.tan(((HIGH_BEAM_ANGLE_DEG * Math.PI) / 180) / 2);
+
+    for (let index = 0; index < LAMP_POINTS.length; index++) {
+      const side = index === 0 ? 'l' : 'r';
+      const flood = MeshBuilder.CreateCylinder(
+        `${p}-beamcone-${side}-low`,
+        { diameterTop: floodDiameter, diameterBottom: 0.2, height: BEAM_CONE_FLOOD_M, tessellation: 20, cap: 0 },
+        scene,
+      );
+      flood.material = floodMat;
+      flood.isPickable = false;
+      flood.receiveShadows = false;
+      this.beamCones.push(flood);
+
+      const high = MeshBuilder.CreateCylinder(
+        `${p}-beamcone-${side}-high`,
+        { diameterTop: highDiameter, diameterBottom: 0.14, height: BEAM_CONE_HIGH_M, tessellation: 20, cap: 0 },
+        scene,
+      );
+      high.material = highMat;
+      high.isPickable = false;
+      high.receiveShadows = false;
+      this.beamConesHigh.push(high);
+    }
   }
 
   /**
@@ -1776,6 +1902,27 @@ export class OpenBuggy {
         ? (isHighBeam ? HIGH_BEAM_INTENSITY : LOW_BEAM_INTENSITY)
         : 0;
     }
+
+    // Spec 23 §2.4.2: sweep the additive dust-scattering shells with the same
+    // chassis-derived aim. Each shell sits with its narrow end at the lamp
+    // and its mouth down-range: centre = lamp + aim·(L/2), orientation maps
+    // the cylinder axis (+y) onto the beam direction. Because the aim comes
+    // from the chassis world matrix — recomputed from live pitch/yaw/roll
+    // every synced frame — the cones track the suspension without lagging a
+    // frame behind the SpotLights (no jitter, no double-smoothing).
+    const coneVisible = this.lampOn;
+    const alignCone = (cone: Mesh, length: number, lampPointIdx: number): void => {
+      Vector3.TransformCoordinatesToRef(LAMP_POINTS[lampPointIdx], matrix, this.scratchPoint);
+      cone.position.copyFrom(this.scratchPoint);
+      this.scratchBeamOffset.copyFrom(this.scratchAim);
+      this.scratchBeamOffset.scaleInPlace(length / 2);
+      cone.position.addInPlace(this.scratchBeamOffset);
+      if (cone.rotationQuaternion === null) cone.rotationQuaternion = new Quaternion();
+      alignYTo(this.scratchAim, cone.rotationQuaternion);
+      cone.isVisible = coneVisible;
+    };
+    for (let i = 0; i < this.beamCones.length; i++) alignCone(this.beamCones[i], BEAM_CONE_FLOOD_M, i);
+    for (let i = 0; i < this.beamConesHigh.length; i++) alignCone(this.beamConesHigh[i], BEAM_CONE_HIGH_M, i);
   }
 
   private static resolvePoint(candidate: MountCandidate | undefined): { x: number; y: number; z: number } | null {

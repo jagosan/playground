@@ -2516,6 +2516,14 @@ export class ClientApp {
       const suit = this.requireSuit();
       rig.update(suit.getPosition(), suit.getHeading(), dt, suit.getPitch(), 0);
     }
+    // Spec 23 Phase 5 (Pillar 4 polish): once the rig's per-mode smoothing
+    // has settled this frame, re-centre the sun's tight 120 m shadow box on
+    // the rig's jitter-RELAXED focus point (subject position eased at
+    // SHADOW_FOCUS_RATE_PER_S, snapped on teleports). Across high-density
+    // rock fields and terrain detail the shadow field then glides with the
+    // camera instead of strobing at suspension frequency, while the subject
+    // always stays well inside the box (easing lag ≪ 120 m frustum).
+    this.world.updateShadowFocus(rig.getShadowFocusPosition());
   }
 
   /** 20 Hz `MOVE` stream while connected (deterministic accumulator). */

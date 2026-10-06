@@ -171,6 +171,40 @@ function approach(current: number, goal: number, t: number): number {
   return current + (goal - current) * t;
 }
 
+/**
+ * Spec 23 Phase 5: temporal smoothing law for the sun's dynamic shadow-focus
+ * point. The raw subject position (chassis over a high-density rock field,
+ * or a suit bobbing on foot) carries high-frequency suspension jitter; a
+ * focus box snapping to it frame-to-frame smears every shadow edge in the
+ * rig's view. A low-rate exponential ease (≈ 15 /s — attenuates ≥ 5 Hz
+ * suspension harmonics to < 0.2 amplitude while the steady-state tracking
+ * lag stays under 4 m at reference chase speed) reads as the shadow field
+ * gliding with the camera. Jumps larger than {@link SHADOW_FOCUS_SNAP_M}
+ * (teleports, respawns, mount warps) snap immediately so shadows never
+ * trail a teleport across the map.
+ *
+ * Pure function: `current === null` (or non-finite fields) snaps to `goal`.
+ * `dt <= 0` snaps too (a zero-length frame has no time to ease through).
+ */
+export const SHADOW_FOCUS_RATE_PER_S = 15;
+export const SHADOW_FOCUS_SNAP_M = 25;
+
+export function smoothShadowFocus(
+  current: { x: number; y: number; z: number } | null,
+  goal: { x: number; y: number; z: number },
+  dt: number,
+): { x: number; y: number; z: number } {
+  const finite =
+    current !== null && Number.isFinite(current.x) && Number.isFinite(current.y) && Number.isFinite(current.z);
+  if (!finite || dt <= 0) return { x: goal.x, y: goal.y, z: goal.z };
+  const dx = goal.x - current.x;
+  const dy = goal.y - current.y;
+  const dz = goal.z - current.z;
+  if (Math.hypot(dx, dy, dz) > SHADOW_FOCUS_SNAP_M) return { x: goal.x, y: goal.y, z: goal.z };
+  const t = smoothFactor(SHADOW_FOCUS_RATE_PER_S, dt);
+  return { x: current.x + dx * t, y: current.y + dy * t, z: current.z + dz * t };
+}
+
 /** Shortest signed delta between two angles, wrapped to (-pi, pi]. */
 export function angleDelta(from: number, to: number): number {
   let d = (to - from) % (Math.PI * 2);
@@ -209,6 +243,14 @@ export class CameraRig {
   private currentPitch = 0;
   private currentOrbitAzimuth = Math.PI; // behind-target azimuth for arcs
   private hasState = false;
+  /**
+   * Spec 23 Phase 5: jitter-relaxed shadow-focus point emitted through
+   * `onUpdate`. Eases toward the tracked subject at SHADOW_FOCUS_RATE_PER_S
+   * and snaps on jumps > SHADOW_FOCUS_SNAP_M, so the sun's tight shadow box
+   * glides across high-density rock fields instead of strobing with every
+   * suspension tick.
+   */
+  private shadowFocus: { x: number; y: number; z: number } | null = null;
 
   constructor(scene: Scene, options: CameraRigOptions = {}) {
     if (scene === null || scene === undefined) {
@@ -352,6 +394,12 @@ export class CameraRig {
     if (this.options.onUpdate !== undefined) {
       this.options.onUpdate(targetPos);
     }
+
+    // Spec 23 Phase 5: keep a jitter-relaxed copy of the focus target for
+    // consumers that need GLIDING tracking (the sun's shadow box in the full
+    // client) rather than the raw per-frame subject pose the legacy onUpdate
+    // hook carries. The raw hook stays exact for engine-standalone harnesses.
+    this.shadowFocus = smoothShadowFocus(this.shadowFocus, targetPos, dt);
 
     // Physics frame → Babylon frame: (x, y, z↑) → (x, z↑, -y).
     const bx = targetPos.x;
@@ -504,6 +552,18 @@ export class CameraRig {
   getPhysicsPosition(): { x: number; y: number; z: number } {
     const p = this.getActiveCamera().globalPosition;
     return { x: p.x, y: -p.z, z: p.y };
+  }
+
+  /**
+   * Spec 23 Phase 5: jitter-relaxed shadow-focus point (physics frame).
+   * Falls back to the raw camera position before the first `update()`. Use
+   * this — not `getPhysicsPosition()` — to feed dynamic shadow boxes so they
+   * glide across high-density rock fields instead of strobing at suspension
+   * frequency; teleports > SHADOW_FOCUS_SNAP_M snap immediately.
+   */
+  getShadowFocusPosition(): { x: number; y: number; z: number } {
+    if (this.shadowFocus !== null) return { ...this.shadowFocus };
+    return this.getPhysicsPosition();
   }
 
   dispose(): void {

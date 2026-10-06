@@ -51,6 +51,10 @@ export {
   CHASE_LOOKAHEAD_BETA,
   CHASE_LOOKAHEAD_MIN_SPEED,
   velocityLookaheadTheta,
+  // Spec 23 Phase 5: jitter-relaxed dynamic shadow-focus smoothing law.
+  SHADOW_FOCUS_RATE_PER_S,
+  SHADOW_FOCUS_SNAP_M,
+  smoothShadowFocus,
   type CameraMode,
   type CameraModeConfig,
   type CameraRigOptions,

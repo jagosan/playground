@@ -28,6 +28,8 @@ import { NullEngine } from '@babylonjs/core/Engines/nullEngine.js';
 import {
   EvaSuitAvatar,
   HEADLIGHT_INTENSITY,
+  HEADLIGHT_ANGLE_DEG,
+  HEADLIGHT_RANGE_M,
 } from '../src/entities/AstronautSuit.ts';
 import {
   IDLE_SUIT_INPUT,
@@ -194,6 +196,16 @@ section('5. headlight toggle');
 const lamp = avatar.getHeadlight()!;
 const onIntensity = lamp.intensity;
 check('lit intensity matches HEADLIGHT_INTENSITY while alive', Math.abs(onIntensity - HEADLIGHT_INTENSITY) < 1e-9);
+// Spec 23 §2.4.3 / acceptance gate 4: helmet projector re-cut to 6.0 / 85° /
+// 50 m (from the Spec 21 2.0 / 70° / 30 m flashlight). Assert the new
+// contract exactly, on the constant AND on the live SpotLight.
+check('helmet projector constants are Spec 23 grade (6.0 / 85° / 50 m)',
+  HEADLIGHT_INTENSITY === 6.0 && HEADLIGHT_ANGLE_DEG === 85 && HEADLIGHT_RANGE_M === 50,
+  `${HEADLIGHT_INTENSITY} / ${HEADLIGHT_ANGLE_DEG}° / ${HEADLIGHT_RANGE_M} m`);
+check('live helmet SpotLight carries the Spec 23 beam geometry',
+  Math.abs(lamp.range - 50) < 1e-9 && Math.abs((lamp.angle * 180) / Math.PI - 85) < 1e-6);
+check('gate 4 bounds hold (intensity ≥ 5.0, throw ≥ 45 m, angle ≥ 80°)',
+  HEADLIGHT_INTENSITY >= 5.0 && HEADLIGHT_RANGE_M >= 45 && HEADLIGHT_ANGLE_DEG >= 80);
 
 check('setHeadlight(false) returns false', avatar.setHeadlight(false) === false);
 check('lamp intensity drops to 0', lamp.intensity === 0);

@@ -33,6 +33,9 @@ import { NullEngine } from '@babylonjs/core/Engines/nullEngine.js';
 import { Scene } from '@babylonjs/core/scene.js';
 import { Vector3 } from '@babylonjs/core/Maths/math.vector.js';
 import { UniversalCamera } from '@babylonjs/core/Cameras/universalCamera.js';
+import type { DirectionalLight } from '@babylonjs/core/Lights/directionalLight.js';
+
+import { smoothShadowFocus } from '../src/engine/index.ts';
 
 import {
   HintArrowSystem,
@@ -1054,6 +1057,62 @@ section('D. input routing & hotkeys');
   app.handleKeyInput('KeyF', 'down');
   check('[F] toggles suit headlight on foot', app.getSuit().isHeadlightOn() !== lampBefore);
   check('buggy lamps untouched by on-foot [F]', app.getBuggy().isHeadlightsOn() === true);
+
+  // Spec 23 Phase 4/5 integration (acceptance gates 3 & 4 + Phase 5 polish):
+  // the live in-app suit helmet projector and buggy stadium rig carry the
+  // re-cut values, and the sun's dynamic shadow focus glides with the rig.
+  {
+    const suitLamp = app.getSuit().getHeadlight();
+    // The [F] edge above left the helmet lamp OFF — force it lit so the
+    // intensity contract is measured on a live, alive suit.
+    app.getSuit().setHeadlight(true);
+    check('suit helmet projector live at Spec 23 §2.4.3 (6.0 / 85° / 50 m)', (() => {
+      if (suitLamp === null) return false;
+      const deg = (r: number) => (r * 180) / Math.PI;
+      return Math.abs(suitLamp.intensity - 6.0) < 1e-9
+        && Math.abs(deg(suitLamp.angle) - 85) < 1e-6
+        && Math.abs(suitLamp.range - 50) < 1e-9;
+    })());
+    check('suit headlight gate 4 bounds (≥5.0 int, ≥45 m, ≥80°)', (() => {
+      if (suitLamp === null) return false;
+      const deg = (r: number) => (r * 180) / Math.PI;
+      return suitLamp.intensity >= 5.0 && suitLamp.range >= 45 && deg(suitLamp.angle) >= 80;
+    })());
+    check('in-app buggy carries the stadium rig (8.5/85 m flood, 16.0/250 m spot)', (() => {
+      const bs = app.getBuggy().getHeadlights();
+      const lows = bs.filter((_, i) => i % 2 === 0);
+      const highs = bs.filter((_, i) => i % 2 === 1);
+      return lows.length === 2 && highs.length === 2
+        && lows.every((l) => Math.abs(l.intensity - 8.5) < 1e-9 && Math.abs(l.range - 85) < 1e-9)
+        && highs.every((l) => Math.abs(l.intensity - 16.0) < 1e-9 && Math.abs(l.range - 250) < 1e-9);
+    })());
+    check('in-app buggy has 4 volumetric beam cones', app.getBuggy().getBeamCones().length === 4);
+    // Shadow-focus smoothing law (Phase 5): high-frequency subject jitter is
+    // attenuated; a teleport-scale jump snaps through immediately.
+    const f0 = smoothShadowFocus({ x: 100, y: 0, z: 0 }, { x: 100.1, y: 0, z: 0 }, 1 / 60);
+    const f1 = smoothShadowFocus({ x: 100, y: 0, z: 0 }, { x: 250, y: 0, z: 0 }, 1 / 60);
+    check('shadow focus eases small subject jitter (< half a tick per frame)',
+      f0.x - 100 < 0.05 && f0.x > 100, `Δ=${(f0.x - 100).toFixed(4)}`);
+    check('shadow focus snaps on teleport-scale jumps', f1.x === 250);
+    // Live integration: the sun tracks the rig each app frame and its
+    // per-frame travel stays bounded (no strobing) across the update loop.
+    const sunLight = app.world.getScene().lights.find((l) => l.name === 'sun') as DirectionalLight | undefined;
+    check('shadow focus keeps the sun gliding across app frames', (() => {
+      if (sunLight === undefined) return false;
+      let prev = sunLight.position.clone();
+      let maxStep = 0;
+      for (let i = 0; i < 30; i++) {
+        nowMs += 16;
+        app.update(nowMs);
+        maxStep = Math.max(maxStep, Vector3.Distance(prev, sunLight.position));
+        prev = sunLight.position.clone();
+        if (![sunLight.position.x, sunLight.position.y, sunLight.position.z].every(Number.isFinite)) return false;
+      }
+      // On-foot idle cadence: the eased focus must not whip the 120 m box
+      // more than a few metres per frame.
+      return maxStep < 5;
+    })(), 'sun position bounded & finite over 30 app frames');
+  }
 
   // [V] cycles all three camera modes.
   app.world.getCameraRig().setMode('eva_first_person');

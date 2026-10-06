@@ -44,12 +44,17 @@ import { worldToBabylon } from '../engine/CameraRig.ts';
 
 /** Helmet eye height above boot soles, metres. */
 export const DEFAULT_HEAD_HEIGHT = 1.62;
-/** Helmet lamp intensity while lit (Spec 21 §2.2). */
-export const HEADLIGHT_INTENSITY = 2.0;
-/** Helmet lamp cone full angle, degrees (Spec 21 §2.2). */
-export const HEADLIGHT_ANGLE_DEG = 70;
-/** Helmet lamp beam range, metres (Spec 21 §2.2). */
-export const HEADLIGHT_RANGE_M = 30;
+/**
+ * Helmet lamp intensity while lit. Spec 23 §2.4.3 / acceptance gate 4
+ * upgraded the EVA searchlight from the Spec 21 2.0 / 70° / 30 m flashlight
+ * to a stadium-glass helmet projector: 6.0 intensity, 85° cone, 50 m throw,
+ * so on-foot exploration of shadowed crater bottoms keeps crisp contrast.
+ */
+export const HEADLIGHT_INTENSITY = 6.0;
+/** Helmet lamp cone full angle, degrees (Spec 23 §2.4.3). */
+export const HEADLIGHT_ANGLE_DEG = 85;
+/** Helmet lamp beam range, metres (Spec 23 §2.4.3). */
+export const HEADLIGHT_RANGE_M = 50;
 /** Fraction of look-pitch the stiff torso copies. */
 export const PITCH_LEAN_SCALE = 0.4;
 

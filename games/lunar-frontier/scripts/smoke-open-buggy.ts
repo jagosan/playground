@@ -19,7 +19,10 @@
  *   6. Mount/dismount: mount, double-mount rejection, canMount range, and a
  *      real `EvaSuitAvatar` dismounted ~2 m to the driver side, then able to
  *      climb back in.
- *   7. Headlights: intensity toggles between lit and off; state query tracks.
+ *   7. Headlights: Spec 23 §2.4 stadium projector contract — dual-stage
+ *      intensities, throw ranges, cone angles, high-beam colour, toggles.
+ *   7b. Volumetric beam cones (Spec 23 §2.4.2): additive-blend dust shells
+ *      tracking the chassis pitch/yaw/roll kinematics frame-to-frame.
  *   8. Lifecycle: idempotent dispose, post-dispose update keeps stepping
  *      physics without throwing, caller-owned engine survives.
  *
@@ -27,13 +30,21 @@
  */
 
 import { NullEngine } from '@babylonjs/core/Engines/nullEngine.js';
-import { Vector3 } from '@babylonjs/core/Maths/math.vector.js';
+import { Engine } from '@babylonjs/core/Engines/engine.js';
+import { Matrix, Vector3 } from '@babylonjs/core/Maths/math.vector.js';
 import { PBRMaterial } from '@babylonjs/core/Materials/PBR/pbrMaterial.js';
 
 import {
   OpenBuggy,
   LOW_BEAM_INTENSITY,
   HIGH_BEAM_INTENSITY,
+  LOW_BEAM_ANGLE_DEG,
+  HIGH_BEAM_ANGLE_DEG,
+  LOW_BEAM_RANGE_M,
+  HIGH_BEAM_RANGE_M,
+  HIGH_BEAM_COLOR,
+  BEAM_CONE_FLOOD_M,
+  BEAM_CONE_HIGH_M,
   MOUNT_RADIUS_M,
   COIL_SCALE_BUMP,
   coilScaleFor,
@@ -450,12 +461,41 @@ check(
 section('7. headlights toggle');
 
 const lamps = rover.getHeadlights();
-// Spec 21 §2.2 dual-stage beams: pairs of (low flood 2.8, high spot 4.5).
+// Spec 23 §2.4 / ADR-023-4 dual-stage stadium beams: pairs of
+// (low mega-flood 8.5, high piercing projector 16.0) — the Spec 21
+// 2.8/4.5 values were re-cut by the Spec 23 acceptance gate 3.
 const stageOk = (ls: typeof lamps): boolean =>
   ls.length === 4 &&
   ls.every((l, i) => Math.abs(l.intensity - (i % 2 === 1 ? HIGH_BEAM_INTENSITY : LOW_BEAM_INTENSITY)) < 1e-9);
-check('dual-stage beams lit (low 2.8 / high 4.5, Spec 21 §2.2)', stageOk(lamps),
+check('dual-stage beams lit (low flood 8.5 / high projector 16.0, Spec 23 §2.4)', stageOk(lamps),
   lamps.map((l) => l.intensity).join(','));
+// Acceptance gate 3 (Spec 23 §5): low-beam intensity ≥ 8.0, throw ≥ 80 m,
+// angle ≥ 100°; high-beam intensity ≥ 15.0, throw ≥ 200 m, angle ≤ 35°.
+check('stadium low-beam intensity ≥ 8.0', LOW_BEAM_INTENSITY >= 8.0, `${LOW_BEAM_INTENSITY}`);
+check('stadium low-beam throw ≥ 80 m', LOW_BEAM_RANGE_M >= 80, `${LOW_BEAM_RANGE_M} m`);
+check('stadium low-beam angle ≥ 100°', LOW_BEAM_ANGLE_DEG >= 100, `${LOW_BEAM_ANGLE_DEG}°`);
+check('piercing spot intensity ≥ 15.0', HIGH_BEAM_INTENSITY >= 15.0, `${HIGH_BEAM_INTENSITY}`);
+check('piercing spot throw ≥ 200 m', HIGH_BEAM_RANGE_M >= 200, `${HIGH_BEAM_RANGE_M} m`);
+check('piercing spot angle ≤ 35°', HIGH_BEAM_ANGLE_DEG <= 35, `${HIGH_BEAM_ANGLE_DEG}°`);
+check('beam ranges applied to the live SpotLights', (() => {
+  const lows = lamps.filter((_, i) => i % 2 === 0);
+  const highs = lamps.filter((_, i) => i % 2 === 1);
+  return lows.every((l) => Math.abs(l.range - LOW_BEAM_RANGE_M) < 1e-9)
+    && highs.every((l) => Math.abs(l.range - HIGH_BEAM_RANGE_M) < 1e-9);
+})());
+check('beam cone angles applied to the live SpotLights', (() => {
+  const lows = lamps.filter((_, i) => i % 2 === 0);
+  const highs = lamps.filter((_, i) => i % 2 === 1);
+  const deg = (r: number) => (r * 180) / Math.PI;
+  return lows.every((l) => Math.abs(deg(l.angle) - LOW_BEAM_ANGLE_DEG) < 1e-6)
+    && highs.every((l) => Math.abs(deg(l.angle) - HIGH_BEAM_ANGLE_DEG) < 1e-6);
+})(), lamps.map((l) => ((l.angle * 180) / Math.PI).toFixed(1)).join(','));
+check('high-beam crisp daylight-white Color3(1.0, 0.98, 0.95)', (() => {
+  const highs = lamps.filter((_, i) => i % 2 === 1);
+  const d = highs[0].diffuse;
+  return Math.abs(d.r - 1.0) < 1e-9 && Math.abs(d.g - 0.98) < 1e-9 && Math.abs(d.b - 0.95) < 1e-9
+    && HIGH_BEAM_COLOR.r === 1.0 && HIGH_BEAM_COLOR.g === 0.98 && HIGH_BEAM_COLOR.b === 0.95;
+})());
 check('setHeadlights(false) returns false', rover.setHeadlights(false) === false);
 check('both beams drop to 0', lamps.every((l) => l.intensity === 0));
 check('isHeadlightsOn() false', rover.isHeadlightsOn() === false);
@@ -464,6 +504,99 @@ check('beam intensity restored', stageOk(lamps), lamps.map((l) => l.intensity).j
 check('force-on twice is idempotent', rover.setHeadlights(true) === true && rover.setHeadlights(true) === true);
 check('beams aim along heading (finite unit dirs)', lamps.every((l) => Number.isFinite(l.direction.x) && l.direction.lengthSquared() > 0));
 check('beams sit ahead of the chassis datum', lamps.every((l) => Number.isFinite(l.position.x) && Number.isFinite(l.position.z)));
+
+// ---------------------------------------------------------------------------
+// 7b. Volumetric dust-scattering beam cones (Spec 23 §2.4.2 / ADR-023-4)
+// ---------------------------------------------------------------------------
+section('7b. volumetric beam cones (Spec 23 §2.4.2)');
+
+{
+  // Fresh instance on a step field so the suspension pitches the chassis and
+  // the cone tracking law is exercised under real kinematics.
+  const step = (x: number, _y: number): number => (x > 6 && x < 9 ? 0.25 : 0);
+  const rig = new OpenBuggy({ groundElevation: step });
+  check('no cones before init', rig.getBeamCones().length === 0);
+  rig.init();
+  const cones = rig.getBeamCones();
+  check('4 volumetric cone shells (flood L/R + projector L/R)', cones.length === 4, `got ${cones.length}`);
+  check('cones named buggy-beamcone-*', cones.every((c) => c.name.startsWith('buggy-beamcone-')));
+  check('cones kept OUT of the physical parts list (69-mesh contract intact)',
+    rig.getMeshes().length === 69 && rig.getMeshes().every((m) => !m.name.includes('beamcone')),
+    `meshes=${rig.getMeshes().length}`);
+  check('cone material NullEngine-safe additive blend', (() => {
+    const mats = new Set(cones.map((c) => c.material));
+    return mats.size === 2 && [...mats].every((m) =>
+      m !== null && m.alphaMode === Engine.ALPHA_ADD && m.alpha > 0 && m.alpha < 1
+      && m.backFaceCulling === false);
+  })());
+  check('cones invisible while headlights off', (() => {
+    rig.setHeadlights(false);
+    const hidden = rig.getBeamCones().every((c) => c.isVisible === false);
+    rig.setHeadlights(true);
+    return hidden && rig.getBeamCones().every((c) => c.isVisible === true);
+  })());
+
+  // Exact placement contract every frame: cone centre = lamp position +
+  // beam direction · (shell length / 2), and the cone's cylinder axis (+y
+  // under its orientation quaternion) equals the SpotLight beam direction —
+  // so the shell sweeps with chassis pitch/yaw/roll on the SAME frame as the
+  // lights (zero relative jitter).
+  // Pairing: cones = [lowL, lowR, highL, highR]; lamps interleave per side
+  // [lowL, highL, lowR, highR] → cone i ↔ lamp (i%2)*2 + (i<2 ? 0 : 1).
+  const lampList = rig.getHeadlights();
+  const scratchRot = new Matrix();
+  const coneContract = (c: OpenBuggy, frame: string): string | null => {
+    const cs = c.getBeamCones();
+    for (let i = 0; i < cs.length; i++) {
+      const shellLen = i < 2 ? BEAM_CONE_FLOOD_M : BEAM_CONE_HIGH_M;
+      const paired = lampList[(i % 2) * 2 + (i < 2 ? 0 : 1)];
+      const aim = paired.direction;
+      const want = paired.position.add(aim.scale(shellLen / 2));
+      if (Vector3.Distance(cs[i].position, want) > 1e-5) return `${frame} cone ${i} centre off beam axis`;
+      const q = cs[i].rotationQuaternion;
+      if (q === null) return `${frame} cone ${i} has no orientation quaternion`;
+      q.toRotationMatrix(scratchRot);
+      const axis = Vector3.TransformNormal(Vector3.Up(), scratchRot);
+      if (!Number.isFinite(axis.x) || !Number.isFinite(axis.y) || !Number.isFinite(axis.z)) return `${frame} cone ${i} axis non-finite`;
+      const aligned = Vector3.Dot(axis.normalize(), aim);
+      if (aligned < 0.999999) return `${frame} cone ${i} axis off SpotLight dir (${aligned.toFixed(6)})`;
+    }
+    return null;
+  };
+  check('cones sit centred on the beam axis at rest', coneContract(rig, 'rest') === null, coneContract(rig, 'rest') ?? '');
+
+  let maxAxisTilt = 0;
+  let lawHolds = true;
+  let firstFail = '';
+  const prevConePos = cones.map((c) => c.position.clone());
+  let maxStepJump = 0;
+  for (let i = 0; i < 900; i++) {
+    rig.update(DT, drive());
+    const err = coneContract(rig, `f${i}`);
+    if (err !== null && lawHolds) { lawHolds = false; firstFail = err; }
+    const cs = rig.getBeamCones();
+    for (let c = 0; c < cs.length; c++) {
+      // Axis tilt vs horizontal = how much the shell pitches with the chassis.
+      const q = cs[c].rotationQuaternion;
+      if (q !== null) {
+        q.toRotationMatrix(scratchRot);
+        const axis = Vector3.TransformNormal(Vector3.Up(), scratchRot).normalize();
+        maxAxisTilt = Math.max(maxAxisTilt, Math.abs(axis.y));
+      }
+      // Frame-to-frame shell motion stays bounded (smooth sweep, no strobing).
+      const d = Vector3.Distance(cs[c].position, prevConePos[c]);
+      maxStepJump = Math.max(maxStepJump, d);
+      prevConePos[c] = cs[c].position.clone();
+    }
+  }
+  check('cones track chassis pitch over the step (axis tilts off horizontal)', maxAxisTilt > 1e-3, `max |axis.y| = ${maxAxisTilt.toFixed(4)}`);
+  check('cone-light sync law holds every frame of the traverse', lawHolds, firstFail);
+  check('cone sweep is continuous (per-frame jump bounded)', maxStepJump < 1.0, `max delta = ${maxStepJump.toFixed(4)} m`);
+  check('cone shells dispose cleanly with the entity', (() => {
+    rig.dispose();
+    return rig.getBeamCones().length === 0;
+  })());
+}
 
 // ---------------------------------------------------------------------------
 // 8. Dispose lifecycle
