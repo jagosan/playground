@@ -12,6 +12,7 @@
     "smoke:world": "node --no-warnings scripts/smoke-lunarworld.ts",
     "smoke:market": "npx tsx scripts/smoke-market-and-rails.ts",
     "smoke:client": "npx tsx scripts/smoke-client-app.ts",
+    "verify:surface": "npx tsx tests/verify-surface-rendering.ts",
     "typecheck:server": "tsc -p tsconfig.server.json"
   },
   "dependencies": {
