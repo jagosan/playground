@@ -436,6 +436,13 @@ export interface LunarHUDOptions {
   commodities?: readonly string[];
   /** Number of simultaneous prompt slots. */
   promptSlots?: number;
+  /**
+   * Spec 24 Phase 5 §3.3 — fired when the player presses the in-HUD
+   * `[🔄 Replay]` control. ClientApp wires this to `replayIntro()`, which
+   * resets the IntroDirector, teleports the avatar back into the cabin spawn,
+   * and restarts the arrival sequence from 'orbit'.
+   */
+  onReplayIntro?: () => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -560,6 +567,8 @@ export class LunarHUD {
   private readonly doc: Documentish;
   private readonly promptSlots: number;
   private readonly onTrade: ((request: HudTradeRequest) => void) | undefined;
+  /** Spec 24 Phase 5 §3.3 — replay-arrival callback (optional). */
+  private readonly onReplayIntro: (() => void) | undefined;
 
   /** Every interesting element, addressed by a stable logical key. */
   private readonly els = new Map<string, Elementish>();
@@ -642,6 +651,7 @@ export class LunarHUD {
     this.doc = doc;
     this.promptSlots = Math.max(1, options.promptSlots ?? 5);
     this.onTrade = options.onTrade;
+    this.onReplayIntro = options.onReplayIntro;
 
     // A fresh HUD always wins: drop any previous overlay (HMR / re-init).
     this.disposeExisting(HUD_ROOT_ID);
@@ -1018,6 +1028,18 @@ export class LunarHUD {
   /** Currently-active input source for the prompt glyphs. */
   getInputSource(): HudInputSource {
     return this.inputSource;
+  }
+
+  /**
+   * Spec 24 Phase 5 §3.3 — programmatic replay trigger (what the HUD's
+   * `[🔄 Replay]` button fires; harnesses call it directly instead of
+   * synthesising a click). Returns false when no callback is wired.
+   */
+  triggerReplayIntro(): boolean {
+    if (this.disposed) return false;
+    if (typeof this.onReplayIntro !== 'function') return false;
+    this.onReplayIntro();
+    return true;
   }
 
   private paintLegend(): void {
@@ -1544,6 +1566,21 @@ export class LunarHUD {
       mapButton.addEventListener('click', () => this.toggleMap());
     }
     strip.appendChild(mapButton);
+
+    // Spec 24 Phase 5 §3.3 — [🔄 Replay] restarts the arrival cinematic.
+    const replayButton = this.make(
+      'button',
+      'lunar-hud-intro-replay',
+      'hud-map-button intro-replay-button',
+      'intro-replay',
+    );
+    replayButton.textContent = '[🔄 Replay]';
+    replayButton.setAttribute('type', 'button');
+    replayButton.setAttribute('aria-label', 'Replay the arrival sequence');
+    if (typeof replayButton.addEventListener === 'function') {
+      replayButton.addEventListener('click', () => this.onReplayIntro?.());
+    }
+    strip.appendChild(replayButton);
   }
 
   /**

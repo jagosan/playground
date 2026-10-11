@@ -55,7 +55,7 @@ import {
   type Quest,
 } from './QuestEngine.ts';
 import { HintArrowSystem, type HintArrowTarget } from './HintArrowSystem.ts';
-import { IntroDirector } from './IntroDirector.ts';
+import { IntroDirector, type IntroPhase } from './IntroDirector.ts';
 import { FactionBases } from '../infrastructure/Factions.ts';
 import {
   TunnelNetwork,
@@ -101,6 +101,25 @@ import type { TopoMapPOI, TopoMapState } from '../ui/LunarHUD.ts';
 
 /** Outbound movement stream cadence — matches the server's 20 Hz tick. */
 export const MOVE_INTERVAL_MS = 50;
+
+/**
+ * Spec 24 §3.1 / blueprint §5.1 — storage key recording that the first-time
+ * arrival intro has been completed (`'1'` when done). Absent ⇒ play the intro;
+ * present + not forced ⇒ spawn directly on the surface.
+ */
+export const INTRO_COMPLETED_KEY = 'lunar_frontier_intro_completed';
+
+/**
+ * Spec 24 Phase 5 §3.4 — dev hotkey jump map: `[1]`–`[5]` → orbit /
+ * burn / touchdown / depressurize / ramp. Only honoured when `devMode`.
+ */
+export const INTRO_DEV_PHASE_KEYS: Readonly<Record<string, IntroPhase>> = {
+  Digit1: 'orbit',
+  Digit2: 'burn',
+  Digit3: 'touchdown',
+  Digit4: 'depressurize',
+  Digit5: 'ramp',
+};
 
 /** Handheld scanner sweep radius (vein surface distance), metres. */
 export const SCAN_RANGE_M = 80;
@@ -430,6 +449,24 @@ export interface ClientAppOptions {
    * pinging while still strapped in. Default false (legacy: start at boot).
    */
   deferQuestUntilIntroComplete?: boolean;
+  /**
+   * Spec 24 Phase 5 §3.1 — injected URL query string (`?intro=1&skip_intro=…`)
+   * for intro-launch decisions. Headless harnesses pass a literal; the browser
+   * path reads `window.location.search` when this is omitted.
+   */
+  introQuery?: string;
+  /**
+   * Spec 24 Phase 5 §3.1 — injected persistence backend for
+   * `lunar_frontier_intro_completed`. Defaults to `localStorage`; headless
+   * harnesses inject an in-memory {@link Storage}.
+   */
+  introStorage?: Storage;
+  /**
+   * Spec 24 Phase 5 §3.4 — when true, dev hotkeys are live: `[F8]` wipes
+   * the intro-completion flag and restarts from Beat 1; `[1]`–`[5]` jump
+   * directly to orbit / burn / touchdown / depressurize / ramp.
+   */
+  devMode?: boolean;
 }
 
 export interface ClientInputFrame {
@@ -613,6 +650,16 @@ export interface MiningOutcome {
 // ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
+
+/** Spec 24 §3.1 — accepted `intro_phase` values (subset of {@link IntroPhase}). */
+const VALID_INTRO_PHASES: ReadonlySet<string> = new Set([
+  'orbit',
+  'burn',
+  'touchdown',
+  'depressurize',
+  'ramp',
+  'walkout',
+]);
 
 function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
@@ -991,6 +1038,8 @@ export class ClientApp {
         this.hud = new LunarHUD({
           document: doc,
           onTrade: (request) => this.submitTrade(request),
+          // Spec 24 Phase 5 §3.3 — [🔄 Replay] restarts the arrival.
+          onReplayIntro: () => this.replayIntro(),
         });
       }
     }
@@ -1090,6 +1139,9 @@ export class ClientApp {
     // Spec 24 Phase 2: tick the arrival director with the frame dt so phase
     // transitions, lander effects and intro camera tracks advance in lockstep.
     this.introDirector?.update(dt);
+    // Spec 24 §3.2: hold-to-skip — [Space] or Gamepad (B) accumulates a
+    // radial skip meter; crossing the 1.2 s threshold skips to the next beat.
+    this.pumpIntroSkipInput(dt);
     // Spec 24 Phase 4 §2.6: when boots touch regolith the director flips to
     // `completed` — fire the handoff (retract intro HUD, dust puff, bridge to
     // QuestEngine) exactly once per attached director.
@@ -1099,6 +1151,8 @@ export class ClientApp {
       !this.introCompletedHandled
     ) {
       this.introCompletedHandled = true;
+      // Spec 24 §3.1 — persist completion so future boots spawn on the surface.
+      this.markIntroCompleted();
       this.handleIntroCompleted();
     }
     // Spec 17 Phase 4: step the circuit lap-timing state machine with the
@@ -1437,6 +1491,121 @@ export class ClientApp {
     return this;
   }
 
+  /**
+   * Spec 24 §3.1 / blueprint §5.1 — parse the intro-launch decision from URL
+   * query params (or the injected `introQuery`):
+   *
+   *   • `intro=1`            → force playback regardless of storage.
+   *   • `skip_intro=1` / `intro=0` → suppress the intro entirely.
+   *   • `intro_phase=…`     → jump to a specific beat (`orbit`, `burn`,
+   *                            `touchdown`, `depressurize`, `ramp`, `walkout`).
+   *   • `intro_speed=…`     → timeScale multiplier (default 1.0).
+   *
+   * Returns whether the intro should play, plus the requested phase / speed.
+   */
+  parseIntroLaunch(): {
+    play: boolean;
+    phase?: IntroPhase;
+    speed: number;
+  } {
+    const query = this.options.introQuery ?? this.readLocationSearch();
+    const params = new URLSearchParams(query);
+    const forceIntro = params.get('intro') === '1';
+    const skipIntro =
+      params.get('skip_intro') === '1' || params.get('intro') === '0';
+    const alreadyCompleted = this.isIntroCompleted();
+
+    const phaseRaw = params.get('intro_phase');
+    const phase =
+      phaseRaw !== null && VALID_INTRO_PHASES.has(phaseRaw as IntroPhase)
+        ? (phaseRaw as IntroPhase)
+        : undefined;
+
+    const speedRaw = Number.parseFloat(params.get('intro_speed') ?? '1.0');
+    const speed = Number.isFinite(speedRaw) && speedRaw > 0 ? speedRaw : 1.0;
+
+    return {
+      play: !skipIntro && (forceIntro || !alreadyCompleted),
+      phase,
+      speed,
+    };
+  }
+
+  /** Spec 24 §3.1 — has the intro been completed in storage? */
+  isIntroCompleted(): boolean {
+    return this.introStorageBackend()?.getItem(INTRO_COMPLETED_KEY) === '1';
+  }
+
+  /** Spec 24 §3.1 — write `'1'` on completion (idempotent, headless-safe). */
+  markIntroCompleted(): void {
+    try {
+      this.introStorageBackend()?.setItem(INTRO_COMPLETED_KEY, '1');
+    } catch {
+      /* storage unavailable / quota — persistence is advisory. */
+    }
+  }
+
+  /** Spec 24 §3.4 [F8] — wipe the intro-completion flag (restart from Beat 1). */
+  clearIntroCompletion(): void {
+    try {
+      this.introStorageBackend()?.removeItem(INTRO_COMPLETED_KEY);
+    } catch {
+      /* storage unavailable — nothing to clear. */
+    }
+  }
+
+  /**
+   * Spec 24 §3.1 — resolve the URL flags + storage and either start the intro
+   * (attached director) or spawn the player directly on the surface.
+   *
+   * Returns `'intro'` when it started a cinematic, `'skipped'` when the
+   * player spawned straight onto regolith. No-op (returns `'skipped'`) with
+   * no attached director.
+   */
+  launchIntroFromUrl(): 'intro' | 'skipped' {
+    const d = this.introDirector;
+    if (d === null) return 'skipped';
+    const decision = this.parseIntroLaunch();
+    if (!decision.play) {
+      this.spawnPlayerDirectly();
+      return 'skipped';
+    }
+    d.timeScale = decision.speed;
+    d.start(decision.phase ?? 'orbit');
+    return 'intro';
+  }
+
+  /**
+   * Spec 24 Phase 5 §3.3 — replay the arrival sequence: reset the director,
+   * teleport the avatar back into the cabin spawn, and restart from 'orbit'.
+   * Returns false when no director is attached.
+   */
+  replayIntro(): boolean {
+    const d = this.introDirector;
+    if (d === null || !this.initialized) return false;
+    // §5.2 clean teardown — stop tweens/particles, close the ramp, idle.
+    d.reset();
+    // Teleport the avatar back into the cabin jump-seat spawn point.
+    try {
+      const anchor = babylonToWorld(d.getLander().getCabinSpawnPoint());
+      this.requireSuit().setState({
+        x: anchor.x,
+        y: anchor.y,
+        z: anchor.z,
+        vx: 0,
+        vy: 0,
+        vz: 0,
+        jumpImpulse: 0,
+        isGrounded: true,
+      });
+    } catch {
+      /* lander/hull absent — avatar stays put; the cinematic still restarts. */
+    }
+    this.introCompletedHandled = false;
+    d.start('orbit');
+    return true;
+  }
+
   getNetwork(): NetworkClient | null {
     return this.network;
   }
@@ -1583,10 +1752,38 @@ export class ClientApp {
   handleKeyInput(code: string, phase: 'down' | 'up'): boolean {
     if (this.disposed || typeof code !== 'string') return false;
     if (!this.initialized) return false;
+
+    // Spec 24 Phase 5 §3.4 — dev hotkeys (only when `devMode`): [F8] wipes
+    // the intro-completion flag and restarts from Beat 1; [1]–[5] jump to a
+    // specific beat. Honoured on key-down, before any gameplay routing.
+    if (this.options.devMode === true && phase === 'down') {
+      const d = this.introDirector;
+      if (code === 'F8') {
+        this.clearIntroCompletion();
+        if (d !== null) {
+          d.reset();
+          d.start('orbit');
+        }
+        return true;
+      }
+      const jumpPhase = INTRO_DEV_PHASE_KEYS[code];
+      if (jumpPhase !== undefined) {
+        if (d !== null) d.jumpToPhase(jumpPhase);
+        return true;
+      }
+    }
+
     const tradeOpen = this.hud?.isTradeDialogOpen() ?? false;
 
     if (code === 'Escape') {
       if (phase === 'down') {
+        // Spec 24 §3.2 — Escape immediately skips straight to Beat 6 /
+        // completed while the intro is running.
+        const d = this.introDirector;
+        if (d !== null && d.isRunning()) {
+          d.skipToFinish();
+          return true;
+        }
         if (tradeOpen) this.hud?.hideTradeDialog();
         // Spec 21 §2.5: Escape dismisses the tactical map first.
         else if (this.hud?.isMapVisible() ?? false) this.hud?.hideMap();
@@ -1941,6 +2138,27 @@ export class ClientApp {
     const v = pad.axes[index];
     if (typeof v !== 'number' || !Number.isFinite(v)) return 0;
     return clamp(v, -1, 1);
+  }
+
+  /**
+   * Spec 24 §3.2 — hold-to-skip: while the intro director is running, feed
+   * [Space] / Gamepad (B) into `updateSkipInput` so a 1.2 s hold skips to
+   * the next beat. Also surfaces the skip progress to the HUD radial ring.
+   */
+  private pumpIntroSkipInput(dt: number): void {
+    const d = this.introDirector;
+    if (d === null || !d.isRunning()) return;
+    const holding =
+      this.pressed.has('Space') ||
+      this.gamepadButtonHeld(GAMEPAD_BUTTONS.trade); // B / button 1
+    d.updateSkipInput(holding, dt);
+  }
+
+  /** True while the given gamepad button is pressed on the active pad. */
+  private gamepadButtonHeld(index: number): boolean {
+    const pad = this.pollGamepad();
+    if (pad === null) return false;
+    return pad.buttons[index]?.pressed === true;
   }
 
   /**
@@ -3957,6 +4175,39 @@ export class ClientApp {
     if (this.options.spawn !== undefined) return this.options.spawn;
     const spawn = this.world.getSpawnPoint();
     return { x: spawn.x, y: spawn.y };
+  }
+
+  /** Spec 24 §3.1 — window query string, or `''` when headless / absent. */
+  private readLocationSearch(): string {
+    const loc = (globalThis as { location?: { search?: string } }).location;
+    if (loc === undefined || typeof loc.search !== 'string') return '';
+    return loc.search;
+  }
+
+  /** Spec 24 §3.1 — injected storage backend, else `localStorage` or null. */
+  private introStorageBackend(): Storage | null {
+    if (this.options.introStorage !== undefined) return this.options.introStorage;
+    const g = globalThis as { localStorage?: Storage };
+    if (
+      typeof g.localStorage === 'object' &&
+      g.localStorage !== null &&
+      typeof g.localStorage.getItem === 'function'
+    ) {
+      return g.localStorage;
+    }
+    return null;
+  }
+
+  /**
+   * Spec 24 §3.1 — when the intro is skipped (URL flag or already-completed),
+   * spawn the player directly on the surface: retract the intro overlay and
+   * bridge the deferred tutorial quest so the dispatch comms still fire.
+   */
+  private spawnPlayerDirectly(): void {
+    this.hud?.updateIntroTelemetry(null);
+    if (this.options.deferQuestUntilIntroComplete === true) {
+      this.questEngine?.notifyIntroCompleted(this.buildTutorialQuestOptions());
+    }
   }
 
   private activePosition(): { x: number; y: number; z: number } {
