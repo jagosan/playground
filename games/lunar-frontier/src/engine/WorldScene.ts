@@ -89,6 +89,10 @@ import {
   type RockFieldSnapshot,
 } from '../world/LunarWorldGenerator.ts';
 import { CameraRig, worldToBabylon, type CameraMode } from './CameraRig.ts';
+import {
+  TransportLander,
+  type TransportLanderOptions,
+} from '../entities/TransportLander.ts';
 
 // ---------------------------------------------------------------------------
 // Options & tuning
@@ -683,6 +687,12 @@ export class WorldScene {
   /** Total thin instances spawned across all archetypes (harness readback). */
   private rockTotalInstances = 0;
 
+  /**
+   * Spec 24 Phase 1: the mounted transport lander (null until
+   * `mountTransportLander`, re-nulled after dispose).
+   */
+  private transportLander: TransportLander | null = null;
+
   constructor(options: WorldSceneOptions = {}) {
     this.options = {
       ...options,
@@ -888,6 +898,16 @@ export class WorldScene {
     // Spec 23 §2.2: clast meshes, shared material, root node & CPU matrices.
     this.disposeRockFields();
 
+    // Spec 24 Phase 1: tear down the mounted transport lander (if any).
+    if (this.transportLander !== null) {
+      try {
+        this.transportLander.dispose();
+      } catch {
+        /* already gone */
+      }
+      this.transportLander = null;
+    }
+
     for (const mesh of this.entities) mesh.parent = null;
     this.entities.clear();
 
@@ -991,6 +1011,43 @@ export class WorldScene {
 
   getWorldGenerator(): LunarWorldGenerator {
     return this.worldGen;
+  }
+
+  // -- Spec 24 Phase 1: transport lander --------------------------------------
+
+  /**
+   * Mount a procedural CEC Ore-Hauler transport lander into the world at a
+   * Babylon-frame position/heading (Spec 24 §4.1). Requires `init()`; a second
+   * call disposes any previously mounted lander first, so mounting is idempotent.
+   * The lander root is parented to the terrain root and its meshes are registered
+   * as world entities + shadow casters, exactly like other scene furniture.
+   *
+   * Headless-safe: builds fine on a NullEngine scene. Returns the mounted
+   * {@link TransportLander}.
+   */
+  mountTransportLander(options: Omit<TransportLanderOptions, 'scene'>): TransportLander {
+    const scene = this.requireScene();
+    if (this.transportLander !== null) {
+      try {
+        this.transportLander.dispose();
+      } catch {
+        /* already gone */
+      }
+      this.transportLander = null;
+    }
+    const lander = new TransportLander({ ...options, scene });
+    lander.getRootNode().parent = this.terrainRoot ?? null;
+    for (const mesh of lander.getMeshes()) {
+      this.addEntity(mesh);
+    }
+    this.registerShadowCasters(lander.getMeshes());
+    this.transportLander = lander;
+    return lander;
+  }
+
+  /** The mounted transport lander, or null before mount / after dispose. */
+  getTransportLander(): TransportLander | null {
+    return this.transportLander;
   }
 
   // -- surface detritus & salvage (Spec 21 §2.1) -------------------------------

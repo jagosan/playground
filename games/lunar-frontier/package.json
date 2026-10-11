@@ -10,6 +10,7 @@
     "dev": "vite --host 0.0.0.0 --port 5174",
     "build": "vite build",
     "smoke:world": "node --no-warnings scripts/smoke-lunarworld.ts",
+    "smoke:transport": "npx tsx scripts/smoke-transport-lander.ts",
     "smoke:market": "npx tsx scripts/smoke-market-and-rails.ts",
     "smoke:client": "npx tsx scripts/smoke-client-app.ts",
     "verify:surface": "npx tsx tests/verify-surface-rendering.ts",
