@@ -22,9 +22,10 @@
  * idempotent; after disposal `update()` keeps stepping physics and returns
  * state instead of throwing.
  */
-import { Color3 } from '@babylonjs/core/Maths/math.color.js';
+import { Color3, Color4 } from '@babylonjs/core/Maths/math.color.js';
 import { Vector3 } from '@babylonjs/core/Maths/math.vector.js';
 import { NullEngine } from '@babylonjs/core/Engines/nullEngine.js';
+import { ParticleSystem } from '@babylonjs/core/Particles/particleSystem.js';
 import type { AbstractEngine } from '@babylonjs/core/Engines/abstractEngine.js';
 import { SpotLight } from '@babylonjs/core/Lights/spotLight.js';
 import { PBRMaterial } from '@babylonjs/core/Materials/PBR/pbrMaterial.js';
@@ -79,6 +80,16 @@ export const TORSO_BOB_M = 0.025;
  * 500 kg-capacity rover — mining on foot caps (or rejects) above it.
  */
 export const SUIT_MAX_CARGO_KG = 50;
+
+/**
+ * Spec 24 Phase 4 §2.6: fine regolith boot-dust puff budget. A tiny
+ * ballistic emitter at the heels kicks up a handful of low-velocity dust motes
+ * on each step — pure vacuum physics (no drag, g = −1.62 m/s²), matching
+ * the retro-ejecta spec (§4.4) at foot scale.
+ */
+export const BOOT_DUST_PARTICLE_COUNT = 24;
+/** Boot-dust puff gravity, metres per second squared (lunar datum). */
+const BOOT_DUST_GRAVITY_Y = -1.62;
 
 export interface EvaSuitAvatarOptions {
   /** Seed for the owned `LunarEvaSuit` (spawn position, reserves…). */
@@ -170,6 +181,12 @@ export class EvaSuitAvatar {
   private cargoCapKg = SUIT_MAX_CARGO_KG;
   private built = false;
   private disposed = false;
+
+  /** Spec 24 Phase 4 §2.6 boot-dust emitter (NullEngine-safe fallback node). */
+  private bootDust?: ParticleSystem;
+  private bootDustFallback?: TransformNode;
+  /** Number of boot-dust puffs emitted since init (smoke readback). */
+  private bootDustPuffCount = 0;
   /** Most recently stepped state — keeps getters honest across scene life. */
   private last: SuitState;
 
@@ -271,6 +288,14 @@ export class EvaSuitAvatar {
     this.visor = null;
     for (const material of this.materials) EvaSuitAvatar.disposeQuietly(material);
     this.materials = [];
+    if (this.bootDust !== undefined) {
+      EvaSuitAvatar.disposeQuietly(this.bootDust);
+      this.bootDust = undefined;
+    }
+    if (this.bootDustFallback !== undefined) {
+      EvaSuitAvatar.disposeQuietly(this.bootDustFallback);
+      this.bootDustFallback = undefined;
+    }
     EvaSuitAvatar.disposeQuietly(this.root);
     this.root = null;
 
@@ -451,6 +476,58 @@ export class EvaSuitAvatar {
   /** The scene the avatar lives in (null before init / after dispose). */
   getScene(): Scene | null {
     return this.scene;
+  }
+
+  /**
+   * Spec 24 Phase 4 §2.6: kick up a fine regolith boot-dust puff at the
+   * suit's current heels (or an explicit world-frame point). NullEngine-safe —
+   * with no GPU context we only bump the emitted-puff counter and track a
+   * fallback node, so smoke harnesses exercise the trigger without WebGL.
+   * Returns the cumulative number of puffs emitted since init (≥ 1 after a
+   * successful call).
+   */
+  triggerBootDustPuff(at?: { x: number; y: number; z: number }): number {
+    if (this.disposed) return this.bootDustPuffCount;
+    const scene = this.scene;
+    if (scene === null || scene.isDisposed) return this.bootDustPuffCount;
+    const isNull = scene.getEngine().name === 'NullEngine';
+    if (isNull) {
+      if (this.bootDustFallback === undefined) {
+        this.bootDustFallback = new TransformNode('eva-boot-dust-fallback', scene);
+      }
+      this.bootDustPuffCount += 1;
+      return this.bootDustPuffCount;
+    }
+    if (this.bootDust === undefined) {
+      const ps = new ParticleSystem('eva-boot-dust', BOOT_DUST_PARTICLE_COUNT, scene);
+      ps.minEmitPower = 0.4;
+      ps.maxEmitPower = 1.3;
+      ps.minLifeTime = 0.5;
+      ps.maxLifeTime = 1.6;
+      ps.minSize = 0.06;
+      ps.maxSize = 0.28;
+      ps.gravity = new Vector3(0, BOOT_DUST_GRAVITY_Y, 0);
+      ps.color1 = new Color4(0.62, 0.58, 0.52, 0.9);
+      ps.color2 = new Color4(0.85, 0.8, 0.74, 0.15);
+      ps.direction1 = new Vector3(-0.7, 0.5, -0.6);
+      ps.direction2 = new Vector3(0.9, 0.95, 0.75);
+      this.bootDust = ps;
+    }
+    const p = at ?? { x: this.last.x, y: this.last.y, z: this.last.z };
+    const b = worldToBabylon(p);
+    (this.bootDust.emitter as Vector3).set(b.x, b.y + 0.15, b.z);
+    try {
+      this.bootDust.start();
+    } catch {
+      /* NullEngine / disposed scene — never propagate a GPU failure. */
+    }
+    this.bootDustPuffCount += 1;
+    return this.bootDustPuffCount;
+  }
+
+  /** Cumulative boot-dust puffs emitted since init (smoke readback). */
+  getBootDustPuffCount(): number {
+    return this.bootDustPuffCount;
   }
 
   // -- internals --------------------------------------------------------------

@@ -62,6 +62,14 @@ export interface IntroDirectorOptions {
   timeScale?: number;
   /** Optional persistence backend (defaults to localStorage in ClientApp). */
   storage?: Storage;
+  /**
+   * Spec 24 Phase 4 §2.6: optional live avatar-position reader used during
+   * the `walkout` phase to detect boots-on-regolith. When provided, the
+   * director completes as soon as the player reaches the ramp exit point
+   * (Spec 24 §2.6 handoff); when absent it falls back to the walkout
+   * duration so legacy harnesses keep their deterministic timeline.
+   */
+  getAvatarPosition?: () => { x: number; y: number; z: number } | null;
 }
 
 /** Phase durations in seconds at `timeScale = 1`. */
@@ -90,6 +98,15 @@ export const PHASE_ORDER: readonly IntroPhase[] = [
 
 /** Hold-to-skip threshold, seconds (Spec 24 §3.2). */
 export const SKIP_HOLD_THRESHOLD_S = 1.2;
+
+/**
+ * Spec 24 Phase 4 §2.6: horizontal radius around the ramp exit point at
+ * which boots-on-regolith is considered reached and the intro completes. The
+ * ramp foot rests exactly on the regolith datum, so a small contact radius
+ * (≈1 m) reads as "stepped off the grating" without demanding a precise
+ * pixel-perfect footfall.
+ */
+export const WALKOUT_REACHED_REGOLITH_M = 1.2;
 
 /**
  * Intro flight telemetry pushed to the HUD overlay every frame (Spec 24 Phase 3,
@@ -158,6 +175,8 @@ export class IntroDirector {
   private readonly onPhaseChange?: (phase: IntroPhase) => void;
   private readonly onComplete?: () => void;
   private readonly storage?: Storage;
+  /** Optional live avatar-position reader for walkout regolith contact. */
+  private getAvatarPosition?: () => { x: number; y: number; z: number } | null;
 
   private running = false;
   private disposed = false;
@@ -187,6 +206,7 @@ export class IntroDirector {
     const ts = Number.isFinite(options.timeScale ?? 1) ? (options.timeScale ?? 1) : 1;
     this.timeScale = Math.max(0, ts);
     this.storage = options.storage;
+    this.getAvatarPosition = options.getAvatarPosition;
 
     // Build the vacuum ejecta emitter up-front (NullEngine-safe; see §4.4).
     this.buildEjecta();
@@ -233,8 +253,19 @@ export class IntroDirector {
         this.lander.setRampDeployment(this.rampProgress());
         this.lander.setThrusterIntensity(0);
         break;
+      case 'walkout':
+        // Spec 24 Phase 4 §2.6: the walkout beat ends the moment boots
+        // touch regolith — the player reaches the ramp exit point (or crosses
+        // past it). With a live avatar reader attached we complete on contact;
+        // without one (legacy harness) the duration fallback still advances.
+        this.lander.setThrusterIntensity(0);
+        if (this.checkWalkoutReachedRegolith()) {
+          this.completeFromWalkout();
+          return;
+        }
+        break;
       default:
-        // orbit / depressurize / ramp / walkout: thrusters off between burns.
+        // orbit / depressurize: thrusters off between burns.
         this.lander.setThrusterIntensity(0);
     }
 
@@ -319,6 +350,23 @@ export class IntroDirector {
   /** Whether the sequence is actively running. */
   isRunning(): boolean {
     return this.running;
+  }
+
+  /**
+   * Spec 24 Phase 4 §2.6: attach (or clear) the live avatar-position reader
+   * used to detect boots-on-regolith during `walkout`. Set by ClientApp when
+   * it wires the director, so the walkout completion is position-driven in the
+   * real game while legacy harnesses keep their duration fallback.
+   */
+  setAvatarPositionProvider(
+    reader: (() => { x: number; y: number; z: number } | null) | undefined,
+  ): void {
+    this.getAvatarPosition = reader;
+  }
+
+  /** The transport lander this director animates (readback for ClientApp). */
+  getLander(): TransportLander {
+    return this.lander;
   }
 
   /** The current phase (readback for HUD / harness). */
@@ -417,6 +465,32 @@ export class IntroDirector {
   private thrusterForTouchdown(): number {
     const dur = PHASE_DURATIONS.touchdown;
     return clamp01(1 - this.phaseElapsed / dur);
+  }
+
+  /**
+   * Spec 24 Phase 4 §2.6: true once the avatar has reached the regolith —
+   * horizontal distance from the fully-deployed ramp exit point ≤
+   * {@link WALKOUT_REACHED_REGOLITH_M}. The ramp foot is exactly on the
+   * datum, so crossing the threshold means stepping off the grating onto lunar
+   * soil. Requires a live avatar reader; otherwise returns false (duration
+   * fallback drives the legacy timeline).
+   */
+  private checkWalkoutReachedRegolith(): boolean {
+    const reader = this.getAvatarPosition;
+    if (!reader) return false;
+    const pos = reader();
+    if (pos === null || !Number.isFinite(pos.x)) return false;
+    // Ramp exit is a Babylon-frame anchor; bring it into the physics frame.
+    const exit = babylonToWorld(this.lander.getRampExitPoint());
+    const dx = pos.x - exit.x;
+    const dy = pos.y - exit.y;
+    return Math.hypot(dx, dy) <= WALKOUT_REACHED_REGOLITH_M;
+  }
+
+  /** Complete the intro from boots-on-regolith contact (fires onComplete once). */
+  private completeFromWalkout(): void {
+    this.setPhase('completed');
+    this.finish();
   }
 
   /** Ramp deployment progress [0,1] across the ramp phase. */

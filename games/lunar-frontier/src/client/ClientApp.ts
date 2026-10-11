@@ -41,7 +41,7 @@ import { StandardMaterial } from '@babylonjs/core/Materials/standardMaterial.js'
 import { Color3 } from '@babylonjs/core/Maths/math.color.js';
 import type { Mesh } from '@babylonjs/core/Meshes/mesh.js';
 
-import { WorldScene, worldToBabylon, type CameraMode, type MiningBeamEffect } from '../engine/index.ts';
+import { WorldScene, worldToBabylon, babylonToWorld, type CameraMode, type MiningBeamEffect } from '../engine/index.ts';
 import { ProvingGroundsScene, type LapTelemetry } from '../engine/ProvingGroundsScene.ts';
 import { EvaSuitAvatar, SUIT_MAX_CARGO_KG } from '../entities/AstronautSuit.ts';
 import { OpenBuggy, MOUNT_RADIUS_M, type BuggyDashTelemetry } from '../entities/OpenBuggy.ts';
@@ -52,6 +52,7 @@ import {
   type CommsDialogue,
   type QuestCompletedPayload,
   type QuestStorage,
+  type Quest,
 } from './QuestEngine.ts';
 import { HintArrowSystem, type HintArrowTarget } from './HintArrowSystem.ts';
 import { IntroDirector } from './IntroDirector.ts';
@@ -421,6 +422,14 @@ export interface ClientAppOptions {
    * manually or restore a saved run).
    */
   startQuest?: boolean;
+  /**
+   * Spec 24 Phase 4 §2.6: when true AND an IntroDirector is attached, the
+   * tutorial quest is NOT started at spawn — it waits for the intro's
+   * boots-on-regolith handoff (`notifyIntroCompleted`), so the corporate
+   * dispatch comms fire exactly as the player steps off the ramp instead of
+   * pinging while still strapped in. Default false (legacy: start at boot).
+   */
+  deferQuestUntilIntroComplete?: boolean;
 }
 
 export interface ClientInputFrame {
@@ -670,6 +679,12 @@ export class ClientApp {
    * {@link setIntroDirector}; ticked every frame in `update()`.
    */
   private introDirector: IntroDirector | null = null;
+  /**
+   * Spec 24 Phase 4: once the attached director reaches `completed`, the
+   * boots-on-regolith handoff (full HUD + QuestEngine bridge) fires exactly
+   * once. Reset when a new director is attached.
+   */
+  private introCompletedHandled = false;
   /** Quest reward credited (Spec 18 §5 Stage 5: 500 cr) — harness readback. */
   private questRewardCredits = 0;
   /** Per-frame locomotion accumulators feeding `recordMoveDistance` (m). */
@@ -1013,28 +1028,11 @@ export class ClientApp {
       scene: this.world.getScene(),
       onHudUpdate: (payload) => this.hud?.updateHintArrow(payload),
     });
-    if (this.options.startQuest !== false) {
-      this.questEngine.startQuest(
-        createTutorialQuest({
-          faction: this.options.faction ?? 'CEC',
-          spawnPosition: { x: spawn.x, y: spawn.y, z: this.groundAt(spawn.x, spawn.y) },
-          veinPosition: this.veinAnchorFor(spawn.x, spawn.y) ?? {
-            x: spawn.x,
-            y: spawn.y + 45,
-            z: this.groundAt(spawn.x, spawn.y + 45),
-          },
-          buggyPosition: (() => {
-            const b = this.buggy?.getPosition() ?? { x: spawn.x + 9, y: spawn.y + 4, z: 0 };
-            return { x: b.x, y: b.y, z: b.z };
-          })(),
-          terminalPosition: this.nearestBaseTo({ x: spawn.x, y: spawn.y })?.position ?? {
-            x: spawn.x - 60,
-            y: spawn.y - 80,
-            z: this.groundAt(spawn.x - 60, spawn.y - 80),
-          },
-          buggyEntityId: 'buggy-local',
-        }),
-      );
+    // Spec 24 Phase 4 §2.6: when the intro director owns the first moments,
+    // defer the tutorial quest until boots touch regolith (`deferQuestUntilIntroComplete`).
+    const questDeferred = this.options.deferQuestUntilIntroComplete === true;
+    if (this.options.startQuest !== false && !questDeferred) {
+      this.questEngine.startQuest(this.buildTutorialQuestOptions());
     }
     this.questFootPrev = { x: spawn.x, y: spawn.y };
     this.questBuggyPrev = null;
@@ -1080,11 +1078,29 @@ export class ClientApp {
     // the button snapshot for the following frame).
     this.pumpGamepadLatch(dt);
     this.pumpGamepadActions();
-    this.stepEntities(dt);
+    // Spec 24 Phase 4 §2.6: during cinematic beats (orbit → ramp) the player
+    // is not yet free — avatar input is locked and the suit is tethered to the
+    // cabin interior so it rides down with the hull instead of walking off.
+    if (this.isIntroCinematic()) {
+      this.tetherAvatarToCabin();
+    } else {
+      this.stepEntities(dt);
+    }
     this.stepRailSystem(dt);
     // Spec 24 Phase 2: tick the arrival director with the frame dt so phase
     // transitions, lander effects and intro camera tracks advance in lockstep.
     this.introDirector?.update(dt);
+    // Spec 24 Phase 4 §2.6: when boots touch regolith the director flips to
+    // `completed` — fire the handoff (retract intro HUD, dust puff, bridge to
+    // QuestEngine) exactly once per attached director.
+    if (
+      this.introDirector !== null &&
+      this.introDirector.getPhase() === 'completed' &&
+      !this.introCompletedHandled
+    ) {
+      this.introCompletedHandled = true;
+      this.handleIntroCompleted();
+    }
     // Spec 17 Phase 4: step the circuit lap-timing state machine with the
     // freshly stepped buggy pose and repaint the lap HUD panel.
     this.pumpLapTiming(dt);
@@ -1411,6 +1427,13 @@ export class ClientApp {
   setIntroDirector(director: IntroDirector | null): this {
     if (this.disposed) return this;
     this.introDirector = director;
+    // Spec 24 Phase 4 §2.6 — a fresh director gets a fresh handoff latch and,
+    // when it animates the transport lander, a live avatar reader so walkout
+    // completes on boots-on-regolith contact rather than by wall-clock.
+    this.introCompletedHandled = false;
+    if (director !== null) {
+      director.setAvatarPositionProvider(() => this.activePosition());
+    }
     return this;
   }
 
@@ -3940,6 +3963,103 @@ export class ClientApp {
     return this.mode === 'buggy'
       ? this.requireBuggy().getPosition()
       : this.requireSuit().getPosition();
+  }
+
+  /**
+   * Spec 18 §5 / Spec 24 Phase 4 §2.6: the canonical tutorial quest
+   * payload ("Boots on the Ground", Stage 1). Shared by the boot-time
+   * auto-start and the intro walkout handoff so both bridge to QuestEngine
+   * with identical world anchors.
+   */
+  private buildTutorialQuestOptions(): Quest {
+    const spawn = this.resolveSpawn();
+    return createTutorialQuest({
+      faction: this.options.faction ?? 'CEC',
+      spawnPosition: { x: spawn.x, y: spawn.y, z: this.groundAt(spawn.x, spawn.y) },
+      veinPosition: this.veinAnchorFor(spawn.x, spawn.y) ?? {
+        x: spawn.x,
+        y: spawn.y + 45,
+        z: this.groundAt(spawn.x, spawn.y + 45),
+      },
+      buggyPosition: (() => {
+        const b = this.buggy?.getPosition() ?? { x: spawn.x + 9, y: spawn.y + 4, z: 0 };
+        return { x: b.x, y: b.y, z: b.z };
+      })(),
+      terminalPosition: this.nearestBaseTo({ x: spawn.x, y: spawn.y })?.position ?? {
+        x: spawn.x - 60,
+        y: spawn.y - 80,
+        z: this.groundAt(spawn.x - 60, spawn.y - 80),
+      },
+      buggyEntityId: 'buggy-local',
+    });
+  }
+
+  /**
+   * Spec 24 Phase 4 §2.6: true while the attached director is mid-cinematic —
+   * orbit, burn, touchdown, depressurize or ramp — meaning the player is still
+   * strapped in and input must be locked (avatar tethered to the cabin).
+   */
+  private isIntroCinematic(): boolean {
+    const d = this.introDirector;
+    if (d === null || !d.isRunning()) return false;
+    const phase = d.getPhase();
+    return (
+      phase === 'orbit' ||
+      phase === 'burn' ||
+      phase === 'touchdown' ||
+      phase === 'depressurize' ||
+      phase === 'ramp'
+    );
+  }
+
+  /**
+   * Spec 24 Phase 4 §2.6: pin the EVA suit to the lander's cabin interior
+   * spawn point (Babylon-frame anchor converted into the physics frame) with zero
+   * velocity, so the avatar rides down inside the hull during cinematic beats.
+   */
+  private tetherAvatarToCabin(): void {
+    const d = this.introDirector;
+    if (d === null || !d.isRunning()) return;
+    try {
+      const anchor = babylonToWorld(d.getLander().getCabinSpawnPoint());
+      const suit = this.requireSuit();
+      suit.setState({
+        x: anchor.x,
+        y: anchor.y,
+        z: anchor.z,
+        vx: 0,
+        vy: 0,
+        vz: 0,
+        jumpImpulse: 0,
+        isGrounded: true,
+      });
+    } catch {
+      /* lander/hull absent — leave the avatar where it stands. */
+    }
+  }
+
+  /**
+   * Spec 24 Phase 4 §2.6 — boots-on-regolith handoff. Runs exactly once
+   * when the attached IntroDirector reaches `completed`:
+   *   1. Retract the intro overlay (full exploration HUD takes over).
+   *   2. Kick a fine regolith boot-dust puff at the player's feet.
+   *   3. Bridge to QuestEngine: initialize Spec 18 Stage 1 ("Boots on the
+   *      Ground") with the corporate dispatch comms, unless it is already
+   *      running (never double-initializes).
+   */
+  private handleIntroCompleted(): void {
+    const hud = this.hud;
+    if (hud !== null) hud.updateIntroTelemetry(null);
+    // Boots on regolith — fine dust puff at the avatar's current heels.
+    const p = this.activePosition();
+    try {
+      this.requireSuit().triggerBootDustPuff({ x: p.x, y: p.y, z: p.z });
+    } catch {
+      /* NullEngine scene — dust is cosmetic; never break the handoff. */
+    }
+    // Bridge to QuestEngine (Spec 18 Stage 1) with tutorial anchors.
+    this.questEngine?.notifyIntroCompleted(this.buildTutorialQuestOptions());
+    this.log('intro completed — boots on regolith, quest engine bridged');
   }
 
   private requireSuit(): EvaSuitAvatar {

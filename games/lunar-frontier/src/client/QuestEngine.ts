@@ -315,6 +315,20 @@ export class QuestEngine {
     return this.quest;
   }
 
+  /**
+   * Spec 24 Phase 4 §2.6 quest bridge: initialize (or re-trigger) the
+   * tutorial from the intro's boots-on-regolith handoff. Starts Spec 18
+   * Stage 1 ("Boots on the Ground") with the corporate dispatch comms when no
+   * quest is active; otherwise it is a strict no-op so an already-running or
+   * restored run never double-initializes. Returns true when a fresh tutorial
+   * was started.
+   */
+  notifyIntroCompleted(options: TutorialQuestOptions = {}): boolean {
+    if (this.quest !== null) return false;
+    this.startQuest(createTutorialQuest(options));
+    return true;
+  }
+
   getActiveStage(): QuestStage | null {
     if (this.quest === null) return null;
     return this.quest.stages[this.quest.currentStageIndex] ?? null;
