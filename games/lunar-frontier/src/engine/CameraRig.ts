@@ -40,7 +40,13 @@ import { FollowCamera } from '@babylonjs/core/Cameras/followCamera.js';
 import type { Camera } from '@babylonjs/core/Cameras/camera.js';
 import type { Scene } from '@babylonjs/core/scene.js';
 
-export type CameraMode = 'eva_first_person' | 'eva_third_person' | 'vehicle_chase';
+export type CameraMode =
+  | 'eva_first_person'
+  | 'eva_third_person'
+  | 'vehicle_chase'
+  // Spec 24 §4.3: arrival-sequence camera tracks.
+  | 'intro_cabin'
+  | 'intro_cinematic';
 
 /**
  * Physics frame (x, y lateral, z = elevation up) → Babylon left-handed y-up
@@ -60,7 +66,16 @@ export const CAMERA_MODES: readonly CameraMode[] = [
   'eva_first_person',
   'eva_third_person',
   'vehicle_chase',
+  'intro_cabin',
+  'intro_cinematic',
 ];
+
+// -- Spec 24 §4.3 intro-camera constants --------------------------------------
+
+/** Intro cabin free-look yaw clamp: ±60° (spec 24 §4.3). */
+export const INTRO_CABIN_YAW_CLAMP_RAD = Math.PI / 3;
+/** Intro cabin free-look pitch clamp: ±35° (spec 24 §4.3). */
+export const INTRO_CABIN_PITCH_CLAMP_RAD = (35 * Math.PI) / 180;
 
 // -- Spec 17 §2.4 chase-camera constants -------------------------------------
 
@@ -159,6 +174,26 @@ export const DEFAULT_MODE_CONFIGS: Record<CameraMode, CameraModeConfig> = {
     rotationSmoothing: 4.5,
     groundClearance: 1.1,
   },
+  intro_cabin: {
+    // Spec 24 §4.3: interior cabin viewport — wide FOV, tight eye point at
+    // the passenger jump seat, generous smoothing for a calm arrival gaze.
+    fovDegrees: 70,
+    distance: 0,
+    heightOffset: 1.8,
+    positionSmoothing: 10,
+    rotationSmoothing: 6,
+    groundClearance: 0.35,
+  },
+  intro_cinematic: {
+    // Spec 24 §4.3: exterior tracking shot — long orbit radius, high altitude
+    // so the whole dropship + retro-burn reads against the lunar horizon.
+    fovDegrees: 55,
+    distance: 26,
+    heightOffset: 16,
+    positionSmoothing: 4.5,
+    rotationSmoothing: 3.2,
+    groundClearance: 1.6,
+  },
 };
 
 /** Frame-rate independent exponential approach: k = 1 - exp(-rate * dt). */
@@ -229,6 +264,10 @@ export class CameraRig {
   private readonly firstPerson: UniversalCamera;
   private readonly thirdPerson: ArcRotateCamera;
   private readonly chase: ArcRotateCamera;
+  /** Spec 24 §4.3: interior cabin viewport camera (intro_cabin). */
+  private readonly introCabin: UniversalCamera;
+  /** Spec 24 §4.3: exterior cinematic tracking camera (intro_cinematic). */
+  private readonly introCinematic: ArcRotateCamera;
   /** Constructed but unused without a FollowCamera lock target; kept for
    *  attach/getActiveCamera symmetry and future cockpit work. */
   private readonly follow: FollowCamera;
@@ -306,6 +345,31 @@ export class CameraRig {
     this.chase.lowerRadiusLimit = 6;
     this.chase.upperRadiusLimit = 40;
     this.chase.panningSensibility = 0;
+
+    // Spec 24 §4.3: interior cabin viewport — a UniversalCamera at the
+    // passenger jump seat, yaw/pitch constrained by the director's free-look.
+    const cabinCfg = merged.intro_cabin;
+    this.introCabin = new UniversalCamera('rig_intro_cabin', this.currentPos.clone(), scene);
+    this.introCabin.rotation = new Vector3(0, 0, 0);
+    this.applyCommonSettings(this.introCabin, minZ, maxZ);
+    this.applyFov(this.introCabin, cabinCfg.fovDegrees);
+
+    // Spec 24 §4.3: exterior cinematic tracking — a wide ArcRotateCamera that
+    // the director orbits around the descending dropship (retro-burn / touchdown).
+    const cineCfg = merged.intro_cinematic;
+    this.introCinematic = new ArcRotateCamera(
+      'rig_intro_cinematic',
+      Math.PI,
+      Math.PI / 2 - 0.12, // slightly elevated exterior gaze
+      cineCfg.distance,
+      new Vector3(0, 8, 0),
+      scene,
+    );
+    this.applyCommonSettings(this.introCinematic, minZ, maxZ);
+    this.applyFov(this.introCinematic, cineCfg.fovDegrees);
+    this.introCinematic.lowerRadiusLimit = 10;
+    this.introCinematic.upperRadiusLimit = 60;
+    this.introCinematic.panningSensibility = 0;
 
     this.follow = new FollowCamera('rig_follow', new Vector3(0, 5, -10), scene);
     this.applyCommonSettings(this.follow, minZ, maxZ);
@@ -417,23 +481,60 @@ export class CameraRig {
     const posT = smoothFactor(cfg.positionSmoothing, dt);
     const rotT = smoothFactor(cfg.rotationSmoothing, dt);
 
-    this.currentYaw = approachAngle(this.currentYaw, targetYaw, rotT);
-    this.currentPitch = approach(this.currentPitch, clamp(targetPitch, -1.35, 1.35), rotT);
+    // Spec 24 §4.3: intro cabin free-look is constrained to ±60° yaw / ±35°
+    // pitch so the arrival gaze sweeps the viewport and cabin without spinning
+    // out of control. The goal angles are clamped BEFORE smoothing so the camera
+    // eases into the stop rather than overshooting past it.
+    const lookYawGoal =
+      this.mode === 'intro_cabin'
+        ? clamp(targetYaw, -INTRO_CABIN_YAW_CLAMP_RAD, INTRO_CABIN_YAW_CLAMP_RAD)
+        : targetYaw;
+    const lookPitchGoal = clamp(
+      this.mode === 'intro_cabin'
+        ? clamp(targetPitch, -INTRO_CABIN_PITCH_CLAMP_RAD, INTRO_CABIN_PITCH_CLAMP_RAD)
+        : targetPitch,
+      -1.35,
+      1.35,
+    );
+    this.currentYaw = approachAngle(this.currentYaw, lookYawGoal, rotT);
+    this.currentPitch = approach(this.currentPitch, lookPitchGoal, rotT);
 
-    if (this.mode === 'eva_first_person') {
+    if (this.mode === 'eva_first_person' || this.mode === 'intro_cabin') {
       this.currentPos.set(
         approach(this.currentPos.x, bx, posT),
         approach(this.currentPos.y, by + cfg.heightOffset, posT),
         approach(this.currentPos.z, bz, posT),
       );
       this.keepAboveGround(cfg);
-      this.firstPerson.position.copyFrom(this.currentPos);
+      const cam = this.mode === 'intro_cabin' ? this.introCabin : this.firstPerson;
+      cam.position.copyFrom(this.currentPos);
       // Babylon left-handed y-up: a camera facing physics-forward
       // (cos yaw, sin yaw, 0) → (cos yaw, 0, -sin yaw) has rotation.y =
       // π/2 + yaw. Pitch + (up) is negative rotation.x.
-      this.firstPerson.rotation.y = Math.PI / 2 + this.currentYaw;
-      this.firstPerson.rotation.x = -this.currentPitch;
-      this.firstPerson.rotation.z = 0;
+      cam.rotation.y = Math.PI / 2 + this.currentYaw;
+      cam.rotation.x = -this.currentPitch;
+      cam.rotation.z = 0;
+    } else if (this.mode === 'intro_cinematic') {
+      // Spec 24 §4.3: exterior tracking — orbit the dropship from a fixed
+      // elevated elevation, sweeping slowly so retro-burn / touchdown read as a
+      // single continuous descent shot.
+      const arc = this.introCinematic;
+      const goalAzimuth = Math.PI - this.wrapTargetYaw(targetYaw);
+      this.currentOrbitAzimuth = approachAngle(this.currentOrbitAzimuth, goalAzimuth, rotT * 0.6);
+      arc.alpha = this.currentOrbitAzimuth;
+      arc.beta = clamp(Math.PI / 2 - 0.12 - this.currentPitch * 0.25, 0.3, 1.5);
+
+      const pivotX = approach(arc.target.x, bx, posT);
+      const pivotY = approach(arc.target.y, by + cfg.heightOffset * 0.6, posT);
+      const pivotZ = approach(arc.target.z, bz, posT);
+      arc.target.set(pivotX, pivotY, pivotZ);
+      this.currentPos.set(pivotX, pivotY, pivotZ);
+      // Force a matrix rebuild so headless consumers read truthful globalPosition.
+      arc.computeWorldMatrix();
+      if (this.keepArcAboveGround(arc, cfg)) {
+        arc.computeWorldMatrix();
+      }
+      return;
     } else {
       const arc = this.mode === 'vehicle_chase' ? this.chase : this.thirdPerson;
       // Spec 17 §2.4.2: in chase mode the azimuth goal tracks the velocity
@@ -534,7 +635,9 @@ export class CameraRig {
   /** The Babylon camera currently rendering. */
   getActiveCamera(): Camera {
     if (this.mode === 'eva_first_person') return this.firstPerson;
+    if (this.mode === 'intro_cabin') return this.introCabin;
     if (this.mode === 'vehicle_chase') return this.chase;
+    if (this.mode === 'intro_cinematic') return this.introCinematic;
     return this.thirdPerson;
   }
 
@@ -585,7 +688,14 @@ export class CameraRig {
   // -- internals ----------------------------------------------------------------
 
   private allCameras(): Camera[] {
-    return [this.firstPerson, this.thirdPerson, this.chase, this.follow];
+    return [
+      this.firstPerson,
+      this.thirdPerson,
+      this.chase,
+      this.introCabin,
+      this.introCinematic,
+      this.follow,
+    ];
   }
 
   /**
@@ -597,12 +707,18 @@ export class CameraRig {
    */
   private seedActiveCamera(): void {
     if (!this.hasState) return;
-    if (this.mode === 'eva_first_person') {
-      this.firstPerson.position.copyFrom(this.currentPos);
-      this.firstPerson.rotation.y = Math.PI / 2 + this.currentYaw;
-      this.firstPerson.rotation.x = -this.currentPitch;
+    if (this.mode === 'eva_first_person' || this.mode === 'intro_cabin') {
+      const cam = this.mode === 'intro_cabin' ? this.introCabin : this.firstPerson;
+      cam.position.copyFrom(this.currentPos);
+      cam.rotation.y = Math.PI / 2 + this.currentYaw;
+      cam.rotation.x = -this.currentPitch;
     } else {
-      const arc = this.mode === 'vehicle_chase' ? this.chase : this.thirdPerson;
+      const arc =
+        this.mode === 'vehicle_chase'
+          ? this.chase
+          : this.mode === 'intro_cinematic'
+            ? this.introCinematic
+            : this.thirdPerson;
       arc.target.copyFrom(this.currentPos);
       arc.alpha = this.currentOrbitAzimuth;
     }
@@ -631,7 +747,9 @@ export class CameraRig {
 
   private cameraForMode(mode: CameraMode): Camera {
     if (mode === 'eva_first_person') return this.firstPerson;
+    if (mode === 'intro_cabin') return this.introCabin;
     if (mode === 'vehicle_chase') return this.chase;
+    if (mode === 'intro_cinematic') return this.introCinematic;
     return this.thirdPerson;
   }
 

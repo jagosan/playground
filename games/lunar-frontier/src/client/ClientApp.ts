@@ -54,6 +54,7 @@ import {
   type QuestStorage,
 } from './QuestEngine.ts';
 import { HintArrowSystem, type HintArrowTarget } from './HintArrowSystem.ts';
+import { IntroDirector } from './IntroDirector.ts';
 import { FactionBases } from '../infrastructure/Factions.ts';
 import {
   TunnelNetwork,
@@ -663,6 +664,12 @@ export class ClientApp {
   private questEngine: QuestEngine | null = null;
   private hintArrowSystem: HintArrowSystem | null = null;
   private lastComms: CommsDialogue | null = null;
+  /**
+   * Spec 24 §4.2: first-time arrival cinematic director. Owned by the caller
+   * (ClientApp doesn't build a `TransportLander` itself) and attached via
+   * {@link setIntroDirector}; ticked every frame in `update()`.
+   */
+  private introDirector: IntroDirector | null = null;
   /** Quest reward credited (Spec 18 §5 Stage 5: 500 cr) — harness readback. */
   private questRewardCredits = 0;
   /** Per-frame locomotion accumulators feeding `recordMoveDistance` (m). */
@@ -1075,6 +1082,9 @@ export class ClientApp {
     this.pumpGamepadActions();
     this.stepEntities(dt);
     this.stepRailSystem(dt);
+    // Spec 24 Phase 2: tick the arrival director with the frame dt so phase
+    // transitions, lander effects and intro camera tracks advance in lockstep.
+    this.introDirector?.update(dt);
     // Spec 17 Phase 4: step the circuit lap-timing state machine with the
     // freshly stepped buggy pose and repaint the lap HUD panel.
     this.pumpLapTiming(dt);
@@ -1386,6 +1396,22 @@ export class ClientApp {
 
   getHud(): LunarHUD | null {
     return this.hud;
+  }
+
+  /** The attached arrival director, or null before {@link setIntroDirector}. */
+  getIntroDirector(): IntroDirector | null {
+    return this.introDirector;
+  }
+
+  /**
+   * Attach (or clear) the Spec 24 first-time-arrival director. ClientApp owns
+   * no `TransportLander`, so the caller constructs both and hands them in; once
+   * attached, `update()` ticks the director every frame.
+   */
+  setIntroDirector(director: IntroDirector | null): this {
+    if (this.disposed) return this;
+    this.introDirector = director;
+    return this;
   }
 
   getNetwork(): NetworkClient | null {
