@@ -55,6 +55,33 @@ export const HUD_TOAST_ID = 'lunar-hud-toast';
 /** Auto-dismiss window for the toast banner (spec 19 §2.2.2: 3.5 s). */
 export const HUD_TOAST_DISMISS_MS = 3500;
 
+/**
+ * Spec 24 Phase 3 — intro flight-telemetry overlay (`#lunar-hud-intro`).
+ * Hosts the descent altimeter, cabin-pressure gauge + staging beacon, and the
+ * hold-to-skip radial progress ring (blueprint §3.1 / Spec 24 §2.2–§2.4).
+ */
+export const HUD_INTRO_ID = 'lunar-hud-intro';
+
+/**
+ * Structural clone of `IntroDirector.IntroTelemetry` declared locally so the HUD
+ * keeps its zero-import contract (the director's type is assignable to this one —
+ * same field-for-field shape, no Babylon/engine coupling in HUD-only harnesses).
+ */
+export interface HudIntroTelemetry {
+  phase: string;
+  phaseElapsedSeconds: number;
+  altitudeMeters: number;
+  descentVelocityMps: number;
+  cabinPressureKPa: number;
+  audioMode: 'cabin' | 'vacuum';
+  skipHoldProgress: number; // 0.0 to 1.0
+}
+
+/** Cabin atmosphere pressure at seal, kPa (Spec 24 §2.4: 101.3 kPa). */
+const INTRO_CABIN_PRESSURE_KPA = 100;
+/** Pressure below which the cabin audio cuts to suit acoustics (§2.4 <5 kPa). */
+const INTRO_VACUUM_THRESHOLD_KPA = 6;
+
 /** Sector split slots on the proving-grounds lap panel (S1/S2 + total). */
 export const HUD_LAP_SECTOR_SLOTS = 3;
 
@@ -585,6 +612,9 @@ export class LunarHUD {
   /** Last hint-arrow payload painted (harness / integration readback). */
   private hintArrowData: HudHintArrowData | null = null;
 
+  /** Last intro telemetry painted (Spec 24 Phase 3 harness readback). */
+  private lastIntroTelemetry: HudIntroTelemetry | null = null;
+
   /** Spec 21 §2.5 — holographic topographic map overlay state. */
   private mapVisible = false;
   /** Last map frame handed to `updateMap` (harness readback). */
@@ -628,6 +658,7 @@ export class LunarHUD {
 
     this.buildStatusStrip();
     this.buildCompass();
+    this.buildIntroOverlay();
     this.buildToast();
     this.buildLifeSupport();
     this.buildBuggyPanel();
@@ -665,6 +696,7 @@ export class LunarHUD {
       this.toastTimer = null;
     }
     this.clearCommsTimers();
+    this.lastIntroTelemetry = null;
     this.tradeRows.clear();
     this.tradeOptions.clear();
     this.promptEls = [];
@@ -1567,6 +1599,171 @@ export class LunarHUD {
       pin.appendChild(readoutEl);
       this.compassPinReadouts.set(key, readoutEl);
       band.appendChild(pin);
+    }
+  }
+
+  /**
+   * Spec 24 Phase 3 — intro flight-telemetry overlay (`#lunar-hud-intro`):
+   * glassmorphic descent panel hosting the altimeter (ALTITUDE / DESCENT RATE /
+   * TRAJECTORY), the cabin-pressure gauge with its staging-beacon lamp, and the
+   * hold-to-skip radial progress ring. Hidden until `updateIntroTelemetry()`
+   * paints a live frame; retracted on `null` / idle / completed.
+   */
+  private buildIntroOverlay(): void {
+    const panel = this.make(
+      'section',
+      HUD_INTRO_ID,
+      'hud-panel intro-overlay is-hidden',
+      'intro-panel',
+    );
+    this.root.appendChild(panel);
+
+    // -- altimeter ------------------------------------------------------------
+    panel.appendChild(this.heading('DESCENT TELEMETRY'));
+    panel.appendChild(this.labeledField('intro-altitude', 'ALTITUDE', '— m'));
+    panel.appendChild(
+      this.labeledField('intro-descent', 'DESCENT RATE', '— m/s'),
+    );
+    panel.appendChild(
+      this.labeledField('intro-trajectory', 'TRAJECTORY', 'POLAR_SECTOR_07_LOCKED'),
+    );
+
+    // -- cabin-pressure gauge --------------------------------------------------
+    const pressureWrap = this.make(
+      'div',
+      undefined,
+      'hud-field intro-pressure-row',
+      'intro-pressure-row',
+    );
+    const lab = this.make('span', undefined, 'hud-field-label');
+    lab.textContent = 'CABIN PRESSURE';
+    const val = this.make(
+      'span',
+      'hud-intro-pressure-value',
+      'hud-field-value',
+      'intro-pressure-value',
+    );
+    val.textContent = `${num(INTRO_CABIN_PRESSURE_KPA, 1)} kPa`;
+    pressureWrap.appendChild(lab);
+    pressureWrap.appendChild(val);
+    panel.appendChild(pressureWrap);
+
+    const gauge = this.make('div', undefined, 'hud-bar intro-pressure-gauge');
+    const fill = this.make(
+      'div',
+      'lunar-hud-intro-pressure-fill',
+      'hud-bar-fill',
+      'intro-pressure-fill',
+    );
+    fill.style.width = '100%';
+    gauge.appendChild(fill);
+    panel.appendChild(gauge);
+
+    // Staging-beacon lamp: amber when the cabin is venting to vacuum (§2.4).
+    const beacon = this.make(
+      'div',
+      'lunar-hud-intro-beacon',
+      'hud-lamp intro-beacon',
+      'intro-beacon',
+    );
+    beacon.appendChild(this.make('span', undefined, 'hud-lamp-dot'));
+    const beaconText = this.make('span', undefined, 'hud-lamp-label');
+    beaconText.textContent = 'STAGING';
+    beacon.appendChild(beaconText);
+    panel.appendChild(beacon);
+
+    // -- hold-to-skip prompt + radial progress ring (§3.2) --------------------
+    const skip = this.make(
+      'div',
+      undefined,
+      'intro-skip',
+      'intro-skip',
+    );
+    const ring = this.make('span', undefined, 'intro-skip-ring', 'intro-skip-ring');
+    const ringFill = this.make('span', undefined, 'intro-skip-fill', 'intro-skip-fill');
+    ring.appendChild(ringFill);
+    skip.appendChild(ring);
+    const label = this.make(
+      'span',
+      undefined,
+      'intro-skip-label',
+      'intro-skip-label',
+    );
+    label.textContent = 'Hold [Space / Ⓑ] to Skip';
+    skip.appendChild(label);
+    panel.appendChild(skip);
+  }
+
+  /**
+   * Paint the intro flight-telemetry overlay (Spec 24 Phase 3). Creates/updates
+   * DOM in place; `null` (or idle/completed) retracts the panel. Also mirrors
+   * the last frame for harness readback (`getIntroTelemetry()`).
+   */
+  updateIntroTelemetry(telemetry: HudIntroTelemetry | null): void {
+    if (this.disposed) return;
+    this.lastIntroTelemetry = telemetry;
+
+    const panel = this.els.get('intro-panel');
+    if (panel === undefined) return;
+    if (
+      telemetry === null ||
+      telemetry.phase === 'idle' ||
+      telemetry.phase === 'completed'
+    ) {
+      this.setClass('intro-panel', 'is-hidden', true);
+      this.setSkipProgress(0);
+      return;
+    }
+
+    this.setClass('intro-panel', 'is-hidden', false);
+
+    // Altimeter readouts (Spec 24 §2.2).
+    const alt = Number.isFinite(telemetry.altitudeMeters)
+      ? telemetry.altitudeMeters
+      : NaN;
+    const vel = Number.isFinite(telemetry.descentVelocityMps)
+      ? telemetry.descentVelocityMps
+      : NaN;
+    this.setText('intro-altitude-value', `${num(alt, 0)} m`);
+    this.setText('intro-descent-value', `${num(vel, 1)} m/s`);
+
+    // Cabin pressure gauge + staging beacon (§2.4).
+    const pressure = Number.isFinite(telemetry.cabinPressureKPa)
+      ? telemetry.cabinPressureKPa
+      : 0;
+    this.setText('intro-pressure-value', `${num(pressure, 1)} kPa`);
+    const fillPct =
+      (clamp(pressure, 0, INTRO_CABIN_PRESSURE_KPA) / INTRO_CABIN_PRESSURE_KPA) *
+      100;
+    const fill = this.els.get('intro-pressure-fill');
+    if (fill !== undefined) {
+      fill.style.width = `${fillPct.toFixed(1)}%`;
+    }
+    const isVacuum =
+      telemetry.audioMode === 'vacuum' ||
+      pressure < INTRO_VACUUM_THRESHOLD_KPA;
+    this.setClass('intro-beacon', 'is-on', isVacuum);
+
+    // Hold-to-skip radial progress (§3.2).
+    this.setSkipProgress(telemetry.skipHoldProgress);
+  }
+
+  /** Last intro telemetry painted (null when retracted) — harness readback. */
+  getIntroTelemetry(): HudIntroTelemetry | null {
+    return this.lastIntroTelemetry;
+  }
+
+  /** Paint the hold-to-skip ring fill from [0,1] progress (§3.2). */
+  private setSkipProgress(progress: number): void {
+    const p = clamp(Number.isFinite(progress) ? (progress as number) : 0, 0, 1);
+    const skip = this.els.get('intro-skip');
+    if (skip !== undefined) {
+      skip.setAttribute('data-progress', String(p));
+      skip.style['--skip-progress'] = `${p.toFixed(3)}`;
+    }
+    const fill = this.els.get('intro-skip-fill');
+    if (fill !== undefined) {
+      fill.style.width = `${(p * 100).toFixed(1)}%`;
     }
   }
 

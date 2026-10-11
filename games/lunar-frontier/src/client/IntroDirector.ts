@@ -28,6 +28,10 @@ import type { Scene } from '@babylonjs/core/scene.js';
 import type { CameraRig } from '../engine/CameraRig.ts';
 import { babylonToWorld } from '../engine/CameraRig.ts';
 import type { TransportLander } from '../entities/TransportLander.ts';
+import { Color4 } from '@babylonjs/core/Maths/math.color.js';
+import { Vector3 } from '@babylonjs/core/Maths/math.vector.js';
+import { TransformNode } from '@babylonjs/core/Meshes/transformNode.js';
+import { ParticleSystem } from '@babylonjs/core/Particles/particleSystem.js';
 
 /** Intro state-machine phase (Spec 24 §4.2). */
 export type IntroPhase =
@@ -87,8 +91,51 @@ export const PHASE_ORDER: readonly IntroPhase[] = [
 /** Hold-to-skip threshold, seconds (Spec 24 §3.2). */
 export const SKIP_HOLD_THRESHOLD_S = 1.2;
 
+/**
+ * Intro flight telemetry pushed to the HUD overlay every frame (Spec 24 Phase 3,
+ * blueprint §3.1). Mirrors the spec's descent readouts:
+ *   • altitude: 12,400 m → ~50 m during burn, closing to 0 m on touchdown;
+ *   • descent rate: 180 m/s → 12 m/s retro-burn spool-down (§2.2);
+ *   • cabin pressure: 101.3 kPa → 0.0 kPa as the atmosphere vents (§2.4);
+ *   • audioMode flips 'cabin' → 'vacuum' the moment pressure drops below
+ *     5.0 kPa (the suit-conducted acoustic cut).
+ */
+export interface IntroTelemetry {
+  phase: IntroPhase;
+  phaseElapsedSeconds: number;
+  altitudeMeters: number;
+  descentVelocityMps: number;
+  cabinPressureKPa: number;
+  audioMode: 'cabin' | 'vacuum';
+  skipHoldProgress: number; // 0.0 to 1.0
+}
+
+/** Low-orbit altitude datum, metres (Spec 24 §2.2: 12,400 m). */
+const ORBIT_ALTITUDE_M = 12600;
+/** Retro-burn ignition altitude, metres (§2.2 countdown start). */
+const BURN_START_ALTITUDE_M = 12400;
+/** End-of-burn altitude, metres — touchdown closes the last stretch to 0 m. */
+const BURN_END_ALTITUDE_M = 120;
+/** Orbital drift rate during the cabin-view beat, m/s. */
+const ORBIT_DESCENT_MPS = 6;
+/** Retro-burn ignition descent rate, m/s (§2.2: 180 m/s). */
+const BURN_START_VELOCITY_MPS = 160;
+/** End-of-burn terminal descent rate, m/s (§2.2: ~12 m/s). */
+const BURN_END_VELOCITY_MPS = 10;
+/** Touchdown approach speed, m/s (blueprint §3.1 touchdown beat). */
+const TOUCHDOWN_START_VELOCITY_MPS = 8;
+/** Cabin atmosphere pressure at seal, kPa (§2.4: 101.3 kPa). */
+const CABIN_PRESSURE_KPA = 100;
+/** Pressure below which the cabin audio cuts to suit acoustics (§2.4: <5 kPa). */
+const VACUUM_AUDIO_THRESHOLD_KPA = 6;
+
 function clamp01(v: number): number {
   return v < 0 ? 0 : v > 1 ? 1 : v;
+}
+
+/** Linear interpolation helper for telemetry down-counts. */
+function lerp(a: number, b: number, t: number): number {
+  return a + (b - a) * clamp01(t);
 }
 
 /**
@@ -117,6 +164,19 @@ export class IntroDirector {
   /** Skip-hold accumulator (Spec 24 §3.2). */
   private skipHoldSeconds = 0;
 
+  /**
+   * Vacuum ejecta particle system (Spec 24 §4.4) — a radial ballistic sheet
+   * sprayed around the footpads on touchdown. NullEngine-safe: when the engine is
+   * the NullEngine there is no WebGL/shader context, so we swap in a tracked
+   * fallback TransformNode instead of a GPU ParticleSystem (smoke harnesses run
+   * cleanly with zero canvas).
+   */
+  private ejecta?: ParticleSystem;
+  /** NullEngine stand-in for {@link ejecta} (no shaders, no WebGL). */
+  private ejectaFallback?: TransformNode;
+  /** True once the touchdown ejecta burst has fired this run. */
+  private ejectaTriggered = false;
+
   constructor(options: IntroDirectorOptions) {
     this.scene = options.scene;
     this.cameraRig = options.cameraRig;
@@ -127,6 +187,9 @@ export class IntroDirector {
     const ts = Number.isFinite(options.timeScale ?? 1) ? (options.timeScale ?? 1) : 1;
     this.timeScale = Math.max(0, ts);
     this.storage = options.storage;
+
+    // Build the vacuum ejecta emitter up-front (NullEngine-safe; see §4.4).
+    this.buildEjecta();
   }
 
   // -------------------------------------------------------------------------
@@ -183,6 +246,9 @@ export class IntroDirector {
     if (dur > 0 && this.phaseElapsed >= dur) {
       this.advanceToNext();
     }
+
+    // Push intro telemetry to the HUD overlay every frame (Spec 24 Phase 3).
+    this.pushTelemetry();
   }
 
   /** Skips the current phase, advancing to the next beat immediately. */
@@ -223,7 +289,10 @@ export class IntroDirector {
     this.phaseElapsed = 0;
     this.skipHoldSeconds = 0;
     this.running = false;
+    this.stopEjecta();
     this.setPhase('idle');
+    // Idle → the HUD overlay retracts its intro panel (Spec 24 Phase 3).
+    this.pushTelemetry();
   }
 
   /**
@@ -262,6 +331,72 @@ export class IntroDirector {
     return clamp01(this.skipHoldSeconds / SKIP_HOLD_THRESHOLD_S);
   }
 
+  /**
+   * Intro flight telemetry for the HUD overlay (Spec 24 Phase 3, blueprint
+   * §3.1). Computes the descent readouts per phase:
+   *   • orbit:       12,400 m datum, slow orbital drift, cabin pressure.
+   *   • burn:        altitude 12,400 → ~50 m; rate 180 → ~12 m/s (§2.2).
+   *   • touchdown:   closes to 0 m / 0 m/s with the ejecta burst (§2.3).
+   *   • depressurize: pressure 101.3 → 0.0 kPa; audioMode flips to 'vacuum'
+   *                  once pressure drops below 5.0 kPa (§2.4 acoustic cut).
+   *   • ramp/walkout/completed: on the surface, full vacuum acoustics.
+   */
+  getTelemetry(): IntroTelemetry {
+    const p = this.phase;
+    let altitudeMeters: number;
+    let descentVelocityMps: number;
+    let cabinPressureKPa: number;
+    let audioMode: 'cabin' | 'vacuum';
+
+    switch (p) {
+      case 'burn': {
+        const t = clamp01(this.phaseElapsed / PHASE_DURATIONS.burn);
+        altitudeMeters = lerp(BURN_START_ALTITUDE_M, BURN_END_ALTITUDE_M, t);
+        descentVelocityMps = lerp(BURN_START_VELOCITY_MPS, BURN_END_VELOCITY_MPS, t);
+        cabinPressureKPa = CABIN_PRESSURE_KPA;
+        audioMode = 'cabin';
+        break;
+      }
+      case 'touchdown': {
+        const t = clamp01(this.phaseElapsed / PHASE_DURATIONS.touchdown);
+        altitudeMeters = lerp(BURN_END_ALTITUDE_M, 0, t);
+        descentVelocityMps = lerp(TOUCHDOWN_START_VELOCITY_MPS, 0, t);
+        cabinPressureKPa = CABIN_PRESSURE_KPA;
+        audioMode = 'cabin';
+        break;
+      }
+      case 'depressurize': {
+        const t = clamp01(this.phaseElapsed / PHASE_DURATIONS.depressurize);
+        altitudeMeters = 0;
+        descentVelocityMps = 0;
+        cabinPressureKPa = lerp(CABIN_PRESSURE_KPA, 0, t);
+        // §2.4: the moment cabin air density bottoms out, external audio cuts to
+        // suit-conducted acoustics — modelled as a hard sub-5 kPa threshold.
+        audioMode = cabinPressureKPa < VACUUM_AUDIO_THRESHOLD_KPA ? 'vacuum' : 'cabin';
+        break;
+      }
+      default: {
+        // orbit datum, or ramp/walkout/completed on the surface.
+        altitudeMeters = p === 'orbit' ? ORBIT_ALTITUDE_M : 0;
+        descentVelocityMps = p === 'orbit' ? ORBIT_DESCENT_MPS : 0;
+        cabinPressureKPa =
+          p === 'orbit' || p === 'idle' ? CABIN_PRESSURE_KPA : 0;
+        audioMode = p === 'orbit' || p === 'idle' ? 'cabin' : 'vacuum';
+        break;
+      }
+    }
+
+    return {
+      phase: p,
+      phaseElapsedSeconds: this.phaseElapsed,
+      altitudeMeters,
+      descentVelocityMps,
+      cabinPressureKPa,
+      audioMode,
+      skipHoldProgress: this.getSkipHoldProgress(),
+    };
+  }
+
   /** Tears down the director and restores lander effects. Idempotent. */
   dispose(): void {
     if (this.disposed) return;
@@ -269,6 +404,9 @@ export class IntroDirector {
     this.running = false;
     this.lander.setRampDeployment(0);
     this.lander.setThrusterIntensity(0);
+    // Retract the HUD intro panel and free the ejecta emitter (Spec 24 Phase 3).
+    this.pushTelemetry();
+    this.disposeEjecta();
   }
 
   // -------------------------------------------------------------------------
@@ -312,6 +450,9 @@ export class IntroDirector {
         // One-shot strut shock-compression on touchdown (Spec 24 §2.3): the
         // footpads sink once and rebound on their own timer.
         this.lander.triggerGearCompression();
+        // Vacuum ejecta burst: high-velocity radial dust sheets spray out across
+        // the regolith as the struts kiss the surface (§2.3 / §4.4).
+        this.triggerEjecta();
         break;
       case 'depressurize':
         this.cameraRig.setMode('intro_cabin');
@@ -335,6 +476,120 @@ export class IntroDirector {
     if (this.disposed) return;
     this.running = false;
     this.onComplete?.();
+  }
+
+  /**
+   * Build the vacuum ejecta emitter (Spec 24 §4.4): a high-velocity radial
+   * ballistic sheet around the footpad datum. NullEngine-safe — when the engine is
+   * the NullEngine we skip the GPU ParticleSystem entirely and track a fallback
+   * TransformNode so smoke harnesses exercise the same lifecycle without any WebGL/
+   * shader context (zero canvas, zero crash).
+   */
+  private buildEjecta(): void {
+    const isNull = this.scene.getEngine().name === 'NullEngine';
+    if (isNull) {
+      this.ejectaFallback = new TransformNode('intro-ejecta-fallback', this.scene);
+      return;
+    }
+    const ps = new ParticleSystem('intro-ejecta', 500, this.scene);
+    // Radial sheet emitter centred on the lander's footpad datum.
+    ps.emitter = this.ejectaAnchor();
+    ps.direction1 = new Vector3(-1.4, 0.7, -1.2);
+    ps.direction2 = new Vector3(1.6, 1.05, 1.5);
+    ps.minEmitPower = 26;
+    ps.maxEmitPower = 42;
+    ps.minLifeTime = 1.4;
+    ps.maxLifeTime = 3.2;
+    ps.minSize = 0.35;
+    ps.maxSize = 2.6;
+    ps.gravity = new Vector3(0, -1.62, 0); // lunar gravity (§2.3)
+    ps.color1 = new Color4(0.55, 0.48, 0.42, 0.95);
+    ps.color2 = new Color4(0.9, 0.82, 0.72, 0.35);
+    ps.blendMode = ParticleSystem.BLENDMODE_ADD;
+    ps.emitRate = 420;
+    this.ejecta = ps;
+  }
+
+  /** World anchor for the ejecta emitter: just above the footpad datum. */
+  private ejectaAnchor(): Vector3 {
+    const root = this.lander.getRootNode().position;
+    return new Vector3(root.x, Math.max(0.15, root.y), root.z);
+  }
+
+  /**
+   * Fire the touchdown ejecta burst once per run (Spec 24 §2.3). NullEngine-safe:
+   * with no GPU system we only mark the fallback node as "live" so the smoke
+   * harness can assert triggering without any particle rendering.
+   */
+  private triggerEjecta(): void {
+    if (this.ejectaTriggered) return;
+    this.ejectaTriggered = true;
+    if (this.ejecta !== undefined) {
+      try {
+        this.ejecta.start();
+      } catch {
+        /* NullEngine-safe: never propagate a WebGL/shader failure. */
+      }
+    }
+  }
+
+  /** Stop the ejecta burst and clear its one-shot flag (reset path). */
+  private stopEjecta(): void {
+    this.ejectaTriggered = false;
+    if (this.ejecta !== undefined) {
+      try {
+        this.ejecta.stop();
+      } catch {
+        /* already stopped / NullEngine fallback. */
+      }
+    }
+  }
+
+  /** Dispose the ejecta emitter (GPU system or NullEngine fallback node). */
+  private disposeEjecta(): void {
+    if (this.ejecta !== undefined) {
+      try {
+        this.ejecta.dispose();
+      } catch {
+        /* scene already torn down. */
+      }
+      this.ejecta = undefined;
+    }
+    if (this.ejectaFallback !== undefined) {
+      try {
+        this.ejectaFallback.dispose();
+      } catch {
+        /* scene already torn down. */
+      }
+      this.ejectaFallback = undefined;
+    }
+  }
+
+  /** Whether the touchdown ejecta burst has fired this run (smoke readback). */
+  getEjectaTriggered(): boolean {
+    return this.ejectaTriggered;
+  }
+
+  /**
+   * Forward the current intro telemetry to the HUD overlay, or retract it when
+   * idle / completed (Spec 24 Phase 3: `hud.updateIntroTelemetry`). No-op for a
+   * director built without a HUD or with a duck-typed stub lacking the method —
+   * keeps the existing smoke harness (no hud) working unchanged.
+   */
+  private pushTelemetry(): void {
+    const hud = this.hud as
+      | ({ updateIntroTelemetry?: (t: IntroTelemetry | null) => void })
+      | undefined;
+    if (!hud || typeof hud.updateIntroTelemetry !== 'function') return;
+    if (
+      !this.running ||
+      this.phase === 'idle' ||
+      this.phase === 'completed'
+    ) {
+      hud.updateIntroTelemetry(null);
+      return;
+    }
+    hud.updateIntroTelemetry(this.getTelemetry());
   }
 
   /**

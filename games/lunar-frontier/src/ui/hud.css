@@ -336,6 +336,82 @@
   animation: lf-vignette 1.4s ease-in-out infinite;
 }
 
+/* --- intro flight-telemetry overlay (Spec 24 Phase 3) ----------------------
+   Glassmorphic descent panel: altimeter + cabin-pressure gauge + staging
+   beacon + hold-to-skip radial ring. Sits centre-left over the viewport glass
+   during the arrival sequence (§2.2–§2.4). */
+
+#lunar-hud-intro {
+  top: 50%;
+  left: 16px;
+  transform: translateY(-50%);
+  width: 252px;
+}
+
+.intro-overlay.is-hidden {
+  display: none;
+}
+
+/* Amber staging-beacon lamp (§2.4: cabin venting to vacuum). */
+.intro-beacon {
+  margin-top: 8px;
+}
+
+.intro-beacon.is-on .hud-lamp-dot {
+  background: var(--lf-warn);
+  box-shadow: 0 0 10px 3px rgba(255, 204, 85, 0.75);
+  border-color: rgba(255, 232, 170, 0.9);
+  animation: lf-pulse 1.4s ease-in-out infinite;
+}
+
+.intro-beacon.is-on {
+  color: var(--lf-warn);
+}
+
+/* Cabin-pressure gauge fill turns critical as it vents to vacuum. */
+.intro-pressure-gauge .hud-bar-fill.is-critical {
+  background: linear-gradient(90deg, rgba(255, 93, 92, 0.7), var(--lf-bad));
+}
+
+/* Hold-to-skip radial ring (§3.2): a conic fill driven by --skip-progress,
+   with the label whispering beneath. */
+.intro-skip {
+  margin-top: 12px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 11px;
+  color: var(--lf-dim);
+  letter-spacing: 0.06em;
+}
+
+.intro-skip-ring {
+  position: relative;
+  width: 22px;
+  height: 26px;
+  border-radius: 50%;
+  background: conic-gradient(
+    var(--lf-cyan) calc(var(--skip-progress, 0) * 1turn),
+    rgba(255, 255, 255, 0.12) 0
+  );
+  mask-image: radial-gradient(circle, transparent 62%, #000 63%);
+  -webkit-mask-image: radial-gradient(circle, transparent 60%, #000 61%);
+}
+
+.intro-skip-fill {
+  display: none;
+}
+
+.intro-skip-label {
+  white-space: nowrap;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .intro-beacon.is-on .hud-lamp-dot {
+    animation: none;
+  }
+}
+
 /* --- floating operational toast (Spec 19 §2.2.2 / ADR-3) --------------------
    Top-centre glassmorphic pill that surfaces gameplay feedback (mining,
    mount, capacity rejections) above every other panel. `pointer-events: none`
