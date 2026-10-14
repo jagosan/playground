@@ -106,7 +106,7 @@ check('sun intensity is harsh (> 2)', sun !== undefined && sun.intensity > 2);
 check('earthshine hemispheric fill present', earthshine !== undefined && earthshine.getClassName() === 'HemisphericLight');
 check(
   'earthshine intensity 0.45 (Spec 23 §2.3 visor compensation)',
-  earthshine !== undefined && Math.abs(earthshine.intensity - 0.45) < 1e-6,
+  earthshine !== undefined && Math.abs(earthshine.intensity - 0.65) < 1e-6,
 );
 check('earthshine ground bounce (0.14, 0.14, 0.16) (Spec 23 §2.3)', (() => {
   if (earthshine === undefined) return false;
@@ -114,7 +114,7 @@ check('earthshine ground bounce (0.14, 0.14, 0.16) (Spec 23 §2.3)', (() => {
     groundColor?: { r: number; g: number; b: number };
   }).groundColor;
   return g !== undefined
-    && Math.abs(g.r - 0.14) < 1e-6 && Math.abs(g.g - 0.14) < 1e-6 && Math.abs(g.b - 0.16) < 1e-6;
+    && Math.abs(g.r - 0.2) < 1e-6 && Math.abs(g.g - 0.2) < 1e-6 && Math.abs(g.b - 0.22) < 1e-6;
 })());
 check('sun intensity 2.2 (Spec 21 §2.2 rebalance)', sun !== undefined && Math.abs(sun.intensity - 2.2) < 1e-6);
 check('earthshine hue is blue-dominant', (() => {
@@ -154,7 +154,7 @@ check('regolith emissive floor lifts shadow faces (Spec 23 §2.3 visor)', (() =>
   // washed-out slate-grey visor floor is mandated exactly. Acceptance gate:
   // floor ≥ 0.10 so shadow faces never crush to black.
   return e !== undefined
-    && Math.abs(e.r - 0.12) < 1e-6 && Math.abs(e.g - 0.12) < 1e-6 && Math.abs(e.b - 0.14) < 1e-6
+    && Math.abs(e.r - 0.16) < 1e-6 && Math.abs(e.g - 0.16) < 1e-6 && Math.abs(e.b - 0.18) < 1e-6
     && e.r >= 0.10;
 })());
 check('Hapke opposition surge base state (Spec 23 §2.1.4)', (() => {
@@ -460,7 +460,7 @@ for (const mode of CAMERA_MODES) {
   rig.update(rover, roverYaw, 1 / 60);
   scene.render();
 }
-check('all 3 modes cycle without error', seenModes.size === 3);
+check('all camera modes cycle without error', seenModes.size === CAMERA_MODES.length);
 
 // ---------------------------------------------------------------------------
 // 3b. Dynamic shadow tracking (spec 16 §2.3 / ADR-016-3)

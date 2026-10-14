@@ -986,7 +986,11 @@ export class ClientApp {
       // invented client-side.
       this.factionBases = new FactionBases(snapshot).init(scene);
       this.tunnelNetwork = new TunnelNetwork(snapshot).init(scene);
-      this.railSystem = new RailSystem(snapshot).init(scene);
+      // Spec 25 §2.1: rail roadbeds are clamped against generator terrain
+      // truth so ballast berms (never floating steel) fill craters/hollows.
+      this.railSystem = new RailSystem(snapshot, {
+        elevationAt: (x: number, y: number) => this.world.getWorldGenerator().elevationAt(x, y),
+      }).init(scene);
       
       // Spec 21 §2.3: automated freight train consist on primary line
       if (snapshot.railRoutes.length > 0) {

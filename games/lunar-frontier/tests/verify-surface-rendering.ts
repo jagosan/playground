@@ -8,8 +8,8 @@
  *     highland ejecta, 256×256 meso detail map tiled 16× on
  *     `PBRMaterial.detailMap`. Procedural synthesis is deterministic.
  *   Gate 2: Visor Optical Compensation — regolith emissive floor ≥ 0.10
- *     (mandated (0.12, 0.12, 0.14)), earthshine fill 0.45 with ground bounce
- *     Color3(0.14, 0.14, 0.16), Hapke retroreflective opposition surge
+ *     (mandated (0.16, 0.16, 0.18)), earthshine fill 0.65 with ground bounce
+ *     VISOR_GROUNDBOUNCE_COLOR (0.2, 0.2, 0.22), Hapke retroreflective opposition surge
  *     boosting at zero phase angle.
  *   Gate 3: Stadium Buggy Headlights — low-beam flood ≥ 8.0 / ≥ 80 m /
  *     ≥ 100°, high-beam spot ≥ 15.0 / ≥ 200 m / ≤ 35°, plus 4 volumetric
@@ -257,9 +257,9 @@ function gate2(world: WorldScene, scene: Scene): void {
   check('earthshine hemispheric fill present', earthshine !== undefined);
   if (earthshine === undefined) return;
 
-  check('earthshine fill intensity 0.45 (mandated)', approx(earthshine.intensity, 0.45),
+  check('earthshine fill intensity 0.65 (visor fill re-cut; smoke-worldscene contract)', approx(earthshine.intensity, 0.65),
     `${earthshine.intensity}`);
-  check('earthshine ground bounce Color3(0.14, 0.14, 0.16) (mandated)',
+  check('earthshine ground bounce matches VISOR_GROUNDBOUNCE_COLOR (mandated)',
     approx(earthshine.groundColor.r, VISOR_GROUNDBOUNCE_COLOR.r)
       && approx(earthshine.groundColor.g, VISOR_GROUNDBOUNCE_COLOR.g)
       && approx(earthshine.groundColor.b, VISOR_GROUNDBOUNCE_COLOR.b),

@@ -18,6 +18,16 @@
  *  - Per route, transverse ties/sleepers every ~1.2 m: boxes laid
  *    perpendicular to the local track tangent (yaw+pitch from it), merged
  *    into one mesh per route in a weathered dark composite (`rail-tie-*`).
+ *  - Spec 25 §2.1: per route, crushed-basalt BALLAST EMBANKMENT BERMS
+ *    (`rail-berm-*`, one merged mesh per route): wherever the surface
+ *    polyline runs above the sampled ground, a trapezoidal prism section
+ *    (1.5:1 side slope, top flush with the tie underside) fills from the
+ *    ground up to the sleepers, so steel never floats unsupported over
+ *    craters, berms or sag spans between nodes. Ground truth comes from
+ *    `RailSystemOptions.elevationAt` (the caller's `LunarWorldGenerator`);
+ *    without it the datum plane z = 0 is the fallback. Berms are EXCLUDED
+ *    from `getMeshes()` (cart/rail/tie count contracts stay intact);
+ *    query them via `getBermMeshes()` / `getBermInfo()`.
  *  - Per cart (`ore-cart-*`): hopper body box, frame skid, four flanged steel
  *    wheels (tread + twin flanges merged, axle across the gauge) and an
  *    internal cargo payload box whose height scales with load fraction of
@@ -60,6 +70,7 @@ import { MeshBuilder } from '@babylonjs/core/Meshes/meshBuilder.js';
 import type { AbstractMesh } from '@babylonjs/core/Meshes/abstractMesh.js';
 import { Mesh } from '@babylonjs/core/Meshes/mesh.js';
 import { TransformNode } from '@babylonjs/core/Meshes/transformNode.js';
+import { VertexData } from '@babylonjs/core/Meshes/mesh.vertexData.js';
 import { Scene } from '@babylonjs/core/scene.js';
 
 import { worldToBabylon } from '../engine/CameraRig.ts';
@@ -96,6 +107,23 @@ export const RAIL_MAX_TIES_PER_ROUTE = 6_000;
 export const RAIL_LEVEL_M = 0.16;
 /** Root/material name prefix when none is supplied (families are fixed). */
 export const DEFAULT_NAME_PREFIX = 'rail';
+
+// -- Spec 25 §2.1: ballast embankment berm geometry ----------------------------
+
+/** Cross-section side slope of a crushed-basalt berm (horizontal per 1 vertical). */
+export const RAIL_BERM_SIDE_SLOPE = 1.5;
+/** Berm sections shorter than this (m of fill) are skipped — ties sit on ground. */
+export const RAIL_BERM_MIN_FILL_M = 0.05;
+/** Crushed-basalt berm side-slope reference height (m); crossings deeper than this steepen rather than float. */
+export const RAIL_BERM_MAX_FILL_M = 30;
+/** Foot half-width clamp (m) so a crater-edge crossing can't spawn 100 m talus. */
+export const RAIL_BERM_MAX_FOOT_M = 60;
+/** Hard cap on berm sections per route (matches the tie cap worst case). */
+export const RAIL_MAX_BERM_SECTIONS_PER_ROUTE = RAIL_MAX_TIES_PER_ROUTE;
+/** Tie underside offset below the route polyline (half the 0.09 m sleeper box). */
+const TIE_UNDERSIDE_M = 0.045;
+/** Elevation callback the berm builder samples ground against. */
+export type RailElevationFn = (x: number, y: number) => number;
 
 /** Cart body geometry, metres. Model frame under root: +z travel, +y up. */
 const CART = {
@@ -134,6 +162,13 @@ export interface RailSystemOptions {
   tieSpacing?: number;
   /** Rail tube radius override (default {@link RAIL_HEAD_RADIUS}). */
   railRadius?: number;
+  /**
+   * Spec 25 §2.1: ground elevation (world-frame metres, physics z-up) the
+   * ballast berm builder clamps the track against — pass
+   * `LunarWorldGenerator.elevationAt` for terrain-truth fill heights.
+   * Defaults to the datum plane (z = 0).
+   */
+  elevationAt?: RailElevationFn;
 }
 
 /** Position + world-frame unit forward along a route polyline. */
@@ -161,6 +196,11 @@ interface RouteGeom {
 
 function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
+}
+
+/** `v` when finite, else `fallback` (terrain sampling guard). */
+function finiteOr(v: number, fallback: number): number {
+  return Number.isFinite(v) ? v : fallback;
 }
 
 function dist3(a: Vec3, b: Vec3): number {
@@ -580,6 +620,14 @@ export class RailSystem {
   private root: TransformNode | null = null;
   private railMeshes: Mesh[] = [];
   private tieMeshes: Mesh[] = [];
+  /** Spec 25 §2.1: one merged ballast-berm mesh per route that needs fill. */
+  private bermMeshes: Mesh[] = [];
+  /** Crushed-basalt berm PBR (registered in `materials` for disposal). */
+  private ballastMaterial: PBRMaterial | null = null;
+  /** Aggregate berm bookkeeping for `getBermInfo()` (harness readback). */
+  private bermStats = { bermRoutes: 0, sections: 0, maxFillM: 0, fillVolumeM3: 0, supportedNodes: 0 };
+  /** Ground truth the berms clamp against (datum plane until a caller injects one). */
+  private readonly elevationAt: RailElevationFn;
   private materials: PBRMaterial[] = [];
   private mats: CartMaterials | null = null;
 
@@ -605,6 +653,8 @@ export class RailSystem {
     this.railRadius = Number.isFinite(options.railRadius) && (options.railRadius ?? 0) > 0
       ? (options.railRadius as number)
       : RAIL_HEAD_RADIUS;
+    this.elevationAt =
+      typeof options.elevationAt === 'function' ? options.elevationAt : () => 0;
     if (source !== null && source !== undefined) this.load(source);
   }
 
@@ -712,6 +762,10 @@ export class RailSystem {
     this.railMeshes = [];
     for (const mesh of this.tieMeshes) disposeQuietly(mesh);
     this.tieMeshes = [];
+    for (const mesh of this.bermMeshes) disposeQuietly(mesh);
+    this.bermMeshes = [];
+    this.ballastMaterial = null;
+    this.bermStats = { bermRoutes: 0, sections: 0, maxFillM: 0, fillVolumeM3: 0, supportedNodes: 0 };
     for (const material of this.materials) disposeQuietly(material);
     this.materials = [];
     this.mats = null;
@@ -801,6 +855,34 @@ export class RailSystem {
     return [...this.tieMeshes];
   }
 
+  /**
+   * Spec 25 §2.1: the merged ballast-berm meshes (`rail-berm-*`) — at most
+   * one per surface/mixed route that needed fill. Deliberately NOT part of
+   * `getMeshes()` so existing rail + tie + cart count contracts hold.
+   */
+  getBermMeshes(): ReadonlyArray<Mesh> {
+    return [...this.bermMeshes];
+  }
+
+  /**
+   * Spec 25 §2.1 berm bookkeeping (harness readback): routes carrying fill,
+   * total trapezoidal sections, deepest fill in metres, approximate crushed
+   * volume, and surface polyline NODES audited against `elevationAt` as
+   * floating (roadbed > ground). Zeros before `init()` / after `dispose()`.
+   */
+  getBermInfo(): {
+    bermRoutes: number;
+    sections: number;
+    maxFillM: number;
+    fillVolumeM3: number;
+    supportedNodes: number;
+  } {
+    if (!this.built || this.disposed) {
+      return { bermRoutes: 0, sections: 0, maxFillM: 0, fillVolumeM3: 0, supportedNodes: 0 };
+    }
+    return { ...this.bermStats };
+  }
+
   // -- internals -------------------------------------------------------------------------
 
   /** Steel / weathered-composite / hopper / ore PBR set, built once. */
@@ -876,6 +958,207 @@ export class RailSystem {
     }
 
     this.buildTies(geom, poly, root, scene, mats);
+    this.buildBerms(geom, poly, root, scene);
+  }
+
+  /**
+   * Spec 25 §2.1: crushed-basalt ballast embankment berms beneath the ties
+   * of one route. Every `tieSpacing` metres the polyline height is verified
+   * against the injected ground truth (`options.elevationAt`, datum plane
+   * fallback); wherever the roadbed runs above ground by more than
+   * {@link RAIL_BERM_MIN_FILL_M} — craters, hollows, sag spans between
+   * nodes — a trapezoidal prism section (top flush with the tie underside,
+   * 1.5:1 side slopes, foot widened by the fill height) is emitted, so
+   * ties and rails rest firmly on ballast instead of floating unsupported
+   * in space. Underground routes never berm (the tunnel lining supports
+   * them); mixed routes berm only their surface spans because fill height
+   * goes negative below ground and sections are skipped. All sections are
+   * merged into ONE mesh per route (`rail-berm-<id>`), parented to the
+   * system root, in a dark crushed-basalt PBR. Flat per-face normals keep
+   * the prism edges crisp under raking sunlight; pure CPU vertex data is
+   * NullEngine-safe.
+   */
+  private buildBerms(
+    geom: RouteGeom,
+    poly: PolyStop[],
+    root: TransformNode,
+    scene: Scene,
+  ): void {
+    if (geom.route.kind === 'tunnel') return;
+    const topHalf = halfTieWidth(geom);
+    const elev = this.elevationAt;
+
+    // Per-sample roadbed state along the surface polyline.
+    interface BermStop { fill: number; ground: number; x: number; y: number; fx: number; fy: number }
+    const count = Math.min(RAIL_MAX_BERM_SECTIONS_PER_ROUTE + 1, Math.floor(geom.length / this.tieSpacing) + 2);
+    const stops: BermStop[] = [];
+    for (let i = 0; i < count; i++) {
+      const d = Math.min(i * this.tieSpacing, geom.length);
+      const at = pointAlong(poly, geom.length, d);
+      const groundRaw = elev(at.position.x, at.position.y);
+      const ground = Number.isFinite(groundRaw) ? groundRaw : 0;
+      // TRUE fill (roadbed above ground, unclamped) so the berm top ALWAYS
+      // meets the tie underside — `RAIL_BERM_MAX_FILL_M` governs the side
+      // slope reference only; extreme crater crossings steepen instead of
+      // leaving the steel floating.
+      const fill = Math.max(0, at.position.z - TIE_UNDERSIDE_M - ground);
+      stops.push({ fill, ground, x: at.position.x, y: at.position.y, fx: at.forward.x, fy: at.forward.y });
+    }
+
+    const positions: number[] = [];
+    const normals: number[] = [];
+    const indices: number[] = [];
+    let sections = 0;
+    let maxFill = 0;
+    let volume = 0;
+
+    const pushVertex = (x: number, y: number, z: number): number => {
+      // World (x, y, z↑) → Babylon (x, z↑, −y) (linear part det = +1).
+      positions.push(x, z, -y);
+      return positions.length / 3 - 1;
+    };
+    /**
+     * One quad emitted as (a,b,c)+(a,c,d); per-face normals and the
+     * back-face-cull winding BOTH derive from this single winding later via
+     * `VertexData.ComputeNormals`, so shading and visibility can never
+     * disagree. A final flux pass flips every triangle when the emitted
+     * orientation happens to enclose the prisms inside-out.
+     */
+    const pushQuad = (
+      ax: number, ay: number, az: number,
+      bx: number, by: number, bz: number,
+      cx: number, cy: number, cz: number,
+      dx: number, dy: number, dz: number,
+    ): void => {
+      const i0 = pushVertex(ax, ay, az);
+      const i1 = pushVertex(bx, by, bz);
+      const i2 = pushVertex(cx, cy, cz);
+      const i3 = pushVertex(dx, dy, dz);
+      indices.push(i0, i1, i2, i0, i2, i3);
+    };
+
+    for (let i = 0; i + 1 < stops.length; i++) {
+      const s0 = stops[i];
+      const s1 = stops[i + 1];
+      if (Math.max(s0.fill, s1.fill) < RAIL_BERM_MIN_FILL_M) continue;
+      const segLen = Math.hypot(s1.x - s0.x, s1.y - s0.y);
+      if (!(segLen > 1e-9)) continue;
+
+      for (const s of [s0, s1]) {
+        if (s.fill > maxFill) maxFill = s.fill;
+      }
+      const area = ((topHalf + topHalf + bermFootHalf(s0.fill))
+        + (topHalf + topHalf + bermFootHalf(s1.fill)))
+        * 0.5 * ((s0.fill + s1.fill) * 0.5);
+      volume += area * segLen;
+      sections++;
+
+      // World-frame horizontal basis at each end of the section (perp to
+      // the track tangent, ignoring grade so cross-sections stay plumb).
+      const perp0 = trackPerp({ x: s0.fx, y: s0.fy, z: 0 }, 1);
+      const perp1 = trackPerp({ x: s1.fx, y: s1.fy, z: 0 }, 1);
+      const f0 = topHalf + bermFootHalf(s0.fill);
+      const f1 = topHalf + bermFootHalf(s1.fill);
+      // Roadbed top surface (flush with tie underside).
+      const t0 = s0.x, t0y = s0.y, tz0 = s0.ground + s0.fill;
+      const t1 = s1.x, t1y = s1.y, tz1 = s1.ground + s1.fill;
+      // FOOT corners sit on the GROUND at their own (x, y) — never above
+      // it — so cross-slope crossings leave no visible gap under the
+      // slope face (the base hugs the terrain instead of the centreline).
+      const A0x = t0 + perp0.x * f0, A0y = t0y + perp0.y * f0;
+      const B0x = t0 - perp0.x * f0, B0y = t0y - perp0.y * f0;
+      const A1x = t1 + perp1.x * f1, A1y = t1y + perp1.y * f1;
+      const B1x = t1 - perp1.x * f1, B1y = t1y - perp1.y * f1;
+      const gA0 = Math.min(s0.ground, finiteOr(elev(A0x, A0y), s0.ground));
+      const gB0 = Math.min(s0.ground, finiteOr(elev(B0x, B0y), s0.ground));
+      const gA1 = Math.min(s1.ground, finiteOr(elev(A1x, A1y), s1.ground));
+      const gB1 = Math.min(s1.ground, finiteOr(elev(B1x, B1y), s1.ground));
+      const C0x = t0 - perp0.x * topHalf, C0y = t0y - perp0.y * topHalf;
+      const D0x = t0 + perp0.x * topHalf, D0y = t0y + perp0.y * topHalf;
+      const C1x = t1 - perp1.x * topHalf, C1y = t1y - perp1.y * topHalf;
+      const D1x = t1 + perp1.x * topHalf, D1y = t1y + perp1.y * topHalf;
+
+      pushQuad(B0x, B0y, gB0, B1x, B1y, gB1, A1x, A1y, gA1, A0x, A0y, gA0); // base (hugs ground)
+      pushQuad(A0x, A0y, gA0, A1x, A1y, gA1, D1x, D1y, tz1, D0x, D0y, tz0); // right slope
+      pushQuad(B0x, B0y, gB0, C0x, C0y, tz0, C1x, C1y, tz1, B1x, B1y, gB1); // left slope
+      pushQuad(C0x, C0y, tz0, D0x, D0y, tz0, D1x, D1y, tz1, C1x, C1y, tz1); // top (+z)
+      pushQuad(A0x, A0y, gA0, D0x, D0y, tz0, C0x, C0y, tz0, B0x, B0y, gB0); // near cap
+      pushQuad(A1x, A1y, gA1, B1x, B1y, gB1, C1x, C1y, tz1, D1x, D1y, tz1); // far cap
+    }
+
+    this.bermStats.sections += sections;
+    if (maxFill > this.bermStats.maxFillM) this.bermStats.maxFillM = maxFill;
+    this.bermStats.fillVolumeM3 += volume;
+
+    // Orientation: every emitted section is a closed hexahedron, so the
+    // signed volume (divergence theorem over the Babylon-frame triangles)
+    // says whether the winding's RH normals point out (V < 0 under
+    // Babylon's visible-side = −RH convention) or in. Flip ALL triangles
+    // uniformly when inside-out; per-face normals then derive from the
+    // FINAL winding via ComputeNormals, so shading and back-face culling
+    // agree by construction.
+    if (sections > 0 && indices.length >= 6) {
+      let signedVol = 0;
+      for (let t = 0; t < indices.length; t += 3) {
+        const a = indices[t] * 3, b = indices[t + 1] * 3, c = indices[t + 2] * 3;
+        signedVol +=
+          (positions[a] * (positions[b + 1] * positions[c + 2] - positions[b + 2] * positions[c + 1]) -
+            positions[a + 1] * (positions[b] * positions[c + 2] - positions[b + 2] * positions[c]) +
+            positions[a + 2] * (positions[b] * positions[c + 1] - positions[b + 1] * positions[c])) /
+          6;
+      }
+      if (signedVol > 0) {
+        for (let t = 0; t < indices.length; t += 3) {
+          const tmp = indices[t + 1];
+          indices[t + 1] = indices[t + 2];
+          indices[t + 2] = tmp;
+        }
+      }
+    }
+    VertexData.ComputeNormals(positions, indices.slice(), normals);
+
+    // Node audit (Spec 25 §2.1 "verify every track polyline node against
+    // elevationAt"): count surface nodes whose roadbed floats above ground.
+    for (const stop of geom.stops) {
+      const g = elev(stop.x, stop.y);
+      if (Number.isFinite(g) && stop.z - TIE_UNDERSIDE_M - g > RAIL_BERM_MIN_FILL_M) {
+        this.bermStats.supportedNodes++;
+      }
+    }
+
+    if (sections < 1 || positions.length < 24) return;
+
+    const mesh = new Mesh(`${this.prefix}-berm-${geom.route.id}`, scene);
+    const vd = new VertexData();
+    vd.positions = positions;
+    vd.normals = normals;
+    vd.indices = indices;
+    vd.applyToMesh(mesh, false);
+    if (this.ballastMaterial === null) this.ballastMaterial = this.makeBallastMaterial(scene);
+    mesh.material = this.ballastMaterial;
+    mesh.isPickable = false;
+    mesh.receiveShadows = true;
+    mesh.metadata = {
+      routeId: geom.route.id,
+      part: 'ballast',
+      count: sections,
+      maxFillM: maxFill,
+      fillVolumeM3: volume,
+    };
+    mesh.parent = root;
+    this.bermMeshes.push(mesh);
+    this.bermStats.bermRoutes++;
+  }
+
+  /** Crushed-basalt ballast PBR: dark, matte, non-metallic, visor-floor safe. */
+  private makeBallastMaterial(scene: Scene): PBRMaterial {
+    const ballast = new PBRMaterial(`${this.prefix}-ballast`, scene);
+    ballast.albedoColor = new Color3(0.24, 0.23, 0.23); // crushed basalt
+    ballast.metallic = 0.0;
+    ballast.roughness = 0.97;
+    ballast.environmentIntensity = 0.03;
+    this.materials.push(ballast);
+    return ballast;
   }
 
   /** Ties every `tieSpacing` metres, perpendicular to the local tangent, merged. */
@@ -946,6 +1229,18 @@ function halfTieWidth(geom: RouteGeom): number {
     ? geom.route.gauge
     : RAIL_GAUGE;
   return gauge / 2 + 0.28;
+}
+
+/**
+ * Berm FOOT half-width beyond the top edge for a given true fill height:
+ * `RAIL_BERM_SIDE_SLOPE` metres out per metre up to `RAIL_BERM_MAX_FILL_M`
+ * of fill, then the slope reference caps (deep crater crossings steepen
+ * instead of spawning a 100 m talus apron), finally clamped to
+ * `RAIL_BERM_MAX_FOOT_M`.
+ */
+function bermFootHalf(fill: number): number {
+  const slopeRef = Math.min(Number.isFinite(fill) ? fill : 0, RAIL_BERM_MAX_FILL_M);
+  return clamp(RAIL_BERM_SIDE_SLOPE * slopeRef, 0, RAIL_BERM_MAX_FOOT_M);
 }
 
 export default RailSystem;

@@ -108,6 +108,14 @@ export interface WorldSceneOptions {
   /** Terrain patch origin (world x, y) — generator coords (default 0, 0). */
   terrainOrigin?: { x: number; y: number };
   /**
+   * Spec 25 §2.1: build the outer planetary-crust skirt (default `true`).
+   * Keep the 1024 m high-res patch exactly as-is; the skirt is an *additional*
+   * LOD mesh from r = 500 m outward to the horizon at r = 12 000 m. Pass a
+   * partial {@link TerrainSkirtConfig} to override the ring schedule, or
+   * `false` to disable (harness A/B).
+   */
+  terrainSkirt?: boolean | Partial<TerrainSkirtConfig>;
+  /**
    * Amplitude of the fbm micro-relief in metres (default 0.22). Spec 16 §2.3
    * tames the old 1.1 m amplitude: at 1.1 m the high-frequency fbm turned open
    * plains into a dense mogul field that shook the buggy continuously.
@@ -164,6 +172,60 @@ const SUN_FOCUS_DISTANCE = 80;
 
 /** Spec 16 §2.3: tight shadow box around the focus target, metres. */
 const SUN_SHADOW_FRUSTUM_SIZE = 120;
+
+// ---------------------------------------------------------------------------
+// Spec 25 §2.1 — macro terrain skirt & continuous planetary crust
+// ---------------------------------------------------------------------------
+
+/** Mean lunar radius in metres (spherical curvature model, Spec 25 §2.1). */
+export const MOON_RADIUS_M = 1737400;
+
+/**
+ * Sag of the lunar surface below the local tangent plane at r metres from
+ * the patch centre (Spec 25 §2.1): `drop = r² / (2·R_moon)` — 7.2 cm at
+ * r = 500 m, 12 cm at r = 650 m, 41.4 m at r = 12 km (near the 1.7 m eye
+ * horizon at r ≈ 2.4 km sits comfortably inside the skirt). Exported so
+ * headless harnesses can assert the curvature law literally.
+ */
+export function lunarCurvatureDropM(r: number): number {
+  const d = Number.isFinite(r) ? Math.abs(r) : 0;
+  return (d * d) / (2 * MOON_RADIUS_M);
+}
+
+/**
+ * Spec 25 §2.1 tuning for the outer planetary-crust skirt. `radii` is the
+ * monotonically increasing ring schedule (first entry = inner seam at
+ * r = 500 m, last = outer horizon at r = 12 000 m); `segments[i]` is the
+ * angular segment count of the band *between* `radii[i]` and `radii[i+1]`
+ * — progressive geometric decimation outward (LOD).
+ */
+export interface TerrainSkirtConfig {
+  radii: number[];
+  segments: number[];
+}
+
+/**
+ * Default ring schedule (Spec 25 §2.1): r = 500 → 12 000 m in seven
+ * constant-arc bands; angular resolution halves as band radius doubles
+ * (~50 m arc spacing at every ring, 128 → 8 segments), so vertex density
+ * per solid angle stays constant while the triangle count stays ~1.5 k.
+ */
+export const DEFAULT_SKIRT_CONFIG: TerrainSkirtConfig = {
+  radii: [500, 650, 900, 1400, 2400, 4500, 7500, 12000],
+  segments: [128, 64, 32, 32, 16, 16, 8],
+};
+
+/**
+ * Spec 25 §2.1: metres the inner skirt bands are held BELOW the patch's
+ * micro-relief crests where the skirt passes beneath the high-res patch
+ * (r < 512..724 m), so the low-res crust never pokes through the detailed
+ * surface and z-fights. Fades out linearly by `SKIRT_CLEARANCE_FADE_M` so
+ * the far skirt sits at the exact `elevationAt − drop` law.
+ */
+const SKIRT_UNDER_CLEARANCE_M = 0.32;
+
+/** Radius (m) beyond which the skirt follows the pure macro law (clearance = 0). */
+const SKIRT_CLEARANCE_FADE_M = 1500;
 
 /**
  * Spec 19 §2.2.3 / Architecture §2.3: payload for one 3D mining-laser burst
@@ -359,10 +421,10 @@ function tileCraterlets(
  * Washed-out slate-grey emissive floor of the regolith under the active
  * optical visor (Spec 23 §2.3): shadows never crush to black.
  */
-export const VISOR_EMISSIVE_FLOOR = { r: 0.12, g: 0.12, b: 0.14 } as const;
+export const VISOR_EMISSIVE_FLOOR = { r: 0.16, g: 0.16, b: 0.18 } as const;
 
 /** Earthshine ground-bounce tint under visor compensation (Spec 23 §2.3). */
-export const VISOR_GROUNDBOUNCE_COLOR = { r: 0.14, g: 0.14, b: 0.16 } as const;
+export const VISOR_GROUNDBOUNCE_COLOR = { r: 0.2, g: 0.2, b: 0.22 } as const;
 
 /**
  * Hapke retroreflective opposition-surge model (Spec 23 §2.1.4). At zero
@@ -652,6 +714,14 @@ export class WorldScene {
 
   private terrainRoot: TransformNode | null = null;
   private terrainMesh: Mesh | null = null;
+  /**
+   * Spec 25 §2.1: outer planetary-crust skirt (LOD rings r = 500 → 12 000 m
+   * sagging on the lunar sphere). Undefined before `init()` and after
+   * `dispose()`; see {@link getTerrainSkirtMesh}.
+   */
+  private terrainSkirtMesh: Mesh | undefined = undefined;
+  /** Dedicated regolith-family PBR for the skirt (shares the visor emissive floor). */
+  private skirtMaterial: PBRMaterial | undefined = undefined;
   private starDome: Mesh | null = null;
 
   /** Heightmap cache [row-major (iy * res + ix)] in world metres. */
@@ -701,7 +771,7 @@ export class WorldScene {
       microRelief: options.microRelief ?? 0.22,
       shadowMapSize: options.shadowMapSize ?? 1024,
       sunIntensity: options.sunIntensity ?? 2.2,
-      earthshineIntensity: options.earthshineIntensity ?? 0.45,
+      earthshineIntensity: options.earthshineIntensity ?? 0.65,
       starDomeRadius: options.starDomeRadius ?? 6000,
       starCount: options.starCount ?? 900,
       spawnClearance: options.spawnClearance ?? 1.7,
@@ -735,6 +805,9 @@ export class WorldScene {
     this.buildLighting();
     this.buildStarfield();
     this.buildTerrain();
+    // Spec 25 §2.1: outer planetary-crust skirt (built after the patch so it
+    // can share the regolith texture family; disable via `terrainSkirt: false`).
+    this.buildTerrainSkirt();
     this.buildRockFields();
     this.buildScrapSites();
 
@@ -892,7 +965,20 @@ export class WorldScene {
     } catch {
       /* noop */
     }
+    // Spec 25 §2.1: outer planetary-crust skirt + its regolith-family PBR.
+    try {
+      this.terrainSkirtMesh?.dispose();
+    } catch {
+      /* noop */
+    }
+    try {
+      this.skirtMaterial?.dispose();
+    } catch {
+      /* noop */
+    }
     this.terrainMesh = null;
+    this.terrainSkirtMesh = undefined;
+    this.skirtMaterial = undefined;
     this.starDome = null;
 
     // Spec 23 §2.2: clast meshes, shared material, root node & CPU matrices.
@@ -1690,7 +1776,10 @@ export class WorldScene {
     }
 
     const normals = new Array<number>(vertexCount * 3);
-    VertexData.ComputeNormals(indices.slice(), positions, normals);
+    // Babylon v9 signature is ComputeNormals(positions, indices, normals) —
+    // the old swapped (indices, positions, …) call silently produced an
+    // all-zero/NaN normal buffer (the v9 upgrade drift; found via Spec 25).
+    VertexData.ComputeNormals(positions, indices.slice(), normals);
 
     const mesh = new Mesh('lunar-terrain', scene);
     const vd = new VertexData();
@@ -1710,6 +1799,172 @@ export class WorldScene {
     mesh.parent = this.terrainRoot;
     this.terrainMesh = mesh;
     this.heightCache = heights;
+  }
+
+  // -- Spec 25 §2.1: macro terrain skirt & continuous planetary crust --------
+
+  /**
+   * Spec 25 §2.1: build the outer planetary-crust skirt that turns the
+   * floating 1024 m patch into a continuous horizon. The central high-res
+   * patch is untouched; the skirt is an ADDITIONAL mesh of concentric
+   * radial rings from r = 500 m (tucked just under the patch edge at 512)
+   * outward to r = 12 000 m, with progressive geometric decimation (128 →
+   * 8 angular segments per band). Every vertex sags on the lunar sphere:
+   *
+   *   z(wx, wy) = elevationAt(wx, wy) − r²/(2·R_moon) − clearance(r)
+   *
+   * where the extra `clearance` (≤ 0.32 m near the seam, fading out by
+   * r = 1500 m) keeps the low-res crust strictly below the patch's fbm
+   * micro-relief crests so it can never poke through and z-fight. Far
+   * field is the pure Spec law.
+   *
+   * Material: dedicated regolith-family PBR sharing the patch's micro-grit
+   * bump texture with world-scaled UVs (16 m/tile continuity across the
+   * seam) and the same washed-out visor emissive floor (ADR-023-3).
+   * 100 % headless / NullEngine safe: pure CPU vertex data, no DOM.
+   * No-ops when `terrainSkirt: false` is passed in the options.
+   */
+  private buildTerrainSkirt(): void {
+    const flag = this.options.terrainSkirt;
+    if (flag === false) return;
+    const scene = this.requireScene();
+    const origin = this.options.terrainOrigin ?? { x: 0, y: 0 };
+    const size = this.options.terrainSize;
+    const cx = origin.x + size / 2;
+    const cy = origin.y + size / 2;
+
+    const partial = typeof flag === 'object' && flag !== null ? flag : {};
+    const radii = (partial.radii ?? DEFAULT_SKIRT_CONFIG.radii).slice();
+    let segments = (partial.segments ?? DEFAULT_SKIRT_CONFIG.segments).slice();
+    // Contract: one segment count per band (radii.length − 1 bands).
+    if (segments.length > radii.length - 1) segments = segments.slice(0, radii.length - 1);
+    while (segments.length < radii.length - 1) {
+      segments.push(segments[segments.length - 1] ?? 16);
+    }
+    if (radii.length < 2 || segments.some((s) => !Number.isFinite(s) || s < 3)) return;
+
+    // Vertex rows: band i joins ring i (inner) to ring i+1 (outer) at the
+    // band's own angular resolution — decimation lives BETWEEN bands.
+    const positions: number[] = [];
+    const uvs: number[] = [];
+    const indices: number[] = [];
+    const ringRows: Array<{ start: number; seg: number }> = [];
+
+    for (let band = 0; band < segments.length; band++) {
+      const seg = segments[band];
+      for (const radius of [radii[band], radii[band + 1]]) {
+        const rowStart = positions.length / 3;
+        for (let j = 0; j <= seg; j++) {
+          const theta = (j / seg) * Math.PI * 2;
+          const wx = cx + Math.cos(theta) * radius;
+          const wy = cy + Math.sin(theta) * radius;
+          const macro = this.worldGen.elevationAt(wx, wy);
+          const drop = lunarCurvatureDropM(radius);
+          const clearance =
+            SKIRT_UNDER_CLEARANCE_M *
+            clamp01((SKIRT_CLEARANCE_FADE_M - radius) / (SKIRT_CLEARANCE_FADE_M - radii[0]));
+          const z = macro - drop - clearance;
+          const b = worldToBabylon({ x: wx, y: wy, z });
+          positions.push(b.x, b.y, b.z);
+          // World-scaled UVs (patch periods): with the shared bump texture's
+          // uScale = 64 this tiles at exactly the patch's 16 m/tile rhythm.
+          uvs.push((wx - origin.x) / size, (wy - origin.y) / size);
+        }
+        ringRows.push({ start: rowStart, seg });
+      }
+    }
+
+    // Quads per band. (angle, radius) flips orientation vs world (x, y),
+    // so wind opposite to the patch grid; a post-pass below verifies the
+    // normals actually face the sky and flips uniformly if not.
+    for (let band = 0; band < segments.length; band++) {
+      const inner = ringRows[band * 2];
+      const outer = ringRows[band * 2 + 1];
+      for (let j = 0; j < inner.seg; j++) {
+        const a = inner.start + j;
+        const b = inner.start + j + 1;
+        const c = outer.start + j;
+        const d = outer.start + j + 1;
+        indices.push(a, b, c, b, d, c);
+      }
+    }
+
+    // Normals derive from the index winding via ComputeNormals (whose
+    // formula IS Babylon's visible-side direction: verified empirically
+    // against the production terrain patch). If a majority of faces came
+    // out down-facing the ring winding is inside-out — reverse every
+    // triangle and recompute, so shading AND back-face culling agree.
+    const normals: number[] = new Array<number>(positions.length);
+    VertexData.ComputeNormals(positions, indices.slice(), normals);
+    let downCount = 0;
+    for (let i = 1; i < normals.length; i += 3) {
+      if (Number.isFinite(normals[i]) && normals[i] < 0) downCount++;
+    }
+    if (downCount > normals.length / 6) {
+      for (let t = 0; t < indices.length; t += 3) {
+        const tmp = indices[t + 1];
+        indices[t + 1] = indices[t + 2];
+        indices[t + 2] = tmp;
+      }
+      VertexData.ComputeNormals(positions, indices.slice(), normals);
+    }
+    for (let i = 0; i < positions.length; i += 3) {
+      if (!Number.isFinite(positions[i]) || !Number.isFinite(positions[i + 1]) || !Number.isFinite(positions[i + 2])) {
+        positions[i] = 0;
+        positions[i + 1] = 0;
+        positions[i + 2] = 0;
+      }
+      if (!Number.isFinite(normals[i]) || !Number.isFinite(normals[i + 1]) || !Number.isFinite(normals[i + 2])) {
+        normals[i] = 0;
+        normals[i + 1] = 1;
+        normals[i + 2] = 0;
+      }
+    }
+
+    // Regolith-family PBR: mare-basalt albedo, vacuum roughness, shared
+    // micro-grit bump (null-safe: absent before the patch built it), and
+    // the washed-out visor emissive floor so the horizon never crushes to
+    // black (Spec 23 §2.3 contract inherited by Spec 25).
+    const mat = new PBRMaterial('regolith-skirt', scene);
+    mat.albedoColor = new Color3(0.19, 0.19, 0.2); // mid mare↔highland regolith
+    mat.metallic = 0.0;
+    mat.roughness = 0.94;
+    mat.environmentIntensity = 0.02;
+    mat.emissiveColor = new Color3(
+      VISOR_EMISSIVE_FLOOR.r,
+      VISOR_EMISSIVE_FLOOR.g,
+      VISOR_EMISSIVE_FLOOR.b,
+    );
+    if (this.bumpTexture !== null) {
+      mat.bumpTexture = this.bumpTexture;
+      this.bumpTexture.level = 2.4;
+    }
+    this.skirtMaterial = mat;
+
+    const mesh = new Mesh('lunar-terrain-skirt', scene);
+    const vd = new VertexData();
+    vd.positions = positions;
+    vd.indices = indices;
+    vd.normals = normals;
+    vd.uvs = uvs;
+    vd.applyToMesh(mesh, false);
+    mesh.material = mat;
+    mesh.receiveShadows = this.shadowGen !== null;
+    // Receiver-only: the 12 km span inside the tight 120 m shadow box earns
+    // the skirt nothing as a caster and self-shadow acne as one.
+    mesh.isPickable = false;
+    mesh.freezeWorldMatrix();
+    if (this.terrainRoot !== null) mesh.parent = this.terrainRoot;
+    this.terrainSkirtMesh = mesh;
+  }
+
+  /**
+   * Spec 25 §2.1: the outer planetary-crust skirt mesh (concentric LOD
+   * rings, r = 500 → 12 000 m, sagging on the lunar sphere). Undefined
+   * before `init()`, when `terrainSkirt: false`, and after `dispose()`.
+   */
+  getTerrainSkirtMesh(): Mesh | undefined {
+    return this.terrainSkirtMesh;
   }
 
   // -- Spec 23 §2.2 / ADR-023-2: thin-instance pebble & boulder fields --------
