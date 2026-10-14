@@ -170,6 +170,16 @@ export const CLAIM_RADIUS_M = 20;
 export const GAMEPAD_DEADZONE = 0.15;
 
 /**
+ * Spec 25 §2.2.3: strict 0.15 deadzone enforced across the STICK-Y axes —
+ * left stick Y (throttle demand) and right stick Y (look pitch) — BEFORE any
+ * downstream curve, filter, or physics throttle computation. Aliased to the
+ * canonical {@link GAMEPAD_DEADZONE}; separated as a named constant so the
+ * drive-channel gate reads as its own invariant and a future retune of the
+ * generic pad deadzone cannot silently move it.
+ */
+export const GAMEPAD_STICK_DEADZONE = GAMEPAD_DEADZONE;
+
+/**
  * Steering deadzone for the exponential stick curve (Spec 17 §2.2.2). Axis
  * magnitudes at or below this read as centred; beyond it the response is
  * re-normalised to (0..1) before the exponent, so a slightly-drifting pad
@@ -1906,9 +1916,22 @@ export class ClientApp {
     // Spec 19 §2.1.2 normalisation: a trigger axis whose rest was calibrated
     // on the negative rail (Linux xpad parks LT/RT at −1 when released) is
     // remapped [−1, +1] → [0, 1]; otherwise standard unipolar travel applies.
+    //
+    // Spec 25 §2.2.3 defensive trigger clamping: every axis trigger channel
+    // resolves against the safe resting baseline {@link
+    // TRIGGER_REST_BASELINE} (0.0 — matching the 0.0 initialisation of the
+    // gamma-shaped demands and the anti-jerk filter state). An axis NOT yet
+    // qualified as a bipolar slider reads pure unipolar travel ABOVE that
+    // baseline with the strict 0.15 deadzone applied first, so a Linux
+    // bipolar axis parked on its rail, or a slider drifting inside its rest
+    // band, emits exactly 0.0 demand while untouched — never a forward-
+    // throttle creep.
+    const TRIGGER_REST_BASELINE = 0;
     const triggerFromAxis = (index: number, bipolar: boolean | undefined): number => {
       const v = rawAxis(index);
-      return bipolar ? clamp((v + 1) / 2, 0, 1) : clamp(v, 0, 1);
+      if (bipolar === true) return clamp((v + 1) / 2, 0, 1);
+      if (Math.abs(v) <= GAMEPAD_STICK_DEADZONE) return TRIGGER_REST_BASELINE;
+      return clamp(v - TRIGGER_REST_BASELINE, 0, 1);
     };
 
     // Spec 19 §2.1.2: RT spans buttons[7].value, axes[5] AND (calibrated
@@ -1940,7 +1963,15 @@ export class ClientApp {
     this.lastThrottleDemand = gamepadThrottleCurve(rawThrottleTrigger);
     this.lastBrakeDemand = gamepadBrakeCurve(rawBrakeTrigger);
 
-    const baseForward = frame.forward + axis(GAMEPAD_AXES.throttle) * -1;
+    // Spec 25 §2.2.3: strict 0.15 deadzone on the throttle stick-Y axis
+    // enforced BEFORE the drive channel is computed (see `axisThrottle` —
+    // magnitudes at or below GAMEPAD_STICK_DEADZONE read exactly 0, never a
+    // scaled creep value feeding the physics throttle).
+    const axisThrottle = (index: number): number => {
+      const v = rawAxis(index);
+      return Math.abs(v) <= GAMEPAD_STICK_DEADZONE ? 0 : v;
+    };
+    const baseForward = frame.forward + axisThrottle(GAMEPAD_AXES.throttle) * -1;
 
     // Spec 19 §2.1.3 / ADR-2 — brake-to-reverse (buggy only): stopped with a
     // held LT, LT pressure becomes proportional REVERSE throttle instead of
@@ -2688,7 +2719,12 @@ export class ClientApp {
     if (Math.abs(this.filteredBrake) < 1e-4) this.filteredBrake = 0;
     if (this.mode === 'buggy') {
       const buggy = this.requireBuggy();
-      const steerInput = frame.strafe !== 0 ? frame.strafe : frame.yaw;
+      // Spec 25 §2.2.3 hard decoupling: the buggy steering channel reads the
+      // steering axis ONLY. The legacy `frame.strafe !== 0 ? frame.strafe
+      // : frame.yaw` fallback bled camera-yaw (right stick X) into the rack
+      // whenever steering was centred, so looking around while driving
+      // steered the rover. `frame.yaw` remains exclusively camera/look.
+      const steerInput = frame.strafe;
       const handbrake = frame.jump; // Space on keyboard, Button A on pad
       const physicsThrottle = clamp(this.filteredThrottle, -1, 1);
       const input: BuggyInput = {

@@ -604,6 +604,30 @@ export const BUGGY_YAW_ASSIST_SPEED = 4.0;
 export const BUGGY_YAW_ASSIST_MAX_RATE = 1.8;
 /** Brake-hold window (m/s): throttle intent flips the drive direction instantly inside it (spec 16 §2.6). */
 export const BUGGY_REVERSE_ENGAGE_V = 0.4;
+/**
+ * Neutral-throttle deadband (Spec 25 §2.2): |throttle| at or below this reads
+ * as zero driver demand — coast regen and hill-hold live behind it.
+ */
+export const BUGGY_THROTTLE_DEADBAND = 0.05;
+/**
+ * Coast-regen / hill-hold handoff speed (m/s, Spec 25 §2.2): above it a
+ * neutral throttle coasts under automatic regen; at or below it the drive
+ * mode drops straight to STOPPED and the mechanical hold takes over.
+ */
+export const BUGGY_COAST_REGEN_CUTOFF_V = 0.35;
+/** Automatic regenerative coast retarding force (N, Spec 25 §2.2.1). */
+export const BUGGY_COAST_REGEN_FORCE = 1_800;
+/** Rigid mechanical hill-hold force budget per contact patch (N, Spec 25 §2.2.2). */
+export const BUGGY_HILL_HOLD_FORCE = 1_800;
+/**
+ * Hill-hold anti-jerk slew rate (1/s, Spec 25 §2.2.2): the hold actuator
+ * ramps in/out over ~1/12 s so a tip-in releases smoothly exactly as the
+ * motor spool (BUGGY_THROTTLE_RISE, same rate) picks up the drive — clean
+ * hill starts with no rollback.
+ */
+export const BUGGY_HILL_HOLD_SLEW_RATE = 12.0;
+/** Lunar regolith angle of repose (rad, Spec 25 §2.2.2): 35°. */
+export const REGOLITH_ANGLE_OF_REPOSE = (35 * Math.PI) / 180;
 /** Regenerator round-trip efficiency. */
 export const BUGGY_REGEN_EFFICIENCY = 0.62;
 /** Rolling resistance coefficient into loose regolith (Spec 15: 0.04). */
@@ -739,6 +763,14 @@ export class LunarBuggy {
   private readonly absLocked: boolean[] = [false, false, false, false];
   private absClock = 0;
   private motorTorque = 0;
+  /**
+   * Spec 25 §2.2.2 hill-hold actuator (0..1 of full clamp authority).
+   * Engages INSTANTLY when the drive mode drops to STOPPED with a neutral
+   * throttle (rigid lock demanded), and releases along an exponential
+   * {@link BUGGY_HILL_HOLD_SLEW_RATE} ramp so a tip-in hands torque over
+   * smoothly instead of snapping the restraints — no rollback, no jerk.
+   */
+  private hillHoldFrac = 0;
   /** Leaky integrator of the pivot yaw-rate error (rad·s, Spec 17 Phase 6). */
   private pivotIntegral = 0;
   private driveMode: 'FORWARD' | 'STOPPED' | 'REVERSE' = 'STOPPED';
@@ -924,7 +956,7 @@ export class LunarBuggy {
     if (this.driveMode === 'FORWARD') {
       if (s.vLong <= BUGGY_REVERSE_ENGAGE_V && rawThrottle < -0.05) {
         this.driveMode = 'REVERSE';
-      } else if (Math.abs(s.vLong) < 0.2 && Math.abs(rawThrottle) <= 0.05) {
+      } else if (Math.abs(s.vLong) <= BUGGY_COAST_REGEN_CUTOFF_V && Math.abs(rawThrottle) <= 0.05) {
         this.driveMode = 'STOPPED';
       }
     } else if (this.driveMode === 'STOPPED') {
@@ -936,7 +968,7 @@ export class LunarBuggy {
     } else if (this.driveMode === 'REVERSE') {
       if (s.vLong >= -BUGGY_REVERSE_ENGAGE_V && rawThrottle > 0.05) {
         this.driveMode = 'FORWARD';
-      } else if (Math.abs(s.vLong) < 0.2 && Math.abs(rawThrottle) <= 0.05) {
+      } else if (Math.abs(s.vLong) <= BUGGY_COAST_REGEN_CUTOFF_V && Math.abs(rawThrottle) <= 0.05) {
         this.driveMode = 'STOPPED';
       }
     }
@@ -1037,7 +1069,21 @@ export class LunarBuggy {
     // ramp through zero and fling the buggy into spurious counter-motion,
     // which also blocks instant brake-to-reverse (the mode machine keeps
     // seeing velocity of the wrong sign).
-    let brakeTotal = regenForce + frictionBrakeForce;
+    //
+    // Spec 25 §2.2.1 automatic powertrain regenerative coast: with the
+    // throttle in its neutral deadband and the rover still rolling above the
+    // handoff speed, the drive motors back-feed the pack at a constant
+    // F_regen = 1,800 N opposing motion, so a lifted throttle brings the
+    // rover to a controlled stop (~4 s from 10 m/s) instead of coasting (or
+    // accelerating downhill) indefinitely. The constant min(1800, maxBrake)
+    // cap below arrests the last substep cleanly at zero.
+    const coastRegenForce =
+      Math.abs(rawThrottle) <= BUGGY_THROTTLE_DEADBAND &&
+      Math.abs(s.vLong) > BUGGY_COAST_REGEN_CUTOFF_V &&
+      !this.state.rolled
+        ? -Math.sign(s.vLong) * BUGGY_COAST_REGEN_FORCE
+        : 0;
+    let brakeTotal = regenForce + frictionBrakeForce + coastRegenForce;
     if (Math.abs(s.vLong) > 1e-6) {
       const maxBrake = (Math.abs(s.vLong) * m) / dt;
       brakeTotal = clamp(brakeTotal, -maxBrake, maxBrake);
@@ -1074,8 +1120,40 @@ export class LunarBuggy {
       : rawSteer * maxSteer;
     this.steerAngle = Math.abs(steerAngle) < 1e-6 ? 0 : steerAngle;
 
-    const isHillHold = this.driveMode === 'STOPPED' && Math.abs(rawThrottle) < 0.05;
+    // Spec 25 §2.2.2 active mechanical hill-hold. The drive-mode machine
+    // above drops a neutral rover straight to STOPPED at the coast handoff
+    // speed (|vLong| ≤ 0.35 m/s); the parking brake is the same rigid
+    // contact-patch restraint. {@link hillHoldFrac} is the actuator state:
+    //   - ENGAGEMENT is instant (a locked patch is demanded the frame the
+    //     driver holds the rover with a neutral throttle, or the handbrake
+    //     is on);
+    //   - RELEASE trails on a 12 s⁻¹ exponential
+    //     (BUGGY_HILL_HOLD_SLEW_RATE, ~83 ms to bleed off): the slope-
+    //     gravity reaction below fades along that curve exactly as the
+    //     motor torque spool (BUGGY_THROTTLE_RISE, same rate) ramps up,
+    //     handing the load from the locked patches to the drivetrain —
+    //     smooth hill starts with no rollback and no release jerk.
+    const isHillHold =
+      this.driveMode === 'STOPPED' &&
+      Math.abs(rawThrottle) <= BUGGY_THROTTLE_DEADBAND;
+    if (isHillHold || input.parkBrake) {
+      this.hillHoldFrac = 1;
+    } else {
+      this.hillHoldFrac = approach(this.hillHoldFrac, 0, BUGGY_HILL_HOLD_SLEW_RATE, dt);
+      if (this.hillHoldFrac < 1e-4) this.hillHoldFrac = 0;
+    }
     const parkSlipLock = input.parkBrake || isHillHold;
+    // Contact-patch creep-hold envelope: the corner model applies its
+    // velocity-proportional holding force inside this window. Spec 25 §2.2:
+    // with a mechanical hold demanded (STOPPED + neutral throttle) the window
+    // extends to the coast handoff speed, so the proportional hold covers the
+    // gap between it and the legacy 0.25 m/s band and a held rover on grade
+    // decays monotonically to the rigid arrest instead of chattering against
+    // the regen cut-off.
+    const holdCreepWindow =
+      Math.abs(s.vLat) < 0.25 &&
+      (Math.abs(s.vLong) < 0.25 ||
+        (isHillHold && Math.abs(s.vLong) <= BUGGY_COAST_REGEN_CUTOFF_V));
 
     // -- Per-corner suspension & tyres ----------------------------------------
     let sumZ = 0;
@@ -1179,6 +1257,11 @@ export class LunarBuggy {
       const wheelSurface = wheel.spin * BUGGY_WHEEL_RADIUS;
       let slip = (wheelSurface - wx) / Math.max(Math.abs(wx), 0.1);
       if (Math.abs(slip) > 4) slip = Math.sign(slip) * 4;
+      // Spec 25 §2.2.2: inside the rigid contact-patch hold the wheel sits
+      // static on the ground (no shear at all), so the slip RATIO reads zero
+      // — the raw formula's −1 artifact comes from dividing the pre-arrest
+      // chassis velocity by itself while the patch is locked to the surface.
+      if (parkSlipLock && holdCreepWindow) slip = 0;
 
       // Grouser-limited active longitudinal force (spec 16 §2.5): a rigid
       // groused lunar wheel is a ground-implement — drive AND braking forces
@@ -1285,7 +1368,7 @@ export class LunarBuggy {
       // Park-brake holding force against creep.
       if (parkSlipLock) {
         const hold = Math.min(fMax, 1800);
-        if (Math.abs(s.vLong) < 0.25 && Math.abs(s.vLat) < 0.25) {
+        if (holdCreepWindow) {
           fxOut = -s.vLong * 1200;
           fyOut = -s.vLat * 1200;
           fxOut = clamp(fxOut, -hold, hold);
@@ -1394,13 +1477,39 @@ export class LunarBuggy {
     const gravLong = -env.gravity * Math.sin(slopePitch) * cp;
     const gravLat = env.gravity * Math.sin(slopeRoll);
 
-    s.vLong += (aDrive - (rolling + aeroDrag + plume) / m + gravLong) * dt;
-    s.vLat += (FyBody / m - gravLat) * dt;
+    // Spec 25 §2.2.2: rigid contact-patch lock — while a mechanical hold is
+    // engaged (STOPPED + neutral throttle, or the parking brake) and the
+    // chassis sits inside the creep window, the locked contact patches carry
+    // the slope gravity components F_hold = −m·g·sinθ (longitudinal and
+    // lateral) as static reaction, scaled by the hold actuator {@link
+    // hillHoldFrac}. Up to the 35° lunar angle of repose
+    // (REGOLITH_ANGLE_OF_REPOSE) the hold budget — 4 × min(μ·N,
+    // BUGGY_HILL_HOLD_FORCE) per axis — always exceeds m·g·sinθ (lunar worst
+    // case 880·1.62·sin35° = 821 N vs ≥1,643 N available; Earth asphalt
+    // 4,965 N vs 15.2 kN), so cancelling them is force-balanced: at full
+    // engagement the held rover exhibits exactly 0.00 m/s drift, and on a
+    // tip-in the reaction fades along the 12 s⁻¹ anti-jerk curve exactly as
+    // motor torque spools up to carry it — no rollback, no release jerk.
+    const holdReaction =
+      parkSlipLock &&
+      holdCreepWindow &&
+      Math.abs(slopePitch) <= REGOLITH_ANGLE_OF_REPOSE &&
+      Math.abs(slopeRoll) <= REGOLITH_ANGLE_OF_REPOSE
+        ? (isHillHold || input.parkBrake ? 1 : this.hillHoldFrac)
+        : 0;
+    const rigidHoldArrest = holdReaction >= 0.999;
+
+    s.vLong += (aDrive - (rolling + aeroDrag + plume) / m +
+      gravLong * (1 - holdReaction)) * dt;
+    s.vLat += (FyBody / m - gravLat * (1 - holdReaction)) * dt;
 
     if (isZeroSteer && Math.abs(s.vLat) < 0.015) {
       s.vLat *= Math.exp(-12.0 * dt);
     }
-    if (isHillHold && Math.abs(s.vLong) < 0.1) {
+    if (rigidHoldArrest) {
+      // Static-friction arrest: the patch shears nothing below the hold
+      // budget, so velocity settles dead at zero (0.00 m/s drift) and the
+      // position integrators below advance the rover not at all.
       s.vLong = 0;
       s.vLat = 0;
     }
@@ -1486,6 +1595,12 @@ export class LunarBuggy {
     const recovered = regenW * dt * BUGGY_REGEN_EFFICIENCY;
     s.regenEnergyJ += recovered;
     s.batteryKwh = clamp(s.batteryKwh + recovered / 3_600_000, 0, this.batteryCapKwh);
+    // Spec 25 §2.2.1: the automatic coast regenerator feeds the same pack
+    // through the same round-trip efficiency as the commanded regenerator.
+    const coastRegenW = Math.max(0, -coastRegenForce * s.vLong);
+    const coastRecovered = coastRegenW * dt * BUGGY_REGEN_EFFICIENCY;
+    s.regenEnergyJ += coastRecovered;
+    s.batteryKwh = clamp(s.batteryKwh + coastRecovered / 3_600_000, 0, this.batteryCapKwh);
   }
 }
 
