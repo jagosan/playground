@@ -57,6 +57,8 @@ import {
 import { HintArrowSystem, type HintArrowTarget } from './HintArrowSystem.ts';
 import { IntroDirector, type IntroPhase } from './IntroDirector.ts';
 import { FactionBases } from '../infrastructure/Factions.ts';
+import { BOT_PUSH_EFFECTIVE_MASS_KG } from '../entities/NPCProspectorBot.ts';
+import type { NPCProspectorBot } from '../entities/NPCProspectorBot.ts';
 import {
   TunnelNetwork,
   type VaultDoorRecord,
@@ -430,6 +432,11 @@ export interface ClientAppOptions {
   spawn?: { x: number; y: number };
   /** Skip console chatter in CI. */
   silent?: boolean;
+  /**
+   * Spec 25 §2.3: desired autonomous NPC prospector fleet size (clamped to
+   * 3–6 and to available staging spots). Default 4.
+   */
+  npcBotCount?: number;
   /** Terrain tuning passthrough. */
   terrainSize?: number;
   terrainResolution?: number;
@@ -845,6 +852,12 @@ export class ClientApp {
   private moveAccumulatorMs = 0;
   private lastScanAt: number | null = null;
   private lastMineAt = -Infinity;
+  /**
+   * Spec 25 §2.3: timestamp (ms) of the most recent mining-laser pulse — the
+   * `isMining` signal fed to the NPC prospector fleet (a pulse keeps bots in
+   * harass posture for their own linger window).
+   */
+  private lastMiningPulseAt = Number.NEGATIVE_INFINITY;
   private pendingTrades = 0;
 
   /**
@@ -880,6 +893,14 @@ export class ClientApp {
   private gamepadLatchedId = '';
   /** Cooldown so the dormant prompt re-shows at most every few seconds. */
   private gamepadPromptCooldown = 0;
+  /**
+   * Spec 25 §2.3: cooldown gate on the rival-bot comms channel so a fleet of
+   * prospectors can't drown the HUD (every broadcast reaches the rolling log;
+   * only the on-screen comms popup is rate-limited).
+   */
+  private npcCommsCooldown = 0;
+  /** Rolling log of NPC bot broadcasts (harness readback via {@link getNPCBotCommsLog}). */
+  private readonly npcBotCommsLog: CommsDialogue[] = [];
   /** Static POI layer cache (bases/portals/veins/craters — built once). */
   private mapStaticPois: TopoMapPOI[] | null = null;
   /** Seconds since the last full tactical-map POI rebuild. */
@@ -1012,6 +1033,15 @@ export class ClientApp {
         const h2 = this.railSystem.spawnCart(routeId, { kind: 'hopper', load: 3000 });
         if (h2) h2.physics.setDistance(13);
       }
+
+      // Spec 25 §2.3 / §3.1: autonomous rival-prospector fleet staged across
+      // the local resource sectors (3–6 bots, one per fictional faction).
+      // Meshes register as world entities + shadow casters inside the spawn
+      // call; teardown runs with the world itself (`world.dispose()`).
+      this.world.spawnNPCBotFleet({
+        around: spawn,
+        ...(this.options.npcBotCount !== undefined ? { count: this.options.npcBotCount } : {}),
+      });
     }
     this.traversal =
       snapshot !== null
@@ -1150,6 +1180,10 @@ export class ClientApp {
       this.stepEntities(dt);
     }
     this.stepRailSystem(dt);
+    // Spec 25 §2.3: tick the autonomous rival-prospector fleet with this
+    // frame's active player coordinates + mining state, then consume any
+    // chassis-bump impulses the bots accrued against the player.
+    this.stepNPCBots(dt);
     // Spec 24 Phase 2: tick the arrival director with the frame dt so phase
     // transitions, lander effects and intro camera tracks advance in lockstep.
     this.introDirector?.update(dt);
@@ -1641,6 +1675,19 @@ export class ClientApp {
   /** Rail system assembly, or null before `init()`/without a snapshot. */
   getRailSystem(): RailSystem | null {
     return this.railSystem;
+  }
+
+  /**
+   * Spec 25 §2.3: the live autonomous NPC prospector fleet ([] before init /
+   * after dispose). Telemetry per bot via `getTelemetry()`.
+   */
+  getNPCBots(): NPCProspectorBot[] {
+    return this.world.getNPCBots();
+  }
+
+  /** Spec 25 §2.3: rolling log of rival-bot broadcasts (contest claims etc.). */
+  getNPCBotCommsLog(): readonly CommsDialogue[] {
+    return this.npcBotCommsLog;
   }
 
   isMounted(): boolean {
@@ -2562,6 +2609,8 @@ export class ClientApp {
       }
     }
     this.lastMineAt = now;
+    // Spec 25 §2.3: pulse signal for the NPC prospector fleet (harass trigger).
+    this.lastMiningPulseAt = now;
 
     // -- local extraction (spec 19 §2.2.1): survey mutation + inventory +
     // quest bookkeeping run on EVERY pull, online or offline. Online the
@@ -3142,6 +3191,89 @@ export class ClientApp {
       }
     }
     return best;
+  }
+
+  /**
+   * Spec 25 §2.3: one fleet tick. Feeds every NPC prospector bot the active
+   * player coordinates + mining pulse, applies chassis-bump impulses back to
+   * the rider (on-foot: velocity kick; driving: a shove on the buggy body),
+   * and drains bot broadcasts into the comms log / HUD popup.
+   */
+  private stepNPCBots(dt: number): void {
+    if (this.disposed) return;
+    const bots = this.world.getNPCBots();
+    if (bots.length === 0) return;
+
+    const player = this.activePosition();
+    const isMining =
+      this.nowMs() - this.lastMiningPulseAt < 2500 ||
+      this.world.getActiveMiningEffectCount() > 0;
+    this.world.updateNPCBots(dt, { x: player.x, y: player.y, z: player.z, isMining });
+
+    // Chassis pushback: 1 500 N·s per bump (Spec 25 §2.3) → Δv against the
+    // rider's effective mass. On foot the suit takes a velocity kick along
+    // the bot→player line; driving, the buggy gets the same Δv on vLong/vLat.
+    for (const bot of bots) this.applyBotBump(bot);
+
+    // Broadcasts → rolling log + rate-limited comms popup.
+    this.npcCommsCooldown = Math.max(0, this.npcCommsCooldown - dt);
+    for (const bot of bots) {
+      for (const b of bot.consumeBroadcasts()) {
+        const dialogue: CommsDialogue = {
+          sender: `${bot.getTelemetry().id} · ${bot.getId()}`,
+          callsign: bot.getId(),
+          transmission: b.text,
+          audioTone: 'alert',
+        };
+        this.npcBotCommsLog.push(dialogue);
+        if (this.npcBotCommsLog.length > 32) this.npcBotCommsLog.shift();
+        if (this.npcCommsCooldown <= 0) {
+          this.npcCommsCooldown = 4;
+          this.hud?.showComms(dialogue);
+        }
+      }
+    }
+  }
+
+  /** Convert one pending bot bump impulse into a rider velocity change. */
+  private applyBotBump(bot: NPCProspectorBot): void {
+    const impulse = bot.consumePlayerImpulse();
+    if (impulse === null) return;
+    const dvx = impulse.x / BOT_PUSH_EFFECTIVE_MASS_KG;
+    const dvy = impulse.y / BOT_PUSH_EFFECTIVE_MASS_KG;
+    if (!Number.isFinite(dvx) && !Number.isFinite(dvy)) return;
+    if (this.mode === 'buggy') {
+      const buggy = this.buggy;
+      if (buggy === null) return;
+      const v = buggy.getVelocity();
+      const heading = buggy.getHeading();
+      const ch = Math.cos(heading);
+      const sh = Math.sin(heading);
+      // World (x, y) Δv → body frame (long, lat).
+      const wvx = v.vLong * ch - v.vLat * sh + dvx;
+      const wvy2 = v.vLong * sh + v.vLat * ch + dvy;
+      const vLong = clamp(wvx * ch + wvy2 * sh, -22, 22);
+      const vLat = clamp(-wvx * sh + wvy2 * ch, -3, 3);
+      // `setStateFromMount` rides on LunarBuggy's prototype (physics module);
+      // the structural cast mirrors OpenBuggy's own seat-state interface.
+      const seat = buggy.getPhysics() as unknown as {
+        setStateFromMount?: (vLong: number, vLat: number) => void;
+      };
+      if (typeof seat.setStateFromMount === 'function') {
+        seat.setStateFromMount(vLong, vLat);
+      }
+    } else {
+      const suit = this.suit;
+      if (suit === null) return;
+      const p = suit.getPosition();
+      const state = suit.getState();
+      suit.setState({
+        vx: state.vx + dvx,
+        vy: state.vy + dvy,
+        x: p.x + dvx * 0.05,
+        y: p.y + dvy * 0.05,
+      });
+    }
   }
 
   private stepRailSystem(dt: number): void {

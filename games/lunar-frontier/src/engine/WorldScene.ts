@@ -93,6 +93,11 @@ import {
   TransportLander,
   type TransportLanderOptions,
 } from '../entities/TransportLander.ts';
+import {
+  NPCProspectorBot,
+  planNPCBotFleet,
+  type NPCBotConfig,
+} from '../entities/NPCProspectorBot.ts';
 
 // ---------------------------------------------------------------------------
 // Options & tuning
@@ -763,6 +768,12 @@ export class WorldScene {
    */
   private transportLander: TransportLander | null = null;
 
+  /**
+   * Spec 25 §2.3: autonomous NPC prospector fleet (empty until
+   * {@link spawnNPCBotFleet}; every entry disposed by `dispose()`).
+   */
+  private npcBots: NPCProspectorBot[] = [];
+
   constructor(options: WorldSceneOptions = {}) {
     this.options = {
       ...options,
@@ -994,6 +1005,9 @@ export class WorldScene {
       this.transportLander = null;
     }
 
+    // Spec 25 §2.3: tear down the autonomous NPC prospector fleet.
+    this.disposeNPCBots();
+
     for (const mesh of this.entities) mesh.parent = null;
     this.entities.clear();
 
@@ -1134,6 +1148,72 @@ export class WorldScene {
   /** The mounted transport lander, or null before mount / after dispose. */
   getTransportLander(): TransportLander | null {
     return this.transportLander;
+  }
+
+  // -- Spec 25 §2.3: autonomous NPC prospector fleet --------------------------
+
+  /**
+   * Spawn the autonomous rival-prospector fleet (Spec 25 §2.3 / §3.1). Bot
+   * staging is planned from the generated world snapshot (top-ranked mineral
+   * deposits near `options.around`, rotated across the four fictional
+   * factions); explicit `bots` configs override the plan 1:1. Idempotent: a
+   * second call disposes the previous fleet first.
+   *
+   * Headless-safe (NullEngine fine). Each bot's meshes are registered as
+   * world entities + shadow casters, parented under the terrain root like
+   * every other scene furniture. Returns the spawned bots.
+   */
+  spawnNPCBotFleet(
+    options: {
+      around?: { x: number; y: number };
+      count?: number;
+      bots?: NPCBotConfig[];
+    } = {},
+  ): NPCProspectorBot[] {
+    const scene = this.requireScene();
+    this.disposeNPCBots();
+    const around = options.around ?? this.getSpawnPoint();
+    const configs =
+      options.bots ??
+      planNPCBotFleet(this.snapshot ?? { veins: [], sectors: [] }, {
+        around,
+        ...(options.count !== undefined ? { count: options.count } : {}),
+      });
+    for (const config of configs) {
+      const bot = new NPCProspectorBot(scene, config, this.worldGen);
+      const rootNode = bot.getRootNode();
+      if (rootNode !== null) rootNode.parent = this.terrainRoot ?? null;
+      for (const mesh of bot.getMeshes()) this.addEntity(mesh);
+      this.registerShadowCasters(bot.getMeshes());
+      this.npcBots.push(bot);
+    }
+    return [...this.npcBots];
+  }
+
+  /** The live NPC prospector fleet ([] before spawn / after dispose). */
+  getNPCBots(): NPCProspectorBot[] {
+    return this.disposed ? [] : [...this.npcBots];
+  }
+
+  /** Tick every NPC bot with the frame dt + active player state. */
+  updateNPCBots(
+    dt: number,
+    playerState: { x: number; y: number; z: number; isMining: boolean },
+  ): void {
+    if (this.disposed) return;
+    for (const bot of this.npcBots) bot.update(dt, playerState);
+  }
+
+  /** Tear down the NPC fleet (called from `dispose()`; idempotent). */
+  private disposeNPCBots(): void {
+    for (const bot of this.npcBots) {
+      try {
+        bot.dispose();
+      } catch {
+        /* already gone */
+      }
+    }
+    this.npcBots = [];
   }
 
   // -- surface detritus & salvage (Spec 21 §2.1) -------------------------------

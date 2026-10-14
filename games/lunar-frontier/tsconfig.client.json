@@ -21,6 +21,7 @@
     "src/entities/AstronautSuit.ts",
     "src/entities/OpenBuggy.ts",
     "src/entities/TransportLander.ts",
+    "src/entities/NPCProspectorBot.ts",
     "src/physics/TraversalPhysics.ts",
     "src/network/NetworkClient.ts",
     "src/world/LunarWorldGenerator.ts"

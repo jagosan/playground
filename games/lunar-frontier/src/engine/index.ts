@@ -89,4 +89,28 @@ export {
   type ProvingGroundsSceneOptions,
 } from './ProvingGroundsScene.ts';
 
+// Spec 25 §2.3: autonomous NPC prospector bots + fictional faction flags
+// (re-exported through the engine barrel for harnesses and client wiring).
+export {
+  NPCProspectorBot,
+  planNPCBotFleet,
+  NPC_FLAG_COLORS,
+  NPC_BOT_FLEET_FACTIONS,
+  NPC_BOT_CALLSIGNS,
+  SURVEY_RANGE_M as NPC_SURVEY_RANGE_M,
+  CONTEST_RANGE_M as NPC_CONTEST_RANGE_M,
+  HARASS_BUMP_RANGE_M as NPC_HARASS_BUMP_RANGE_M,
+  SIPHON_RANGE_M as NPC_SIPHON_RANGE_M,
+  BOT_CARGO_CAPACITY_KG,
+  BOT_PUSH_IMPULSE_N_S,
+  BOT_PUSH_EFFECTIVE_MASS_KG,
+  BOT_STATE_SPEEDS,
+  type NPCBotFaction,
+  type NPCBotState,
+  type NPCBotConfig,
+  type NPCBotTelemetry,
+  type NPCBotBroadcast,
+  type NPCBotFleetPlanOptions,
+} from '../entities/NPCProspectorBot.ts';
+
 export { WorldScene as default } from './WorldScene.ts';
