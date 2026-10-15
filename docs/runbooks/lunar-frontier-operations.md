@@ -94,12 +94,25 @@ npx tsx tests/verify-phase8-interactive.ts
 # 5. Multi-client persistent server E2E test suite (144 assertions):
 npx tsx tests/verify-lunar-frontier.ts
 
-# 6. Typecheck and production bundle build:
+# 6. Spec 25 General Cleanup & World Expansion smoke suite (162 assertions):
+npx tsx scripts/smoke-general-cleanup.ts
+
+# 7. Derelict rival outposts smoke suite (59 assertions):
+npx tsx scripts/smoke-rival-bases.ts
+
+# 8. Typecheck and production bundle build:
 npm run typecheck:server
 npm run build
 ```
 
-## 5. Production Build & Deployment
+## 5. Frontier Systems & Operational Notes (Spec 25)
+- **12 km Planetary Crust Skirt & Ballast Berms:** Concentric ring lattice extends horizon out to 12 km following lunar spherical curvature ($R = 1,737.4\,\text{km}$), eliminating black void pop-in. All rail lines grounded with crushed-basalt ballast berm prisms.
+- **Powertrain Hill-Hold & Zero-Drift:** Automatic $1,800\,\text{N}$ regenerative coast deceleration below neutral throttle deadband ($|\text{throttle}| \le 0.05$). Rigid mechanical slope gravity cancellation up to $35^\circ$ regolith angle of repose ($0.00\,\text{m/s}$ drift). Slew-rate anti-jerk release ($12\,\text{s}^{-1}$).
+- **Autonomous NPC Prospector Bots:** Autonomous roving bots flying waving cloth pennants from 4 factions (Republic of Caelum, United Sol Syndicate, Valles Marineris Conglomerate, New Borealis Commonwealth). AI state machine (patrol, survey, contest claim, harass mine, $1,500\,\text{N}\cdot\text{s}$ dynamic collision nudge, ore siphoning, flee/unload).
+- **Derelict Rival Bases:** 3 distinct decayed archetypes (The Scrapper Syndicate Fortress, The Derelict Corporate Enclave, The Nomad Drilling Rig) with territory boundaries ($60\text{--}90\,\text{m}$), damaged defense turret sockets, and surveyable depots.
+- **Procedural Web Audio Engine:** $100\%$ zero-asset Web Audio API synthesis engine (sub-bass life-support drone, generative pentatonic synth pads, speed-modulated motor whine, regolith tyre crunch, mining laser hum, crystalline ore chimes, comms chirps) with dedicated HUD audio mixer panel.
+
+## 6. Production Build & Deployment
 ```bash
 cd games/lunar-frontier
 npm run build
