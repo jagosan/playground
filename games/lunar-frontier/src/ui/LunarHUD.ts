@@ -62,6 +62,37 @@ export const HUD_TOAST_DISMISS_MS = 3500;
  */
 export const HUD_INTRO_ID = 'lunar-hud-intro';
 
+/** Spec 25 §2.5 — audio mixer panel (`#lunar-hud-audio`). */
+export const HUD_AUDIO_ID = 'lunar-hud-audio';
+
+/**
+ * Spec 25 §2.5 — structural clone of the audio engine's `AudioVolumes`
+ * declared locally so the HUD keeps its zero-import contract. Field-for-field
+ * compatible; an engine `AudioVolumes` assigns here and vice versa.
+ */
+export interface HudAudioVolumes {
+  master: number;
+  ambience: number;
+  music: number;
+  sfx: number;
+}
+
+/** Fader channels, in panel order. */
+export const HUD_AUDIO_CHANNELS = ['master', 'ambience', 'music', 'sfx'] as const;
+export type HudAudioChannel = (typeof HUD_AUDIO_CHANNELS)[number];
+
+/**
+ * Fader defaults — mirrored structurally by the engine's
+ * `DEFAULT_AUDIO_VOLUMES` (zero-import contract keeps the two files
+ * independent; ClientApp syncs the engine from the panel at boot).
+ */
+export const HUD_DEFAULT_AUDIO_VOLUMES: Readonly<HudAudioVolumes> = {
+  master: 1.0,
+  ambience: 0.7,
+  music: 0.55,
+  sfx: 0.9,
+};
+
 /**
  * Structural clone of `IntroDirector.IntroTelemetry` declared locally so the HUD
  * keeps its zero-import contract (the director's type is assignable to this one —
@@ -443,6 +474,12 @@ export interface LunarHUDOptions {
    * and restarts the arrival sequence from 'orbit'.
    */
   onReplayIntro?: () => void;
+  /**
+   * Spec 25 §2.5 — fired whenever a fader moves or mute flips, with the full
+   * effective volume snapshot (master reads 0 while muted). `ClientApp`
+   * forwards it to `LunarAudioSystem.setVolumes`.
+   */
+  onAudioVolumes?: (volumes: HudAudioVolumes) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -569,6 +606,13 @@ export class LunarHUD {
   private readonly onTrade: ((request: HudTradeRequest) => void) | undefined;
   /** Spec 24 Phase 5 §3.3 — replay-arrival callback (optional). */
   private readonly onReplayIntro: (() => void) | undefined;
+  /** Spec 25 §2.5 — audio-mixer callback (optional). */
+  private readonly onAudioVolumes: ((volumes: HudAudioVolumes) => void) | undefined;
+  /** Spec 25 §2.5 — live fader state (raw positions; mute overlays master=0). */
+  private audioVolumes: HudAudioVolumes = { ...HUD_DEFAULT_AUDIO_VOLUMES };
+  private audioMuted = false;
+  /** Master position to restore on unmute. */
+  private audioPreMuteMaster = HUD_DEFAULT_AUDIO_VOLUMES.master;
 
   /** Every interesting element, addressed by a stable logical key. */
   private readonly els = new Map<string, Elementish>();
@@ -652,6 +696,7 @@ export class LunarHUD {
     this.promptSlots = Math.max(1, options.promptSlots ?? 5);
     this.onTrade = options.onTrade;
     this.onReplayIntro = options.onReplayIntro;
+    this.onAudioVolumes = options.onAudioVolumes;
 
     // A fresh HUD always wins: drop any previous overlay (HMR / re-init).
     this.disposeExisting(HUD_ROOT_ID);
@@ -678,6 +723,7 @@ export class LunarHUD {
     this.buildTutorial();
     this.buildCommsPanel();
     this.buildHintArrow();
+    this.buildAudioPanel();
     this.buildMapOverlay();
     this.buildTradeTerminal(options.commodities ?? HUD_DEFAULT_COMMODITIES);
 
@@ -1377,6 +1423,100 @@ export class LunarHUD {
     return this.hintArrowData;
   }
 
+  // -- audio mixer (Spec 25 §2.5) -------------------------------------------------
+
+  /**
+   * Effective volume snapshot for the audio engine: the raw fader positions
+   * with `master` forced to 0 while muted.
+   */
+  getAudioVolumes(): HudAudioVolumes {
+    return { ...this.audioVolumes, master: this.audioMuted ? 0 : this.audioVolumes.master };
+  }
+
+  /** True while the mute latch is engaged. */
+  isAudioMuted(): boolean {
+    return this.audioMuted && !this.disposed;
+  }
+
+  /**
+   * Flip the mute button: muting stores the master fader position, unmuting
+   * restores it. Always fires `onAudioVolumes` with the effective snapshot.
+   */
+  toggleAudioMute(): boolean {
+    if (this.disposed) return this.audioMuted;
+    if (this.audioMuted) {
+      this.audioMuted = false;
+      this.audioVolumes.master = this.audioPreMuteMaster;
+    } else {
+      this.audioPreMuteMaster = this.audioVolumes.master;
+      this.audioMuted = true;
+    }
+    this.paintAudioPanel();
+    this.emitAudioVolumes();
+    return this.audioMuted;
+  }
+
+  /**
+   * Move one fader (0..1; also the DOM `input` handler's entry point — the
+   * harness can call it directly like `submitOrder`). Grabbing any fader
+   * while muted implicitly un-mutes. Fires `onAudioVolumes` with the new
+   * effective snapshot and returns it.
+   */
+  setAudioSlider(channel: HudAudioChannel, value: number): HudAudioVolumes | null {
+    if (this.disposed) return null;
+    const v = Number.isFinite(value) ? clamp(value, 0, 1) : 0;
+    this.audioVolumes[channel] = v;
+    if (this.audioMuted) {
+      // Direct fader intent outranks the mute latch.
+      this.audioMuted = false;
+    }
+    this.audioPreMuteMaster = this.audioVolumes.master;
+    this.paintAudioPanel();
+    this.emitAudioVolumes();
+    return this.getAudioVolumes();
+  }
+
+  /**
+   * External sync (no callback echo): paint an authoritative volume snapshot
+   * into the panel without re-triggering `onAudioVolumes`.
+   */
+  setAudioVolumes(volumes: Partial<HudAudioVolumes>): void {
+    if (this.disposed) return;
+    for (const channel of HUD_AUDIO_CHANNELS) {
+      const v = volumes[channel];
+      if (v !== undefined && Number.isFinite(v)) {
+        this.audioVolumes[channel] = clamp(v, 0, 1);
+      }
+    }
+    this.audioPreMuteMaster = this.audioVolumes.master;
+    this.paintAudioPanel();
+  }
+
+  private emitAudioVolumes(): void {
+    if (typeof this.onAudioVolumes === 'function') {
+      this.onAudioVolumes(this.getAudioVolumes());
+    }
+  }
+
+  /** Repaint the mute button, the four faders, and the percent readouts. */
+  private paintAudioPanel(): void {
+    if (this.disposed) return;
+    const mute = this.els.get('audio-mute');
+    if (mute !== undefined) {
+      mute.textContent = this.audioMuted ? '🔇 MUTED' : '🔊 LIVE';
+      mute.setAttribute('data-muted', this.audioMuted ? '1' : '0');
+      this.setClassEl(mute, 'is-muted', this.audioMuted);
+    }
+    const effective = this.getAudioVolumes();
+    for (const channel of HUD_AUDIO_CHANNELS) {
+      const slider = this.els.get(`audio-slider-${channel}`);
+      if (slider !== undefined) {
+        (slider as unknown as { value?: string }).value = String(this.audioVolumes[channel]);
+        slider.setAttribute('data-value', String(this.audioVolumes[channel]));
+      }
+      this.setText(`audio-${channel}-value`, pct(effective[channel] * 100));
+    }
+  }
 
   // -- status strip --------------------------------------------------------------------------
 
@@ -2084,6 +2224,70 @@ export class LunarHUD {
     const label = this.make('span', 'lunar-hud-hint-arrow-label', 'hint-arrow-label', 'hint-arrow-label');
     label.textContent = '';
     arrow.appendChild(label);
+  }
+
+  /**
+   * Audio mixer panel (Spec 25 §2.5): glassmorphic card docked under the
+   * life-support column with four faders (Master / Ambience / Music / SFX)
+   * and a mute button. Every change routes the effective volume snapshot to
+   * `onAudioVolumes` (ClientApp → `LunarAudioSystem.setVolumes`). The panel
+   * is interactive DOM (pointer-events re-enabled via CSS); headless harness
+   * fakes satisfy the same `input` surface and may drive `setAudioSlider`
+   * directly.
+   */
+  private buildAudioPanel(): void {
+    const panel = this.make('section', HUD_AUDIO_ID, 'hud-panel audio-mixer', 'audio-panel');
+    this.root.appendChild(panel);
+    panel.appendChild(this.heading('AUDIO'));
+
+    for (const channel of HUD_AUDIO_CHANNELS) {
+      const row = this.make('div', `lunar-hud-audio-${channel}`, 'audio-level-row');
+      const label = this.make('span', undefined, 'audio-level-label');
+      label.textContent = channel.toUpperCase();
+      const slider = this.make(
+        'input',
+        `lunar-hud-audio-slider-${channel}`,
+        'audio-slider',
+        `audio-slider-${channel}`,
+      );
+      Object.assign(slider as unknown as Record<string, unknown>, {
+        type: 'range',
+        min: '0',
+        max: '1',
+        step: '0.01',
+        value: String(this.audioVolumes[channel]),
+        'aria-label': `${channel} volume`,
+      });
+      if (typeof slider.addEventListener === 'function') {
+        const read = () => {
+          const raw = Number((slider as unknown as { value?: string }).value);
+          this.setAudioSlider(channel, Number.isFinite(raw) ? raw : 0);
+        };
+        slider.addEventListener('input', read);
+        slider.addEventListener('change', read);
+      }
+      const readout = this.make(
+        'span',
+        `hud-audio-${channel}-value`,
+        'audio-level-value',
+        `audio-${channel}-value`,
+      );
+      readout.textContent = pct(this.audioVolumes[channel] * 100);
+      row.appendChild(label);
+      row.appendChild(slider);
+      row.appendChild(readout);
+      panel.appendChild(row);
+    }
+
+    const mute = this.make('button', 'lunar-hud-audio-mute', 'audio-mute-button', 'audio-mute');
+    mute.setAttribute('type', 'button');
+    mute.setAttribute('aria-label', 'Mute all audio');
+    if (typeof mute.addEventListener === 'function') {
+      mute.addEventListener('click', () => this.toggleAudioMute());
+    }
+    panel.appendChild(mute);
+
+    this.paintAudioPanel();
   }
 
   private buildTradeTerminal(commodities: readonly string[]): void {

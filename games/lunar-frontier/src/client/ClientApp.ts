@@ -99,6 +99,10 @@ import LunarHUD, {
 } from '../ui/LunarHUD.ts';
 import type { ResourceVein, ScrapSite } from '../world/LunarWorldGenerator.ts';
 import type { TopoMapPOI, TopoMapState } from '../ui/LunarHUD.ts';
+// Spec 25 §2.5: 100% procedural Web Audio engine (zero assets; the module
+// imports nothing and falls back to an internal mock context headless, so
+// NullEngine smoke suites never touch a real AudioContext).
+import { LunarAudioSystem } from '../audio/LunarAudioSystem.ts';
 
 // ---------------------------------------------------------------------------
 // Tunables
@@ -161,6 +165,21 @@ export const MINE_AMOUNT = 20;
 
 /** Minimum spacing between two MINE frames (trigger discipline). */
 export const MINE_COOLDOWN_MS = 350;
+
+/**
+ * Spec 25 §2.5: metres of walked regolith per suit footstep (stride grows
+ * slightly with speed — the low-g lope). Teleport-guarded like the quest
+ * odometer so spawn corrections never thump.
+ */
+export const FOOTSTEP_STRIDE_BASE_M = 2.0;
+export const FOOTSTEP_STRIDE_SPEED_GAIN = 0.35;
+
+/**
+ * Spec 25 §2.5: how long the mining-laser audio loop keeps burning after a
+ * pull (the visual beam burst is 600 ms; the tail bridges chained pulls so
+ * continuous drilling reads as one sustained laser).
+ */
+export const MINING_AUDIO_TAIL_MS = 650;
 
 /** Scanner re-scan period while running (Hz-wise: 4/s). */
 export const SCAN_INTERVAL_MS = 250;
@@ -950,6 +969,20 @@ export class ClientApp {
   private disposed = false;
   private domAttached = false;
 
+  /**
+   * Spec 25 §2.5: the owned procedural audio engine. Constructed eagerly
+   * (constructor touches no Web Audio API) and graph-initialised in `init()`;
+   * headless runs transparently ride the internal mock context. Null only
+   * after `dispose()`.
+   */
+  private audio: LunarAudioSystem | null = new LunarAudioSystem();
+  /** Footfall odometer: last suit position sample (physics frame x/y). */
+  private audioFootPrev: { x: number; y: number } | null = null;
+  /** Metres walked since the last `playFootstep()` thump. */
+  private audioFootTravelled = 0;
+  /** Wall-clock ms until which the mining-laser loop keeps burning. */
+  private miningAudioUntilMs = Number.NEGATIVE_INFINITY;
+
   /** Scratch vector for remote-avatar placement (no per-frame allocation). */
   private readonly scratch = new Vector3(0, 0, 0);
 
@@ -1087,6 +1120,8 @@ export class ClientApp {
           onTrade: (request) => this.submitTrade(request),
           // Spec 24 Phase 5 §3.3 — [🔄 Replay] restarts the arrival.
           onReplayIntro: () => this.replayIntro(),
+          // Spec 25 §2.5 — the in-HUD audio mixer drives the engine.
+          onAudioVolumes: (volumes) => this.audio?.setVolumes(volumes),
         });
       }
     }
@@ -1106,6 +1141,8 @@ export class ClientApp {
     this.questEngine.onCommsReceived((dialogue) => {
       this.lastComms = dialogue;
       this.hud?.showComms(dialogue);
+      // Spec 25 §2.5: sonify every narrative transmission on arrival.
+      this.playCommsChirp(dialogue.audioTone);
     });
     this.questEngine.onObjectiveUpdated(() => this.pushQuestStageToHud());
     this.questEngine.onStageAdvanced(() => {
@@ -1137,6 +1174,15 @@ export class ClientApp {
     this.wireNetwork();
     this.attachDomInput();
     this.attachGamepadHotplug();
+
+    // Spec 25 §2.5: procedural audio boot. Autoplay-policy-safe (the context
+    // stays suspended until the first pointer/key gesture in browsers) and
+    // mock-backed headless, so smoke suites never touch a real AudioContext.
+    // The HUD mixer panel is the single source of truth for fader defaults.
+    if (this.audio === null) this.audio = new LunarAudioSystem();
+    if (this.hud !== null) this.audio.setVolumes(this.hud.getAudioVolumes());
+    this.audio.setAudioMode('vacuum');
+    void this.audio.init().catch(() => undefined);
 
     if (this.ownsNetwork && this.network !== null) {
       // Fire-and-forget: the `connected` handler performs the JOIN. A failed
@@ -1190,6 +1236,9 @@ export class ClientApp {
     // Spec 24 Phase 2: tick the arrival director with the frame dt so phase
     // transitions, lander effects and intro camera tracks advance in lockstep.
     this.introDirector?.update(dt);
+    // Spec 25 §2.5: frame-boundary audio pump — cabin↔vacuum acoustics,
+    // motor/crunch driving loop, mining-laser tail, suit footfall cadence.
+    this.pumpAudio(dt);
     // Spec 24 §3.2: hold-to-skip — [Space] or Gamepad (B) accumulates a
     // radial skip meter; crossing the 1.2 s threshold skips to the next beat.
     this.pumpIntroSkipInput(dt);
@@ -1500,6 +1549,10 @@ export class ClientApp {
     // unparents them — idempotent even after the world is gone).
     this.provingGrounds?.dispose();
     this.provingGrounds = null;
+    // Spec 25 §2.5: tear the synthesis graph down before the HUD overlay
+    // (idempotent; the mock context headless closes without a browser).
+    this.audio?.dispose();
+    this.audio = null;
     this.world.dispose();
     this.hud?.dispose();
     this.hud = null;
@@ -1517,6 +1570,14 @@ export class ClientApp {
 
   getHud(): LunarHUD | null {
     return this.hud;
+  }
+
+  /**
+   * Spec 25 §2.5: the owned procedural audio engine (null after `dispose()`).
+   * Headless runs get the mock-backed instance — every public call is safe.
+   */
+  getAudio(): LunarAudioSystem | null {
+    return this.audio;
   }
 
   /** The attached arrival director, or null before {@link setIntroDirector}. */
@@ -2679,6 +2740,16 @@ export class ClientApp {
       this.lastMiningLaser = null;
     }
 
+    // Spec 25 §2.5: sonify the burst — laser loop (square + tremolo + crackle)
+    // burns for the beam's lifetime, mineral chime credits the pull. Fires on
+    // the optimistic local leg, online or offline, exactly like the toast.
+    {
+      const intensity = 0.6 + 0.4 * (credited / Math.max(1, extract));
+      this.audio?.setMiningAudioActive(true, intensity);
+      this.miningAudioUntilMs = now + MINING_AUDIO_TAIL_MS;
+      this.audio?.playOreCollectChime();
+    }
+
     const carrierLabel = onFoot ? 'backpack' : 'flatbed';
     const carrierNow = onFoot ? suit.getCargoMass() : buggy.getCargoMass();
     const capped = cappedByBackpack || cappedByFlatbed;
@@ -2870,6 +2941,93 @@ export class ClientApp {
     } catch {
       /* haptics are advisory — a pad that refuses to rumble still drives */
     }
+  }
+
+  // -- audio (Spec 25 §2.5) -----------------------------------------------------------
+
+  /**
+   * Frame-boundary audio pump. Cabin↔vacuum acoustics follow the intro
+   * director while it owns the cinematic beats (Spec 24 §2.4 acoustic cut at
+   * <5 kPa), then settle to vacuum for the lunar surface. The driving loop
+   * reads this frame's buggy speed + filtered throttle demand; the mining
+   * loop burns until its post-beam tail expires; footfalls fire on walking
+   * cadence while the suit is grounded.
+   */
+  private pumpAudio(dt: number): void {
+    const audio = this.audio;
+    if (audio === null || this.disposed) return;
+
+    if (this.isIntroCinematic()) {
+      const tele = this.introDirector?.getTelemetry();
+      audio.setAudioMode(tele?.audioMode === 'vacuum' ? 'vacuum' : 'cabin');
+    } else {
+      // Airless surface — suit-conducted acoustics only (drone ducked,
+      // world loops attenuated; one-shots survive at full level).
+      audio.setAudioMode('vacuum');
+    }
+
+    if (this.mode === 'buggy') {
+      const buggy = this.requireBuggy();
+      audio.updateDrivingAudio(
+        buggy.getSpeed(),
+        Math.abs(this.filteredThrottle),
+        !buggy.getState().airborne,
+      );
+    } else {
+      audio.updateDrivingAudio(0, 0, false);
+    }
+
+    // Mining-laser tail: silence the loop once the burst window closes.
+    if (
+      this.miningAudioUntilMs !== Number.NEGATIVE_INFINITY &&
+      this.nowMs() >= this.miningAudioUntilMs
+    ) {
+      this.miningAudioUntilMs = Number.NEGATIVE_INFINITY;
+      audio.setMiningAudioActive(false);
+    }
+
+    this.pumpFootstepAudio();
+    void dt;
+  }
+
+  /**
+   * Suit footfall cadence: accumulate grounded walking distance and thump
+   * once per stride (2.0 m base, stretched by speed for the low-g lope).
+   * Mirrors the quest odometer's teleport guard — a >25 m single-frame jump
+   * is a spawn correction, never a footstep.
+   */
+  private pumpFootstepAudio(): void {
+    const audio = this.audio;
+    if (audio === null || this.disposed) return;
+    if (this.mode !== 'suit') {
+      this.audioFootPrev = null;
+      return;
+    }
+    const suit = this.requireSuit();
+    const pos = suit.getPosition();
+    const prev = this.audioFootPrev;
+    this.audioFootPrev = { x: pos.x, y: pos.y };
+    if (prev === null) return;
+    const step = Math.hypot(pos.x - prev.x, pos.y - prev.y);
+    if (step <= 0.005 || step >= ClientApp.QUEST_TELEPORT_GUARD_M) return;
+    if (!suit.getState().isGrounded) return;
+    const stride =
+      FOOTSTEP_STRIDE_BASE_M + FOOTSTEP_STRIDE_SPEED_GAIN * suit.getSpeed();
+    this.audioFootTravelled += step;
+    if (this.audioFootTravelled >= stride) {
+      this.audioFootTravelled = 0;
+      audio.playFootstep();
+    }
+  }
+
+  /**
+   * Map a comms dialogue tone onto a chirp flavour (Spec 25 §2.5): corporate
+   * bursts chirp fast-and-wide, alerts bite, everything else is the calm
+   * three-note incoming cadence.
+   */
+  private playCommsChirp(tone?: string): void {
+    const kind = tone === 'burst' ? 'burst' : tone === 'alert' ? 'alert' : 'incoming';
+    this.audio?.playCommsChirp(kind);
   }
 
   private syncCamera(dt: number): void {
@@ -3250,6 +3408,8 @@ export class ClientApp {
         if (this.npcCommsCooldown <= 0) {
           this.npcCommsCooldown = 4;
           this.hud?.showComms(dialogue);
+          // Spec 25 §2.5: rival-bot chatter chirps on the same comms channel.
+          this.playCommsChirp(dialogue.audioTone);
         }
       }
     }

@@ -1312,3 +1312,95 @@
     animation: none;
   }
 }
+
+/* --- audio mixer (Spec 25 §2.5) ------------------------------------------------- */
+
+#lunar-hud-audio {
+  top: 386px;
+  left: 16px;
+  width: 232px;
+  /* The one telemetry card that takes pointer input (faders + mute). */
+  pointer-events: auto;
+}
+
+#lunar-hud-audio .hud-heading {
+  margin-bottom: 6px;
+}
+
+.audio-level-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 7px 0;
+}
+
+.audio-level-label {
+  flex: 0 0 78px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--lf-dim);
+}
+
+.audio-level-value {
+  flex: 0 0 42px;
+  text-align: right;
+  font-size: 11px;
+  color: var(--lf-cyan);
+}
+
+.audio-slider {
+  flex: 1 1 auto;
+  appearance: none;
+  -webkit-appearance: none;
+  height: 4px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.14);
+  border: none;
+  outline: none;
+  cursor: pointer;
+}
+
+.audio-slider::-webkit-slider-thumb {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--lf-cyan);
+  border: 1px solid rgba(4, 18, 26, 0.9);
+  box-shadow: 0 0 8px rgba(86, 224, 255, 0.7);
+}
+
+.audio-slider::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--lf-cyan);
+  border: 1px solid rgba(4, 18, 26, 0.9);
+  box-shadow: 0 0 8px rgba(86, 224, 255, 0.7);
+}
+
+.audio-mute-button {
+  margin-top: 8px;
+  width: 100%;
+  padding: 5px 10px;
+  font-family: var(--lf-mono);
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--lf-good);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--lf-rule);
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.audio-mute-button.is-muted {
+  color: var(--lf-bad);
+  border-color: rgba(255, 93, 92, 0.5);
+}
+
+.audio-mute-button:hover {
+  background: rgba(86, 224, 255, 0.12);
+}

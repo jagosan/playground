@@ -128,4 +128,16 @@ export {
   type RivalArchetypeDefinition,
 } from '../infrastructure/RivalBases.ts';
 
+// Spec 25 §2.5: procedural Web Audio engine — 100% synthesised ambience,
+// driving/mining loops and SFX (zero assets; headless mock context for CI),
+// re-exported through the engine barrel for harnesses and client wiring.
+export {
+  LunarAudioSystem,
+  MockAudioContext,
+  DEFAULT_AUDIO_VOLUMES,
+  type AudioVolumes,
+  type AudioMode,
+  type CommsChirpType,
+} from '../audio/LunarAudioSystem.ts';
+
 export { WorldScene as default } from './WorldScene.ts';
