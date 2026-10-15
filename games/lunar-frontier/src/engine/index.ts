@@ -113,4 +113,19 @@ export {
   type NPCBotFleetPlanOptions,
 } from '../entities/NPCProspectorBot.ts';
 
+// Spec 25 §2.4: derelict rival-team outposts — scrapper fortress, corporate
+// enclave, nomad rig (re-exported through the engine barrel for harnesses
+// and client wiring).
+export {
+  RivalBases,
+  RIVAL_BASE_ARCHETYPES,
+  MIN_PERIMETER_RADIUS_M,
+  MAX_PERIMETER_RADIUS_M,
+  type RivalBaseArchetype,
+  type RivalBaseSite,
+  type RivalBasesOptions,
+  type RivalBasesSource,
+  type RivalArchetypeDefinition,
+} from '../infrastructure/RivalBases.ts';
+
 export { WorldScene as default } from './WorldScene.ts';

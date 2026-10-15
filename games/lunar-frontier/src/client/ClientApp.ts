@@ -57,6 +57,9 @@ import {
 import { HintArrowSystem, type HintArrowTarget } from './HintArrowSystem.ts';
 import { IntroDirector, type IntroPhase } from './IntroDirector.ts';
 import { FactionBases } from '../infrastructure/Factions.ts';
+// Spec 25 §2.4: derelict rival-team outposts (built inside WorldScene.init;
+// ClientApp exposes the accessor and territory query for quests/HUD).
+import type { RivalBases, RivalBaseSite } from '../infrastructure/RivalBases.ts';
 import { BOT_PUSH_EFFECTIVE_MASS_KG } from '../entities/NPCProspectorBot.ts';
 import type { NPCProspectorBot } from '../entities/NPCProspectorBot.ts';
 import {
@@ -1675,6 +1678,23 @@ export class ClientApp {
   /** Rail system assembly, or null before `init()`/without a snapshot. */
   getRailSystem(): RailSystem | null {
     return this.railSystem;
+  }
+
+  /**
+   * Spec 25 §2.4: the derelict rival-team outpost system, or null before
+   * `init()`/without a snapshot. Ruins are built inside `WorldScene.init()`;
+   * this exposes the roster, territory query and surveyables for quests/HUD.
+   */
+  getRivalBases(): RivalBases | null {
+    return this.world.getRivalBases();
+  }
+
+  /**
+   * Spec 25 §2.4: which rival outpost's territory contains this world point
+   * (null when none). `thresholdM` overrides every site's own perimeter.
+   */
+  isNearRivalBase(pos: { x: number; y: number }, thresholdM?: number): RivalBaseSite | null {
+    return this.world.getRivalBases()?.isNearRivalBase(pos, thresholdM) ?? null;
   }
 
   /**

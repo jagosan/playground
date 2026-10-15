@@ -98,6 +98,9 @@ import {
   planNPCBotFleet,
   type NPCBotConfig,
 } from '../entities/NPCProspectorBot.ts';
+// Spec 25 §2.4: derelict rival-team outposts (ruins are world furniture,
+// built from the generated snapshot — never invented client-side).
+import { RivalBases, type RivalBasesOptions } from '../infrastructure/RivalBases.ts';
 
 // ---------------------------------------------------------------------------
 // Options & tuning
@@ -773,6 +776,10 @@ export class WorldScene {
    * {@link spawnNPCBotFleet}; every entry disposed by `dispose()`).
    */
   private npcBots: NPCProspectorBot[] = [];
+  /** Spec 25 §2.4: derelict rival-team outposts (null before build / after dispose). */
+  private rivalBases: RivalBases | null = null;
+  /** Spec 25 §2.4: accumulated seconds driving beacon/capacitor flicker. */
+  private rivalBasesElapsed = 0;
 
   constructor(options: WorldSceneOptions = {}) {
     this.options = {
@@ -821,6 +828,9 @@ export class WorldScene {
     this.buildTerrainSkirt();
     this.buildRockFields();
     this.buildScrapSites();
+    // Spec 25 §2.4: derelict rival-team outposts anchored on snapshot nodes
+    // / crater rims (idempotent accessor: `getRivalBases()`).
+    this.buildRivalBases();
 
     this.rig = new CameraRig(this.scene, {
       initialMode: this.options.cameraMode ?? 'eva_first_person',
@@ -841,6 +851,12 @@ export class WorldScene {
   render(): this {
     if (this.scene === null || this.disposed) return this;
     this.updateMiningEffects();
+    // Spec 25 §2.4: beacon + capacitor-spark flicker on the rival ruins.
+    if (this.rivalBases !== null) {
+      const dtMs = this.engine?.getDeltaTime() ?? 16.7;
+      this.rivalBasesElapsed += dtMs / 1000;
+      this.rivalBases.update(this.rivalBasesElapsed);
+    }
     // Spec 23 §2.1.4: re-evaluate the Hapke opposition surge against the
     // current camera view before every frame is submitted.
     this.updateOppositionSurge();
@@ -1007,6 +1023,16 @@ export class WorldScene {
 
     // Spec 25 §2.3: tear down the autonomous NPC prospector fleet.
     this.disposeNPCBots();
+
+    // Spec 25 §2.4: tear down the derelict rival-team outposts.
+    if (this.rivalBases !== null) {
+      try {
+        this.rivalBases.dispose();
+      } catch {
+        /* already gone */
+      }
+      this.rivalBases = null;
+    }
 
     for (const mesh of this.entities) mesh.parent = null;
     this.entities.clear();
@@ -1214,6 +1240,35 @@ export class WorldScene {
       }
     }
     this.npcBots = [];
+  }
+
+  // -- Spec 25 §2.4: derelict rival-team outposts --------------------------------
+
+  /**
+   * Build the derelict rival-team outposts (Spec 25 §2.4): three weathered
+   * archetypes (scrapper fortress / corporate enclave / nomad rig) anchored
+   * deterministically on snapshot sector nodes and crater rims, each with a
+   * 60–90 m pylon-marked territory, core command hub + faction banner, 2–4
+   * damaged point-defense railgun sockets and surveyable resource depots.
+   *
+   * Idempotent (a second call returns the existing system). Meshes register
+   * as shadow casters; teardown runs from `dispose()`. Headless-safe: with
+   * no snapshot the system plans an empty roster but still answers queries.
+   */
+  buildRivalBases(options: RivalBasesOptions = {}): RivalBases {
+    if (this.rivalBases !== null) return this.rivalBases;
+    const scene = this.requireScene();
+    const rivals = new RivalBases(this.snapshot, options).init(scene);
+    const rootNode = rivals.getRootNode();
+    if (rootNode !== null) rootNode.parent = this.terrainRoot ?? null;
+    this.registerShadowCasters(rivals.getShadowCasterMeshes());
+    this.rivalBases = rivals;
+    return rivals;
+  }
+
+  /** The rival outpost system, or null before build / after dispose. */
+  getRivalBases(): RivalBases | null {
+    return this.disposed ? null : this.rivalBases;
   }
 
   // -- surface detritus & salvage (Spec 21 §2.1) -------------------------------
