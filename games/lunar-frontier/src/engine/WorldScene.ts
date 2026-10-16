@@ -88,7 +88,7 @@ import {
   type RockArchetype,
   type RockFieldSnapshot,
 } from '../world/LunarWorldGenerator.ts';
-import { CameraRig, worldToBabylon, type CameraMode } from './CameraRig.ts';
+import { CameraRig, worldToBabylon, babylonToWorld, type CameraMode } from './CameraRig.ts';
 import {
   TransportLander,
   type TransportLanderOptions,
@@ -101,6 +101,13 @@ import {
 // Spec 25 §2.4: derelict rival-team outposts (ruins are world furniture,
 // built from the generated snapshot — never invented client-side).
 import { RivalBases, type RivalBasesOptions } from '../infrastructure/RivalBases.ts';
+// Spec 26 §3.1: X-Corp Citadel "The Obsidian Apex" (fixed canonical seat,
+// defense perimeter answers before the mesh build).
+import {
+  XCorpCitadel,
+  type CitadelOptions,
+  type CitadelPerimeterStatus,
+} from '../infrastructure/XCorpCitadel.ts';
 
 // ---------------------------------------------------------------------------
 // Options & tuning
@@ -780,6 +787,8 @@ export class WorldScene {
   private rivalBases: RivalBases | null = null;
   /** Spec 25 §2.4: accumulated seconds driving beacon/capacitor flicker. */
   private rivalBasesElapsed = 0;
+  /** Spec 26 §3.1: X-Corp Citadel (null before {@link buildXCorpCitadel} / after dispose). */
+  private xcorpCitadel: XCorpCitadel | null = null;
 
   constructor(options: WorldSceneOptions = {}) {
     this.options = {
@@ -857,11 +866,31 @@ export class WorldScene {
       this.rivalBasesElapsed += dtMs / 1000;
       this.rivalBases.update(this.rivalBasesElapsed);
     }
+    // Spec 26 §3.1: shield shimmer + CIWS tracking, evaluated against the
+    // live camera (the player proxy) in world metres.
+    if (this.xcorpCitadel !== null) {
+      const dtMs = this.engine?.getDeltaTime() ?? 16.7;
+      const cam = this.scene.activeCamera;
+      if (cam !== null && cam !== undefined) {
+        this.xcorpCitadel.update(dtMs / 1000, babylonToWorld(cam.position));
+      }
+    }
     // Spec 23 §2.1.4: re-evaluate the Hapke opposition surge against the
     // current camera view before every frame is submitted.
     this.updateOppositionSurge();
     this.scene.render();
     return this;
+  }
+
+  /**
+   * Spec 26 §3.1: drive the X-Corp Citadel defense perimeter for one frame
+   * (shield shimmer, CIWS tracking) and evaluate it against the player's
+   * world-frame position. Returns null when no citadel is built (or after
+   * dispose); otherwise the perimeter status the HUD/quests consume.
+   */
+  update(dtMs: number, playerWorldPos: { x: number; y: number; z: number }): CitadelPerimeterStatus | null {
+    if (this.xcorpCitadel === null || this.disposed) return null;
+    return this.xcorpCitadel.update(dtMs / 1000, playerWorldPos);
   }
 
   /** Start the engine render loop (browser convenience; headless stays manual). */
@@ -1032,6 +1061,16 @@ export class WorldScene {
         /* already gone */
       }
       this.rivalBases = null;
+    }
+
+    // Spec 26 §3.1: tear down the X-Corp Citadel.
+    if (this.xcorpCitadel !== null) {
+      try {
+        this.xcorpCitadel.dispose();
+      } catch {
+        /* already gone */
+      }
+      this.xcorpCitadel = null;
     }
 
     for (const mesh of this.entities) mesh.parent = null;
@@ -1269,6 +1308,38 @@ export class WorldScene {
   /** The rival outpost system, or null before build / after dispose. */
   getRivalBases(): RivalBases | null {
     return this.disposed ? null : this.rivalBases;
+  }
+
+  // -- Spec 26 §3.1: X-Corp Citadel "The Obsidian Apex" -------------------------
+
+  /**
+   * Build the X-Corp Citadel (Spec 26 §3.1): the 85 m obsidian monolith with
+   * gold mullions, cantilevered executive penthouse pods, the grand maglev
+   * terminal viaduct sealed behind blast gates, dual VIP landing pads, the
+   * 220 m neon-cyan kinetic forcefield dome and three 35 m CIWS sentry
+   * spires patrolling the 180 m lethal threshold.
+   *
+   * Seated at the canonical highland-basin coordinates (-1850, 2400) unless
+   * `options.worldCenter` says otherwise. Idempotent (a second call returns
+   * the existing system). Meshes register as shadow casters (the energy
+   * barrier excepted); teardown runs from `dispose()`. The perimeter
+   * potential field answers even before this call via
+   * `new XCorpCitadel(options).getPerimeterStatus(...)`.
+   */
+  buildXCorpCitadel(options: Partial<CitadelOptions> = {}): XCorpCitadel {
+    if (this.xcorpCitadel !== null) return this.xcorpCitadel;
+    const scene = this.requireScene();
+    const citadel = new XCorpCitadel(options).init(scene);
+    const rootNode = citadel.getRootNode();
+    if (rootNode !== null) rootNode.parent = this.terrainRoot ?? null;
+    this.registerShadowCasters(citadel.getShadowCasterMeshes());
+    this.xcorpCitadel = citadel;
+    return citadel;
+  }
+
+  /** The X-Corp Citadel system, or null before build / after dispose. */
+  getXCorpCitadel(): XCorpCitadel | null {
+    return this.disposed ? null : this.xcorpCitadel;
   }
 
   // -- surface detritus & salvage (Spec 21 §2.1) -------------------------------

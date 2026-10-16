@@ -142,3 +142,11 @@ The subsystem is validated headlessly via `games/lunar-frontier/scripts/smoke-x-
    - Verifies vault hacking timer, loot generation, and 45s countdown trigger.
 4. **Bailout Kinematics & Extraction (20 assertions):**
    - Verifies ballistic launch impulse and safe landing envelope outside the Citadel lethal threshold.
+
+---
+
+## 5. 💡 Note to Future Self: Hosting Portability
+
+- **Client/Server Decoupling:** The X-Corp Citadel collision geometry, barrier potential field equations, and high-speed maglev spline evaluations run on deterministic client-side mathematics (`NullEngine`-compatible). When migrating to full authoritative multiplayer sync on `LunarServer.ts`, train position $s(t)$ and vault state are easily driven via a single scalar timestamp $t_\text{server}$ replicated across WebSocket frames without high-bandwidth mesh replication.
+- **Platform Agnostic Rendering:** Procedural shaders and meshes use standard Babylon.js PBR materials and fall back cleanly under WebGL2 or headless `NullEngine` environments without vendor-specific WebGPU extensions.
+
