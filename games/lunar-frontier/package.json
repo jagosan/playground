@@ -14,6 +14,7 @@
     "smoke:intro": "npx tsx scripts/smoke-intro-experience.ts",
     "smoke:market": "npx tsx scripts/smoke-market-and-rails.ts",
     "smoke:client": "npx tsx scripts/smoke-client-app.ts",
+    "smoke:xcorp-heist": "npx tsx scripts/smoke-x-corp-heist.ts",
     "lunar:smoke:cleanup": "npx tsx scripts/smoke-general-cleanup.ts",
     "verify:surface": "npx tsx tests/verify-surface-rendering.ts",
     "typecheck:server": "tsc -p tsconfig.server.json"
