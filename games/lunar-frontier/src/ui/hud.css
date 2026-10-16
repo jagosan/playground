@@ -1404,3 +1404,317 @@
 .audio-mute-button:hover {
   background: rgba(86, 224, 255, 0.12);
 }
+
+/* ==========================================================================
+   Spec 26 §3.5.1 — heist telemetry overlay (#lunar-hud-heist).
+
+   "Operation Gilded Serpent" chrome: the high-speed intercept radar, the
+   depot breach countdown bar (amber → crimson below T-30), the holographic
+   3-ring Mag-Lock decryption dial, and the glowing gold contraband pill.
+   Same smoked-glass language as every other panel; the heist widgets borrow
+   the cyan rule for scanning state and go warm (amber → crimson → gold)
+   when the operation is live.
+   ========================================================================== */
+
+#lunar-hud-heist {
+  top: 96px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 340px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  border-color: rgba(255, 196, 88, 0.35);
+}
+
+#lunar-hud-heist.is-hidden {
+  opacity: 0;
+  visibility: hidden;
+}
+
+/* --- 1. high-speed intercept radar ---------------------------------------- */
+
+.heist-radar {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--lf-rule);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.heist-radar.is-hidden {
+  display: none;
+}
+
+.heist-radar-readout {
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  color: var(--lf-cyan);
+}
+
+#hud-heist-dv-value {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.heist-lat-bar {
+  height: 5px;
+}
+
+.heist-lat-bar .hud-bar-fill {
+  background: linear-gradient(90deg, rgba(86, 224, 255, 0.75), rgba(92, 230, 164, 0.9));
+}
+
+.heist-reticle {
+  position: relative;
+  align-self: center;
+  width: 34px;
+  height: 34px;
+  opacity: 0.75;
+}
+
+.heist-reticle-ring {
+  position: absolute;
+  inset: 0;
+  border: 1.5px solid var(--lf-cyan);
+  border-radius: 50%;
+  animation: heist-reticle-pulse 1.4s ease-in-out infinite;
+}
+
+.heist-reticle-cross {
+  position: absolute;
+  inset: 10px;
+  border: 1px dashed rgba(86, 224, 255, 0.6);
+  border-radius: 50%;
+}
+
+.heist-reticle.is-locked {
+  opacity: 1;
+}
+
+.heist-reticle.is-locked .heist-reticle-ring {
+  border-color: var(--lf-good);
+  border-style: solid;
+  border-width: 2px;
+  box-shadow: 0 0 12px rgba(92, 230, 164, 0.8);
+  animation-duration: 0.6s;
+}
+
+.heist-lock-status {
+  text-align: center;
+  font-size: 10.5px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--lf-dim);
+}
+
+#hud-heist-lock-status:not(:empty) {
+  color: var(--lf-cyan);
+}
+
+.heist-reticle.is-locked + .heist-lock-status {
+  color: var(--lf-good);
+  text-shadow: 0 0 8px rgba(92, 230, 164, 0.6);
+}
+
+@keyframes heist-reticle-pulse {
+  0%,
+  100% {
+    transform: scale(1);
+    opacity: 0.7;
+  }
+
+  50% {
+    transform: scale(1.12);
+    opacity: 1;
+  }
+}
+
+/* --- 2. depot breach countdown bar ----------------------------------------- */
+
+.heist-countdown {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px;
+  border: 1px solid rgba(255, 204, 85, 0.45);
+  border-radius: 10px;
+  background: rgba(255, 204, 85, 0.07);
+}
+
+.heist-countdown.is-hidden {
+  display: none;
+}
+
+.heist-countdown-value {
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  color: var(--lf-warn);
+}
+
+.heist-countdown-bar {
+  height: 8px;
+}
+
+.heist-countdown-bar .hud-bar-fill {
+  /* amber → crimson along the drain direction */
+  background: linear-gradient(90deg, #ffcc55, #ff9a3c 60%, #ff5d5c);
+}
+
+.heist-countdown-caption {
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--lf-dim);
+}
+
+.heist-countdown.is-critical {
+  border-color: rgba(255, 93, 92, 0.7);
+  background: rgba(255, 93, 92, 0.12);
+  animation: heist-critical-blink 0.8s ease-in-out infinite;
+}
+
+.heist-countdown.is-critical .heist-countdown-value {
+  color: var(--lf-bad);
+  text-shadow: 0 0 10px rgba(255, 93, 92, 0.8);
+}
+
+@keyframes heist-critical-blink {
+  0%,
+  100% {
+    box-shadow: 0 0 0 rgba(255, 93, 92, 0);
+  }
+
+  50% {
+    box-shadow: 0 0 18px rgba(255, 93, 92, 0.55);
+  }
+}
+
+/* --- 3. Mag-Lock decryption circular dial ----------------------------------- */
+
+.heist-decrypt-dial {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 10px;
+  border: 1px solid rgba(86, 224, 255, 0.4);
+  border-radius: 12px;
+  background: rgba(10, 22, 18, 0.45);
+}
+
+.heist-decrypt-dial.is-hidden {
+  display: none;
+}
+
+.heist-dial-rings {
+  position: relative;
+  width: 72px;
+  height: 72px;
+}
+
+.heist-dial-ring {
+  position: absolute;
+  border: 1.5px solid rgba(86, 224, 255, 0.28);
+  border-radius: 50%;
+  transition:
+    border-color 200ms ease,
+    box-shadow 200ms ease;
+}
+
+.heist-dial-ring:nth-child(1) {
+  inset: 0;
+}
+
+.heist-dial-ring:nth-child(2) {
+  inset: 12px;
+}
+
+.heist-dial-ring:nth-child(3) {
+  inset: 24px;
+}
+
+.heist-dial-ring.is-aligned {
+  border-color: var(--lf-cyan);
+  box-shadow:
+    0 0 10px rgba(86, 224, 255, 0.65),
+    inset 0 0 6px rgba(86, 224, 255, 0.35);
+}
+
+.heist-dial-value {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--lf-cyan);
+}
+
+.heist-dial-caption {
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--lf-dim);
+}
+
+/* --- 4. contraband inventory pill ------------------------------------------- */
+
+.heist-loot-pill {
+  align-self: center;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border: 1px solid rgba(255, 210, 63, 0.6);
+  border-radius: 999px;
+  background: rgba(255, 210, 63, 0.08);
+  box-shadow: 0 0 14px rgba(255, 210, 63, 0.25);
+}
+
+.heist-loot-pill.is-hidden {
+  display: none;
+}
+
+.heist-loot-slots {
+  display: flex;
+  gap: 4px;
+}
+
+.heist-loot-slot {
+  width: 10px;
+  height: 14px;
+  border: 1px solid rgba(255, 210, 63, 0.35);
+  border-radius: 3px;
+  background: rgba(255, 210, 63, 0.06);
+}
+
+.heist-loot-slot.is-secured {
+  background: radial-gradient(circle at 50% 35%, #ffe9a3, #ffb347 70%, #d98c1f);
+  border-color: #ffd23f;
+  box-shadow: 0 0 8px rgba(255, 210, 63, 0.9);
+  animation: heist-loot-glow 1.8s ease-in-out infinite;
+}
+
+#hud-heist-loot-count {
+  font-size: 13px;
+  font-weight: 700;
+  color: #ffd23f;
+}
+
+.heist-loot-caption {
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--lf-dim);
+}
+
+@keyframes heist-loot-glow {
+  0%,
+  100% {
+    box-shadow: 0 0 6px rgba(255, 210, 63, 0.6);
+  }
+
+  50% {
+    box-shadow: 0 0 12px rgba(255, 210, 63, 1);
+  }
+}

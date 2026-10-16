@@ -29,6 +29,11 @@
  * and the smoke harness can assert on DOM text without any renderer.
  */
 
+// Spec 26 §3.5.1: the heist overlay paints the TrainHeistDirector's
+// telemetry. `import type` is erased at compile time — the HUD keeps its
+// zero-RUNTIME-import contract (no Babylon/engine code lands in HUD bundles).
+import type { HeistTelemetry } from '../quests/TrainHeistDirector.ts';
+
 // ---------------------------------------------------------------------------
 // Types & constants
 // ---------------------------------------------------------------------------
@@ -64,6 +69,30 @@ export const HUD_INTRO_ID = 'lunar-hud-intro';
 
 /** Spec 25 §2.5 — audio mixer panel (`#lunar-hud-audio`). */
 export const HUD_AUDIO_ID = 'lunar-hud-audio';
+
+/**
+ * Spec 26 §3.5.1 — "Operation Gilded Serpent" heist overlay
+ * (`#lunar-hud-heist`): high-speed intercept radar, depot breach countdown
+ * bar, Mag-Lock decryption circular dial, and the contraband inventory pill.
+ * Hidden while the heist phase is `INACTIVE`.
+ */
+export const HUD_HEIST_ID = 'lunar-hud-heist';
+
+/**
+ * Depot countdown full-scale (s) — local mirror of
+ * `TrainHeistDirector.DEPOT_COUNTDOWN_S` (Spec 26 §3.3.4: exactly 44.0 s);
+ * the zero-runtime-import contract keeps the two files independent.
+ */
+export const HUD_HEIST_COUNTDOWN_FULL_S = 44.0;
+
+/** Crimson/critical threshold (s) — mirror of `BAILOUT_WARNING_S` (§3.3.4). */
+export const HUD_HEIST_CRITICAL_S = 30.0;
+
+/** Contraband pill slots — canonical loot table 3 + 1 + 2 = 6 (§3.3.3). */
+export const HUD_HEIST_LOOT_SLOTS = 6;
+
+/** Lateral-distance radar bar full-scale (m) — a palm past the 5.5 m band. */
+export const HUD_HEIST_LAT_FULL_M = 6.0;
 
 /**
  * Spec 25 §2.5 — structural clone of the audio engine's `AudioVolumes`
@@ -668,6 +697,9 @@ export class LunarHUD {
   /** Last intro telemetry painted (Spec 24 Phase 3 harness readback). */
   private lastIntroTelemetry: HudIntroTelemetry | null = null;
 
+  /** Spec 26 §3.5.1 — last heist telemetry painted (harness readback). */
+  private lastHeistTelemetry: HeistTelemetry | null = null;
+
   /** Spec 21 §2.5 — holographic topographic map overlay state. */
   private mapVisible = false;
   /** Last map frame handed to `updateMap` (harness readback). */
@@ -714,6 +746,7 @@ export class LunarHUD {
     this.buildStatusStrip();
     this.buildCompass();
     this.buildIntroOverlay();
+    this.buildHeistOverlay();
     this.buildToast();
     this.buildLifeSupport();
     this.buildBuggyPanel();
@@ -753,6 +786,7 @@ export class LunarHUD {
     }
     this.clearCommsTimers();
     this.lastIntroTelemetry = null;
+    this.lastHeistTelemetry = null;
     this.tradeRows.clear();
     this.tradeOptions.clear();
     this.promptEls = [];
@@ -1942,6 +1976,216 @@ export class LunarHUD {
     if (fill !== undefined) {
       fill.style.width = `${(p * 100).toFixed(1)}%`;
     }
+  }
+
+  // -- Spec 26 §3.5.1: heist telemetry overlay ------------------------------------
+
+  /**
+   * "Operation Gilded Serpent" overlay (`#lunar-hud-heist`, Spec 26 §3.5.1).
+   * Four widgets, each independently visible while the phase machine is live:
+   *
+   *   1. High-Speed Intercept Radar — Δv readout (m/s AND km/h), lateral
+   *      distance bar, and a pulsing targeting reticle that locks green
+   *      (`VELOCITY MATCHED // READY TO BOARD`) while `canBoard` holds.
+   *   2. Depot Breach Countdown Bar — segmented amber bar draining from the
+   *      canonical T-44.0 s; flips crimson (`.is-critical`) below 30.0 s.
+   *   3. Mag-Lock Decryption Circular Dial — holographic 3-ring alignment
+   *      dial painting `hackProgressFraction` during ON_BOARD_CRACKING.
+   *   4. Contraband Inventory Pill — six glowing gold slots + secured count.
+   *
+   * Every value mirrors into a `data-*` attribute on the panel (headless
+   * DOMs have no CSS cadence), and every element lives in the stable
+   * `els` key map, so a tsx fake-DOM harness asserts exactly like a browser.
+   */
+  private buildHeistOverlay(): void {
+    const panel = this.make(
+      'section',
+      HUD_HEIST_ID,
+      'hud-panel heist-overlay is-hidden',
+      'heist-panel',
+    );
+    this.root.appendChild(panel);
+    panel.setAttribute('data-phase', 'INACTIVE');
+
+    // -- 1. high-speed intercept radar ---------------------------------------------
+    const radar = this.make('div', 'lunar-hud-heist-radar', 'heist-radar is-hidden', 'heist-radar');
+    const dv = this.make('div', 'hud-heist-dv-value', 'heist-radar-readout', 'heist-dv-value');
+    dv.textContent = 'Δv: — m/s (— km/h)';
+    const lat = this.make('div', 'hud-heist-lat-value', 'heist-radar-readout', 'heist-lat-value');
+    lat.textContent = 'LAT: — m';
+    radar.appendChild(dv);
+    radar.appendChild(lat);
+    const latTrack = this.make('div', 'lunar-hud-heist-lat-bar', 'hud-bar heist-lat-bar', 'heist-lat-track');
+    const latFill = this.make('div', 'lunar-hud-heist-lat-fill', 'hud-bar-fill', 'heist-lat-fill');
+    latFill.style.width = '0%';
+    latTrack.appendChild(latFill);
+    radar.appendChild(latTrack);
+    const reticle = this.make('div', 'lunar-hud-heist-reticle', 'heist-reticle', 'heist-reticle');
+    reticle.appendChild(this.make('span', undefined, 'heist-reticle-ring'));
+    reticle.appendChild(this.make('span', undefined, 'heist-reticle-cross'));
+    radar.appendChild(reticle);
+    const lock = this.make('div', 'hud-heist-lock-status', 'heist-lock-status', 'heist-lock-status');
+    lock.textContent = 'SCANNING — NO VELOCITY LOCK';
+    radar.appendChild(lock);
+    panel.appendChild(radar);
+
+    // -- 2. depot breach countdown bar ----------------------------------------------
+    const countdown = this.make(
+      'div',
+      'lunar-hud-heist-countdown',
+      'heist-countdown is-hidden',
+      'heist-countdown',
+    );
+    const cdValue = this.make(
+      'span',
+      'hud-heist-countdown-value',
+      'heist-countdown-value',
+      'heist-countdown-value',
+    );
+    cdValue.textContent = `T-${HUD_HEIST_COUNTDOWN_FULL_S.toFixed(1)}s`;
+    countdown.appendChild(cdValue);
+    const cdTrack = this.make(
+      'div',
+      'lunar-hud-heist-countdown-bar',
+      'hud-bar heist-countdown-bar',
+      'heist-countdown-track',
+    );
+    const cdFill = this.make('div', 'lunar-hud-heist-countdown-fill', 'hud-bar-fill', 'heist-countdown-fill');
+    cdFill.style.width = '100%';
+    cdTrack.appendChild(cdFill);
+    countdown.appendChild(cdTrack);
+    const cdLabel = this.make('span', undefined, 'heist-countdown-caption');
+    cdLabel.textContent = 'DEPOT BREACH // BAIL OUT NOW';
+    countdown.appendChild(cdLabel);
+    panel.appendChild(countdown);
+
+    // -- 3. Mag-Lock decryption circular dial ----------------------------------------
+    const dial = this.make('div', 'lunar-hud-heist-dial', 'heist-decrypt-dial is-hidden', 'heist-dial');
+    const rings = this.make('div', undefined, 'heist-dial-rings');
+    for (let i = 1; i <= 3; i++) {
+      rings.appendChild(
+        this.make('span', `lunar-hud-heist-ring-${i}`, 'heist-dial-ring', `heist-ring-${i}`),
+      );
+    }
+    dial.appendChild(rings);
+    const dialValue = this.make('div', 'hud-heist-dial-value', 'heist-dial-value', 'heist-dial-value');
+    dialValue.textContent = '0%';
+    dial.appendChild(dialValue);
+    const dialCaption = this.make('span', undefined, 'heist-dial-caption');
+    dialCaption.textContent = 'MAG-LOCK DECRYPTION';
+    dial.appendChild(dialCaption);
+    panel.appendChild(dial);
+
+    // -- 4. contraband inventory pill --------------------------------------------------
+    const loot = this.make('div', 'lunar-hud-heist-loot', 'heist-loot-pill is-hidden', 'heist-loot');
+    loot.setAttribute('data-loot-count', '0');
+    const slots = this.make('div', undefined, 'heist-loot-slots');
+    for (let i = 0; i < HUD_HEIST_LOOT_SLOTS; i++) {
+      slots.appendChild(
+        this.make('span', `lunar-hud-heist-loot-slot-${i}`, 'heist-loot-slot', `heist-loot-slot-${i}`),
+      );
+    }
+    loot.appendChild(slots);
+    const lootCount = this.make('span', 'hud-heist-loot-count', 'heist-loot-count', 'heist-loot-count');
+    lootCount.textContent = '×0';
+    loot.appendChild(lootCount);
+    const lootCaption = this.make('span', undefined, 'heist-loot-caption');
+    lootCaption.textContent = 'CONTRABAND SECURED';
+    loot.appendChild(lootCaption);
+    panel.appendChild(loot);
+  }
+
+  /**
+   * Paint the heist overlay from a director telemetry frame (Spec 26 §3.5.1).
+   * `null` or phase `INACTIVE` retracts the whole overlay; otherwise each
+   * widget lights per the phase machine — radar during the intercept /
+   * boarding window, countdown once the alarm has armed the depot clock,
+   * dial during ON_BOARD_CRACKING, pill while secured cargo rides with the
+   * player. Non-finite telemetry fields degrade to zeros, never NaN text.
+   */
+  updateHeistTelemetry(telemetry: HeistTelemetry | null): void {
+    if (this.disposed) return;
+    this.lastHeistTelemetry = telemetry;
+
+    const panel = this.els.get('heist-panel');
+    if (panel === undefined) return;
+    if (telemetry === null || telemetry.phase === 'INACTIVE') {
+      panel.setAttribute('data-phase', 'INACTIVE');
+      this.setClass('heist-panel', 'is-hidden', true);
+      return;
+    }
+
+    const finite = (v: number | undefined): number =>
+      typeof v === 'number' && Number.isFinite(v) ? v : 0;
+    const phase = telemetry.phase;
+    panel.setAttribute('data-phase', phase);
+    this.setClass('heist-panel', 'is-hidden', false);
+
+    // -- 1. intercept radar: Δv (m/s + km/h), lateral bar, boarding reticle ----
+    const radarActive = phase === 'INTERCEPTING' || phase === 'BOARDING_WINDOW';
+    this.setClass('heist-radar', 'is-hidden', !radarActive);
+    if (radarActive) {
+      const dv = Math.max(0, finite(telemetry.relativeSpeedMps));
+      this.setText('heist-dv-value', `Δv: ${num(dv, 1)} m/s (${num(dv * 3.6, 1)} km/h)`);
+      const lat = Math.max(0, finite(telemetry.lateralDistanceM));
+      this.setText('heist-lat-value', `LAT: ${num(lat, 1)} m`);
+      const latFill = this.els.get('heist-lat-fill');
+      if (latFill !== undefined) {
+        latFill.style.width = pct((lat / HUD_HEIST_LAT_FULL_M) * 100);
+        latFill.setAttribute('data-lat-m', lat.toFixed(2));
+      }
+      const locked = telemetry.canBoard === true;
+      this.setClass('heist-reticle', 'is-locked', locked);
+      this.setText(
+        'heist-lock-status',
+        locked ? 'VELOCITY MATCHED // READY TO BOARD' : 'SCANNING — NO VELOCITY LOCK',
+      );
+    }
+
+    // -- 2. depot breach countdown ----------------------------------------------
+    const cdS = clamp(finite(telemetry.countdownRemainingS), 0, HUD_HEIST_COUNTDOWN_FULL_S);
+    const cdActive = cdS > 0 || phase === 'DEPOT_COUNTDOWN' || phase === 'LOOT_SECURED';
+    this.setClass('heist-countdown', 'is-hidden', !cdActive);
+    if (cdActive) {
+      this.setText('heist-countdown-value', `T-${cdS.toFixed(1)}s`);
+      const cdFill = this.els.get('heist-countdown-fill');
+      if (cdFill !== undefined) {
+        cdFill.style.width = pct((cdS / HUD_HEIST_COUNTDOWN_FULL_S) * 100);
+      }
+      this.setClass('heist-countdown', 'is-critical', cdS < HUD_HEIST_CRITICAL_S);
+      panel.setAttribute('data-countdown-s', cdS.toFixed(1));
+    } else {
+      this.setClass('heist-countdown', 'is-critical', false);
+    }
+
+    // -- 3. Mag-Lock decryption dial ----------------------------------------------
+    const dialActive = phase === 'ON_BOARD_CRACKING';
+    this.setClass('heist-dial', 'is-hidden', !dialActive);
+    if (dialActive) {
+      const p = clamp(finite(telemetry.hackProgressFraction), 0, 1);
+      this.setText('heist-dial-value', `${Math.round(p * 100)}%`);
+      // Ring i aligns at the i-th third of the 6.0 s bypass (epsilon keeps
+      // 1/3-repeating fractions aligned on the frame they land).
+      for (let i = 1; i <= 3; i++) {
+        this.setClass(`heist-ring-${i}`, 'is-aligned', p >= i / 3 - 1e-9);
+      }
+      panel.setAttribute('data-hack', p.toFixed(3));
+    }
+
+    // -- 4. contraband inventory pill ----------------------------------------------
+    const stolen = Math.max(0, Math.round(finite(telemetry.stolenCargoCount)));
+    this.setClass('heist-loot', 'is-hidden', stolen <= 0);
+    const pill = this.els.get('heist-loot');
+    if (pill !== undefined) pill.setAttribute('data-loot-count', String(stolen));
+    this.setText('heist-loot-count', `×${stolen}`);
+    for (let i = 0; i < HUD_HEIST_LOOT_SLOTS; i++) {
+      this.setClass(`heist-loot-slot-${i}`, 'is-secured', i < stolen);
+    }
+  }
+
+  /** Last heist telemetry painted (null when retracted) — harness readback. */
+  getHeistTelemetry(): HeistTelemetry | null {
+    return this.lastHeistTelemetry;
   }
 
   /**

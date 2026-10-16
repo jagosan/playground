@@ -61,6 +61,16 @@ export const DEFAULT_AUDIO_VOLUMES: Readonly<AudioVolumes> = {
   sfx: 0.9,
 };
 
+/** Last Doppler flyby record (context time, trigger speed, pass-by pitch ratio). */
+export interface MaglevFlybyRecord {
+  /** `AudioContext` time the flyby was scheduled at (s). */
+  atContextTimeS: number;
+  /** Train speed the Doppler shift was computed from (m/s). */
+  speedMps: number;
+  /** approach/apprecate pitch ratio (1 + β)/(1 − β), β = v/c. */
+  dopplerRatio: number;
+}
+
 // ---------------------------------------------------------------------------
 // Tunables
 // ---------------------------------------------------------------------------
@@ -121,6 +131,44 @@ const CHIME_END_HZ = 2640;
 /** Suit footstep thud (Spec: 80 Hz muffled) + anti-machine-gun gate. */
 const FOOTSTEP_THUD_HZ = 80;
 const FOOTSTEP_MIN_GAP_S = 0.14;
+
+// -- Spec 26 §3.5.2: maglev / heist procedural voices -------------------------
+
+/**
+ * Linear induction guideway hum (Spec 26 §3.5.2): 120–280 Hz carrier rising
+ * proportionally with Apex Express velocity, stator-slot amplitude wobble.
+ */
+export const MAGLEV_HUM_FLOOR_HZ = 120;
+export const MAGLEV_HUM_CEILING_HZ = 280;
+const MAGLEV_HUM_LFO_HZ = 9;
+const MAGLEV_HUM_BASE_LEVEL = 0.12;
+
+/** Doppler flyby: resonant whoosh + pitch-shifted consist body (25 m/s ≈ 90 km/h). */
+const MAGLEV_FLYBY_NOISE_HZ = 160;
+const MAGLEV_FLYBY_BODY_HZ = 90;
+const MAGLEV_FLYBY_Q = 14;
+const MAGLEV_FLYBY_DURATION_S = 1.15;
+const DEFAULT_FLYBY_SPEED_MPS = 25;
+/** Air sound speed used for the Doppler ratio (m/s, ~20 °C sea-level datum). */
+const SPEED_OF_SOUND_MPS = 343;
+
+/** Mag-Lock mechanical disengage: 40 Hz sub-bass magnetic thud + pneumatic hiss. */
+export const MAGLOCK_THUD_HZ = 40;
+const MAGLOCK_HISS_DELAY_S = 0.06;
+const MAGLOCK_HISS_S = 0.55;
+
+/**
+ * Citadel intrusion klaxon (Spec 26 §3.5.2): two-tone 660 Hz ↔ 880 Hz siren
+ * ringing through the helmet comms during the escape window. Synthesised as
+ * a 770 Hz saw carrier swung ±110 Hz by a square LFO — pure Web Audio, no
+ * wall-clock timers, deterministic in the mock context.
+ */
+export const KLAXON_LOW_HZ = 660;
+export const KLAXON_HIGH_HZ = 880;
+const KLAXON_BASE_HZ = (KLAXON_LOW_HZ + KLAXON_HIGH_HZ) / 2; // 770
+const KLAXON_SWING_HZ = (KLAXON_HIGH_HZ - KLAXON_LOW_HZ) / 2; // 110
+const KLAXON_ALTERNATION_HZ = 1.1;
+const KLAXON_BASE_LEVEL = 0.16;
 
 /** Noise buffer length baked once per context (seconds). */
 const NOISE_BUFFER_SECONDS = 2;
@@ -339,6 +387,22 @@ export class LunarAudioSystem {
 
   private miningGain: Gainish | null = null;
 
+  // -- Spec 26 §3.5.2: maglev hum + citadel klaxon (persistent voices) --------
+  private maglevHumOsc: Oscillatorish | null = null;
+  private maglevHumFilter: Filterish | null = null;
+  private maglevHumGain: Gainish | null = null;
+  /** Speed fraction (0..1) last written by `setMaglevInductionHum`. */
+  private maglevHumFraction = 0;
+  /** Hum drive envelope (0..1, 0 while the consist is parked). */
+  private maglevHumDrive = 0;
+  private klaxonOsc: Oscillatorish | null = null;
+  private klaxonGain: Gainish | null = null;
+  private klaxonActive = false;
+  /** Context time of the last mag-lock disengage impulse (−∞ before first). */
+  private lastMagLockAt = Number.NEGATIVE_INFINITY;
+  /** Last flyby record (null before the first pass). */
+  private lastFlyby: MaglevFlybyRecord | null = null;
+
   private musicFilter: Filterish | null = null;
 
   /** Drive factors (0..1) written by `updateDrivingAudio` every frame. */
@@ -378,6 +442,10 @@ export class LunarAudioSystem {
     this.buildGraph(ctx);
     this.applyVolumes();
     this.applyModeTargets();
+    // Spec 26 §3.5.2: a klaxon armed before the graph existed opens now.
+    const klaxonArmed = this.klaxonActive;
+    this.klaxonActive = false;
+    this.setCitadelAlarmActive(klaxonArmed);
     this.attachAutoplayHandlers();
 
     // Generative music loop: self-rescheduling 12–20 s chain (unref'd so a
@@ -433,6 +501,15 @@ export class LunarAudioSystem {
     this.crunchFilter = null;
     this.crunchGain = null;
     this.miningGain = null;
+    this.maglevHumOsc = null;
+    this.maglevHumFilter = null;
+    this.maglevHumGain = null;
+    this.klaxonOsc = null;
+    this.klaxonGain = null;
+    this.maglevHumDrive = 0;
+    this.klaxonActive = false;
+    this.lastFlyby = null;
+    this.lastMagLockAt = Number.NEGATIVE_INFINITY;
     this.musicFilter = null;
     this.noiseBuffer = null;
   }
@@ -539,6 +616,92 @@ export class LunarAudioSystem {
       this.miningGain.gain.setTargetAtTime(Math.max(level, 0), t, 0.05);
     }
     void this.resumeIfSuspended();
+  }
+
+  // -- Spec 26 §3.5.2: maglev guideway hum & citadel intrusion klaxon -----------
+
+  /**
+   * Linear induction guideway hum: modulated carrier oscillator steered
+   * 120→280 Hz by the Apex Express speed fraction (0 = parked/line unbuilt,
+   * 1 = full cruise). Level rides the sfx fader through the world sub-bus,
+   * so the vacuum acoustic cut attenuates it like every other world loop.
+   * Safe before `init()` (the fraction is remembered and applied when the
+   * graph is built) and after `dispose()` (no-op).
+   */
+  setMaglevInductionHum(speedFraction: number): void {
+    if (this.disposed) return;
+    const f = clamp01(speedFraction);
+    this.maglevHumFraction = f;
+    // Parked consist is silent; rolling hum blooms in with the first motion.
+    this.maglevHumDrive = f <= 0.02 ? 0 : 0.3 + 0.7 * f;
+    if (!this.ready() || this.maglevHumOsc === null) return;
+    const t = this.ctx!.currentTime;
+    const freq = MAGLEV_HUM_FLOOR_HZ + f * (MAGLEV_HUM_CEILING_HZ - MAGLEV_HUM_FLOOR_HZ);
+    this.maglevHumOsc.frequency.setTargetAtTime(freq, t, 0.12);
+    this.maglevHumOsc.detune.setTargetAtTime(f * 12, t, 0.2);
+    this.applyDriveGains();
+    void this.resumeIfSuspended();
+  }
+
+  /** Current induction-hum carrier frequency (Hz) — harness readback. */
+  getMaglevHumFrequencyHz(): number {
+    if (this.maglevHumOsc !== null && !this.disposed) {
+      return this.maglevHumOsc.frequency.value;
+    }
+    return (
+      MAGLEV_HUM_FLOOR_HZ +
+      this.maglevHumFraction * (MAGLEV_HUM_CEILING_HZ - MAGLEV_HUM_FLOOR_HZ)
+    );
+  }
+
+  /** Hum drive envelope 0..1 (0 = parked) — harness readback. */
+  getMaglevHumLevel(): number {
+    return this.maglevHumDrive;
+  }
+
+  /**
+   * Citadel intrusion klaxon: two-tone 660 Hz ↔ 880 Hz emergency siren
+   * ringing through the helmet comms during the depot escape window.
+   * Idempotent per state; `false` (escape complete / heist reset / fail)
+   * retracts it immediately. Safe before `init()` — the armed state is
+   * remembered and the gain opens when the graph exists.
+   */
+  setCitadelAlarmActive(active: boolean): void {
+    if (this.disposed) return;
+    const on = active === true;
+    if (this.klaxonActive === on) return;
+    this.klaxonActive = on;
+    if (!this.ready() || this.klaxonGain === null) return;
+    const t = this.ctx!.currentTime;
+    this.klaxonGain.gain.cancelScheduledValues(t);
+    this.klaxonGain.gain.setTargetAtTime(
+      on ? KLAXON_BASE_LEVEL * this.volumes.sfx : 0,
+      t,
+      on ? 0.05 : 0.12,
+    );
+    if (on) void this.resumeIfSuspended();
+  }
+
+  /** True while the intrusion klaxon is armed (post-dispose: false). */
+  isCitadelAlarmActive(): boolean {
+    return this.klaxonActive && !this.disposed;
+  }
+
+  /** The siren's canonical tone pair + modulation law — harness readback. */
+  getCitadelAlarmTones(): {
+    lowHz: number;
+    highHz: number;
+    baseHz: number;
+    swingHz: number;
+    alternationHz: number;
+  } {
+    return {
+      lowHz: KLAXON_LOW_HZ,
+      highHz: KLAXON_HIGH_HZ,
+      baseHz: KLAXON_BASE_HZ,
+      swingHz: KLAXON_SWING_HZ,
+      alternationHz: KLAXON_ALTERNATION_HZ,
+    };
   }
 
   // -- one-shots ------------------------------------------------------------------
@@ -654,6 +817,134 @@ export class LunarAudioSystem {
       this.chirpTone(offset, dur, freqStart, freqEnd);
     }
     void this.resumeIfSuspended();
+  }
+
+  /**
+   * High-velocity Doppler flyby (Spec 26 §3.5.2): the Apex Express screaming
+   * past the rover at ~90 km/h. Two layers — a deep resonant noise whoosh
+   * through a Q≈14 band-pass and a pitch-shifted consist body — both swept
+   * high→low by the physical Doppler ratio β = v/343 (approach vs recede).
+   * Records the pass for harness readback via {@link getLastMaglevFlyby}.
+   */
+  playMaglevFlyby(speedMps: number = DEFAULT_FLYBY_SPEED_MPS): void {
+    if (!this.ready()) return;
+    const ctx = this.ctx!;
+    const t0 = ctx.currentTime + 0.01;
+    const speed = Math.abs(Number.isFinite(speedMps) ? speedMps : DEFAULT_FLYBY_SPEED_MPS);
+    const beta = Math.min(0.5, speed / SPEED_OF_SOUND_MPS);
+    const ratioHi = 1 + beta;
+    const ratioLo = Math.max(0.25, 1 - beta);
+    this.lastFlyby = {
+      atContextTimeS: t0,
+      speedMps: speed,
+      dopplerRatio: ratioHi / ratioLo,
+    };
+
+    // Resonant whoosh: band-passed noise centre sweeping across the pass.
+    const whoosh = this.createNoiseSource();
+    if (whoosh !== null) {
+      const band = ctx.createBiquadFilter();
+      band.type = 'bandpass';
+      band.frequency.setValueAtTime(MAGLEV_FLYBY_NOISE_HZ * ratioHi, t0);
+      band.frequency.exponentialRampToValueAtTime(
+        MAGLEV_FLYBY_NOISE_HZ * ratioLo,
+        t0 + MAGLEV_FLYBY_DURATION_S,
+      );
+      band.Q.value = MAGLEV_FLYBY_Q;
+      const whooshGain = ctx.createGain();
+      whooshGain.gain.setValueAtTime(0, t0);
+      whooshGain.gain.linearRampToValueAtTime(
+        BASE_LEVEL.oneShot * 0.5,
+        t0 + MAGLEV_FLYBY_DURATION_S * 0.45,
+      );
+      whooshGain.gain.exponentialRampToValueAtTime(SILENT, t0 + MAGLEV_FLYBY_DURATION_S);
+      whoosh.connect(band);
+      band.connect(whooshGain);
+      whooshGain.connect(this.worldMode!);
+      whoosh.start(t0);
+      whoosh.stop(t0 + MAGLEV_FLYBY_DURATION_S + 0.05);
+    }
+
+    // Pitch-shifted body: the consist itself, sawtooth through a low-pass,
+    // falling from the approach pitch to the recede pitch across 1.15 s.
+    const body = ctx.createOscillator();
+    body.type = 'sawtooth';
+    body.frequency.setValueAtTime(MAGLEV_FLYBY_BODY_HZ * ratioHi, t0);
+    body.frequency.exponentialRampToValueAtTime(
+      MAGLEV_FLYBY_BODY_HZ * ratioLo,
+      t0 + MAGLEV_FLYBY_DURATION_S,
+    );
+    const bodyMuffle = ctx.createBiquadFilter();
+    bodyMuffle.type = 'lowpass';
+    bodyMuffle.frequency.value = 1200;
+    const bodyGain = ctx.createGain();
+    bodyGain.gain.setValueAtTime(0, t0);
+    bodyGain.gain.linearRampToValueAtTime(BASE_LEVEL.oneShot * 0.35, t0 + 0.12);
+    bodyGain.gain.exponentialRampToValueAtTime(SILENT, t0 + MAGLEV_FLYBY_DURATION_S);
+    body.connect(bodyMuffle);
+    bodyMuffle.connect(bodyGain);
+    bodyGain.connect(this.worldMode!);
+    body.start(t0);
+    body.stop(t0 + MAGLEV_FLYBY_DURATION_S + 0.05);
+
+    void this.resumeIfSuspended();
+  }
+
+  /** Last Doppler flyby record (null before the first pass). */
+  getLastMaglevFlyby(): MaglevFlybyRecord | null {
+    return this.lastFlyby;
+  }
+
+  /**
+   * Mag-Lock mechanical disengage (Spec 26 §3.5.2): the vault clamshell
+   * popping open. A heavy sub-bass 40 Hz magnetic impulse (fast attack,
+   * rolling decay) followed 60 ms later by pneumatic venting hiss through a
+   * high-pass — the seal breaking. One-shot; both voices self-stop.
+   */
+  playMagLockDisengage(): void {
+    if (!this.ready()) return;
+    const ctx = this.ctx!;
+    const t0 = ctx.currentTime + 0.005;
+    this.lastMagLockAt = t0;
+
+    // Sub-bass magnetic thud: enters above pitch and slams down onto 40 Hz.
+    const thud = ctx.createOscillator();
+    thud.type = 'sine';
+    thud.frequency.setValueAtTime(MAGLOCK_THUD_HZ * 1.6, t0);
+    thud.frequency.exponentialRampToValueAtTime(MAGLOCK_THUD_HZ, t0 + 0.08);
+    const thudGain = ctx.createGain();
+    thudGain.gain.setValueAtTime(0, t0);
+    thudGain.gain.linearRampToValueAtTime(BASE_LEVEL.oneShot, t0 + 0.006);
+    thudGain.gain.exponentialRampToValueAtTime(SILENT, t0 + 0.35);
+    thud.connect(thudGain);
+    thudGain.connect(this.sfxBus!);
+    thud.start(t0);
+    thud.stop(t0 + 0.4);
+
+    // Pneumatic vent: high-passed noise burst once the seal breaks.
+    const hiss = this.createNoiseSource();
+    if (hiss !== null) {
+      const vent = ctx.createBiquadFilter();
+      vent.type = 'highpass';
+      vent.frequency.value = 1800;
+      const hissGain = ctx.createGain();
+      const tHiss = t0 + MAGLOCK_HISS_DELAY_S;
+      hissGain.gain.setValueAtTime(0, tHiss);
+      hissGain.gain.linearRampToValueAtTime(BASE_LEVEL.oneShot * 0.25, tHiss + 0.04);
+      hissGain.gain.exponentialRampToValueAtTime(SILENT, tHiss + MAGLOCK_HISS_S);
+      hiss.connect(vent);
+      vent.connect(hissGain);
+      hissGain.connect(this.sfxBus!);
+      hiss.start(tHiss);
+      hiss.stop(tHiss + MAGLOCK_HISS_S + 0.05);
+    }
+
+    void this.resumeIfSuspended();
+  }
+
+  /** Context time of the last mag-lock disengage impulse (−∞ before first). */
+  getLastMagLockDisengageAt(): number {
+    return this.lastMagLockAt;
   }
 
   // -- internals ---------------------------------------------------------------------
@@ -775,6 +1066,57 @@ export class LunarAudioSystem {
     this.ownedVoices.push(this.crunchSource);
     this.crunchSource.start();
 
+    // -- maglev: linear induction guideway hum (Spec 26 §3.5.2) -----------------
+    // Sawtooth carrier (rich induction harmonic stack) steered 120→280 Hz by
+    // train speed through a resonant low-pass, with a 9 Hz stator-slot
+    // amplitude wobble riding the shared hum gain. Gain-gated: silent while
+    // the Apex Express is parked or the line is unbuilt.
+    this.maglevHumOsc = ctx.createOscillator();
+    this.maglevHumOsc.type = 'sawtooth';
+    this.maglevHumOsc.frequency.value =
+      MAGLEV_HUM_FLOOR_HZ + this.maglevHumFraction * (MAGLEV_HUM_CEILING_HZ - MAGLEV_HUM_FLOOR_HZ);
+    this.maglevHumFilter = ctx.createBiquadFilter();
+    this.maglevHumFilter.type = 'lowpass';
+    this.maglevHumFilter.frequency.value = 900;
+    this.maglevHumFilter.Q.value = 1.8;
+    this.maglevHumGain = ctx.createGain();
+    this.maglevHumGain.gain.value = 0;
+    this.maglevHumOsc.connect(this.maglevHumFilter);
+    this.maglevHumFilter.connect(this.maglevHumGain);
+    this.maglevHumGain.connect(this.worldMode);
+    const humLfo = ctx.createOscillator();
+    humLfo.type = 'sine';
+    humLfo.frequency.value = MAGLEV_HUM_LFO_HZ;
+    const humLfoDepth = ctx.createGain();
+    humLfoDepth.gain.value = 0.25;
+    humLfo.connect(humLfoDepth);
+    humLfoDepth.connect(this.maglevHumGain.gain);
+    this.ownedVoices.push(this.maglevHumOsc, humLfo);
+    this.maglevHumOsc.start();
+    humLfo.start();
+
+    // -- citadel: intrusion klaxon (Spec 26 §3.5.2) ------------------------------
+    // 770 Hz saw carrier swung ±110 Hz by a 1.1 Hz square LFO — the physical
+    // 660 ↔ 880 two-tone alternation without any wall-clock timer. Gain 0
+    // until `setCitadelAlarmActive(true)`; rides the sfx bus (helmet comms).
+    this.klaxonOsc = ctx.createOscillator();
+    this.klaxonOsc.type = 'sawtooth';
+    this.klaxonOsc.frequency.value = KLAXON_BASE_HZ;
+    const klaxonMod = ctx.createOscillator();
+    klaxonMod.type = 'square';
+    klaxonMod.frequency.value = KLAXON_ALTERNATION_HZ;
+    const klaxonModDepth = ctx.createGain();
+    klaxonModDepth.gain.value = KLAXON_SWING_HZ;
+    klaxonMod.connect(klaxonModDepth);
+    klaxonModDepth.connect(this.klaxonOsc.frequency);
+    this.klaxonGain = ctx.createGain();
+    this.klaxonGain.gain.value = 0;
+    this.klaxonOsc.connect(this.klaxonGain);
+    this.klaxonGain.connect(this.sfxBus);
+    this.ownedVoices.push(this.klaxonOsc, klaxonMod);
+    this.klaxonOsc.start();
+    klaxonMod.start();
+
     // -- mining loop: 440 Hz square, 30 Hz tremolo, noise crackle ---------------
     const miningOsc = ctx.createOscillator();
     miningOsc.type = 'square';
@@ -889,6 +1231,14 @@ export class LunarAudioSystem {
         BASE_LEVEL.crunch * this.volumes.sfx * this.crunchDrive,
         t,
         0.12,
+      );
+    }
+    // Maglev induction hum follows the same sfx-fader law (Spec 26 §3.5.2).
+    if (this.maglevHumGain !== null) {
+      this.maglevHumGain.gain.setTargetAtTime(
+        MAGLEV_HUM_BASE_LEVEL * this.volumes.sfx * this.maglevHumDrive,
+        t,
+        0.15,
       );
     }
   }

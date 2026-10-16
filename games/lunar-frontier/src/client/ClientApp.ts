@@ -76,6 +76,8 @@ import type { OreCartEntity } from '../infrastructure/RailSystem.ts';
 // Spec 26 §3.3 Phase 3: Train Heist Director — velocity-matching envelope,
 // relative platform kinematics, vault crack, depot countdown, bailout.
 import { TrainHeistDirector, heistLootCargoKg, type HeistTelemetry } from '../quests/TrainHeistDirector.ts';
+// Spec 26 §3.5 Phase 5: maglev induction hum speed reference (25 m/s cruise).
+import { DEFAULT_CRUISE_SPEED_MPS } from '../infrastructure/HighSpeedMaglev.ts';
 import {
   BUGGY_MAX_CARGO,
   BUGGY_SPEED_LIMIT,
@@ -3011,6 +3013,15 @@ export class ClientApp {
       audio.updateDrivingAudio(0, 0, false);
     }
 
+    // Spec 26 §3.5.2: linear induction guideway hum — carrier tracks the
+    // Apex Express speed fraction (0 while the line is unbuilt or parked).
+    const maglev = this.world.getHighSpeedMaglev();
+    audio.setMaglevInductionHum(
+      maglev === null
+        ? 0
+        : Math.min(1, Math.abs(maglev.getTrainState().speedMps) / DEFAULT_CRUISE_SPEED_MPS),
+    );
+
     // Mining-laser tail: silence the loop once the burst window closes.
     if (
       this.miningAudioUntilMs !== Number.NEGATIVE_INFINITY &&
@@ -3501,6 +3512,12 @@ export class ClientApp {
       roverVel = director.getBailoutExitVelocity();
     }
     const telemetry = director.update(dt, roverPos, roverVel);
+    // Spec 26 §3.5 Phase 5: paint the heist HUD overlay and keep the
+    // intrusion klaxon in lockstep with the depot clock. STATE-driven and
+    // idempotent per frame (the alarm setter de-dupes), so the LOOT_SECURED
+    // → DEPOT_COUNTDOWN handoff collapsing inside one tick can never miss.
+    this.hud?.updateHeistTelemetry(telemetry);
+    this.audio?.setCitadelAlarmActive(telemetry.phase === 'DEPOT_COUNTDOWN');
     this.syncHeistWithQuest(director, telemetry);
   }
 
@@ -3522,6 +3539,8 @@ export class ClientApp {
     if (!this.heistLootHandedOff && stolen > 0) {
       this.heistLootHandedOff = true;
       this.heistContrabandSecured = true;
+      // Spec 26 §3.5.2: the clamshell pop earns its sub-bass thud + hiss.
+      this.audio?.playMagLockDisengage();
       this.stowHeistLoot(director);
     }
     if (telemetry.phase === 'FAILED' && this.heistContrabandSecured) {
