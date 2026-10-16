@@ -26,6 +26,7 @@
     "src/infrastructure/RivalBases.ts",
     "src/infrastructure/XCorpCitadel.ts",
     "src/infrastructure/HighSpeedMaglev.ts",
+    "src/quests/TrainHeistDirector.ts",
     "src/physics/TraversalPhysics.ts",
     "src/network/NetworkClient.ts",
     "src/world/LunarWorldGenerator.ts"

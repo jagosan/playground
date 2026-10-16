@@ -70,6 +70,9 @@ import {
 } from '../infrastructure/TunnelNetwork.ts';
 import { RailSystem } from '../infrastructure/RailSystem.ts';
 import type { OreCartEntity } from '../infrastructure/RailSystem.ts';
+// Spec 26 §3.3 Phase 3: Train Heist Director — velocity-matching envelope,
+// relative platform kinematics, vault crack, depot countdown, bailout.
+import { TrainHeistDirector } from '../quests/TrainHeistDirector.ts';
 import {
   BUGGY_MAX_CARGO,
   BUGGY_SPEED_LIMIT,
@@ -760,6 +763,14 @@ export class ClientApp {
   private hintArrowSystem: HintArrowSystem | null = null;
   private lastComms: CommsDialogue | null = null;
   /**
+   * Spec 26 §3.3 Phase 3: "Operation Gilded Serpent" heist director. Built
+   * on demand by {@link enableTrainHeistDirector} (which stands up the
+   * Phase 1 Citadel + Phase 2 Apex Express through WorldScene first); ticked
+   * every frame by {@link stepTrainHeistDirector} with the rover's live
+   * pose/velocity. Null until enabled and after `dispose()`.
+   */
+  private trainHeistDirector: TrainHeistDirector | null = null;
+  /**
    * Spec 24 §4.2: first-time arrival cinematic director. Owned by the caller
    * (ClientApp doesn't build a `TransportLander` itself) and attached via
    * {@link setIntroDirector}; ticked every frame in `update()`.
@@ -1233,6 +1244,10 @@ export class ClientApp {
     // frame's active player coordinates + mining state, then consume any
     // chassis-bump impulses the bots accrued against the player.
     this.stepNPCBots(dt);
+    // Spec 26 §3.3 Phase 3: tick the heist director with this frame's rover
+    // state (velocity-match envelope, vault timer, depot countdown). No-op
+    // until enableTrainHeistDirector() has been called.
+    this.stepTrainHeistDirector(dt);
     // Spec 24 Phase 2: tick the arrival director with the frame dt so phase
     // transitions, lander effects and intro camera tracks advance in lockstep.
     this.introDirector?.update(dt);
@@ -1537,6 +1552,10 @@ export class ClientApp {
     this.hintArrowSystem = null;
     this.questEngine = null;
     this.lastComms = null;
+    // Spec 26 §3.3: heist director teardown (state-only; the Citadel and
+    // the Apex Express meshes go with their own systems / the world below).
+    this.trainHeistDirector?.dispose();
+    this.trainHeistDirector = null;
     // Infrastructure teardown before the world itself goes away (their meshes
     // live in the world scene; dispose() unparents and releases materials).
     this.factionBases?.dispose();
@@ -3413,6 +3432,60 @@ export class ClientApp {
         }
       }
     }
+  }
+
+  /**
+   * Spec 26 §3.3 Phase 3: stand up "Operation Gilded Serpent". Idempotent:
+   * ensures the Phase 1 Citadel and the Phase 2 Apex Express exist in the
+   * world (built through `WorldScene` so meshes, shadow casters and the
+   * render-loop kinematics all engage), then constructs the
+   * {@link TrainHeistDirector} against them. The director starts INACTIVE —
+   * call `startHeist()` (Phase 4's QuestEngine will) to open the hunt.
+   */
+  enableTrainHeistDirector(): TrainHeistDirector {
+    if (this.trainHeistDirector !== null && !this.trainHeistDirector.isDisposed()) {
+      return this.trainHeistDirector;
+    }
+    const citadel = this.world.buildXCorpCitadel();
+    const maglev = this.world.buildHighSpeedMaglev();
+    this.trainHeistDirector = new TrainHeistDirector(maglev, citadel);
+    return this.trainHeistDirector;
+  }
+
+  /** The heist director, or null before {@link enableTrainHeistDirector} / after dispose. */
+  getTrainHeistDirector(): TrainHeistDirector | null {
+    return this.disposed ? null : this.trainHeistDirector;
+  }
+
+  /**
+   * Per-frame heist pump: feed the director this frame's rover pose and
+   * world-frame velocity (body-frame vLong/vLat rotated by heading, the same
+   * law the bot-bump solver uses). While the avatar is riding the deck the
+   * suit becomes the rover proxy so telemetry keeps tracking the train.
+   * No-op before {@link enableTrainHeistDirector} and after `dispose()`.
+   */
+  private stepTrainHeistDirector(dt: number): void {
+    const director = this.trainHeistDirector;
+    if (this.disposed || director === null) return;
+    const buggy = this.buggy;
+    if (buggy === null) return;
+    let roverPos = buggy.getPosition();
+    let roverVel: { x: number; y: number; z: number };
+    if (this.mode === 'buggy') {
+      const v = buggy.getVelocity();
+      const ch = Math.cos(buggy.getHeading());
+      const sh = Math.sin(buggy.getHeading());
+      // Body (long, lat) → world (x, y): the applyBotBump law, forward-mapped.
+      roverVel = { x: v.vLong * ch - v.vLat * sh, y: v.vLong * sh + v.vLat * ch, z: 0 };
+    } else {
+      roverVel = { x: 0, y: 0, z: 0 };
+    }
+    if (director.isPlayerOnBoard()) {
+      // Deck-riding: the suit anchors to the car frame; keep telemetry live.
+      roverPos = director.getPlayerWorldPos();
+      roverVel = director.getBailoutExitVelocity();
+    }
+    director.update(dt, roverPos, roverVel);
   }
 
   /** Convert one pending bot bump impulse into a rider velocity change. */
