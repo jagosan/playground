@@ -22,6 +22,7 @@
 - `docs/architecture/23-lunar-frontier-surface-rendering-and-lighting.md`: Surface rendering overhaul, multi-scale regolith detail, stadium headlights, volumetric beam cones & visor exposure compensation.
 - `docs/architecture/24-lunar-frontier-transport-flight-and-landing-experience.md`: Transport flight, orbital descent, retro touchdown, cabin depressurization, ramp walkout & intro test/replay suite.
 - `docs/architecture/25-lunar-frontier-misc-general-cleanup.md`: Extended horizon terrain skirt, rail ballast grounding, powertrain hill-hold & zero drift, autonomous NPC prospector bots with flags, derelict rival bases, and procedural Web Audio engine.
+- `docs/architecture/26-x-corp-citadel-and-rail-heist.md`: X-Corp Citadel monolith, impenetrable kinetic shield defense grid, 3.5km elevated high-speed maglev guideway, Apex Express train consist, and high-speed train heist director.
 - `docs/architecture/15-subagent-context-pruning-and-turn-budgeting.md`: Subagent context pruning, N-3 turn-budget circuit breaker, AST extraction, and Beehive Neo4j symbol discovery.
 - `specs/`:
   - `specs/00-system-overview.md`: Project vision, minigame architecture, rendering stack.
@@ -45,6 +46,7 @@
   - `specs/23-lunar-frontier-surface-rendering-and-lighting.md`: Surface rendering overhaul, multi-scale regolith detail, stadium headlights, volumetric beam cones & visor exposure compensation.
   - `specs/24-lunar-frontier-transport-flight-and-landing-experience.md`: Transport flight, orbital descent, retro touchdown, cabin depressurization, ramp walkout & intro test/replay suite.
   - `specs/25-lunar-frontier-misc-general-cleanup.md`: Extended horizon terrain skirt, rail ballast grounding, powertrain hill-hold & zero drift, autonomous NPC prospector bots with flags, derelict rival bases, and procedural Web Audio engine.
+  - `specs/26-x-corp-citadel-and-rail-heist.md`: X-Corp Citadel monolith, impenetrable kinetic shield defense grid, 3.5km elevated high-speed maglev guideway, Apex Express train consist, and high-speed train heist director.
 
 ## Lunar Frontier Multiplayer & Economy Subsystem (Spec 12)
 - `games/lunar-frontier/server/`: Fastify + `ws` server, SQLite schema, market pricing, 20Hz tick (`LunarServer.ts`, `Database.ts`).
