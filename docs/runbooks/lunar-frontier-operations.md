@@ -103,6 +103,9 @@ npx tsx scripts/smoke-rival-bases.ts
 # 8. Typecheck and production bundle build:
 npm run typecheck:server
 npm run build
+
+# 9. Spec 26 X-Corp Citadel & Rail Heist master acceptance suite (161 assertions):
+npm run smoke:xcorp-heist
 ```
 
 ## 5. Frontier Systems & Operational Notes (Spec 25)
@@ -112,7 +115,26 @@ npm run build
 - **Derelict Rival Bases:** 3 distinct decayed archetypes (The Scrapper Syndicate Fortress, The Derelict Corporate Enclave, The Nomad Drilling Rig) with territory boundaries ($60\text{--}90\,\text{m}$), damaged defense turret sockets, and surveyable depots.
 - **Procedural Web Audio Engine:** $100\%$ zero-asset Web Audio API synthesis engine (sub-bass life-support drone, generative pentatonic synth pads, speed-modulated motor whine, regolith tyre crunch, mining laser hum, crystalline ore chimes, comms chirps) with dedicated HUD audio mixer panel.
 
-## 6. Production Build & Deployment
+## 6. X-Corp Citadel & Great Train Heist Operations (Spec 26)
+- **The Obsidian Apex Monolith (`XCorpCitadel.ts`):** 85m tall hexagonal skyscraper positioned at $(X = -1,850\,\text{m}, Y = 2,400\,\text{m})$, flanked by cantilevered executive penthouse pods, grand rail terminal viaduct, dual illuminated VIP landing pads, and a multi-tier perimeter defense system.
+  - *Warning Zone ($R \le 260\,\text{m}$):* Comms alert warning intrusion and tracking beacon spotlights.
+  - *Kinetic Shield Barrier ($R \le 220\,\text{m}$):* Shimmering geodesic cyan energy curtain enforcing outward repulsion force ($F = 18,000\,\text{N}$ at $r = 200\,\text{m}$).
+  - *Lethal CIWS Sentry Zone ($R \le 180\,\text{m}$):* Triple 35m perimeter spires firing continuous laser beams delivering fatal damage ($150\,\text{HP/s}$ / `Infinity` strike).
+- **High-Speed Maglev Rail Line (`HighSpeedMaglev.ts`):** $3,500\,\text{m}$ elevated linear induction guideway connecting Canyon Extraction Outpost $(X = 1,200\,\text{m}, Y = 800\,\text{m})$ to Citadel Grand Terminal, supported by concrete pylons every $24\,\text{m}$, pulsing forward blue stator coils, and a parallel $4.0\,\text{m}$ starboard service road.
+- **The "Apex Express" Consist:** 4 articulated low-drag cars cruising at $25.0\,\text{m/s}$ ($90\,\text{km/h}$):
+  1. *Locomotive (`apex-loco`):* Streamlined wedge prow with twin searchlights and maglev skirts.
+  2. *Armored Vault Car (`apex-vault`):* Heavy titanium armor with hazard trim, external catwalk with safety grab rails, and roof Cyber-Lock container.
+  3. *Executive Courier (`apex-luxe`):* Luxury passenger cabin with translucent carbon-glass roof.
+  4. *Escort Flatbed (`apex-escort`):* Carrying defense drone and comms uplink dish.
+- **Train Heist Mechanics (`TrainHeistDirector.ts`):**
+  - *Velocity Matching Pocket:* Boarding window triggers when $\Delta v \le 3.5\,\text{m/s}$, lateral offset $d_\text{lat} \in [2.5, 5.5]\,\text{m}$, longitudinal offset $|d_\text{long}| \le 3.0\,\text{m}$.
+  - *Catwalk Deck Traversal:* Relative transform anchoring ($P_\text{world} = M_\text{vault} \cdot P_\text{local}$) with zero relative slip while the rover locks into automated parallel tether tracking on the service road.
+  - *Vault Cracking & Loot:* 6.0s mag-lock bypass yields 3 Enriched He-3 Flasks, 1 Quantum Cipher Slate, and 2 Superconducting Coils (total 24 kg cargo).
+  - *Depot Countdown & Bailout:* Clamshell opening arms a 44.0s countdown as the train speeds toward the Citadel shield barrier. Leaping off deck before the lethal threshold delivers the player safely into the badlands to fence the haul at RustBelt Dockworks.
+- **Narrative Quest ("Operation Gilded Serpent"):** 6-stage quest chain (`MEET_FIXER`, `INTERCEPT_CONVOY`, `BOARD_TRANSPORT`, `CRACK_VAULT`, `LEAP_TO_SAFETY`, `DELIVER_CONTRABAND`).
+- **Heist HUD & Procedural Audio:** Intercept radar with target reticle, segmented depot countdown bar, 3-ring alignment dial, gold contraband pill, 120–280 Hz guideway hum, Doppler flyby whoosh, 40 Hz magnetic disengage thud, and 660/880 Hz alternating klaxon alarm.
+
+## 7. Production Build & Deployment
 ```bash
 cd games/lunar-frontier
 npm run build
