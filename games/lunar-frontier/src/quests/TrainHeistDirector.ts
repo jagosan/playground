@@ -76,6 +76,29 @@ export const LOOT_QUANTUM_CIPHER_SLATES = 1;
 /** Spec 26 §3.3.3 loot table: 2× Military-Grade Superconducting Coils. */
 export const LOOT_SUPERCONDUCTING_COILS = 2;
 
+/**
+ * Spec 26 Phase 4: per-item cargo mass of the vault loot (kg). The siphon
+ * hands the secured payload to the player's carrier (suit backpack, then
+ * buggy flatbed) at the clamshell pop — the full canonical 3/1/2 table
+ * weighs 3×4.0 + 1×1.0 + 2×5.5 = 24 kg.
+ */
+export const HEIST_LOOT_UNIT_MASS_KG = {
+  he3CryoFlask: 4.0,
+  quantumCipherSlate: 1.0,
+  superconductingCoil: 5.5,
+} as const;
+
+/** Total cargo mass (kg) of a loot payload; NaN/negative counts read 0. */
+export function heistLootCargoKg(payload: Partial<HeistLootPayload> | null | undefined): number {
+  if (payload === null || payload === undefined) return 0;
+  const k = (v: number | undefined): number => (Number.isFinite(v) && (v as number) > 0 ? (v as number) : 0);
+  return (
+    k(payload.he3CryoFlasks) * HEIST_LOOT_UNIT_MASS_KG.he3CryoFlask +
+    k(payload.quantumCipherSlates) * HEIST_LOOT_UNIT_MASS_KG.quantumCipherSlate +
+    k(payload.superconductingCoils) * HEIST_LOOT_UNIT_MASS_KG.superconductingCoil
+  );
+}
+
 /** Spec 26 §3.3.4: exactly 44.0 s from the intrusion alarm to depot entry. */
 export const DEPOT_COUNTDOWN_S = 44.0;
 /** Spec 26 §3.3.4: HUD red-banner banner threshold ("BAIL OUT NOW"). */

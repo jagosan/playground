@@ -46,7 +46,13 @@ export type ObjectiveType =
   | 'board_buggy'
   | 'drive_distance'
   | 'trade_commodity'
-  | 'build_structure';
+  | 'build_structure'
+  // Spec 26 §3.4 — "Operation Gilded Serpent" heist objective family.
+  | 'heist_intercept'
+  | 'heist_board'
+  | 'heist_crack_vault'
+  | 'heist_bailout'
+  | 'heist_deliver';
 
 /** Minimal structural world position (physics metres, z up). */
 export interface WorldPosition {
@@ -108,6 +114,42 @@ export interface Quest {
   rewardCredits: number;
   rewardXp: number;
 }
+
+/**
+ * Structural mirror of `TrainHeistDirector`'s `HeistTelemetry` (Spec 26 §4
+ * contract). QuestEngine keeps zero runtime imports, so the telemetry feed
+ * is duck-typed here; the director's own interface satisfies this shape
+ * structurally (`import type { HeistTelemetry } from
+ * '../quests/TrainHeistDirector.ts'` is assignable without an import cycle).
+ * `phase` widens to `string` so the engine never hard-depends on the
+ * `HeistPhase` union.
+ */
+export interface HeistTelemetryLike {
+  phase: string;
+  relativeSpeedMps: number;
+  lateralDistanceM: number;
+  longitudinalOffsetM: number;
+  canBoard: boolean;
+  hackProgressFraction: number;
+  countdownRemainingS: number;
+  stolenCargoCount: number;
+}
+
+/**
+ * Director phases that can only have been reached *through* the intercept
+ * envelope (blueprint §2.1): seeing one proves stage-2's success even when
+ * the sampled `canBoard` frame already fell out of the pocket. `FAILED` is
+ * deliberately absent — "train reaches depot before intercept" is the
+ * Spec 26 stage-2 failure condition, never a completion.
+ */
+export const HEIST_INTERCEPT_PROVEN_PHASES: ReadonlySet<string> = new Set([
+  'BOARDING_WINDOW',
+  'ON_BOARD_CRACKING',
+  'LOOT_SECURED',
+  'DEPOT_COUNTDOWN',
+  'BAILOUT_SUCCESS',
+  'ESCAPE_COMPLETE',
+]);
 
 // ---------------------------------------------------------------------------
 // Event vocabulary & payloads
@@ -251,6 +293,13 @@ const OBJECTIVE_TYPES: readonly string[] = [
   'drive_distance',
   'trade_commodity',
   'build_structure',
+  // Spec 26 §3.4 heist family — REQUIRED here or mid-heist saves fail the
+  // shape validator and `restoreProgress()` wrongly rejects them.
+  'heist_intercept',
+  'heist_board',
+  'heist_crack_vault',
+  'heist_bailout',
+  'heist_deliver',
 ];
 
 function isObjectiveType(value: unknown): value is ObjectiveType {
@@ -455,6 +504,55 @@ export class QuestEngine {
         objective.structureKind === undefined || objective.structureKind === structureKind,
       amount,
     );
+  }
+
+  // -- Spec 26 §3.4 heist hooks (pushed by ClientApp from TrainHeistDirector) --
+
+  /**
+   * Feed one {@link TrainHeistDirector}-style telemetry frame. Completes the
+   * active stage's `heist_intercept` objective when the boarding envelope
+   * holds (`canBoard === true`) or when the director's phase already proves
+   * the intercept happened — every phase from `BOARDING_WINDOW` onward is
+   * only reachable through the envelope (blueprint §2.1). A `FAILED` phase
+   * never counts: the stage-2 failure is "train reaches depot before
+   * intercept". Garbage frames (null payload, non-boolean canBoard, phase
+   * not in the proven set) answer false without touching state.
+   */
+  recordHeistTelemetry(telemetry: HeistTelemetryLike | null | undefined): boolean {
+    if (this.quest === null || telemetry === null || telemetry === undefined) return false;
+    const phase = typeof telemetry.phase === 'string' ? telemetry.phase : '';
+    const matched = telemetry.canBoard === true || HEIST_INTERCEPT_PROVEN_PHASES.has(phase);
+    if (!matched) return false;
+    return this.accumulate('heist_intercept', () => true, 1);
+  }
+
+  /** One High-Speed Jump landed on the vault car catwalk (Spec 26 §3.3.1). */
+  recordHeistBoarded(): boolean {
+    return this.accumulate('heist_board', () => true, 1);
+  }
+
+  /**
+   * One completed Mag-Lock bypass + loot siphon (Spec 26 §3.3.3).
+   * `stolenCount` — the director's `getStolenCargoCount()` at the pop — is
+   * validated but advisory: the objective keys on the crack event, matching
+   * the stage table's "complete hack and siphon loot" criterion. A present
+   * but non-finite / negative count is rejected (false, no mutation).
+   */
+  recordHeistVaultCracked(stolenCount?: number): boolean {
+    if (stolenCount !== undefined && (!Number.isFinite(stolenCount) || stolenCount < 0)) {
+      return false;
+    }
+    return this.accumulate('heist_crack_vault', () => true, 1);
+  }
+
+  /** One successful Leap of Faith off the train before the depot shield. */
+  recordHeistBailout(): boolean {
+    return this.accumulate('heist_bailout', () => true, 1);
+  }
+
+  /** The haul changed hands at the RustBelt fence (contraband delivered). */
+  recordHeistContrabandDelivered(): boolean {
+    return this.accumulate('heist_deliver', () => true, 1);
   }
 
   // -- hint arrow / dashboard support (Spec 18 §6.1 / §6.3) --------------------
@@ -903,6 +1001,207 @@ export function createTutorialQuest(options: TutorialQuestOptions = {}): Quest {
 
 /** Approach radius for the stage-4 LRV (board event itself is triggered by ClientApp). */
 export const MOUNT_APPROACH_RADIUS_M = 4;
+
+// ---------------------------------------------------------------------------
+// Spec 26 §3.4 — "Operation Gilded Serpent" (the Great Lunar Train Heist)
+// ---------------------------------------------------------------------------
+
+/** Canonical quest id for the Spec 26 heist narrative. */
+export const GILDED_SERPENT_QUEST_ID = 'operation-gilded-serpent';
+
+/** Stage 1 marker: the canyon ridge overlook above the service corridor. */
+export const CANYON_OVERLOOK_POSITION: WorldPosition = { x: 850, y: 620, z: 0 };
+/** Stage 1 arrival radius (Spec 26 §3.4: proximity 25 m). */
+export const CANYON_OVERLOOK_PROXIMITY_M = 25;
+
+/**
+ * Fallback stage-6 fence seat (RustBelt Dockworks). `ClientApp` overrides
+ * this with the live `FactionBases` RUSTBELT claim when one exists — the
+ * base anchors are world-gen relative — so the constant only ever seats
+ * stand-alone harnesses and callers without a faction roster.
+ */
+export const RUSTBELT_DOCKWORKS_ANCHOR: WorldPosition = { x: -1240, y: -880, z: 0 };
+/** Stage 6 fence reach (matches the RUSTBELT base perimeter perimeterM). */
+export const RUSTBELT_DOCKWORKS_PROXIMITY_M = 30;
+
+/**
+ * Quest reward (Spec 26 §3.3.3 fence economics): 3× Enriched He-3
+ * Cryo-Flasks @ 15,000 cr + 1× Quantum Cipher Slate @ 25,000 cr bounty.
+ */
+export const GILDED_SERPENT_REWARD_CREDITS = 70_000;
+export const GILDED_SERPENT_REWARD_XP = 2_500;
+
+const FIXER_SENDER = 'Zero-Six';
+const FIXER_CALLSIGN = 'RustBelt Fixer';
+
+export interface GildedSerpentQuestOptions {
+  /** Sponsoring faction (default 'RUSTBELT'). */
+  faction?: string;
+  /** Stage-1 canyon overlook marker (default {@link CANYON_OVERLOOK_POSITION}). */
+  overlookPosition?: WorldPosition;
+  /** Stage-1 arrival radius (default {@link CANYON_OVERLOOK_PROXIMITY_M}). */
+  overlookProximityM?: number;
+  /** Stage-6 RustBelt Dockworks fence seat (default anchor constant). */
+  dockworksPosition?: WorldPosition;
+}
+
+/** Zero-Six comms literal — the fixer owns every stage of the operation. */
+function fixerComms(
+  transmission: string,
+  audioTone: CommsDialogue['audioTone'],
+): CommsDialogue {
+  return {
+    sender: FIXER_SENDER,
+    callsign: FIXER_CALLSIGN,
+    transmission,
+    audioTone,
+    autoDismissMs: 14_000,
+  };
+}
+
+/**
+ * Factory for the Spec 26 §3.4 six-stage heist quest "Operation Gilded
+ * Serpent". Stage objective ids are the spec's Objective Keys verbatim
+ * (MEET_FIXER … DELIVER_CONTRABAND); narrations are the spec briefings
+ * verbatim; objectives 2–5 are driven by the heist hooks
+ * (`recordHeistTelemetry`, `recordHeistBoarded`, `recordHeistVaultCracked`,
+ * `recordHeistBailout`) as `ClientApp` pumps the `TrainHeistDirector`, and
+ * stage 6 combines a `reach_target` at RustBelt Dockworks (fed by the
+ * per-frame `recordPosition`) with the `heist_deliver` fence event
+ * (`recordHeistContrabandDelivered`).
+ */
+export function createOperationGildedSerpentQuest(
+  options: GildedSerpentQuestOptions = {},
+): Quest {
+  const faction = options.faction ?? 'RUSTBELT';
+  const overlook = options.overlookPosition ?? { ...CANYON_OVERLOOK_POSITION };
+  const overlookR =
+    Number.isFinite(options.overlookProximityM) && (options.overlookProximityM ?? 0) > 0
+      ? (options.overlookProximityM as number)
+      : CANYON_OVERLOOK_PROXIMITY_M;
+  const dock = options.dockworksPosition ?? { ...RUSTBELT_DOCKWORKS_ANCHOR };
+
+  return {
+    id: GILDED_SERPENT_QUEST_ID,
+    title: 'Operation Gilded Serpent',
+    faction,
+    category: 'export',
+    currentStageIndex: 0,
+    isCompleted: false,
+    rewardCredits: GILDED_SERPENT_REWARD_CREDITS,
+    rewardXp: GILDED_SERPENT_REWARD_XP,
+    stages: [
+      {
+        stageNumber: 1,
+        stageTitle: 'Meet the Fixer',
+        storyNarration: fixerComms(
+          'The Apex Express runs loaded tonight. Meet me at the canyon overlook.',
+          'burst',
+        ),
+        objectives: [
+          objective(
+            'MEET_FIXER',
+            'Reach the canyon overlook marker (850, 620) and listen for the fixer.',
+            'reach_target',
+            1,
+            { targetPosition: overlook, proximityM: overlookR },
+          ),
+        ],
+        hintArrowTarget: {
+          x: overlook.x,
+          y: overlook.y,
+          z: overlook.z + 1.5,
+          label: 'Canyon overlook',
+        },
+      },
+      {
+        stageNumber: 2,
+        stageTitle: 'The High-Speed Intercept',
+        storyNarration: fixerComms(
+          'Train is inbound on Guideway 1. Match its speed on the service road!',
+          'alert',
+        ),
+        objectives: [
+          objective(
+            'INTERCEPT_CONVOY',
+            'Match the Apex Express on the service road: Δv ≤ 3.5 m/s inside the lateral boarding envelope.',
+            'heist_intercept',
+            1,
+          ),
+        ],
+      },
+      {
+        stageNumber: 3,
+        stageTitle: 'The Speed Leap',
+        storyNarration: fixerComms("Now! Jump while you're in the pocket!", 'alert'),
+        objectives: [
+          objective(
+            'BOARD_TRANSPORT',
+            'Leap [E / Gamepad X] from the cockpit onto the vault car catwalk.',
+            'heist_board',
+            1,
+          ),
+        ],
+      },
+      {
+        stageNumber: 4,
+        stageTitle: 'Crack the Vault',
+        storyNarration: fixerComms(
+          'Bypass the mag-locks and get the He-3 before they hit the terminal gate!',
+          'alert',
+        ),
+        objectives: [
+          objective(
+            'CRACK_VAULT',
+            'Hold the Cyber-Lock terminal to bypass the mag-locks and siphon the He-3 loot.',
+            'heist_crack_vault',
+            1,
+          ),
+        ],
+      },
+      {
+        stageNumber: 5,
+        stageTitle: 'The Leap of Faith',
+        storyNarration: fixerComms(
+          "Jump off! The Citadel's defense shield will vaporize you!",
+          'alert',
+        ),
+        objectives: [
+          objective(
+            'LEAP_TO_SAFETY',
+            'Bail out [SPACE / Gamepad A] onto the regolith before the depot shield claims the train.',
+            'heist_bailout',
+            1,
+          ),
+        ],
+      },
+      {
+        stageNumber: 6,
+        stageTitle: 'Fence the Haul',
+        storyNarration: fixerComms(
+          'You pulled it off! Bring the haul to RustBelt Dockworks before X-Corp locks down the sector.',
+          'success',
+        ),
+        objectives: [
+          objective(
+            'REACH_DOCKWORKS',
+            'Drive the haul to RustBelt Dockworks before X-Corp locks down the sector.',
+            'reach_target',
+            1,
+            { targetPosition: dock, proximityM: RUSTBELT_DOCKWORKS_PROXIMITY_M },
+          ),
+          objective(
+            'DELIVER_CONTRABAND',
+            'Fence the contraband to the RustBelt fixer.',
+            'heist_deliver',
+            1,
+          ),
+        ],
+        hintArrowTarget: { x: dock.x, y: dock.y, z: dock.z + 4, label: 'RustBelt Dockworks' },
+      },
+    ],
+  };
+}
 
 /** Objective literal helper — new objectives always start uncompleted. */
 function objective(

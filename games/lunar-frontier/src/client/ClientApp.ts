@@ -49,6 +49,9 @@ import { TraversalController } from './TraversalController.ts';
 import {
   QuestEngine,
   createTutorialQuest,
+  createOperationGildedSerpentQuest,
+  GILDED_SERPENT_QUEST_ID,
+  DEFAULT_REACH_RADIUS_M,
   type CommsDialogue,
   type QuestCompletedPayload,
   type QuestStorage,
@@ -72,7 +75,7 @@ import { RailSystem } from '../infrastructure/RailSystem.ts';
 import type { OreCartEntity } from '../infrastructure/RailSystem.ts';
 // Spec 26 §3.3 Phase 3: Train Heist Director — velocity-matching envelope,
 // relative platform kinematics, vault crack, depot countdown, bailout.
-import { TrainHeistDirector } from '../quests/TrainHeistDirector.ts';
+import { TrainHeistDirector, heistLootCargoKg, type HeistTelemetry } from '../quests/TrainHeistDirector.ts';
 import {
   BUGGY_MAX_CARGO,
   BUGGY_SPEED_LIMIT,
@@ -770,6 +773,18 @@ export class ClientApp {
    * pose/velocity. Null until enabled and after `dispose()`.
    */
   private trainHeistDirector: TrainHeistDirector | null = null;
+  /**
+   * Spec 26 Phase 4: true once the cracked-vault loot has moved into the
+   * player's cargo for this run (exactly one handoff per heist; cleared
+   * when the director returns to INACTIVE, e.g. after a failed retry).
+   */
+  private heistLootHandedOff = false;
+  /**
+   * Spec 26 Phase 4: the contraband rides in cargo from the siphon pop
+   * until the RustBelt fence takes it — or the depot shield vaporizes it
+   * together with the train (director FAILED).
+   */
+  private heistContrabandSecured = false;
   /**
    * Spec 24 §4.2: first-time arrival cinematic director. Owned by the caller
    * (ClientApp doesn't build a `TransportLander` itself) and attached via
@@ -3485,7 +3500,201 @@ export class ClientApp {
       roverPos = director.getPlayerWorldPos();
       roverVel = director.getBailoutExitVelocity();
     }
-    director.update(dt, roverPos, roverVel);
+    const telemetry = director.update(dt, roverPos, roverVel);
+    this.syncHeistWithQuest(director, telemetry);
+  }
+
+  /**
+   * Spec 26 Phase 4: state-driven bridge from the {@link TrainHeistDirector}
+   * into the "operation-gilded-serpent" quest. Idempotent per frame and
+   * ordered intercept → board → crack → bailout, so a phase the pump
+   * transitions through inside a single frame (LOOT_SECURED hands off and
+   * drains within the same update tick) can never strand a quest stage.
+   * Loot moves into cargo exactly once per run; the contraband survives
+   * until the RustBelt fence takes it or FAILED vaporizes it with the train.
+   * Questless runs (tutorial, sandbox) pay zero cost beyond the id check.
+   */
+  private syncHeistWithQuest(director: TrainHeistDirector, telemetry: HeistTelemetry): void {
+    if (this.disposed) return;
+
+    // -- loot handoff: 0 → 6 items at the clamshell pop, once per run -------
+    const stolen = director.getStolenCargoCount();
+    if (!this.heistLootHandedOff && stolen > 0) {
+      this.heistLootHandedOff = true;
+      this.heistContrabandSecured = true;
+      this.stowHeistLoot(director);
+    }
+    if (telemetry.phase === 'FAILED' && this.heistContrabandSecured) {
+      // Depot shield / countdown expiry: the haul burns with the consist.
+      this.heistContrabandSecured = false;
+      this.hudFeedback('DEPOT SHIELD STRIKE — heist contraband vaporized with the train', 'error');
+    }
+    if (director.getPhase() === 'INACTIVE') {
+      // Reset (QA or failed-run retry): the next crack hands loot off again.
+      this.heistLootHandedOff = false;
+      this.heistContrabandSecured = false;
+    }
+
+    const engine = this.questEngine;
+    if (engine === null) return;
+    const quest = engine.getActiveQuest();
+    if (quest === null || quest.id !== GILDED_SERPENT_QUEST_ID || quest.isCompleted) return;
+
+    // Stage 2: envelope telemetry (canBoard / proven-phase) completes it.
+    engine.recordHeistTelemetry(telemetry);
+    // Stage 3: the avatar riding the deck proves the jump landed.
+    if (!ClientApp.questObjectiveCompleted(quest, 'BOARD_TRANSPORT') && director.isPlayerOnBoard()) {
+      engine.recordHeistBoarded();
+    }
+    // Stage 4: secured cargo proves the Mag-Lock bypass + siphon.
+    if (!ClientApp.questObjectiveCompleted(quest, 'CRACK_VAULT') && stolen > 0) {
+      engine.recordHeistVaultCracked(stolen);
+    }
+    // Stage 5: the director's Leap of Faith states prove the bailout.
+    if (
+      !ClientApp.questObjectiveCompleted(quest, 'LEAP_TO_SAFETY') &&
+      (telemetry.phase === 'BAILOUT_SUCCESS' || telemetry.phase === 'ESCAPE_COMPLETE')
+    ) {
+      engine.recordHeistBailout();
+    }
+    // Stage 6 (`heist_deliver`) closes via {@link deliverHeistContraband};
+    // its `reach_target` half rides the per-frame recordPosition sensor.
+  }
+
+  /** Is the quest's objective with this id completed (true when absent)? */
+  private static questObjectiveCompleted(quest: Quest, objectiveId: string): boolean {
+    for (const stage of quest.stages) {
+      for (const objective of stage.objectives) {
+        if (objective.id === objectiveId) return objective.completed;
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Spec 26 §3.3.3 loot → cargo: the siphoned contraband (3× He-3 cryo-
+   * flasks, 1× quantum cipher slate, 2× superconducting coils — 24 kg for
+   * the canonical table, {@link heistLootCargoKg}) is stowed on the carrier
+   * that holds it: on-foot suits first (that is who cracked the vault on
+   * the deck), otherwise the buggy flatbed. `addCargo` clamps to capacity
+   * and reports what it actually took, so an over-capacity remainder is
+   * reported on the feedback line, never silently eaten.
+   */
+  private stowHeistLoot(director: TrainHeistDirector): void {
+    const kg = heistLootCargoKg(director.getLootPayload());
+    if (kg <= 0) return;
+    const onFoot = this.mode !== 'buggy';
+    const suit = this.suit;
+    const buggy = this.buggy;
+    let moved = 0;
+    if (onFoot && suit !== null) {
+      moved = suit.addCargo(kg);
+    } else if (!onFoot && buggy !== null) {
+      const room = BUGGY_MAX_CARGO - buggy.getCargoMass();
+      moved = buggy.addCargo(Math.min(kg, Math.max(0, room)));
+    }
+    if (moved >= kg - 1e-9) {
+      this.hudFeedback(`Heist loot secured: ${Math.round(kg)} kg of contraband aboard`, 'success');
+    } else {
+      this.hudFeedback(
+        `Heist loot partially stowed: ${Math.round(moved)}/${Math.round(kg)} kg — carrier near capacity`,
+        'info',
+      );
+    }
+  }
+
+  /**
+   * Spec 26 Phase 4: launch "Operation Gilded Serpent". Stands up the
+   * heist director (idempotent through {@link enableTrainHeistDirector}),
+   * opens the interception phase, and installs the six-stage Spec 26 §3.4
+   * quest — seating the stage-6 fence at the live `FactionBases` RUSTBELT
+   * claim when the roster has one. A running tutorial/sandbox quest is
+   * replaced (the heist is the mid-game narrative pivot); heist run state
+   * (loot handoff, contraband) is cleared for the fresh operation.
+   */
+  startOperationGildedSerpent(): Quest | null {
+    if (this.disposed) return null;
+    const engine = this.questEngine;
+    if (engine === null) return null;
+    this.enableTrainHeistDirector().startHeist();
+    const rustbelt = this.factionBases?.getBase('RUSTBELT') ?? null;
+    this.heistLootHandedOff = false;
+    this.heistContrabandSecured = false;
+    return engine.startQuest(
+      createOperationGildedSerpentQuest(
+        rustbelt !== null
+          ? {
+              dockworksPosition: {
+                x: rustbelt.position.x,
+                y: rustbelt.position.y,
+                z: rustbelt.position.z,
+              },
+            }
+          : {},
+      ),
+    );
+  }
+
+  /** Spec 26 Phase 4: true while stolen cargo rides as un-fenced contraband. */
+  hasHeistContraband(): boolean {
+    return this.heistContrabandSecured && !this.disposed;
+  }
+
+  /** Spec 26 §3.3.1: drive the High-Speed Jump ([E] / Gamepad X). */
+  requestHeistBoarding(): boolean {
+    if (this.disposed) return false;
+    return this.trainHeistDirector?.executeBoardingJump() ?? false;
+  }
+
+  /**
+   * Spec 26 §3.3.3: hold the Cyber-Lock terminal for dt seconds. The
+   * CRACK_VAULT objective and the loot handoff follow on the next heist
+   * pump frame ({@link syncHeistWithQuest}), keeping one single code path.
+   */
+  interactHeistVaultLock(dt: number): boolean {
+    if (this.disposed) return false;
+    return this.trainHeistDirector?.interactVaultLock(dt) ?? false;
+  }
+
+  /** Spec 26 §3.3.4: the Leap of Faith ([SPACE] / Gamepad A). */
+  requestHeistBailout(): boolean {
+    if (this.disposed) return false;
+    return this.trainHeistDirector?.executeBailoutJump() ?? false;
+  }
+
+  /**
+   * Spec 26 §3.4 stage 6: fence the haul at RustBelt Dockworks. Requires
+   * secured contraband and, while stage 6 is live, the quest's own
+   * `reach_target` marker in radius (the same distance the REACH_DOCKWORKS
+   * objective uses — the fence only takes deliveries face to face). On
+   * success the contraband changes hands, the director's escape closes out
+   * (BAILOUT_SUCCESS → ESCAPE_COMPLETE), and `DELIVER_CONTRABAND` completes
+   * — the quest-completion reward is paid by the existing quest callback.
+   */
+  deliverHeistContraband(): boolean {
+    if (this.disposed || !this.heistContrabandSecured) return false;
+    const engine = this.questEngine;
+    if (engine === null) return false;
+    const quest = engine.getActiveQuest();
+    if (quest === null || quest.id !== GILDED_SERPENT_QUEST_ID || quest.isCompleted) return false;
+
+    const stage = engine.getActiveStage();
+    if (stage !== null) {
+      const marker = stage.objectives.find(
+        (o) => o.type === 'reach_target' && o.targetPosition !== undefined,
+      );
+      if (marker?.targetPosition !== undefined) {
+        const p = this.activePosition();
+        const d = Math.hypot(p.x - marker.targetPosition.x, p.y - marker.targetPosition.y);
+        if (d > (marker.proximityM ?? DEFAULT_REACH_RADIUS_M)) return false;
+      }
+    }
+
+    this.heistContrabandSecured = false;
+    this.trainHeistDirector?.finishEscape();
+    const delivered = engine.recordHeistContrabandDelivered();
+    if (delivered) this.hudFeedback('Contraband fenced to the RustBelt fixer — the sector is yours', 'success');
+    return delivered;
   }
 
   /** Convert one pending bot bump impulse into a rider velocity change. */
