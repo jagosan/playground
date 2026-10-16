@@ -108,6 +108,12 @@ import {
   type CitadelOptions,
   type CitadelPerimeterStatus,
 } from '../infrastructure/XCorpCitadel.ts';
+// Spec 26 §3.2: High-Speed Maglev guideway + Apex Express consist (spline
+// kinematics answer before the mesh build; Phase 3's heist anchor).
+import {
+  HighSpeedMaglev,
+  type MaglevOptions,
+} from '../infrastructure/HighSpeedMaglev.ts';
 
 // ---------------------------------------------------------------------------
 // Options & tuning
@@ -789,6 +795,8 @@ export class WorldScene {
   private rivalBasesElapsed = 0;
   /** Spec 26 §3.1: X-Corp Citadel (null before {@link buildXCorpCitadel} / after dispose). */
   private xcorpCitadel: XCorpCitadel | null = null;
+  /** Spec 26 §3.2: High-Speed Maglev line (null before {@link buildHighSpeedMaglev} / after dispose). */
+  private highSpeedMaglev: HighSpeedMaglev | null = null;
 
   constructor(options: WorldSceneOptions = {}) {
     this.options = {
@@ -875,6 +883,11 @@ export class WorldScene {
         this.xcorpCitadel.update(dtMs / 1000, babylonToWorld(cam.position));
       }
     }
+    // Spec 26 §3.2: Apex Express spline kinematics + stator chevron pulse.
+    if (this.highSpeedMaglev !== null) {
+      const dtMs = this.engine?.getDeltaTime() ?? 16.7;
+      this.highSpeedMaglev.update(dtMs / 1000);
+    }
     // Spec 23 §2.1.4: re-evaluate the Hapke opposition surge against the
     // current camera view before every frame is submitted.
     this.updateOppositionSurge();
@@ -883,13 +896,20 @@ export class WorldScene {
   }
 
   /**
-   * Spec 26 §3.1: drive the X-Corp Citadel defense perimeter for one frame
-   * (shield shimmer, CIWS tracking) and evaluate it against the player's
-   * world-frame position. Returns null when no citadel is built (or after
-   * dispose); otherwise the perimeter status the HUD/quests consume.
+   * Spec 26 §3.1/§3.2: drive the X-Corp Citadel defense perimeter and the
+   * High-Speed Maglev kinematics for one frame (shield shimmer, CIWS
+   * tracking, Apex Express spline advance) and evaluate the perimeter
+   * against the player's world-frame position. Returns null when no citadel
+   * is built (or after dispose); otherwise the perimeter status the
+   * HUD/quests consume. The maglev advances independently of the return
+   * value — read it via `getHighSpeedMaglev()?.getTrainState()`.
    */
   update(dtMs: number, playerWorldPos: { x: number; y: number; z: number }): CitadelPerimeterStatus | null {
-    if (this.xcorpCitadel === null || this.disposed) return null;
+    if (this.disposed) return null;
+    if (this.highSpeedMaglev !== null) {
+      this.highSpeedMaglev.update(dtMs / 1000);
+    }
+    if (this.xcorpCitadel === null) return null;
     return this.xcorpCitadel.update(dtMs / 1000, playerWorldPos);
   }
 
@@ -1071,6 +1091,16 @@ export class WorldScene {
         /* already gone */
       }
       this.xcorpCitadel = null;
+    }
+
+    // Spec 26 §3.2: tear down the High-Speed Maglev line + Apex Express.
+    if (this.highSpeedMaglev !== null) {
+      try {
+        this.highSpeedMaglev.dispose();
+      } catch {
+        /* already gone */
+      }
+      this.highSpeedMaglev = null;
     }
 
     for (const mesh of this.entities) mesh.parent = null;
@@ -1340,6 +1370,38 @@ export class WorldScene {
   /** The X-Corp Citadel system, or null before build / after dispose. */
   getXCorpCitadel(): XCorpCitadel | null {
     return this.disposed ? null : this.xcorpCitadel;
+  }
+
+  // -- Spec 26 §3.2: High-Speed Maglev rail line & Apex Express -------------------
+
+  /**
+   * Build the High-Speed Maglev line (Spec 26 §3.2): the 3,500 m elevated
+   * linear-induction guideway from the Canyon Extraction Outpost to the
+   * Citadel Grand Terminal — concrete-composite pylons every ~24 m, twin
+   * stator rails pulsing forward blue chevrons, the 4-car Apex Express
+   * consist (locomotive, armored vault car with roof Cyber-Lock container,
+   * executive courier, drone escort flatbed) and the graded maintenance
+   * service road 4.0 m to starboard for the Phase 3 rover interception.
+   *
+   * Idempotent (a second call returns the existing system). Meshes register
+   * as shadow casters (paper-thin ribbons excepted); teardown runs from
+   * `dispose()`. The spline kinematics answer even before this call via
+   * `new HighSpeedMaglev(options).getTrainState()`.
+   */
+  buildHighSpeedMaglev(options: Partial<MaglevOptions> = {}): HighSpeedMaglev {
+    if (this.highSpeedMaglev !== null) return this.highSpeedMaglev;
+    const scene = this.requireScene();
+    const maglev = new HighSpeedMaglev(options).init(scene);
+    const rootNode = maglev.getRootNode();
+    if (rootNode !== null) rootNode.parent = this.terrainRoot ?? null;
+    this.registerShadowCasters(maglev.getShadowCasterMeshes());
+    this.highSpeedMaglev = maglev;
+    return maglev;
+  }
+
+  /** The High-Speed Maglev system, or null before build / after dispose. */
+  getHighSpeedMaglev(): HighSpeedMaglev | null {
+    return this.disposed ? null : this.highSpeedMaglev;
   }
 
   // -- surface detritus & salvage (Spec 21 §2.1) -------------------------------
