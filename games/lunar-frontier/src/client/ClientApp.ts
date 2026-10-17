@@ -76,6 +76,12 @@ import type { OreCartEntity } from '../infrastructure/RailSystem.ts';
 // Spec 26 §3.3 Phase 3: Train Heist Director — velocity-matching envelope,
 // relative platform kinematics, vault crack, depot countdown, bailout.
 import { TrainHeistDirector, heistLootCargoKg, type HeistTelemetry } from '../quests/TrainHeistDirector.ts';
+import {
+  ExportMinigameDirector,
+  SYNDICATE_LAUNDER_COMMS,
+  USP_CITATION_FINE_CREDITS,
+  type ExportOutcome,
+} from '../quests/ExportMinigameDirector.ts';
 // Spec 26 §3.5 Phase 5: maglev induction hum speed reference (25 m/s cruise).
 import { DEFAULT_CRUISE_SPEED_MPS } from '../infrastructure/HighSpeedMaglev.ts';
 import {
@@ -746,6 +752,18 @@ function compassBearingDeg(
 // ClientApp
 // ---------------------------------------------------------------------------
 
+// -- Spec 27 Phase 4: Gauss Needle export console (ClientApp side) ---------------
+
+/** Canonical caldera-rim seat of the Mare Mass Accelerator (Spec 27 §3.1). */
+const EXPORT_CONSOLE_SEAT = { x: -320, y: -1450 };
+/** Console mount radius around the seat (m) — the cupola bunker footprint. */
+const EXPORT_CONSOLE_PROXIMITY_M = 14;
+/** Gunner aim slew rate while the console is mounted (deg/s per full axis). */
+const EXPORT_AIM_SLEW_DPS = 45;
+/** Elevation slew clamp — the gun's own hard stops are the authority below. */
+const EXPORT_AIM_ELEVATION_MIN_DEG = 20;
+const EXPORT_AIM_ELEVATION_MAX_DEG = 89;
+
 export class ClientApp {
   /** The 3D world (constructed eagerly, initialised in `init()`). */
   readonly world: WorldScene;
@@ -787,6 +805,24 @@ export class ClientApp {
    * together with the train (director FAILED).
    */
   private heistContrabandSecured = false;
+  /**
+   * Spec 27 §3.4 Phase 4: "The Gauss Needle" export minigame director.
+   * Built on demand by {@link enableExportMinigameDirector} (Phase 1 coilgun
+   * + Phase 2 orbital traffic first, through WorldScene); ticked every frame
+   * by {@link stepExportMinigameDirector} with console-mount state and the
+   * gunner's aim/trigger input. Null until enabled and after `dispose()`.
+   */
+  private exportDirector: ExportMinigameDirector | null = null;
+  /** True while the avatar stands inside the caldera console radius. */
+  private exportConsoleMounted = false;
+  /** Script/quest-driven charge trigger latch (additive with held [SPACE]). */
+  private exportChargeTriggerHeld = false;
+  /** Gunner fire-control aim (azimuth / elevation, degrees) in the barrel frame. */
+  private exportAimDeg = { azimuth: 0, elevation: 62 };
+  /** Edge-detect memory for one-shot payout/fine/feedback on outcome frames. */
+  private exportLastResolved: ExportOutcome = 'NONE';
+  /** Edge-detect memory for the USP radar-siphon alert toast. */
+  private exportUspAlertWas = false;
   /**
    * Spec 24 §4.2: first-time arrival cinematic director. Owned by the caller
    * (ClientApp doesn't build a `TransportLander` itself) and attached via
@@ -1265,6 +1301,10 @@ export class ClientApp {
     // state (velocity-match envelope, vault timer, depot countdown). No-op
     // until enableTrainHeistDirector() has been called.
     this.stepTrainHeistDirector(dt);
+    // Spec 27 §3.4 Phase 4: export console pump — mount detection near the
+    // caldera seat, gunner aim slew, in-flight canister tracking, and the
+    // payout/confiscation bridge. No-op until a director exists.
+    this.stepExportMinigameDirector(dt);
     // Spec 24 Phase 2: tick the arrival director with the frame dt so phase
     // transitions, lander effects and intro camera tracks advance in lockstep.
     this.introDirector?.update(dt);
@@ -1573,6 +1613,10 @@ export class ClientApp {
     // the Apex Express meshes go with their own systems / the world below).
     this.trainHeistDirector?.dispose();
     this.trainHeistDirector = null;
+    // Spec 27 §3.4: export director teardown (state-only; the coilgun and
+    // the traffic meshes go with their own systems / the world below).
+    this.exportDirector?.dispose();
+    this.exportDirector = null;
     // Infrastructure teardown before the world itself goes away (their meshes
     // live in the world scene; dispose() unparents and releases materials).
     this.factionBases?.dispose();
@@ -3714,6 +3758,172 @@ export class ClientApp {
     const delivered = engine.recordHeistContrabandDelivered();
     if (delivered) this.hudFeedback('Contraband fenced to the RustBelt fixer — the sector is yours', 'success');
     return delivered;
+  }
+
+  // -- Spec 27 Phase 4: The Gauss Needle export minigame ---------------------------------
+
+  /**
+   * Spec 27 §3.4 Phase 4: stand up "The Gauss Needle". Idempotent: ensures
+   * the Phase 1 Mare Mass Accelerator and the Phase 2 Orbital Transport
+   * System exist in the world (built through `WorldScene` so meshes, shadow
+   * casters and the render-loop kinematics all engage), then constructs the
+   * {@link ExportMinigameDirector} against them. The director starts
+   * INACTIVE — open the console through {@link startExportSession}.
+   */
+  enableExportMinigameDirector(): ExportMinigameDirector {
+    if (this.exportDirector !== null && !this.exportDirector.isDisposed()) {
+      return this.exportDirector;
+    }
+    const accelerator = this.world.buildMassAccelerator();
+    const orbitalSystem = this.world.buildOrbitalTransportSystem();
+    this.exportDirector = new ExportMinigameDirector(accelerator, orbitalSystem);
+    return this.exportDirector;
+  }
+
+  /** The export director, or null before {@link enableExportMinigameDirector} / after dispose. */
+  getExportMinigameDirector(): ExportMinigameDirector | null {
+    return this.disposed ? null : this.exportDirector;
+  }
+
+  /** True while the avatar stands inside the caldera console radius (§3.4.1 docking zone). */
+  isExportConsoleMounted(): boolean {
+    return this.exportConsoleMounted && !this.disposed;
+  }
+
+  /**
+   * Dock a cargo lot at the fire-control console (INACTIVE → DOCKING_CONSOLE
+   * inside the director). Stands the chain up on demand; `cargoType` is any
+   * casing of REGOLITH / TITANIUM / HELIUM3 / STOLEN_CONTRABAND. Contraband
+   * arms the 45 s USP intercept clock the moment the coil starts spooling.
+   */
+  startExportSession(cargoType: string, amountKg: number, isContraband?: boolean): boolean {
+    if (this.disposed) return false;
+    return this.enableExportMinigameDirector().startSession(cargoType, amountKg, isContraband);
+  }
+
+  /** Abort the docked/export session; loaded cargo returns to the yard. */
+  cancelExportSession(): void {
+    if (this.disposed) return;
+    this.exportChargeTriggerHeld = false;
+    this.exportDirector?.cancelSession();
+  }
+
+  /** Fire command (Spec 27 §4): release the bank mid-spool on demand. */
+  fireExportLaunch(): boolean {
+    if (this.disposed) return false;
+    return this.exportDirector?.fireLaunch() ?? false;
+  }
+
+  /** Script/quest charge-trigger latch; held [SPACE] at the console adds on top. */
+  setExportChargeTrigger(held: boolean): void {
+    this.exportChargeTriggerHeld = held === true;
+  }
+
+  /** Steer the export fire-control solution (deg deltas; elevation clamped 20–89°). */
+  nudgeExportAim(deltaAzimuthDeg: number, deltaElevationDeg: number): void {
+    const az = this.exportAimDeg.azimuth + (Number.isFinite(deltaAzimuthDeg) ? deltaAzimuthDeg : 0);
+    const el = this.exportAimDeg.elevation + (Number.isFinite(deltaElevationDeg) ? deltaElevationDeg : 0);
+    this.exportAimDeg.azimuth = ((az % 360) + 360) % 360;
+    this.exportAimDeg.elevation = Math.min(
+      EXPORT_AIM_ELEVATION_MAX_DEG,
+      Math.max(EXPORT_AIM_ELEVATION_MIN_DEG, el),
+    );
+  }
+
+  /**
+   * Per-frame export-console pump: console-mount detection near the caldera
+   * seat (-320, -1450) auto-raises the fire-control chain, arrow/pad axes
+   * slew the aim solution while mounted, held [SPACE] (or the script latch)
+   * rides the capacitor trigger, and every outcome frame flows through
+   * {@link syncExportWithQuest}. No-op after `dispose()`; a null director
+   * still runs mount detection so walking up to the cupola builds the gun.
+   */
+  private stepExportMinigameDirector(dt: number): void {
+    if (this.disposed) return;
+    const seat = this.world.getMassAccelerator()?.getWorldSeat() ?? EXPORT_CONSOLE_SEAT;
+    const stance = this.activePosition();
+    const mounted =
+      Math.hypot(stance.x - seat.x, stance.y - seat.y) <= EXPORT_CONSOLE_PROXIMITY_M;
+    if (mounted && this.exportDirector === null) {
+      this.enableExportMinigameDirector();
+      this.hudSay('GAUSS NEEDLE fire-control online — capacitor cold, dock cargo to launch');
+    } else if (mounted && !this.exportConsoleMounted) {
+      this.hudSay('Gauss Needle console — hold [SPACE] to spool the coils, release to fire');
+    }
+    this.exportConsoleMounted = mounted;
+
+    const director = this.exportDirector;
+    if (director === null) return;
+
+    if (mounted && Number.isFinite(dt) && dt > 0) {
+      // sampleInput() is a stateless per-frame query (Spec 19 §2.1) — safe
+      // to sample again here; the physics step above already consumed it.
+      const frame = this.sampleInput();
+      this.nudgeExportAim(frame.yaw * EXPORT_AIM_SLEW_DPS * dt, frame.pitch * EXPORT_AIM_SLEW_DPS * dt);
+    }
+    const chargeHeld =
+      this.exportChargeTriggerHeld || (mounted && this.pressed.has('Space'));
+    const state = director.update(dt, {
+      aimX: this.exportAimDeg.azimuth,
+      aimY: this.exportAimDeg.elevation,
+      chargeHeld,
+    });
+    this.syncExportWithQuest(director, state);
+  }
+
+  /**
+   * Spec 27 Phase 4: state-driven bridge from {@link ExportMinigameDirector}
+   * into credits, comms, and the quest hooks. Edge-triggered on
+   * `lastResult` transitions, so payout, citation, and toasts fire exactly
+   * once per outcome; a fresh session resets the outcome to NONE and
+   * re-arms every edge. Online runs move `network.credits` through
+   * `hud.setCredits` (same law as vault loot); offline runs report the
+   * number and let the server reconcile on the next market sync.
+   */
+  private syncExportWithQuest(
+    director: ExportMinigameDirector,
+    state: { lastResult: ExportOutcome; lastPayoutCredits: number; uspAlertActive: boolean },
+  ): void {
+    if (this.disposed) return;
+    const engine = this.questEngine;
+
+    if (state.uspAlertActive && !this.exportUspAlertWas) {
+      this.hudFeedback(
+        'USP RADAR SIPHON tripped — intercept inbound. Get the package airborne before the clock hits zero.',
+        'error',
+      );
+    }
+    this.exportUspAlertWas = state.uspAlertActive;
+
+    const result = state.lastResult;
+    if (result === this.exportLastResolved) return;
+    this.exportLastResolved = result;
+
+    if (result === 'SUCCESS') {
+      const paid = state.lastPayoutCredits;
+      const identity = this.network?.credits;
+      if (identity !== undefined) this.hud?.setCredits(identity + paid);
+      engine?.recordExportLaunch(paid);
+      if (director.isContrabandLaundered()) {
+        engine?.recordExportLaundered();
+        this.hudFeedback(`LAUNDERED — ${SYNDICATE_LAUNDER_COMMS} (+${paid} CR)`, 'success');
+      } else {
+        this.hudFeedback(`Catch confirmed — freight credit wire +${paid} CR`, 'success');
+      }
+    } else if (result === 'CONFISCATED') {
+      const identity = this.network?.credits;
+      if (identity !== undefined) {
+        this.hud?.setCredits(Math.max(0, identity - USP_CITATION_FINE_CREDITS));
+      }
+      this.hudFeedback(
+        `USP INTERCEPT — cargo confiscated, ${USP_CITATION_FINE_CREDITS} CR citation levied`,
+        'error',
+      );
+    } else if (result === 'MISSED') {
+      this.hudFeedback('Canister missed the catch envelope — cargo destroyed on impact', 'error');
+    } else if (result === 'OVERCHARGED') {
+      this.hudFeedback('Coil bank thermal breaker tripped — 5 s safety lockout', 'error');
+    }
   }
 
   /** Convert one pending bot bump impulse into a rider velocity change. */

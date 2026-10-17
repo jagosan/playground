@@ -52,7 +52,10 @@ export type ObjectiveType =
   | 'heist_board'
   | 'heist_crack_vault'
   | 'heist_bailout'
-  | 'heist_deliver';
+  | 'heist_deliver'
+  // Spec 27 §3.4 — Gauss Needle export/laundering objective family.
+  | 'export_launch'
+  | 'export_launder';
 
 /** Minimal structural world position (physics metres, z up). */
 export interface WorldPosition {
@@ -300,6 +303,10 @@ const OBJECTIVE_TYPES: readonly string[] = [
   'heist_crack_vault',
   'heist_bailout',
   'heist_deliver',
+  // Spec 27 §3.4 export family — REQUIRED here or mid-export saves fail the
+  // shape validator and `restoreProgress()` wrongly rejects them.
+  'export_launch',
+  'export_launder',
 ];
 
 function isObjectiveType(value: unknown): value is ObjectiveType {
@@ -553,6 +560,31 @@ export class QuestEngine {
   /** The haul changed hands at the RustBelt fence (contraband delivered). */
   recordHeistContrabandDelivered(): boolean {
     return this.accumulate('heist_deliver', () => true, 1);
+  }
+
+  // -- Spec 27 §3.4 export hooks (pushed by ClientApp from ExportMinigameDirector) --
+
+  /**
+   * One canister captured by a revenue-class vessel (Spec 27 §3.2.3 / §3.4.2).
+   * `payoutCredits` — the director's `lastPayoutCredits` at the pop — is
+   * validated but advisory (the objective keys on the capture event itself,
+   * matching the §3.4.1 phase table); a present but non-finite / negative
+   * figure is rejected (false, no mutation).
+   */
+  recordExportLaunch(payoutCredits?: number): boolean {
+    if (payoutCredits !== undefined && (!Number.isFinite(payoutCredits) || payoutCredits < 0)) {
+      return false;
+    }
+    return this.accumulate('export_launch', () => true, 1);
+  }
+
+  /**
+   * Contraband washed through the Slip at the Syndicate Runner's bay: USP
+   * alert cancelled, heat cleared, funds wired to the offshore vault
+   * (Spec 27 §3.4.3 outcome 1).
+   */
+  recordExportLaundered(): boolean {
+    return this.accumulate('export_launder', () => true, 1);
   }
 
   // -- hint arrow / dashboard support (Spec 18 §6.1 / §6.3) --------------------

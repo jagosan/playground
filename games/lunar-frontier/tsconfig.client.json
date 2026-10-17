@@ -29,6 +29,7 @@
     "src/infrastructure/MassAccelerator.ts",
     "src/infrastructure/OrbitalTransportSystem.ts",
     "src/quests/TrainHeistDirector.ts",
+    "src/quests/ExportMinigameDirector.ts",
     "src/physics/TraversalPhysics.ts",
     "src/physics/BallisticTrajectoryEngine.ts",
     "src/network/NetworkClient.ts",

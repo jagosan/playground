@@ -101,6 +101,18 @@ export const LOS_ELEVATION_MIN_DEG = 20;
 export const FIRST_TRANSIT_CLOSEST_APPROACH_S = 35;
 /** Vessel is scene-visible this far before the window opens / after it closes (s). */
 export const APPROACH_VISIBILITY_S = 15;
+/**
+ * Phase 4 addendum (Spec 27 §3.2.3 escalation, @owl/@rabbit): a transit's
+ * electromagnetic capture cone is physical, not observational — the vessel
+ * keeps flying (cone sweeping) long after the ≥ 20° firing window closes
+ * and after its scene residency lapses. Transits therefore stay
+ * capture-eligible in `checkCapture()` for this many seconds past window
+ * close, so a canister on a computed lead intercept (catch-matched flight
+ * times run ≈ 40–60 s, longer than window + APPROACH_VISIBILITY_S) can
+ * actually resolve. Scene residency, mesh visibility, getActiveTarget() and
+ * getAllTargets() keep their strict Phase 2 window semantics.
+ */
+export const CAPTURE_GRACE_S = 90;
 /** Spec 27 §3.2.3: tractor funnel length behind the cargo bay (m). */
 export const CAPTURE_FUNNEL_LENGTH_M = 80;
 /** Tractor funnel apex (bay ring) radius — the frustum's narrow end (m). */
@@ -286,6 +298,12 @@ export class OrbitalTransportSystem {
   // -- schedule (deterministic, memoized in transit order) -------------------------
   private readonly plans: TransitPlan[] = [];
   private readonly actives: ActiveTransit[] = [];
+  /**
+   * Departed transits still inside the §3.2.3 capture grace band (see
+   * {@link CAPTURE_GRACE_S}). `checkCapture()` scans actives + this list;
+   * nothing else ever reads it.
+   */
+  private readonly coneRetired: ActiveTransit[] = [];
   private clockS = 0;
 
   // -- scene graph -------------------------------------------------------------------
@@ -413,6 +431,18 @@ export class OrbitalTransportSystem {
         if (active !== undefined && this.clockS > active.closeS + APPROACH_VISIBILITY_S) {
           if (this.built) this.setVesselEnabled(active.plan.blueprint, false);
           this.actives.splice(i, 1);
+          // The cone outflies the camera (§3.2.3 grace band): keep the
+          // departed transit resolvable in checkCapture a while longer.
+          if (!this.coneRetired.some((a) => a.plan.index === active.plan.index)) {
+            this.coneRetired.push(active);
+          }
+        }
+      }
+      // Beyond the grace band no ballistic arc can still matter: prune.
+      for (let i = this.coneRetired.length - 1; i >= 0; i--) {
+        const a = this.coneRetired[i];
+        if (a !== undefined && this.clockS > a.closeS + APPROACH_VISIBILITY_S + CAPTURE_GRACE_S) {
+          this.coneRetired.splice(i, 1);
         }
       }
       // Approach edge: promote scheduled transits into scene residency.
@@ -476,7 +506,7 @@ export class OrbitalTransportSystem {
     let bestMiss = Infinity;
     let bestRel = 0;
 
-    for (const active of this.actives) {
+    for (const active of this.actives.concat(this.coneRetired)) {
       const plan = active.plan;
       const bp = plan.blueprint;
       const t = this.stateOf(plan, this.clockS);
