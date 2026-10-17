@@ -30,6 +30,7 @@
     "src/infrastructure/OrbitalTransportSystem.ts",
     "src/quests/TrainHeistDirector.ts",
     "src/physics/TraversalPhysics.ts",
+    "src/physics/BallisticTrajectoryEngine.ts",
     "src/network/NetworkClient.ts",
     "src/world/LunarWorldGenerator.ts"
   ]
