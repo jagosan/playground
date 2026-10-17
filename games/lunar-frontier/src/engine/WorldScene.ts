@@ -114,6 +114,9 @@ import {
   HighSpeedMaglev,
   type MaglevOptions,
 } from '../infrastructure/HighSpeedMaglev.ts';
+// Spec 27 §3.1: Mare Mass Accelerator "The Gauss Needle" (caldera-rim seat,
+// 2-axis articulation + capacitor spool kinematics answer before the mesh build).
+import { MassAccelerator } from '../infrastructure/MassAccelerator.ts';
 
 // ---------------------------------------------------------------------------
 // Options & tuning
@@ -797,6 +800,8 @@ export class WorldScene {
   private xcorpCitadel: XCorpCitadel | null = null;
   /** Spec 26 §3.2: High-Speed Maglev line (null before {@link buildHighSpeedMaglev} / after dispose). */
   private highSpeedMaglev: HighSpeedMaglev | null = null;
+  /** Spec 27 §3.1: Mare Mass Accelerator (null before {@link buildMassAccelerator} / after dispose). */
+  private massAccelerator: MassAccelerator | null = null;
 
   constructor(options: WorldSceneOptions = {}) {
     this.options = {
@@ -888,6 +893,11 @@ export class WorldScene {
       const dtMs = this.engine?.getDeltaTime() ?? 16.7;
       this.highSpeedMaglev.update(dtMs / 1000);
     }
+    // Spec 27 §3.1: Gauss Needle slew + HTS coil pulse + capacitor glow.
+    if (this.massAccelerator !== null) {
+      const dtMs = this.engine?.getDeltaTime() ?? 16.7;
+      this.massAccelerator.update(dtMs / 1000);
+    }
     // Spec 23 §2.1.4: re-evaluate the Hapke opposition surge against the
     // current camera view before every frame is submitted.
     this.updateOppositionSurge();
@@ -908,6 +918,9 @@ export class WorldScene {
     if (this.disposed) return null;
     if (this.highSpeedMaglev !== null) {
       this.highSpeedMaglev.update(dtMs / 1000);
+    }
+    if (this.massAccelerator !== null) {
+      this.massAccelerator.update(dtMs / 1000);
     }
     if (this.xcorpCitadel === null) return null;
     return this.xcorpCitadel.update(dtMs / 1000, playerWorldPos);
@@ -1101,6 +1114,16 @@ export class WorldScene {
         /* already gone */
       }
       this.highSpeedMaglev = null;
+    }
+
+    // Spec 27 §3.1: tear down the Mare Mass Accelerator.
+    if (this.massAccelerator !== null) {
+      try {
+        this.massAccelerator.dispose();
+      } catch {
+        /* already gone */
+      }
+      this.massAccelerator = null;
     }
 
     for (const mesh of this.entities) mesh.parent = null;
@@ -1402,6 +1425,44 @@ export class WorldScene {
   /** The High-Speed Maglev system, or null before build / after dispose. */
   getHighSpeedMaglev(): HighSpeedMaglev | null {
     return this.disposed ? null : this.highSpeedMaglev;
+  }
+
+  // -- Spec 27 §3.1: Mare Mass Accelerator "The Gauss Needle" ---------------------
+
+  /**
+   * Build the Mare Mass Accelerator (Spec 27 §3.1): the 180 m linear
+   * induction coilgun on its 40 m traversing ring, twin 22 m hydraulic
+   * trunnion towers, 24 sequential HTS stator coils, six cryogenic capacitor
+   * banks, the cargo crane / hopper and the gunner's cupola bunker.
+   *
+   * Seated on the canonical basalt caldera rim at (-320, -1450) unless
+   * `position` says otherwise; the vertical seat is clamped to the local
+   * terrain elevation (never below ground) so the ring foundation reads as
+   * embedded in bedrock. Idempotent (a second call returns the existing
+   * system). Meshes register as shadow casters (cupola glazing excepted);
+   * teardown runs from `dispose()`. The articulation kinematics and
+   * capacitor spool curve answer even before this call via
+   * `new MassAccelerator(position)`.
+   */
+  buildMassAccelerator(position?: { x: number; y: number; z?: number }): MassAccelerator {
+    if (this.massAccelerator !== null) return this.massAccelerator;
+    const scene = this.requireScene();
+    const seatX = position?.x ?? -320;
+    const seatY = position?.y ?? -1450;
+    // Terrain clamp: an explicit z may raise the seat, never bury it.
+    const ground = this.getGroundHeightAt(seatX, seatY);
+    const seatZ = Math.max(position?.z ?? ground, ground);
+    const accelerator = new MassAccelerator({ x: seatX, y: seatY, z: seatZ }).init(scene);
+    const rootNode = accelerator.getRootNode();
+    if (rootNode !== null) rootNode.parent = this.terrainRoot ?? null;
+    this.registerShadowCasters(accelerator.getShadowCasterMeshes());
+    this.massAccelerator = accelerator;
+    return accelerator;
+  }
+
+  /** The Mare Mass Accelerator, or null before build / after dispose. */
+  getMassAccelerator(): MassAccelerator | null {
+    return this.disposed ? null : this.massAccelerator;
   }
 
   // -- surface detritus & salvage (Spec 21 §2.1) -------------------------------
