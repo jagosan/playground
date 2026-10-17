@@ -15,6 +15,7 @@
     "smoke:market": "npx tsx scripts/smoke-market-and-rails.ts",
     "smoke:client": "npx tsx scripts/smoke-client-app.ts",
     "smoke:xcorp-heist": "npx tsx scripts/smoke-x-corp-heist.ts",
+    "smoke:mass-accelerator": "npx tsx scripts/smoke-mass-accelerator.ts",
     "lunar:smoke:cleanup": "npx tsx scripts/smoke-general-cleanup.ts",
     "verify:surface": "npx tsx tests/verify-surface-rendering.ts",
     "typecheck:server": "tsc -p tsconfig.server.json"
