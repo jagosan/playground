@@ -29,11 +29,8 @@
   - `specs/00-system-overview.md`: Project vision, minigame architecture, rendering stack.
   - `specs/01-playground-lobby.md`: 3D retro playground hub, equipment-to-minigame selector.
   - `specs/02-moon-buggy.md`: 1/6th gravity lunar rover physics, controls, rock collection loop.
-  - `specs/03-moonbuggy2.md`: Realistic Apollo LRV physics, photorealistic rendering, GPD Win Max 2.
-  - `specs/04-moonbuggy2-m2.md`: Milestone 2 feedback: 25 km/h speed, dynamic mass, robotic arm, drop station.
-  - `specs/05-blender-asset-pipeline.md`: Headless Blender 4.2 asset generator (bpy), PBR materials, GLB export.
-  - `specs/06-moonbuggy2-engine-m2.md`: Three.js GLTF loader integration, articulated kinematics, HUD telemetry.
-  - `specs/07-asset-pipeline-handoff.md`: Multi-agent handoff, Blender 4.2 pipeline execution, verification.
+  - `specs/03-moonbuggy2.md` / `specs/04-moonbuggy2-m2.md` / `specs/06-moonbuggy2-engine-m2.md`: Realistic Apollo LRV physics, Pacejka slip, 25 km/h speed, robotic arm, Three.js GLTF loader integration.
+  - `specs/05-blender-asset-pipeline.md` / `specs/07-asset-pipeline-handoff.md`: Headless Blender 4.2 asset generator (bpy), PBR materials, multi-agent handoff.
   - `specs/08-artemis-ltv-and-robotic-arm.md`: Artemis LTV 3D model hierarchy, PBR materials, 4-DOF arm kinematics, sample collection.
   - `specs/12-lunar-frontier.md`: Persistent multiplayer moon economy, Babylon.js client, SQLite state, rail lines, mine tunnels, suit and buggy.
   - `specs/15-lunar-buggy-overhaul.md`: Lunar rover visual overhaul, unified kinematics, straight-line stability & keyboard/gamepad controller tuning.
@@ -55,7 +52,9 @@
 - `games/lunar-frontier/src/economy/`: Automated market pricing, commodity liquidity pools (`MarketEngine.ts`).
 - `games/lunar-frontier/src/engine/`: Babylon.js scene manager, lighting, vacuum shadows (`WorldScene.ts`, `CameraRig.ts`).
 - `games/lunar-frontier/src/entities/`: Astronaut suit EVA controller, open-top buggy, dock mechs (`AstronautSuit.ts`, `OpenBuggy.ts`, `LoadingDockMech.ts`).
-- `games/lunar-frontier/src/infrastructure/`: Procedural tunnel mesh builder, rail line spline renderer, ore cart runner (`TunnelNetwork.ts`, `RailSystem.ts`).
+- `games/lunar-frontier/src/infrastructure/`: Procedural tunnel mesh builder, rail line spline renderer, ore cart runner, X-Corp citadel monolith, high-speed maglev, 180m Mare mass accelerator, and Keplerian orbital transports (`TunnelNetwork.ts`, `RailSystem.ts`, `XCorpCitadel.ts`, `HighSpeedMaglev.ts`, `MassAccelerator.ts`, `OrbitalTransportSystem.ts`).
+- `games/lunar-frontier/src/physics/`: Vacuum ballistics, 60Hz lead solver, closed-form intercept math (`BallisticTrajectoryEngine.ts`).
+- `games/lunar-frontier/src/quests/`: High-speed train heist director, export minigame director, USP intercept threat engine (`TrainHeistDirector.ts`, `ExportMinigameDirector.ts`).
 - `games/lunar-frontier/src/network/`: WebSocket client, state delta interpolator, player manager (`NetworkClient.ts`).
 - `games/lunar-frontier/src/ui/`: Glassmorphic telemetry HUD, life support meters, commodity trade modal, hint arrow & comms terminal (`LunarHUD.ts`, `hud.css`).
 - `games/lunar-frontier/src/client/`: Interactive Babylon.js client game loop, quest engine, hint navigation, and Vite web entry (`ClientApp.ts`, `QuestEngine.ts`, `HintArrowSystem.ts`, `main.ts`).

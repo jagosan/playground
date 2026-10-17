@@ -104,8 +104,11 @@ npx tsx scripts/smoke-rival-bases.ts
 npm run typecheck:server
 npm run build
 
-# 9. Spec 26 X-Corp Citadel & Rail Heist master acceptance suite (161 assertions):
+# 9. Spec 26 X-Corp Citadel & Rail Heist central acceptance suite (161 assertions):
 npm run smoke:xcorp-heist
+
+# 10. Spec 27 Mare Mass Accelerator & Export Minigame central acceptance suite (252 assertions):
+npm run smoke:mass-accelerator
 ```
 
 ## 5. Frontier Systems & Operational Notes (Spec 25)
@@ -134,7 +137,27 @@ npm run smoke:xcorp-heist
 - **Narrative Quest ("Operation Gilded Serpent"):** 6-stage quest chain (`MEET_FIXER`, `INTERCEPT_CONVOY`, `BOARD_TRANSPORT`, `CRACK_VAULT`, `LEAP_TO_SAFETY`, `DELIVER_CONTRABAND`).
 - **Heist HUD & Procedural Audio:** Intercept radar with target reticle, segmented depot countdown bar, 3-ring alignment dial, gold contraband pill, 120–280 Hz guideway hum, Doppler flyby whoosh, 40 Hz magnetic disengage thud, and 660/880 Hz alternating klaxon alarm.
 
-## 7. Production Build & Deployment
+## 7. Mare Mass Accelerator & Orbital Export Minigame (Spec 27)
+- **The Mare Mass Accelerator ("The Gauss Needle") (`MassAccelerator.ts`):** 180m elevated electromagnetic coilgun gantry located on the basalt caldera rim at $(X = -320\,\text{m}, Y = -1,450\,\text{m})$:
+  - *Kinematic Articulation:* Azimuth $0\text{--}360^\circ$ at $25^\circ/\text{s}$, elevation $15\text{--}85^\circ$ at $15^\circ/\text{s}$ with shortest-arc wrapping and hard stops to prevent terrain clipping and zenith gimbal lock.
+  - *Cryogenic Capacitor Banks:* Non-linear RC charge profile ($v_0 = 180 + 240(1 - e^{-t/1.6})$). Overcharge breaker trips at $4.5\,\text{s}$ hold, triggering a $5.0\,\text{s}$ lockout quench.
+  - *Linear Induction Barrel:* 24 superconducting HTS coils pulsing sequentially down the barrel during discharge.
+- **Orbital Transport System (`OrbitalTransportSystem.ts`):** Deterministic Keplerian orbit traffic in LLO ($1,200\text{--}2,200\,\text{m}$ altitude, $140\text{--}220\,\text{m/s}$):
+  - *CisLunar Horizon (Bulk Ore Tug):* $1,500\,\text{m}$ alt @ $150\,\text{m/s}$, $35\,\text{m}$ catch radius, $\le 25\,\text{m/s}$ relative $\Delta v$, buys raw minerals at $2.5\times$ base depot rates.
+  - *The Obsidian Slip (Syndicate Runner):* $1,800\,\text{m}$ alt @ $210\,\text{m/s}$, $22\,\text{m}$ catch radius, $\le 18\,\text{m/s}$ relative $\Delta v$, fences contraband at $4.0\times\text{--}5.0\times$ black market rates.
+  - *USP Vigilance (Police Patrol Cutter):* $1,200\,\text{m}$ alt @ $180\,\text{m/s}$, zero catch radius (hostile), scans for Lorentz launch flares.
+  - *Capture Geometry:* 80m aft electromagnetic cone + $1.5\times R_\text{catch}$ magnetic assist sphere.
+- **Vacuum Ballistics Engine (`BallisticTrajectoryEngine.ts`):**
+  - Closed-form vacuum kinematics ($g = 1.62\,\text{m/s}^2$ downward in z-up physics frame).
+  - 60 Hz quadratic lead minimizer calculating intercept time $\tau$, recommended muzzle speed $v_0$, and dynamic predictive lead reticle with near/far arc branching and $\ge 95\%$ intercept guarantee.
+- **Minigame Lifecycle & Contraband Laundering (`ExportMinigameDirector.ts`):**
+  - 8-phase state machine: `INACTIVE` $\to$ `DOCKING_CONSOLE` $\to$ `AWAITING_ORBITAL_PASS` $\to$ `TARGETING_ACTIVE` $\to$ `COIL_CHARGING` $\to$ `IN_FLIGHT_TRACKING` $\to$ `CAPTURE_SUCCESS` / `INTERCEPT_FAILED` $\to$ `COOLING_DOWN`.
+  - *USP Threat Countdown:* Siphoning hot contraband from train heists trips orbital radar, initiating a tense 45-second intercept countdown. Successful launch launders contraband and clears USP Heat Level; timer expiry results in surface confiscation and a 2,500 CR citation fine.
+- **Ballistic HUD & Procedural Audio (`LunarHUD.ts`, `LunarAudioSystem.ts`):**
+  - Fire control overlay with 0.1° AZ/EL crosshair, dynamic pulsating lead reticle with $\pm 1.5^\circ$ green lock snapping (`#00e676`), hemispherical orbital sky-track radar, vertical capacitor muzzle gauge with optimal velocity bracket, and flashing amber/crimson USP threat alert widget.
+  - Procedural Web Audio: 80–880 Hz dual-oscillator capacitor charge whine with 13 Hz AM jitter, 45 Hz sub-bass drop Lorentz blast with 2,400 Hz electrical snap and 320 Hz barrel resonance, Doppler canister hiss, two-tone ascending major capture chime (523 $\to$ 659 Hz), and 440/587 Hz square-LFO emergency klaxon.
+
+## 8. Production Build & Deployment
 ```bash
 cd games/lunar-frontier
 npm run build
