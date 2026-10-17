@@ -81,7 +81,11 @@ import {
   SYNDICATE_LAUNDER_COMMS,
   USP_CITATION_FINE_CREDITS,
   type ExportOutcome,
+  type ExportSessionState,
 } from '../quests/ExportMinigameDirector.ts';
+// Spec 27 §3.5 Phase 5: near-arc lead solver driving the gunner HUD's
+// "Ghost Target" pip at the live capacitor velocity.
+import { BallisticTrajectoryEngine } from '../physics/BallisticTrajectoryEngine.ts';
 // Spec 26 §3.5 Phase 5: maglev induction hum speed reference (25 m/s cruise).
 import { DEFAULT_CRUISE_SPEED_MPS } from '../infrastructure/HighSpeedMaglev.ts';
 import {
@@ -107,7 +111,9 @@ import NetworkClient, {
 } from '../network/NetworkClient.ts';
 import LunarHUD, {
   type HudCompassTargets,
+  type HudExportGunnerTelemetry,
   type HudPrompt,
+  type HudRadarContact,
   type HudScannerReadout,
   type HudTradeRequest,
 } from '../ui/LunarHUD.ts';
@@ -823,6 +829,10 @@ export class ClientApp {
   private exportLastResolved: ExportOutcome = 'NONE';
   /** Edge-detect memory for the USP radar-siphon alert toast. */
   private exportUspAlertWas = false;
+  /** Spec 27 §3.5.2: edge-detect memory for the Lorentz discharge/whistle cue. */
+  private exportFireCueWas = false;
+  /** Spec 27 §3.5.2: edge-detect memory for the magnetic capture chime. */
+  private exportChimeResultWas: ExportOutcome = 'NONE';
   /**
    * Spec 24 §4.2: first-time arrival cinematic director. Owned by the caller
    * (ClientApp doesn't build a `TransportLander` itself) and attached via
@@ -3869,6 +3879,153 @@ export class ClientApp {
       chargeHeld,
     });
     this.syncExportWithQuest(director, state);
+    // Spec 27 §3.5 Phase 5: fire-control HUD + procedural audio ride the
+    // same frame the director resolves, so telemetry never lags a frame.
+    this.syncExportGunnerHud(mounted, state);
+    this.syncExportGunnerAudio(state);
+  }
+
+  /**
+   * Spec 27 §3.5 Phase 5: paint the Gauss Needle fire-control suite from
+   * live data. Barrel angles come from the Mass Accelerator's articulated
+   * gantry state (slew lag included), the "Ghost Target" lead pip from the
+   * near-arc {@link BallisticTrajectoryEngine} solver at the CURRENT
+   * capacitor velocity, the sky-track from the Orbital Transport System's
+   * active vessel, and the USP banner from the session state. The suite is
+   * retracted while the console is unmounted with no session running.
+   */
+  private syncExportGunnerHud(mounted: boolean, state: ExportSessionState): void {
+    const hud = this.hud;
+    if (hud === null) return;
+    if (this.disposed || (!mounted && !state.isActive)) {
+      hud.hideExportGunnerOverlay();
+      return;
+    }
+    hud.renderExportGunnerOverlay(this.buildExportGunnerTelemetry(state));
+  }
+
+  /** Assemble one gunner frame from the live subsystems (never throws). */
+  private buildExportGunnerTelemetry(state: ExportSessionState): HudExportGunnerTelemetry {
+    const director = this.exportDirector;
+    const accel = this.world.getMassAccelerator();
+    const ots = this.world.getOrbitalTransportSystem();
+    const seatPos = accel?.getWorldSeat() ?? EXPORT_CONSOLE_SEAT;
+    const seat = { x: seatPos.x, y: seatPos.y, z: 0 };
+    const muzzle = accel?.getMuzzleWorldPosition() ?? { x: seat.x, y: seat.y, z: seat.z + 22 };
+    const gantry = accel?.getState() ?? null;
+    const muzzleVelocityMps = director?.getMuzzleVelocityMps() ?? 180;
+
+    // -- active vessel + sky-track contacts ----------------------------------
+    const contacts: HudRadarContact[] = [];
+    let targetName: string | null = null;
+    let targetClass: string | null = null;
+    let targetRangeM: number | null = null;
+    let leadAzimuthDeg: number | null = null;
+    let leadElevationDeg: number | null = null;
+    let timeToTargetS: number | null = null;
+    let solutionAvailable = false;
+    let optimalMinMps = 0;
+    let optimalMaxMps = 0;
+    const active = ots?.getActiveTarget() ?? null;
+    if (active !== null) {
+      const dx = active.position.x - muzzle.x;
+      const dy = active.position.y - muzzle.y;
+      const dz = active.position.z - muzzle.z;
+      const horiz = Math.hypot(dx, dy);
+      const range = Math.hypot(horiz, dz);
+      // Barrel-frame compass: az 0 = +x, increasing toward +y (aimVector law).
+      const az = ((((Math.atan2(dy, dx) * 180) / Math.PI) % 360) + 360) % 360;
+      const el = horiz > 1e-9 ? (Math.atan2(dz, horiz) * 180) / Math.PI : 90;
+      // Radial velocity sign buckets the transit phase (closing / opening);
+      // anything straight overhead (>75°) reads as the overhead leg.
+      const radial =
+        range > 1e-9 ? (active.velocity.x * dx + active.velocity.y * dy + active.velocity.z * dz) / range : 0;
+      const phaseBucket =
+        el > 75 ? 'overhead' : radial < 0 ? 'approaching' : 'departing';
+      targetName = active.name;
+      targetClass = active.transportClass;
+      targetRangeM = Number.isFinite(range) ? range : null;
+      contacts.push({
+        id: active.id,
+        label: active.name,
+        transportClass: active.transportClass,
+        phase: phaseBucket,
+        azimuthDeg: az,
+        elevationDeg: el,
+        rangeM: Number.isFinite(range) ? range : undefined,
+      });
+      // Ghost Target pip: near-arc intercept at the current capacitor speed.
+      if (state.isActive) {
+        const sol = BallisticTrajectoryEngine.calculateLead(
+          muzzle,
+          active.position,
+          active.velocity,
+          muzzleVelocityMps,
+        );
+        if (sol.hasSolution && Number.isFinite(sol.leadAzimuthDeg) && Number.isFinite(sol.leadElevationDeg)) {
+          solutionAvailable = true;
+          leadAzimuthDeg = sol.leadAzimuthDeg;
+          leadElevationDeg = sol.leadElevationDeg;
+          timeToTargetS = Number.isFinite(sol.estimatedFlightTimeS)
+            ? sol.estimatedFlightTimeS
+            : null;
+          if (Number.isFinite(sol.recommendedMuzzleSpeedMps) && sol.recommendedMuzzleSpeedMps > 0) {
+            const rec = sol.recommendedMuzzleSpeedMps;
+            optimalMinMps = Math.min(420, Math.max(180, rec * 0.92));
+            optimalMaxMps = Math.min(420, Math.max(180, rec * 1.08));
+          }
+        }
+      }
+    }
+
+    return {
+      phase: director?.getPhase() ?? 'INACTIVE',
+      azimuthDeg: gantry?.azimuthDeg ?? this.exportAimDeg.azimuth,
+      elevationDeg: gantry?.elevationDeg ?? this.exportAimDeg.elevation,
+      leadAzimuthDeg,
+      leadElevationDeg,
+      solutionAvailable,
+      muzzleVelocityMps,
+      capacitorChargeRatio: accel?.getCapacitorChargeRatio() ?? 0,
+      optimalMinMps,
+      optimalMaxMps,
+      targetName,
+      targetClass,
+      targetRangeM,
+      timeToTargetS,
+      contacts,
+      contraband: state.isContraband,
+      uspAlertActive: state.uspAlertActive,
+      uspCountdownRemainingS: state.uspCountdownRemainingS,
+      canisterInFlight: state.canisterInFlight,
+    };
+  }
+
+  /**
+   * Spec 27 §3.5.2: procedural audio bed for the export run. The capacitor
+   * spool whine rides the live bank ratio (cold when no session runs), the
+   * USP klaxon mirrors the siphon countdown, the Lorentz discharge blast +
+   * vacuum whistle fire on the canister's rising edge, and the magnetic
+   * capture chime on the SUCCESS outcome edge. All setters are idempotent,
+   * so the whole pump is safe to call every frame.
+   */
+  private syncExportGunnerAudio(state: ExportSessionState): void {
+    const audio = this.audio;
+    if (audio === null || this.disposed) return;
+    const accel = this.world.getMassAccelerator();
+    const ratio =
+      state.isActive && accel !== null ? accel.getCapacitorChargeRatio() : 0;
+    audio.setCapacitorSpoolWhine(ratio);
+    audio.setUspKlaxonAlert(state.uspAlertActive);
+    if (state.canisterInFlight && !this.exportFireCueWas) {
+      audio.playLorentzDischargeBlast();
+      audio.playCanisterVacuumWhistle();
+    }
+    this.exportFireCueWas = state.canisterInFlight;
+    if (state.lastResult !== this.exportChimeResultWas) {
+      if (state.lastResult === 'SUCCESS') audio.playMagneticCaptureChime();
+      this.exportChimeResultWas = state.lastResult;
+    }
   }
 
   /**

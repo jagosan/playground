@@ -86,6 +86,7 @@ const BASE_LEVEL = {
   crunch: 0.075,
   mining: 0.16,
   oneShot: 0.9,
+  capWhine: 0.12,
 } as const;
 
 /**
@@ -169,6 +170,53 @@ const KLAXON_BASE_HZ = (KLAXON_LOW_HZ + KLAXON_HIGH_HZ) / 2; // 770
 const KLAXON_SWING_HZ = (KLAXON_HIGH_HZ - KLAXON_LOW_HZ) / 2; // 110
 const KLAXON_ALTERNATION_HZ = 1.1;
 const KLAXON_BASE_LEVEL = 0.16;
+
+// -- Spec 27 §3.5.2: Gauss Needle procedural voices ----------------------------
+
+/**
+ * Capacitor charge hum (Spec 27 §3.5.2 item 1): dual-oscillator sweep
+ * (triangle carrier + sub-octave sine) rising 80 Hz → 880 Hz with the coil
+ * spool, subtle amplitude-modulation jitter (13 Hz LFO on the shared gain).
+ */
+export const CAPACITOR_WHINE_FLOOR_HZ = 80;
+export const CAPACITOR_WHINE_CEILING_HZ = 880;
+const CAPACITOR_WHINE_JITTER_LFO_HZ = 13;
+/** Below this spool ratio the whine gate is fully closed (silent). */
+const CAPACITOR_WHINE_SILENT_RATIO = 0.005;
+
+/**
+ * Lorentz discharge blast (Spec 27 §3.5.2 item 2): impulse sub-bass drop
+ * landing on 45 Hz, an electrical snap (2 400 Hz high-passed noise burst)
+ * and the structural barrel ringing at a damped 320 Hz resonance.
+ */
+export const LORENTZ_SUBBASS_HZ = 45;
+export const LORENTZ_SNAP_HZ = 2400;
+export const LORENTZ_RING_HZ = 320;
+
+/** Canister vacuum whistle (item 3): receding Doppler hiss band edges (Hz). */
+export const VACUUM_WHISTLE_HIGH_HZ = 4200;
+export const VACUUM_WHISTLE_LOW_HZ = 1500;
+const VACUUM_WHISTLE_DURATION_S = 1.15;
+const VACUUM_WHISTLE_Q = 7;
+
+/** Magnetic capture chime (item 4): ascending major two-tone, C5 → E5. */
+export const CAPTURE_CHIME_LOW_HZ = 523;
+export const CAPTURE_CHIME_HIGH_HZ = 659;
+
+/**
+ * USP klaxon alarm (Spec 27 §3.5.2 item 5): 440 Hz ↔ 587 Hz emergency
+ * klaxon alternating every 0.4 s during the police countdown. Synthesised
+ * as a 513.5 Hz saw carrier swung ±73.5 Hz by a 1.25 Hz square LFO
+ * (half-period = the canonical 0.4 s alternation) — zero wall-clock timers,
+ * deterministic in the mock context (the Spec 26 citadel klaxon law).
+ */
+export const USP_KLAXON_LOW_HZ = 440;
+export const USP_KLAXON_HIGH_HZ = 587;
+const USP_KLAXON_BASE_HZ = (USP_KLAXON_LOW_HZ + USP_KLAXON_HIGH_HZ) / 2; // 513.5
+const USP_KLAXON_SWING_HZ = (USP_KLAXON_HIGH_HZ - USP_KLAXON_LOW_HZ) / 2; // 73.5
+/** 1 / (2 × 0.4 s) — the LFO rate that alternates the tone every 0.4 s. */
+const USP_KLAXON_ALTERNATION_HZ = 1.25;
+const USP_KLAXON_BASE_LEVEL = 0.17;
 
 /** Noise buffer length baked once per context (seconds). */
 const NOISE_BUFFER_SECONDS = 2;
@@ -398,6 +446,23 @@ export class LunarAudioSystem {
   private klaxonOsc: Oscillatorish | null = null;
   private klaxonGain: Gainish | null = null;
   private klaxonActive = false;
+
+  // -- Spec 27 §3.5.2: Gauss Needle voices (capacitor whine + USP klaxon) --------
+  /** Capacitor spool whine: triangle carrier + sub-octave sine, gain-gated. */
+  private capWhineOsc: Oscillatorish | null = null;
+  private capWhineSubOsc: Oscillatorish | null = null;
+  private capWhineGain: Gainish | null = null;
+  /** Spool ratio (0..1) last written by `setCapacitorSpoolWhine`. */
+  private capWhineRatio = 0;
+  /** Whine drive envelope (0..1, 0 while the bank is cold). */
+  private capWhineDrive = 0;
+  private uspKlaxonOsc: Oscillatorish | null = null;
+  private uspKlaxonGain: Gainish | null = null;
+  private uspKlaxonActive = false;
+  /** Context times of the last export one-shot cues (−∞ before the first). */
+  private lastLorentzDischargeAt = Number.NEGATIVE_INFINITY;
+  private lastVacuumWhistleAt = Number.NEGATIVE_INFINITY;
+  private lastCaptureChimeAt = Number.NEGATIVE_INFINITY;
   /** Context time of the last mag-lock disengage impulse (−∞ before first). */
   private lastMagLockAt = Number.NEGATIVE_INFINITY;
   /** Last flyby record (null before the first pass). */
@@ -446,6 +511,10 @@ export class LunarAudioSystem {
     const klaxonArmed = this.klaxonActive;
     this.klaxonActive = false;
     this.setCitadelAlarmActive(klaxonArmed);
+    // Spec 27 §3.5.2: same re-apply for the USP klaxon armed pre-init.
+    const uspArmed = this.uspKlaxonActive;
+    this.uspKlaxonActive = false;
+    this.setUspKlaxonAlert(uspArmed);
     this.attachAutoplayHandlers();
 
     // Generative music loop: self-rescheduling 12–20 s chain (unref'd so a
@@ -508,6 +577,17 @@ export class LunarAudioSystem {
     this.klaxonGain = null;
     this.maglevHumDrive = 0;
     this.klaxonActive = false;
+    this.capWhineOsc = null;
+    this.capWhineSubOsc = null;
+    this.capWhineGain = null;
+    this.capWhineRatio = 0;
+    this.capWhineDrive = 0;
+    this.uspKlaxonOsc = null;
+    this.uspKlaxonGain = null;
+    this.uspKlaxonActive = false;
+    this.lastLorentzDischargeAt = Number.NEGATIVE_INFINITY;
+    this.lastVacuumWhistleAt = Number.NEGATIVE_INFINITY;
+    this.lastCaptureChimeAt = Number.NEGATIVE_INFINITY;
     this.lastFlyby = null;
     this.lastMagLockAt = Number.NEGATIVE_INFINITY;
     this.musicFilter = null;
@@ -701,6 +781,237 @@ export class LunarAudioSystem {
       baseHz: KLAXON_BASE_HZ,
       swingHz: KLAXON_SWING_HZ,
       alternationHz: KLAXON_ALTERNATION_HZ,
+    };
+  }
+
+  // -- Spec 27 §3.5.2: Gauss Needle procedural voices -----------------------------
+
+  /**
+   * Capacitor charge hum: dual-oscillator sweep (triangle carrier + sub-octave
+   * sine) from 80 Hz at rest to 880 Hz at full charge, with 13 Hz amplitude
+   * jitter on the shared gain. Pass the live capacitor charge ratio
+   * (`chargeKj / CAPACITOR_BANK_KJ`, 0..1); the voice gates hard to silence
+   * below {@link CAPACITOR_WHINE_SILENT_RATIO}. Idempotent per ratio; safe
+   * before `init()` — the ratio is remembered and the voice opens with it.
+   */
+  setCapacitorSpoolWhine(ratio: number): void {
+    if (this.disposed) return;
+    const r = Number.isFinite(ratio) ? Math.max(0, Math.min(1, ratio)) : 0;
+    if (r === this.capWhineRatio && this.capWhineDrive === (r > CAPACITOR_WHINE_SILENT_RATIO ? 1 : 0)) {
+      return;
+    }
+    this.capWhineRatio = r;
+    this.capWhineDrive = r > CAPACITOR_WHINE_SILENT_RATIO ? 1 : 0;
+    if (this.ready() && this.capWhineOsc !== null && this.capWhineSubOsc !== null) {
+      const freq =
+        CAPACITOR_WHINE_FLOOR_HZ +
+        r * (CAPACITOR_WHINE_CEILING_HZ - CAPACITOR_WHINE_FLOOR_HZ);
+      const t = this.ctx!.currentTime;
+      // Short linear glide: the bank spools audibly, it does not jump.
+      this.capWhineOsc.frequency.linearRampToValueAtTime(freq, t + 0.08);
+      this.capWhineSubOsc.frequency.linearRampToValueAtTime(freq / 2, t + 0.08);
+      if (this.capWhineDrive > 0) void this.resumeIfSuspended();
+    }
+    this.applyDriveGains();
+  }
+
+  /** Whine carrier frequency (Hz) for the current spool ratio — readback. */
+  getCapacitorWhineFrequencyHz(): number {
+    if (this.capWhineOsc !== null && !this.disposed) {
+      return this.capWhineOsc.frequency.value;
+    }
+    return (
+      CAPACITOR_WHINE_FLOOR_HZ +
+      this.capWhineRatio * (CAPACITOR_WHINE_CEILING_HZ - CAPACITOR_WHINE_FLOOR_HZ)
+    );
+  }
+
+  /** Whine drive envelope 0..1 (0 = cold bank) — harness readback. */
+  getCapacitorWhineLevel(): number {
+    return this.capWhineDrive;
+  }
+
+  /** True while the charge whine voice is audible (post-dispose: false). */
+  isCapacitorWhineActive(): boolean {
+    return this.capWhineDrive > 0 && !this.disposed;
+  }
+
+  /**
+   * USP intercept klaxon: 440 Hz ↔ 587 Hz emergency siren alternating every
+   * 0.4 s while the radar siphon countdown runs (USP alert). Synthesised as
+   * a 513.5 Hz saw carrier swung ±73.5 Hz by a 1.25 Hz square LFO — the
+   * canonical alternation with zero wall-clock timers. Idempotent per state;
+   * safe before `init()` — the armed state is remembered and the gain opens
+   * when the graph exists (the Spec 26 citadel klaxon law).
+   */
+  setUspKlaxonAlert(active: boolean): void {
+    const on = active === true;
+    if (this.uspKlaxonActive === on) return;
+    this.uspKlaxonActive = on;
+    if (this.disposed || !this.ready() || this.uspKlaxonGain === null) return;
+    const t = this.ctx!.currentTime;
+    this.uspKlaxonGain.gain.cancelScheduledValues(t);
+    this.uspKlaxonGain.gain.setTargetAtTime(
+      on ? USP_KLAXON_BASE_LEVEL * this.volumes.sfx : 0,
+      t,
+      on ? 0.05 : 0.12,
+    );
+    if (on) void this.resumeIfSuspended();
+  }
+
+  /** True while the USP klaxon is armed (post-dispose: false). */
+  isUspKlaxonAlertActive(): boolean {
+    return this.uspKlaxonActive && !this.disposed;
+  }
+
+  /** The USP siren's canonical tone pair + LFO law — harness readback. */
+  getUspKlaxonTones(): {
+    lowHz: number;
+    highHz: number;
+    baseHz: number;
+    swingHz: number;
+    alternationHz: number;
+  } {
+    return {
+      lowHz: USP_KLAXON_LOW_HZ,
+      highHz: USP_KLAXON_HIGH_HZ,
+      baseHz: USP_KLAXON_BASE_HZ,
+      swingHz: USP_KLAXON_SWING_HZ,
+      alternationHz: USP_KLAXON_ALTERNATION_HZ,
+    };
+  }
+
+  /**
+   * Lorentz discharge blast (FIRE, Spec 27 §3.5.2 item 2): impulse sub-bass
+   * drop landing on 45 Hz, an electrical snap (2 400 Hz high-passed noise
+   * burst) and the barrel ringing at a damped 320 Hz resonance.
+   */
+  playLorentzDischargeBlast(): void {
+    if (!this.ready()) return;
+    const ctx = this.ctx!;
+    const t0 = ctx.currentTime + 0.005;
+    this.lastLorentzDischargeAt = t0;
+
+    // Sub-bass drop: 120 Hz → 45 Hz over 100 ms, 550 ms decay.
+    const sub = ctx.createOscillator();
+    sub.type = 'sine';
+    sub.frequency.setValueAtTime(120, t0);
+    sub.frequency.exponentialRampToValueAtTime(LORENTZ_SUBBASS_HZ, t0 + 0.1);
+    const subGain = ctx.createGain();
+    subGain.gain.setValueAtTime(BASE_LEVEL.oneShot, t0);
+    subGain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.55);
+    sub.connect(subGain);
+    subGain.connect(this.sfxBus!);
+    sub.start(t0);
+    sub.stop(t0 + 0.6);
+
+    // Electrical snap: 70 ms of noise above 2 400 Hz.
+    const snap = this.createNoiseSource();
+    if (snap === null) return;
+    snap.loop = true;
+    const snapFilter = ctx.createBiquadFilter();
+    snapFilter.type = 'highpass';
+    snapFilter.frequency.value = LORENTZ_SNAP_HZ;
+    const snapGain = ctx.createGain();
+    snapGain.gain.setValueAtTime(0.7, t0);
+    snapGain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.09);
+    snap.connect(snapFilter);
+    snapFilter.connect(snapGain);
+    snapGain.connect(this.sfxBus!);
+    snap.start(t0);
+    snap.stop(t0 + 0.12);
+
+    // Barrel ring: 320 Hz structural resonance, damped over 1.2 s.
+    const ring = ctx.createOscillator();
+    ring.type = 'triangle';
+    ring.frequency.setValueAtTime(LORENTZ_RING_HZ, t0);
+    const ringFilter = ctx.createBiquadFilter();
+    ringFilter.type = 'bandpass';
+    ringFilter.frequency.value = LORENTZ_RING_HZ;
+    ringFilter.Q.value = 14;
+    const ringGain = ctx.createGain();
+    ringGain.gain.setValueAtTime(0.42, t0);
+    ringGain.gain.exponentialRampToValueAtTime(0.0001, t0 + 1.2);
+    ring.connect(ringFilter);
+    ringFilter.connect(ringGain);
+    ringGain.connect(this.sfxBus!);
+    ring.start(t0);
+    ring.stop(t0 + 1.25);
+  }
+
+  /**
+   * Canister vacuum whistle (launch, Spec 27 §3.5.2 item 3): high-frequency
+   * Doppler hiss — band-passed noise sliding 4 200 Hz → 1 500 Hz over 1.15 s
+   * as the canister punches through the terminator into vacuum. Routed
+   * through the helmet-comms sfx bus: the vacuum kills direct conduction,
+   * the suit relay keeps the receding tone.
+   */
+  playCanisterVacuumWhistle(): void {
+    if (!this.ready()) return;
+    const ctx = this.ctx!;
+    const t0 = ctx.currentTime + 0.01;
+    this.lastVacuumWhistleAt = t0;
+
+    const src = this.createNoiseSource();
+    if (src === null) return;
+    src.loop = true;
+    const band = ctx.createBiquadFilter();
+    band.type = 'bandpass';
+    band.Q.value = VACUUM_WHISTLE_Q;
+    band.frequency.setValueAtTime(VACUUM_WHISTLE_HIGH_HZ, t0);
+    band.frequency.exponentialRampToValueAtTime(
+      VACUUM_WHISTLE_LOW_HZ,
+      t0 + VACUUM_WHISTLE_DURATION_S,
+    );
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(0.0001, t0);
+    gain.gain.linearRampToValueAtTime(0.18, t0 + 0.15);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t0 + VACUUM_WHISTLE_DURATION_S);
+    src.connect(band);
+    band.connect(gain);
+    gain.connect(this.sfxBus!);
+    src.start(t0);
+    src.stop(t0 + VACUUM_WHISTLE_DURATION_S + 0.1);
+  }
+
+  /**
+   * Magnetic capture chime (Spec 27 §3.5.2 item 4): ascending major two-tone
+   * 523 Hz → 659 Hz (C5 → E5) with a shimmer octave, rung through the helmet
+   * comms when the cargo-handlers claw locks the canister.
+   */
+  playMagneticCaptureChime(): void {
+    if (!this.ready()) return;
+    const ctx = this.ctx!;
+    const t0 = ctx.currentTime + 0.01;
+    this.lastCaptureChimeAt = t0;
+
+    const tone = (freq: number, start: number, decay: number, level: number): void => {
+      const osc = ctx.createOscillator();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(freq, start);
+      const gain = ctx.createGain();
+      gain.gain.setValueAtTime(level, start);
+      gain.gain.exponentialRampToValueAtTime(0.0001, start + decay);
+      osc.connect(gain);
+      gain.connect(this.sfxBus!);
+      osc.start(start);
+      osc.stop(start + decay + 0.05);
+    };
+    tone(CAPTURE_CHIME_LOW_HZ, t0, 0.5, 0.45);
+    tone(CAPTURE_CHIME_HIGH_HZ, t0 + 0.13, 0.8, 0.5);
+    tone(CAPTURE_CHIME_HIGH_HZ * 1.5, t0 + 0.13, 1.1, 0.12);
+  }
+
+  /** Context times of the last export one-shot cues — harness readback. */
+  getLastExportCueTimes(): {
+    dischargeAt: number;
+    whistleAt: number;
+    chimeAt: number;
+  } {
+    return {
+      dischargeAt: this.lastLorentzDischargeAt,
+      whistleAt: this.lastVacuumWhistleAt,
+      chimeAt: this.lastCaptureChimeAt,
     };
   }
 
@@ -1117,6 +1428,63 @@ export class LunarAudioSystem {
     this.klaxonOsc.start();
     klaxonMod.start();
 
+    // -- Gauss Needle: capacitor spool whine (Spec 27 §3.5.2 item 1) ----------
+    // Dual-oscillator sweep: a triangle carrier and a sub-octave sine both
+    // steered across 80→880 Hz by the coil spool ratio, with a 13 Hz jitter
+    // LFO riding the shared gain (the charge wobbles like a real bank).
+    // Gain-gated: silent while the capacitors are cold (ratio 0).
+    const capWhineFreq =
+      CAPACITOR_WHINE_FLOOR_HZ +
+      this.capWhineRatio * (CAPACITOR_WHINE_CEILING_HZ - CAPACITOR_WHINE_FLOOR_HZ);
+    this.capWhineOsc = ctx.createOscillator();
+    this.capWhineOsc.type = 'triangle';
+    this.capWhineOsc.frequency.value = capWhineFreq;
+    this.capWhineSubOsc = ctx.createOscillator();
+    this.capWhineSubOsc.type = 'sine';
+    this.capWhineSubOsc.frequency.value = capWhineFreq / 2;
+    this.capWhineGain = ctx.createGain();
+    this.capWhineGain.gain.value = 0;
+    this.capWhineOsc.connect(this.capWhineGain);
+    const capSubMix = ctx.createGain();
+    capSubMix.gain.value = 0.6;
+    this.capWhineSubOsc.connect(capSubMix);
+    capSubMix.connect(this.capWhineGain);
+    const capJitter = ctx.createOscillator();
+    capJitter.type = 'sine';
+    capJitter.frequency.value = CAPACITOR_WHINE_JITTER_LFO_HZ;
+    const capJitterDepth = ctx.createGain();
+    capJitterDepth.gain.value = 0.18;
+    capJitter.connect(capJitterDepth);
+    capJitterDepth.connect(this.capWhineGain.gain);
+    this.capWhineGain.connect(this.sfxBus);
+    this.ownedVoices.push(this.capWhineOsc, this.capWhineSubOsc, capJitter);
+    this.capWhineOsc.start();
+    this.capWhineSubOsc.start();
+    capJitter.start();
+
+    // -- Gauss Needle: USP intercept klaxon (Spec 27 §3.5.2 item 5) -----------
+    // 513.5 Hz saw carrier swung ±73.5 Hz by a 1.25 Hz square LFO — the
+    // physical 440 ↔ 587 alternation every 0.4 s without any wall-clock
+    // timer. Gain 0 until `setUspKlaxonAlert(true)`; rides the sfx bus
+    // (helmet comms) exactly like the Spec 26 citadel klaxon.
+    this.uspKlaxonOsc = ctx.createOscillator();
+    this.uspKlaxonOsc.type = 'sawtooth';
+    this.uspKlaxonOsc.frequency.value = USP_KLAXON_BASE_HZ;
+    const uspKlaxonMod = ctx.createOscillator();
+    uspKlaxonMod.type = 'square';
+    uspKlaxonMod.frequency.value = USP_KLAXON_ALTERNATION_HZ;
+    const uspKlaxonModDepth = ctx.createGain();
+    uspKlaxonModDepth.gain.value = USP_KLAXON_SWING_HZ;
+    uspKlaxonMod.connect(uspKlaxonModDepth);
+    uspKlaxonModDepth.connect(this.uspKlaxonOsc.frequency);
+    this.uspKlaxonGain = ctx.createGain();
+    this.uspKlaxonGain.gain.value = 0;
+    this.uspKlaxonOsc.connect(this.uspKlaxonGain);
+    this.uspKlaxonGain.connect(this.sfxBus);
+    this.ownedVoices.push(this.uspKlaxonOsc, uspKlaxonMod);
+    this.uspKlaxonOsc.start();
+    uspKlaxonMod.start();
+
     // -- mining loop: 440 Hz square, 30 Hz tremolo, noise crackle ---------------
     const miningOsc = ctx.createOscillator();
     miningOsc.type = 'square';
@@ -1239,6 +1607,16 @@ export class LunarAudioSystem {
         MAGLEV_HUM_BASE_LEVEL * this.volumes.sfx * this.maglevHumDrive,
         t,
         0.15,
+      );
+    }
+    // Gauss Needle capacitor whine: same law, driven by the spool envelope
+    // (Spec 27 §3.5.2 item 1). The 13 Hz jitter LFO rides on top of this
+    // intrinsic value — additive summation in real Web Audio.
+    if (this.capWhineGain !== null) {
+      this.capWhineGain.gain.setTargetAtTime(
+        BASE_LEVEL.capWhine * this.volumes.sfx * this.capWhineDrive,
+        t,
+        0.08,
       );
     }
   }

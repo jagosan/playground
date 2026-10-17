@@ -1718,3 +1718,375 @@
     box-shadow: 0 0 12px rgba(255, 210, 63, 1);
   }
 }
+
+/* ==========================================================================
+   Spec 27 §3.5.1 — Gauss Needle gunner fire-control suite (#lunar-hud-gunner).
+
+   The cupola view of the Mare Mass Accelerator: the ballistic crosshair with
+   0.1° barrel readouts, the pulsating "Ghost Target" lead diamond (green
+   #00e676 lock snap inside ±1.5°), the hemispherical orbital sky-track radar,
+   the vertical capacitor charge gauge with the green optimal-velocity
+   bracket, and the amber/crimson USP intercept banner. Same smoked-glass
+   language; the suite runs cyan while scanning and goes hot (amber → crimson)
+   the moment the radar siphon trips.
+   ========================================================================== */
+
+#lunar-hud-gunner {
+  top: 96px;
+  right: 18px;
+  width: 320px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border-color: rgba(86, 224, 255, 0.35);
+}
+
+#lunar-hud-gunner.is-hidden {
+  opacity: 0;
+  visibility: hidden;
+}
+
+/* --- USP heat / detection banner ------------------------------------------ */
+
+.gunner-usp-banner {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 7px 10px;
+  border: 1px solid rgba(255, 204, 85, 0.55);
+  border-radius: 10px;
+  background: rgba(255, 204, 85, 0.08);
+}
+
+.gunner-usp-banner.is-hidden {
+  display: none;
+}
+
+.gunner-usp-value {
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  color: var(--lf-warn);
+}
+
+.gunner-usp-caption {
+  font-size: 9.5px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--lf-dim);
+}
+
+/* Amber pulse while contraband rides the breech. */
+.gunner-usp-banner.is-hot {
+  animation: gunner-usp-amber-pulse 1.2s ease-in-out infinite;
+}
+
+/* Crimson blink under the intercept threshold. */
+.gunner-usp-banner.is-critical {
+  border-color: rgba(255, 93, 92, 0.8);
+  background: rgba(255, 93, 92, 0.14);
+  animation: gunner-usp-critical-blink 0.6s ease-in-out infinite;
+}
+
+.gunner-usp-banner.is-critical .gunner-usp-value {
+  color: var(--lf-bad);
+  text-shadow: 0 0 10px rgba(255, 93, 92, 0.85);
+}
+
+@keyframes gunner-usp-amber-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 rgba(255, 204, 85, 0);
+  }
+
+  50% {
+    box-shadow: 0 0 14px rgba(255, 204, 85, 0.45);
+  }
+}
+
+@keyframes gunner-usp-critical-blink {
+  0%,
+  100% {
+    box-shadow: 0 0 0 rgba(255, 93, 92, 0);
+  }
+
+  50% {
+    box-shadow: 0 0 18px rgba(255, 93, 92, 0.65);
+  }
+}
+
+/* --- ballistic crosshair + lead diamond ------------------------------------ */
+
+.gunner-sight {
+  position: relative;
+  height: 120px;
+  border: 1px solid var(--lf-rule);
+  border-radius: 10px;
+  background:
+    radial-gradient(circle at 50% 60%, rgba(86, 224, 255, 0.06), transparent 70%),
+    rgba(4, 18, 26, 0.45);
+  overflow: hidden;
+}
+
+.gunner-crosshair {
+  position: absolute;
+  width: 44px;
+  height: 44px;
+  transform: translate(-50%, -50%);
+  opacity: 0.9;
+}
+
+.gunner-crosshair-ring-outer,
+.gunner-crosshair-ring-inner {
+  position: absolute;
+  border: 1.5px solid var(--lf-cyan);
+  border-radius: 50%;
+}
+
+.gunner-crosshair-ring-outer {
+  inset: 0;
+}
+
+.gunner-crosshair-ring-inner {
+  inset: 12px;
+  border-style: dashed;
+  border-color: rgba(86, 224, 255, 0.55);
+}
+
+.gunner-crosshair-cross {
+  position: absolute;
+  inset: 21px;
+  border-left: 1px solid rgba(86, 224, 255, 0.8);
+}
+
+/* "Ghost Target": pulsating diamond at the firing solution. */
+.gunner-lead {
+  position: absolute;
+  left: 50%;
+  top: 38%;
+  width: 22px;
+  height: 22px;
+  transform: translate(-50%, -50%);
+}
+
+.gunner-lead.is-hidden {
+  display: none;
+}
+
+.gunner-lead-diamond {
+  position: absolute;
+  inset: 3px;
+  border: 2px solid rgba(255, 196, 88, 0.9);
+  transform: rotate(45deg);
+  animation: gunner-lead-pulse 1.1s ease-in-out infinite;
+}
+
+/* ±1.5° snap: solid green (#00e676) lock indicator. */
+.gunner-lead.is-locked .gunner-lead-diamond {
+  border-color: #00e676;
+  background: rgba(0, 230, 118, 0.35);
+  box-shadow:
+    0 0 12px rgba(0, 230, 118, 0.9),
+    inset 0 0 6px rgba(0, 230, 118, 0.5);
+  animation: none;
+}
+
+@keyframes gunner-lead-pulse {
+  0%,
+  100% {
+    transform: rotate(45deg) scale(1);
+    opacity: 0.75;
+  }
+
+  50% {
+    transform: rotate(45deg) scale(1.18);
+    opacity: 1;
+  }
+}
+
+.gunner-readout-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.gunner-angle-value {
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: var(--lf-cyan);
+}
+
+#hud-gunner-lead-value {
+  min-height: 16px;
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  color: var(--lf-warn);
+}
+
+.gunner-lock-status {
+  font-size: 10.5px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--lf-dim);
+}
+
+#hud-gunner-lock-status:empty {
+  min-height: 0;
+}
+
+/* Mirror the green lock on the status line when data-lock=1. */
+#lunar-hud-gunner[data-lock="1"] .gunner-lock-status {
+  color: #00e676;
+  text-shadow: 0 0 8px rgba(0, 230, 118, 0.6);
+}
+
+/* --- orbital sky-track radar (hemispherical) -------------------------------- */
+
+.gunner-radar-dome {
+  position: relative;
+  width: 148px;
+  height: 148px;
+  align-self: center;
+  border-radius: 50%;
+  background:
+    radial-gradient(circle at 50% 50%, rgba(86, 224, 255, 0.10), transparent 75%),
+    rgba(4, 18, 26, 0.55);
+}
+
+.gunner-radar-ring {
+  position: absolute;
+  border: 1px solid rgba(86, 224, 255, 0.25);
+  border-radius: 50%;
+}
+
+.gunner-radar-ring-outer {
+  inset: 0;
+  border-color: rgba(86, 224, 255, 0.45);
+}
+
+.gunner-radar-ring-mid {
+  inset: 25%;
+}
+
+.gunner-radar-ring-inner {
+  inset: 38%;
+  border-style: dotted;
+}
+
+.gunner-radar-cross-h,
+.gunner-radar-cross-v {
+  position: absolute;
+  background: rgba(86, 224, 255, 0.16);
+}
+
+.gunner-radar-cross-h {
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 1px;
+}
+
+.gunner-radar-cross-v {
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 1px;
+}
+
+.gunner-radar-pip {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  font-size: 8.5px;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+  padding: 1px 3px;
+  border-radius: 4px;
+  background: rgba(4, 18, 26, 0.7);
+  border: 1px solid rgba(86, 224, 255, 0.4);
+  color: var(--lf-cyan);
+}
+
+.gunner-radar-pip.is-hidden {
+  display: none;
+}
+
+.gunner-radar-pip.contact-syndicate_runner {
+  border-color: rgba(180, 107, 255, 0.7);
+  color: #b46bff;
+}
+
+.gunner-radar-pip.contact-usp_patrol {
+  border-color: rgba(255, 93, 92, 0.7);
+  color: var(--lf-bad);
+}
+
+.gunner-radar-pip.contact-bulk_freighter {
+  border-color: rgba(92, 230, 164, 0.7);
+  color: var(--lf-good);
+}
+
+.gunner-radar-readout {
+  align-self: center;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--lf-dim);
+}
+
+/* --- capacitor charge gauge (vertical) -------------------------------------- */
+
+.gunner-capacitor {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+}
+
+.gunner-cap-track {
+  position: relative;
+  width: 18px;
+  height: 120px;
+  border: 1px solid var(--lf-rule);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.04);
+  overflow: hidden;
+}
+
+.gunner-cap-fill {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 0%;
+  background: linear-gradient(0deg, rgba(86, 224, 255, 0.75), rgba(0, 230, 118, 0.9));
+}
+
+/* Inside the optimal velocity bracket the column glows green. */
+.gunner-cap-fill.is-optimal {
+  background: linear-gradient(0deg, rgba(0, 230, 118, 0.85), rgba(122, 255, 180, 0.95));
+  box-shadow: 0 0 10px rgba(0, 230, 118, 0.5);
+}
+
+/* Green optimal-velocity bracket overlay (top edge = optimalMax). */
+.gunner-cap-bracket {
+  position: absolute;
+  left: -2px;
+  right: -2px;
+  border: 1.5px solid rgba(0, 230, 118, 0.85);
+  border-radius: 4px;
+  background: rgba(0, 230, 118, 0.12);
+  pointer-events: none;
+}
+
+.gunner-cap-bracket.is-hidden {
+  display: none;
+}
+
+.gunner-cap-label {
+  align-self: center;
+  font-size: 9.5px;
+  letter-spacing: 0.12em;
+  color: var(--lf-dim);
+  writing-mode: vertical-rl;
+  text-orientation: mixed;
+}

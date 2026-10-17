@@ -94,6 +94,104 @@ export const HUD_HEIST_LOOT_SLOTS = 6;
 /** Lateral-distance radar bar full-scale (m) — a palm past the 5.5 m band. */
 export const HUD_HEIST_LAT_FULL_M = 6.0;
 
+// -- Spec 27 §3.5.1: Gauss Needle gunner fire-control overlay ------------------
+
+/**
+ * Spec 27 §3.5.1 — Mass Accelerator Fire Control Suite (`#lunar-hud-gunner`):
+ * ballistic crosshair (0.1° barrel readouts), the pulsating "Ghost Target"
+ * lead diamond with ±1.5° green lock snap, hemispherical sky-track radar,
+ * the vertical capacitor charge gauge with optimal-velocity bracket, and the
+ * amber/crimson USP intercept banner. Hidden while no export session runs.
+ */
+export const HUD_GUNNER_ID = 'lunar-hud-gunner';
+
+/**
+ * Spec 27 §3.5.1 item 2: lead-pip alignment tolerance (deg, inclusive band).
+ * Inside ±1.5° azimuth AND ±1.5° elevation the diamond snaps to a solid
+ * green (`#00e676`) lock indicator.
+ */
+export const HUD_GUNNER_LOCK_TOL_DEG = 1.5;
+
+/** Charge-gauge scale ends — mirrors MassAccelerator V_MIN/V_MAX (§3.4.2). */
+export const HUD_CAP_MIN_MPS = 180;
+export const HUD_CAP_MAX_MPS = 420;
+
+/** USP intercept clock full scale (s) — mirror of `USP_INTERCEPT_COUNTDOWN_S`. */
+export const HUD_EXPORT_USP_FULL_S = 45.0;
+
+/** Crimson threshold (s) on the USP banner — amber above, blinking below. */
+export const HUD_EXPORT_USP_CRITICAL_S = 15.0;
+
+/** Sky-track radar pip pool size (the schedule never overlaps more anyway). */
+export const HUD_GUNNER_RADAR_SLOTS = 6;
+
+/** Elevation (deg) at or above which a contact counts as "overhead". */
+export const HUD_GUNNER_OVERHEAD_EL_DEG = 60;
+
+/** One sky-track radar contact (hemispherical sky-chart placement). */
+export interface HudRadarContact {
+  id: string;
+  /** Display name (e.g. `Kestrel Hauler`); falls back to the id. */
+  label?: string;
+  /** Canonical vessel class colours the pip (`BULK_FREIGHTER` / `SYNDICATE_RUNNER` / `USP_PATROL`). */
+  transportClass?: string;
+  /** Transit phase bucket for the readout glyph (◀ approaching / ▲ overhead / ▶ departing). */
+  phase?: 'approaching' | 'overhead' | 'departing';
+  /** Compass azimuth from the gun seat (deg, 0 = +x barrel frame, clockwise). */
+  azimuthDeg: number;
+  /** Elevation above the horizon (deg, 0..90). */
+  elevationDeg: number;
+  /** Slant range (m), when known. */
+  rangeM?: number;
+}
+
+/**
+ * Structural clone of the fire-control frame (Spec 27 §3.5.1) declared with
+ * zero imports so the HUD keeps its headless contract — `ClientApp` fills it
+ * from `MassAccelerator.getState()`, `BallisticTrajectoryEngine.calculateLead`
+ * and `OrbitalTransportSystem` state every export frame.
+ */
+export interface HudExportGunnerTelemetry {
+  /** Mirrors `ExportSessionPhase` (§3.4.1) into `data-phase`. */
+  phase: string;
+  /** ACTUAL articulated barrel azimuth (deg) — slew lag included. */
+  azimuthDeg: number;
+  /** ACTUAL articulated barrel elevation (deg). */
+  elevationDeg: number;
+  /** Lead pip azimuth (deg); null when no firing solution exists. */
+  leadAzimuthDeg: number | null;
+  /** Lead pip elevation (deg); null when no firing solution exists. */
+  leadElevationDeg: number | null;
+  /** True when the trajectory engine reports an exact intercept at this charge. */
+  solutionAvailable: boolean;
+  /** Current capacitor muzzle velocity (m/s, 180..420). */
+  muzzleVelocityMps: number;
+  /** Capacitor bank charge 0..1 (post-discharge reads 0). */
+  capacitorChargeRatio: number;
+  /** Green optimal-velocity bracket lower edge (m/s); hides when ≥ optimalMaxMps. */
+  optimalMinMps: number;
+  /** Green optimal-velocity bracket upper edge (m/s). */
+  optimalMaxMps: number;
+  /** Active target name (null when the sky is empty). */
+  targetName?: string | null;
+  /** Active target transport class. */
+  targetClass?: string | null;
+  /** Slant range to the active target (m). */
+  targetRangeM?: number | null;
+  /** Estimated time to intercept (s). */
+  timeToTargetS?: number | null;
+  /** Sky-track contacts (approaching / overhead / departing vessels). */
+  contacts: HudRadarContact[];
+  /** Contraband loaded in the breech (§3.4.3). */
+  contraband: boolean;
+  /** USP radar-siphon alert stands (§3.4.3). */
+  uspAlertActive: boolean;
+  /** Intercept countdown remaining (s). */
+  uspCountdownRemainingS: number;
+  /** Canister currently downrange (IN_FLIGHT_TRACKING). */
+  canisterInFlight: boolean;
+}
+
 /**
  * Spec 25 §2.5 — structural clone of the audio engine's `AudioVolumes`
  * declared locally so the HUD keeps its zero-import contract. Field-for-field
@@ -700,6 +798,11 @@ export class LunarHUD {
   /** Spec 26 §3.5.1 — last heist telemetry painted (harness readback). */
   private lastHeistTelemetry: HeistTelemetry | null = null;
 
+  /** Spec 27 §3.5.1 — last gunner fire-control frame painted (harness readback). */
+  private lastExportGunnerTelemetry: HudExportGunnerTelemetry | null = null;
+  /** Sky-track radar pip pool (`make`n once, rewritten per frame). */
+  private gunnerRadarPips: Elementish[] = [];
+
   /** Spec 21 §2.5 — holographic topographic map overlay state. */
   private mapVisible = false;
   /** Last map frame handed to `updateMap` (harness readback). */
@@ -747,6 +850,7 @@ export class LunarHUD {
     this.buildCompass();
     this.buildIntroOverlay();
     this.buildHeistOverlay();
+    this.buildGunnerOverlay();
     this.buildToast();
     this.buildLifeSupport();
     this.buildBuggyPanel();
@@ -787,6 +891,8 @@ export class LunarHUD {
     this.clearCommsTimers();
     this.lastIntroTelemetry = null;
     this.lastHeistTelemetry = null;
+    this.lastExportGunnerTelemetry = null;
+    this.gunnerRadarPips = [];
     this.tradeRows.clear();
     this.tradeOptions.clear();
     this.promptEls = [];
@@ -2186,6 +2292,375 @@ export class LunarHUD {
   /** Last heist telemetry painted (null when retracted) — harness readback. */
   getHeistTelemetry(): HeistTelemetry | null {
     return this.lastHeistTelemetry;
+  }
+
+  // -- Spec 27 §3.5.1: Gauss Needle gunner fire-control overlay ------------------
+
+  /**
+   * Mass Accelerator Fire Control Suite (`#lunar-hud-gunner`, Spec 27 §3.5.1).
+   * Five widgets, painted every export frame from the fire-control frame:
+   *
+   *   1. Ballistic Crosshair — dual-ring vector sight with 0.1° barrel
+   *      azimuth/elevation readouts (`AZ 214.0° / EL 62.5°`).
+   *   2. Dynamic Lead Reticle ("Ghost Target") — pulsating diamond at the
+   *      firing solution; inside ±{@link HUD_GUNNER_LOCK_TOL_DEG} on BOTH
+   *      axes the diamond snaps to a solid green (`#00e676`) `.is-locked`.
+   *   3. Orbital Sky-Track Radar — hemispherical compass with a pip per
+   *      scene-resident vessel (approaching ◀ / overhead ▲ / departing ▶).
+   *   4. Capacitor Charge Bar — vertical segmented gauge over the canonical
+   *      180..420 m/s bank range with the green optimal-velocity bracket.
+   *   5. USP Heat Banner — amber while contraband rides the breech, crimson
+   *      blink under {@link HUD_EXPORT_USP_CRITICAL_S} to the intercept.
+   *
+   * `null` (or an inactive frame) retracts the whole suite. Every value
+   * mirrors into `data-*` attributes so headless DOMs assert without CSS.
+   */
+  renderExportGunnerOverlay(telemetry: HudExportGunnerTelemetry | null): void {
+    if (this.disposed) return;
+    this.lastExportGunnerTelemetry = telemetry;
+
+    const panel = this.els.get('gunner-panel');
+    if (panel === undefined) return;
+    if (telemetry === null) {
+      this.hideGunnerWidgets();
+      return;
+    }
+
+    const fin = (v: number | null | undefined): number =>
+      typeof v === 'number' && Number.isFinite(v) ? v : 0;
+    const phase = String(telemetry.phase ?? 'INACTIVE');
+    panel.setAttribute('data-phase', phase);
+    this.setClass('gunner-panel', 'is-hidden', false);
+
+    // -- 1. ballistic crosshair (0.1° readouts, Spec §3.5.1 item 1) ---------
+    const az = wrap360(fin(telemetry.azimuthDeg));
+    const el = clamp(fin(telemetry.elevationDeg), -90, 90);
+    this.setText('gunner-az-value', `AZ ${az.toFixed(1)}°`);
+    this.setText('gunner-el-value', `EL ${el.toFixed(1)}°`);
+    panel.setAttribute('data-az', az.toFixed(1));
+    panel.setAttribute('data-el', el.toFixed(1));
+    const crosshair = this.els.get('gunner-crosshair');
+    if (crosshair !== undefined) {
+      // The reticle slides with the barrel: azimuth across the tape, elevation
+      // up the sight column (both normalized to the visible window).
+      crosshair.style['left'] = `${((az / 360) * 100).toFixed(2)}%`;
+      crosshair.style['top'] = `${(((90 - el) / 90) * 50).toFixed(2)}%`;
+    }
+
+    // -- 2. dynamic lead reticle ("Ghost Target", ±1.5° lock snap) ----------
+    const leadAz = telemetry.leadAzimuthDeg;
+    const leadEl = telemetry.leadElevationDeg;
+    const hasLead =
+      telemetry.solutionAvailable === true &&
+      typeof leadAz === 'number' &&
+      Number.isFinite(leadAz) &&
+      typeof leadEl === 'number' &&
+      Number.isFinite(leadEl);
+    this.setClass('gunner-lead', 'is-hidden', !hasLead);
+    // Inclusive ±1.5° band on BOTH axes (epsilon keeps exact-boundary frames
+    // locked — TrainHeistDirector inclusive-band rule).
+    const locked =
+      hasLead &&
+      Math.abs(angleDelta(leadAz as number, az)) <= HUD_GUNNER_LOCK_TOL_DEG + 1e-9 &&
+      Math.abs((leadEl as number) - el) <= HUD_GUNNER_LOCK_TOL_DEG + 1e-9;
+    this.setClass('gunner-lead', 'is-locked', locked);
+    if (hasLead) {
+      this.setText(
+        'gunner-lead-value',
+        `LEAD ${(leadAz as number).toFixed(1)}° / ${(leadEl as number).toFixed(1)}°`,
+      );
+      panel.setAttribute('data-lead-az', (leadAz as number).toFixed(1));
+      panel.setAttribute('data-lead-el', (leadEl as number).toFixed(1));
+      panel.setAttribute(
+        'data-lock-az-delta',
+        angleDelta(leadAz as number, az).toFixed(2),
+      );
+      panel.setAttribute('data-lock-el-delta', ((leadEl as number) - el).toFixed(2));
+    } else {
+      panel.setAttribute('data-lead-az', '');
+      panel.setAttribute('data-lead-el', '');
+    }
+    panel.setAttribute('data-lock', locked ? '1' : '0');
+    this.setText(
+      'gunner-lock-status',
+      locked
+        ? 'LEAD LOCK // ON TARGET'
+        : hasLead
+          ? 'SLEW TO LEAD PIP'
+          : 'NO FIRING SOLUTION',
+    );
+
+    // Target strip (name · class · range · time-to-target).
+    const targetName = String(telemetry.targetName ?? '').trim();
+    if (targetName.length > 0) {
+      const parts = [targetName.toUpperCase()];
+      if (typeof telemetry.targetClass === 'string' && telemetry.targetClass.length > 0) {
+        parts.push(telemetry.targetClass.replace(/_/g, ' '));
+      }
+      if (typeof telemetry.targetRangeM === 'number' && Number.isFinite(telemetry.targetRangeM)) {
+        parts.push(`${num(telemetry.targetRangeM, 0)} m`);
+      }
+      if (typeof telemetry.timeToTargetS === 'number' && Number.isFinite(telemetry.timeToTargetS)) {
+        parts.push(`T+${telemetry.timeToTargetS.toFixed(1)}s`);
+      }
+      this.setText('gunner-target-value', parts.join(' · '));
+    } else {
+      this.setText('gunner-target-value', 'SKY EMPTY — NO ACTIVE FREIGHTER');
+    }
+
+    // -- 3. orbital sky-track radar ------------------------------------------
+    const contacts = Array.isArray(telemetry.contacts) ? telemetry.contacts : [];
+    for (let i = 0; i < this.gunnerRadarPips.length; i++) {
+      const pip = this.gunnerRadarPips[i];
+      const contact = contacts[i];
+      if (contact === undefined || contact === null) {
+        this.setClassEl(pip, 'is-hidden', true);
+        continue;
+      }
+      const cAz = wrap360(fin(contact.azimuthDeg));
+      const cEl = clamp(fin(contact.elevationDeg), 0, 90);
+      // Hemisphere projection: azimuth around the rim, elevation inward
+      // (horizon at the rim, zenith dead centre).
+      const radiusPct = ((90 - cEl) / 90) * 50;
+      const rad = cAz * (Math.PI / 180);
+      pip.style['left'] = `${(50 + radiusPct * Math.sin(rad)).toFixed(2)}%`;
+      pip.style['top'] = `${(50 - radiusPct * Math.cos(rad)).toFixed(2)}%`;
+      const glyph = contact.phase === 'approaching' ? '◀' : contact.phase === 'departing' ? '▶' : '▲';
+      const label = String(contact.label ?? contact.id ?? 'CONTACT').toUpperCase();
+      const range = typeof contact.rangeM === 'number' && Number.isFinite(contact.rangeM)
+        ? ` · ${num(contact.rangeM, 0)} m`
+        : '';
+      pip.textContent = `${glyph} ${label}${range}`;
+      pip.setAttribute('data-contact-id', String(contact.id ?? ''));
+      pip.setAttribute('data-contact-class', String(contact.transportClass ?? ''));
+      pip.setAttribute('data-contact-phase', String(contact.phase ?? 'overhead'));
+      pip.setAttribute('data-contact-az', cAz.toFixed(1));
+      pip.setAttribute('data-contact-el', cEl.toFixed(1));
+      this.setClassEl(pip, `contact-${String(contact.transportClass ?? 'unknown').toLowerCase()}`, true);
+      this.setClassEl(pip, 'is-hidden', false);
+    }
+    this.setText(
+      'gunner-radar-readout',
+      contacts.length === 0
+        ? 'SKY-TRACK: clear'
+        : `SKY-TRACK: ${contacts.length} contact${contacts.length === 1 ? '' : 's'}`,
+    );
+
+    // -- 4. capacitor charge bar (vertical, 180..420 m/s + bracket) ----------
+    const v = clamp(fin(telemetry.muzzleVelocityMps), HUD_CAP_MIN_MPS, HUD_CAP_MAX_MPS);
+    const span = HUD_CAP_MAX_MPS - HUD_CAP_MIN_MPS;
+    const fillPct = ((v - HUD_CAP_MIN_MPS) / span) * 100;
+    const fill = this.els.get('gunner-cap-fill');
+    if (fill !== undefined) {
+      fill.style['height'] = `${fillPct.toFixed(1)}%`;
+      fill.setAttribute('data-mps', v.toFixed(2));
+    }
+    this.setText('gunner-velocity-value', `${num(v, 1)} m/s`);
+    this.setText('gunner-charge-value', pct(clamp(fin(telemetry.capacitorChargeRatio), 0, 1) * 100));
+    panel.setAttribute('data-velocity-mps', v.toFixed(2));
+    panel.setAttribute('data-charge-ratio', clamp(fin(telemetry.capacitorChargeRatio), 0, 1).toFixed(3));
+
+    const optMin = clamp(fin(telemetry.optimalMinMps), 0, HUD_CAP_MAX_MPS);
+    const optMax = clamp(fin(telemetry.optimalMaxMps), 0, HUD_CAP_MAX_MPS);
+    const bracketActive = optMax > optMin && optMax > HUD_CAP_MIN_MPS;
+    this.setClass('gunner-cap-bracket', 'is-hidden', !bracketActive);
+    if (bracketActive) {
+      const bLo = Math.max(optMin, HUD_CAP_MIN_MPS);
+      const bracket = this.els.get('gunner-cap-bracket');
+      if (bracket !== undefined) {
+        // Vertical gauge: 420 m/s at the top, 180 at the bottom.
+        const topPct = ((HUD_CAP_MAX_MPS - Math.min(optMax, HUD_CAP_MAX_MPS)) / span) * 100;
+        const heightPct = ((Math.min(optMax, HUD_CAP_MAX_MPS) - bLo) / span) * 100;
+        bracket.style['top'] = `${topPct.toFixed(1)}%`;
+        bracket.style['height'] = `${Math.max(0, heightPct).toFixed(1)}%`;
+        bracket.setAttribute('data-optimal-min', bLo.toFixed(0));
+        bracket.setAttribute('data-optimal-max', Math.min(optMax, HUD_CAP_MAX_MPS).toFixed(0));
+      }
+    }
+    this.setClass(
+      'gunner-cap-fill',
+      'is-optimal',
+      bracketActive && v >= optMin - 1e-9 && v <= optMax + 1e-9,
+    );
+
+    // -- 5. USP heat / detection banner --------------------------------------
+    const countdown = clamp(fin(telemetry.uspCountdownRemainingS), 0, HUD_EXPORT_USP_FULL_S);
+    const bannerVisible = telemetry.uspAlertActive === true || telemetry.contraband === true;
+    this.setClass('gunner-usp', 'is-hidden', !bannerVisible);
+    if (bannerVisible) {
+      const critical = telemetry.uspAlertActive === true && countdown < HUD_EXPORT_USP_CRITICAL_S;
+      this.setClass('gunner-usp', 'is-critical', critical);
+      this.setClass('gunner-usp', 'is-hot', !critical);
+      this.setText(
+        'gunner-usp-value',
+        telemetry.uspAlertActive === true
+          ? `USP INTERCEPT T-${countdown.toFixed(1)}s`
+          : 'CARGO HOT — SIPHON ARMED ON CHARGE',
+      );
+      panel.setAttribute('data-usp-countdown-s', countdown.toFixed(1));
+    } else {
+      this.setClass('gunner-usp', 'is-critical', false);
+      this.setClass('gunner-usp', 'is-hot', false);
+      panel.setAttribute('data-usp-countdown-s', '');
+    }
+
+    // In-flight chip (canister downrange).
+    this.setChip('gunner-inflight-chip', telemetry.canisterInFlight === true);
+  }
+
+  /** Retract the whole fire-control suite (session closed / console left). */
+  hideExportGunnerOverlay(): void {
+    if (this.disposed) return;
+    this.lastExportGunnerTelemetry = null;
+    this.hideGunnerWidgets();
+  }
+
+  /** Private retraction shared by `render(null)` and the public hide. */
+  private hideGunnerWidgets(): void {
+    this.setClass('gunner-panel', 'is-hidden', true);
+    this.setClass('gunner-lead', 'is-hidden', true);
+    this.setClass('gunner-lead', 'is-locked', false);
+    this.setClass('gunner-usp', 'is-hidden', true);
+    this.setClass('gunner-usp', 'is-critical', false);
+    this.setClass('gunner-usp', 'is-hot', false);
+    this.setClass('gunner-cap-bracket', 'is-hidden', true);
+    this.setClass('gunner-cap-fill', 'is-optimal', false);
+    for (const pip of this.gunnerRadarPips) this.setClassEl(pip, 'is-hidden', true);
+  }
+
+  /** Last gunner frame painted (null when retracted) — harness readback. */
+  getExportGunnerTelemetry(): HudExportGunnerTelemetry | null {
+    return this.lastExportGunnerTelemetry;
+  }
+
+  /**
+   * Fire Control Suite chrome (Spec 27 §3.5.1): the crosshair column, the
+   * lead-diamond widget, the hemispherical sky-track radar, the vertical
+   * capacitor gauge (bracket + segmented fill), and the USP banner. Hidden
+   * until `renderExportGunnerOverlay()` paints a live frame.
+   */
+  private buildGunnerOverlay(): void {
+    const panel = this.make(
+      'section',
+      HUD_GUNNER_ID,
+      'hud-panel gunner-overlay is-hidden',
+      'gunner-panel',
+    );
+    this.root.appendChild(panel);
+    panel.setAttribute('data-phase', 'INACTIVE');
+    panel.setAttribute('data-lock', '0');
+
+    // -- USP heat banner (top of the suite so it never hides behind chrome) --
+    const usp = this.make('div', 'lunar-hud-gunner-usp', 'gunner-usp-banner is-hidden', 'gunner-usp');
+    const uspValue = this.make(
+      'span',
+      'hud-gunner-usp-value',
+      'gunner-usp-value',
+      'gunner-usp-value',
+    );
+    uspValue.textContent = '';
+    usp.appendChild(uspValue);
+    const uspCaption = this.make('span', undefined, 'gunner-usp-caption');
+    uspCaption.textContent = 'UNITED SPACE POLICE // RADAR SIPHON DETECTED';
+    usp.appendChild(uspCaption);
+    panel.appendChild(usp);
+
+    panel.appendChild(this.heading('GAUSS NEEDLE FIRE CONTROL'));
+
+    // Target strip.
+    panel.appendChild(this.labeledField('gunner-target', 'TARGET', 'SKY EMPTY — NO ACTIVE FREIGHTER'));
+
+    // -- ballistic crosshair + lead diamond ----------------------------------
+    const sight = this.make('div', 'lunar-hud-gunner-sight', 'gunner-sight', 'gunner-sight');
+    const crosshair = this.make('div', 'lunar-hud-gunner-crosshair', 'gunner-crosshair', 'gunner-crosshair');
+    crosshair.appendChild(this.make('span', undefined, 'gunner-crosshair-ring-outer'));
+    crosshair.appendChild(this.make('span', undefined, 'gunner-crosshair-ring-inner'));
+    crosshair.appendChild(this.make('span', undefined, 'gunner-crosshair-cross'));
+    sight.appendChild(crosshair);
+    const lead = this.make('div', 'lunar-hud-gunner-lead', 'gunner-lead is-hidden', 'gunner-lead');
+    lead.appendChild(this.make('span', undefined, 'gunner-lead-diamond'));
+    sight.appendChild(lead);
+    panel.appendChild(sight);
+
+    const readoutRow = this.make('div', 'lunar-hud-gunner-readout', 'gunner-readout-row', 'gunner-readout-row');
+    const azValue = this.make('span', 'hud-gunner-az-value', 'gunner-angle-value', 'gunner-az-value');
+    azValue.textContent = 'AZ 0.0°';
+    const elValue = this.make('span', 'hud-gunner-el-value', 'gunner-angle-value', 'gunner-el-value');
+    elValue.textContent = 'EL 0.0°';
+    readoutRow.appendChild(azValue);
+    readoutRow.appendChild(elValue);
+    panel.appendChild(readoutRow);
+
+    const leadValue = this.make('div', 'hud-gunner-lead-value', 'gunner-lead-value', 'gunner-lead-value');
+    leadValue.textContent = '';
+    panel.appendChild(leadValue);
+    const lockStatus = this.make('div', 'hud-gunner-lock-status', 'gunner-lock-status', 'gunner-lock-status');
+    lockStatus.textContent = 'NO FIRING SOLUTION';
+    panel.appendChild(lockStatus);
+
+    // -- orbital sky-track radar ----------------------------------------------
+    const radar = this.make('div', 'lunar-hud-gunner-radar', 'gunner-radar-dome', 'gunner-radar');
+    radar.appendChild(this.make('div', undefined, 'gunner-radar-ring gunner-radar-ring-outer'));
+    radar.appendChild(this.make('div', undefined, 'gunner-radar-ring gunner-radar-ring-mid'));
+    radar.appendChild(this.make('div', undefined, 'gunner-radar-ring gunner-radar-ring-inner'));
+    radar.appendChild(this.make('div', undefined, 'gunner-radar-cross-h'));
+    radar.appendChild(this.make('div', undefined, 'gunner-radar-cross-v'));
+    this.gunnerRadarPips = [];
+    for (let i = 0; i < HUD_GUNNER_RADAR_SLOTS; i++) {
+      const pip = this.make(
+        'span',
+        `lunar-hud-gunner-pip-${i}`,
+        'gunner-radar-pip is-hidden',
+        `gunner-radar-pip-${i}`,
+      );
+      pip.textContent = '';
+      radar.appendChild(pip);
+      this.gunnerRadarPips.push(pip);
+    }
+    panel.appendChild(radar);
+    const radarReadout = this.make('div', 'hud-gunner-radar-readout', 'gunner-radar-readout', 'gunner-radar-readout');
+    radarReadout.textContent = 'SKY-TRACK: clear';
+    panel.appendChild(radarReadout);
+
+    // -- capacitor charge gauge (vertical) ------------------------------------
+    const capWrap = this.make('div', 'lunar-hud-gunner-capacitor', 'gunner-capacitor', 'gunner-capacitor');
+    const capTrack = this.make('div', 'lunar-hud-gunner-cap-track', 'gunner-cap-track', 'gunner-cap-track');
+    const bracket = this.make('div', 'lunar-hud-gunner-cap-bracket', 'gunner-cap-bracket is-hidden', 'gunner-cap-bracket');
+    capTrack.appendChild(bracket);
+    const fill = this.make('div', 'lunar-hud-gunner-cap-fill', 'gunner-cap-fill', 'gunner-cap-fill');
+    fill.style['height'] = '0%';
+    capTrack.appendChild(fill);
+    capWrap.appendChild(capTrack);
+    const capLabel = this.make('span', undefined, 'gunner-cap-label');
+    capLabel.textContent = `${HUD_CAP_MIN_MPS}–${HUD_CAP_MAX_MPS} m/s`;
+    capWrap.appendChild(capLabel);
+    panel.appendChild(capWrap);
+
+    const capReadoutRow = this.make('div', undefined, 'gunner-readout-row');
+    const velocityValue = this.make(
+      'span',
+      'hud-gunner-velocity-value',
+      'gunner-angle-value',
+      'gunner-velocity-value',
+    );
+    velocityValue.textContent = `${num(HUD_CAP_MIN_MPS, 1)} m/s`;
+    const chargeValue = this.make(
+      'span',
+      'hud-gunner-charge-value',
+      'gunner-angle-value',
+      'gunner-charge-value',
+    );
+    chargeValue.textContent = '0%';
+    capReadoutRow.appendChild(velocityValue);
+    capReadoutRow.appendChild(chargeValue);
+    panel.appendChild(capReadoutRow);
+
+    // In-flight chip.
+    const chips = this.make('div', undefined, 'hud-chips');
+    const inflight = this.make('span', 'hud-gunner-inflight-chip', 'hud-chip is-hidden', 'gunner-inflight-chip');
+    inflight.textContent = 'CANISTER IN FLIGHT';
+    chips.appendChild(inflight);
+    panel.appendChild(chips);
   }
 
   /**
