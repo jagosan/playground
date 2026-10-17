@@ -117,6 +117,9 @@ import {
 // Spec 27 §3.1: Mare Mass Accelerator "The Gauss Needle" (caldera-rim seat,
 // 2-axis articulation + capacitor spool kinematics answer before the mesh build).
 import { MassAccelerator } from '../infrastructure/MassAccelerator.ts';
+// Spec 27 §3.2: Orbital Transport System (deterministic 90–120 s transit
+// schedule, firing windows and capture-cone kinematics answer before the mesh build).
+import { OrbitalTransportSystem } from '../infrastructure/OrbitalTransportSystem.ts';
 
 // ---------------------------------------------------------------------------
 // Options & tuning
@@ -802,6 +805,8 @@ export class WorldScene {
   private highSpeedMaglev: HighSpeedMaglev | null = null;
   /** Spec 27 §3.1: Mare Mass Accelerator (null before {@link buildMassAccelerator} / after dispose). */
   private massAccelerator: MassAccelerator | null = null;
+  /** Spec 27 §3.2: orbital freight traffic (null before {@link buildOrbitalTransportSystem} / after dispose). */
+  private orbitalTransport: OrbitalTransportSystem | null = null;
 
   constructor(options: WorldSceneOptions = {}) {
     this.options = {
@@ -898,6 +903,11 @@ export class WorldScene {
       const dtMs = this.engine?.getDeltaTime() ?? 16.7;
       this.massAccelerator.update(dtMs / 1000);
     }
+    // Spec 27 §3.2: orbital transit kinematics + capture-cone shimmer.
+    if (this.orbitalTransport !== null) {
+      const dtMs = this.engine?.getDeltaTime() ?? 16.7;
+      this.orbitalTransport.update(dtMs / 1000);
+    }
     // Spec 23 §2.1.4: re-evaluate the Hapke opposition surge against the
     // current camera view before every frame is submitted.
     this.updateOppositionSurge();
@@ -921,6 +931,9 @@ export class WorldScene {
     }
     if (this.massAccelerator !== null) {
       this.massAccelerator.update(dtMs / 1000);
+    }
+    if (this.orbitalTransport !== null) {
+      this.orbitalTransport.update(dtMs / 1000);
     }
     if (this.xcorpCitadel === null) return null;
     return this.xcorpCitadel.update(dtMs / 1000, playerWorldPos);
@@ -1124,6 +1137,16 @@ export class WorldScene {
         /* already gone */
       }
       this.massAccelerator = null;
+    }
+
+    // Spec 27 §3.2: tear down the orbital transport system.
+    if (this.orbitalTransport !== null) {
+      try {
+        this.orbitalTransport.dispose();
+      } catch {
+        /* already gone */
+      }
+      this.orbitalTransport = null;
     }
 
     for (const mesh of this.entities) mesh.parent = null;
@@ -1463,6 +1486,36 @@ export class WorldScene {
   /** The Mare Mass Accelerator, or null before build / after dispose. */
   getMassAccelerator(): MassAccelerator | null {
     return this.disposed ? null : this.massAccelerator;
+  }
+
+  // -- Spec 27 §3.2: Orbital Transport Traffic & Passing Windows ------------------
+
+  /**
+   * Build the Orbital Transport System (Spec 27 §3.2): the three procedural
+   * vessels — Bulk Ore Tug *CisLunar Horizon* (1,500 m @ 150 m/s, 35 m catch
+   * radius, 2.5× payout), Syndicate Runner *The Obsidian Slip* (1,800 m @
+   * 210 m/s, 22 m radius, 4.0× black-market payout) and USP Patrol Cutter
+   * *USP Vigilance* (1,200 m @ 180 m/s, hostile, no catch envelope) — with
+   * deterministic 90–120 s transit scheduling, 20–35 s ≥ 20°-elevation
+   * firing windows and 80 m electromagnetic tractor capture cones.
+   *
+   * Idempotent (a second call returns the existing system). Vessels are sky
+   * objects: they stay scene-rooted (never parented to `terrainRoot`) and
+   * register no shadow casters; teardown runs from `dispose()`. The transit
+   * schedule, firing-window law and capture-cone kinematics answer even
+   * before this call via `new OrbitalTransportSystem(options)`.
+   */
+  buildOrbitalTransportSystem(options: { seed?: string; observer?: { x: number; y: number; z?: number } } = {}): OrbitalTransportSystem {
+    if (this.orbitalTransport !== null) return this.orbitalTransport;
+    const scene = this.requireScene();
+    const system = new OrbitalTransportSystem(options).init(scene);
+    this.orbitalTransport = system;
+    return system;
+  }
+
+  /** The Orbital Transport System, or null before build / after dispose. */
+  getOrbitalTransportSystem(): OrbitalTransportSystem | null {
+    return this.disposed ? null : this.orbitalTransport;
   }
 
   // -- surface detritus & salvage (Spec 21 §2.1) -------------------------------

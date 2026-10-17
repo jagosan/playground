@@ -27,6 +27,7 @@
     "src/infrastructure/XCorpCitadel.ts",
     "src/infrastructure/HighSpeedMaglev.ts",
     "src/infrastructure/MassAccelerator.ts",
+    "src/infrastructure/OrbitalTransportSystem.ts",
     "src/quests/TrainHeistDirector.ts",
     "src/physics/TraversalPhysics.ts",
     "src/network/NetworkClient.ts",
