@@ -7,9 +7,14 @@
  * integration, no duplicated SUIT_* constants. `update(dt, input)` steps the
  * owned suit once and copies the resulting `SuitState` onto the meshes.
  *
- * Meshes (procedural only, no GLB): torso capsule, helmet sphere, gold visor
- * ellipsoid, PLSS backpack box, chest console box, two leg capsules, and a
- * helmet SpotLight.
+ * Meshes (procedural only, no GLB — Spec 28 §2.2 retro-modern slimmer
+ * silhouette): tapered torso capsule with chest plate and waist compression
+ * band, aerodynamic bubble helmet with panoramic gold-sputtered visor,
+ * contour PLSS pack with twin oxygen cryo-cylinders, central radiator cowl
+ * and lower thruster nozzles, flush chest telemetry pad, dual arm
+ * assemblies (upper arm, forearm, gauntlet + cuff) and slender leg
+ * assemblies (thigh, knee armour, calf, boot), hung on shoulder/elbow/hip/
+ * knee pivots, plus the helmet SpotLight — 28 meshes in `getMeshes()`.
  *
  * Frame convention matches TraversalPhysics / CameraRig: world metres
  * (x, y lateral, z up) map to Babylon (x, z↑, -y) via the shared
@@ -69,10 +74,16 @@ export const WALK_CYCLE_RATE = 7.5;
 export const SPRINT_CYCLE_RATE = 12;
 /** Reference frame time the cycle rates are tuned for (s). */
 export const WALK_CYCLE_FRAME_S = 0.016;
-/** Peak leg swing amplitude (rad); arms/torso counter-move at half rate. */
+/** Peak leg swing amplitude (rad); arms counter-swing at ARM_SWING_SCALE. */
 export const LEG_SWING_RAD = 0.42;
 /** Torso counter-bob amplitude (m). */
 export const TORSO_BOB_M = 0.025;
+/** Spec 28 §2.2: fraction of the leg swing the arms carry in natural opposition. */
+export const ARM_SWING_SCALE = 0.75;
+/** Knee flexion (rad per rad of back-swing) applied during the swing phase. */
+export const KNEE_FLEX_WALK = 0.5;
+/** Resting elbow flex of a relaxed hanging arm (rad). */
+export const ELBOW_REST_RAD = 0.18;
 
 /**
  * Spec 19 §2.3 / ADR-4: the suit backpack hauls at most this many kilograms
@@ -129,14 +140,39 @@ export interface EvaSuitTelemetry {
   cargoCapacity: number;
 }
 
-/** Body geometry, metres. Local frame: +y up, +z is the helmet facing. */
-const GEO = {
-  torso: { radius: 0.29, height: 1.0, y: 0.84 },
-  helmet: { y: 1.56, diameter: 0.44 },
-  visor: { y: 1.58, z: 0.14, diameter: 0.42, sx: 0.88, sy: 0.6, sz: 0.9 },
-  backpack: { y: 1.16, z: -0.36, width: 0.52, height: 0.66, depth: 0.24 },
-  console: { y: 1.16, z: 0.3, size: 0.22 },
-  leg: { radius: 0.13, height: 0.68, y: 0.34, dx: 0.16 },
+/**
+ * Body geometry, metres. Local frame: +y up, +z is the helmet facing.
+ * Spec 28 §2.2 retro-modern slimmer silhouette — exported so smoke
+ * harnesses assert the aesthetic gates (torso r ≤ 0.22, visor d ≥ 0.34,
+ * twin cryo-cylinder r 0.08 / h 0.52) against the live build.
+ */
+export const GEO = {
+  torso: { radius: 0.2, height: 0.92, y: 0.84 },
+  chestPlate: { y: 1.02, z: 0.185, width: 0.3, height: 0.28, depth: 0.07 },
+  waistBand: { y: 0.6, diameter: 0.44, height: 0.09 },
+  helmet: { y: 1.56, diameter: 0.38 },
+  visor: { y: 1.575, z: 0.075, diameter: 0.36, sx: 0.92, sy: 0.65, sz: 0.95 },
+  telemetry: { y: 1.04, z: 0.235, width: 0.16, height: 0.12, depth: 0.03 },
+  plss: {
+    panel: { y: 1.06, z: -0.26, width: 0.36, height: 0.66, depth: 0.1 },
+    tank: { y: 1.08, z: -0.4, dx: 0.115, radius: 0.08, height: 0.52 },
+    cowl: { y: 1.08, z: -0.44, width: 0.14, height: 0.46, depth: 0.14 },
+    nozzle: { y: 0.8, z: -0.38, dx: 0.09, diameter: 0.09, length: 0.12, tilt: 0.7 },
+  },
+  arm: {
+    shoulderY: 1.22, shoulderDx: 0.235,
+    upperRadius: 0.07, upperHeight: 0.32,
+    forearmRadius: 0.065, forearmHeight: 0.28,
+    cuffDiameter: 0.13, cuffHeight: 0.055,
+    glove: { width: 0.1, height: 0.16, depth: 0.085 },
+  },
+  leg: {
+    hipY: 0.66, hipDx: 0.105,
+    thighRadius: 0.095, thighHeight: 0.36,
+    kneeDiameter: 0.13, kneeWidth: 0.11,
+    calfRadius: 0.08, calfHeight: 0.24,
+    boot: { width: 0.11, height: 0.1, depth: 0.22 },
+  },
 } as const;
 
 function clamp(v: number, lo: number, hi: number): number {
@@ -157,11 +193,22 @@ export class EvaSuitAvatar {
   private ownedEngine: AbstractEngine | null = null;
 
   private root: TransformNode | null = null;
+  /** Upper-body pivot (helmet, visor, chest plate, PLSS, arms) — takes the walk bob. */
+  private upperBody: TransformNode | null = null;
   private parts: Mesh[] = [];
   private visor: Mesh | null = null;
   private torso: Mesh | null = null;
-  private legL: Mesh | null = null;
-  private legR: Mesh | null = null;
+  /** Hip pivots swing the leg assemblies in counter-phase (Spec 28 §2.2/§2.3). */
+  private hipL: TransformNode | null = null;
+  private hipR: TransformNode | null = null;
+  /** Knee pivots flex the calf+boot during the swing phase. */
+  private kneeL: TransformNode | null = null;
+  private kneeR: TransformNode | null = null;
+  /** Shoulder pivots swing the arms in natural opposition to the legs. */
+  private shoulderL: TransformNode | null = null;
+  private shoulderR: TransformNode | null = null;
+  private elbowL: TransformNode | null = null;
+  private elbowR: TransformNode | null = null;
   /** Locomotion walk-cycle clock (radians of phase), advanced in syncTransform. */
   private walkCycleTime = 0;
   private lamp: SpotLight | null = null;
@@ -286,6 +333,16 @@ export class EvaSuitAvatar {
     for (const mesh of this.parts) EvaSuitAvatar.disposeQuietly(mesh);
     this.parts = [];
     this.visor = null;
+    this.torso = null;
+    this.upperBody = null;
+    this.hipL = null;
+    this.hipR = null;
+    this.kneeL = null;
+    this.kneeR = null;
+    this.shoulderL = null;
+    this.shoulderR = null;
+    this.elbowL = null;
+    this.elbowR = null;
     for (const material of this.materials) EvaSuitAvatar.disposeQuietly(material);
     this.materials = [];
     if (this.bootDust !== undefined) {
@@ -532,106 +589,370 @@ export class EvaSuitAvatar {
 
   // -- internals --------------------------------------------------------------
 
-  /** Procedural astronaut: torso, helmet, gold visor, PLSS, console, legs, lamp. */
+  /**
+   * Procedural retro-modern astronaut (Spec 28 §2.2): slim tapered torso +
+   * chest plate + waist band, bubble helmet + panoramic gold visor, twin-tank
+   * contour PLSS, flush telemetry pad, dual arms and slender legs on
+   * shoulder/elbow/hip/knee pivots, plus the helmet projector lamp.
+   */
   private buildAvatar(scene: Scene): void {
     const p = this.prefix;
+    const g = GEO;
 
-    const fabric = new PBRMaterial(`${p}-fabric`, scene);
-    fabric.albedoColor = new Color3(0.86, 0.86, 0.83); // sun-bleached white
-    fabric.metallic = 0.0;
-    fabric.roughness = 0.74;
+    // -- three-tier PBR material system (Spec 28 §2.2) ------------------------
+    const fabric = new PBRMaterial(`${p}-fabric-white`, scene);
+    fabric.albedoColor = new Color3(0.88, 0.88, 0.86); // high-density composite weave
+    fabric.metallic = 0.02;
+    fabric.roughness = 0.65;
     fabric.environmentIntensity = 0.05; // vacuum: almost nothing to reflect
 
-    const hardware = new PBRMaterial(`${p}-hardware`, scene);
-    hardware.albedoColor = new Color3(0.6, 0.58, 0.56); // dusted gear grey
-    hardware.metallic = 0.45;
-    hardware.roughness = 0.55;
+    const hardware = new PBRMaterial(`${p}-trim-hardware`, scene);
+    hardware.albedoColor = new Color3(0.25, 0.26, 0.28); // matte slate titanium
+    hardware.metallic = 0.72;
+    hardware.roughness = 0.42;
     hardware.environmentIntensity = 0.05;
 
+    const accent = new PBRMaterial(`${p}-trim-accent`, scene);
+    accent.albedoColor = new Color3(0.92, 0.42, 0.12); // mission safety orange
+    accent.metallic = 0.35;
+    accent.roughness = 0.4;
+    accent.environmentIntensity = 0.05;
+
     const gold = new PBRMaterial(`${p}-visor-gold`, scene);
-    // Apollo EVA gold-sputtered sun visor: bright reflective amber, near-mirror
-    // metalness (TASK-PLAY-060, spec §3.6 visual definition).
-    gold.albedoColor = new Color3(0.92, 0.76, 0.22);
-    gold.metallic = 0.95;
-    gold.roughness = 0.12;
-    gold.emissiveColor = new Color3(0.62, 0.4, 0.08); // classic gold EVA glow
+    // Apollo EVA gold-sputtered sun visor: high-reflectivity mirror metal
+    // with a subtle amber interior glow (TASK-PLAY-060 / Spec 28 §2.2).
+    gold.albedoColor = new Color3(0.95, 0.78, 0.25);
+    gold.metallic = 0.98;
+    gold.roughness = 0.08;
+    gold.emissiveColor = new Color3(0.12, 0.08, 0.02);
     gold.environmentIntensity = 0.05;
 
-    this.materials = [fabric, hardware, gold];
+    this.materials = [fabric, hardware, accent, gold];
     this.root = new TransformNode(`${p}-avatar`, scene);
+    const upperBody = new TransformNode(`${p}-upper-body`, scene);
+    upperBody.parent = this.root;
+    this.upperBody = upperBody;
 
-    const torso = MeshBuilder.CreateCapsule(
-      `${p}-torso`,
-      { radius: GEO.torso.radius, height: GEO.torso.height },
-      scene,
-    );
-    torso.position.set(0, GEO.torso.y, 0);
-    torso.material = fabric;
-
-    const helmet = MeshBuilder.CreateSphere(
-      `${p}-helmet`,
-      { diameter: GEO.helmet.diameter, segments: 16 },
-      scene,
-    );
-    helmet.position.set(0, GEO.helmet.y, 0);
-    helmet.material = fabric;
-
-    const visor = MeshBuilder.CreateSphere(
-      `${p}-visor`,
-      { diameter: GEO.visor.diameter, segments: 16 },
-      scene,
-    );
-    visor.position.set(0, GEO.visor.y, GEO.visor.z);
-    visor.scaling.set(GEO.visor.sx, GEO.visor.sy, GEO.visor.sz);
-    visor.material = gold;
-    this.visor = visor;
-
-    const backpack = MeshBuilder.CreateBox(
-      `${p}-backpack`,
-      {
-        width: GEO.backpack.width,
-        height: GEO.backpack.height,
-        depth: GEO.backpack.depth,
-      },
-      scene,
-    );
-    backpack.position.set(0, GEO.backpack.y, GEO.backpack.z);
-    backpack.material = hardware;
-
-    const consoleBox = MeshBuilder.CreateBox(
-      `${p}-console`,
-      { size: GEO.console.size },
-      scene,
-    );
-    consoleBox.position.set(0, GEO.console.y, GEO.console.z);
-    consoleBox.material = hardware;
-
-    const legL = MeshBuilder.CreateCapsule(
-      `${p}-leg-l`,
-      { radius: GEO.leg.radius, height: GEO.leg.height },
-      scene,
-    );
-    legL.position.set(-GEO.leg.dx, GEO.leg.y, 0);
-    legL.material = fabric;
-
-    const legR = MeshBuilder.CreateCapsule(
-      `${p}-leg-r`,
-      { radius: GEO.leg.radius, height: GEO.leg.height },
-      scene,
-    );
-    legR.position.set(GEO.leg.dx, GEO.leg.y, 0);
-    legR.material = fabric;
-
-    this.torso = torso;
-    this.legL = legL;
-    this.legR = legR;
-
-    this.parts = [torso, helmet, visor, backpack, consoleBox, legL, legR];
-    for (const mesh of this.parts) {
-      mesh.parent = this.root;
+    const meshes: Mesh[] = [];
+    const add = (
+      mesh: Mesh,
+      mat: PBRMaterial,
+      parent: TransformNode,
+      x: number,
+      y: number,
+      z: number,
+    ): Mesh => {
+      mesh.material = mat;
+      mesh.position.set(x, y, z);
+      mesh.parent = parent;
       mesh.isPickable = true;
       mesh.receiveShadows = false;
-    }
+      meshes.push(mesh);
+      return mesh;
+    };
+
+    // -- torso: slender tapered capsule + articulated chest plate + band -----
+    const torso = add(
+      MeshBuilder.CreateCapsule(
+        `${p}-torso`,
+        { radius: g.torso.radius, height: g.torso.height },
+        scene,
+      ),
+      fabric,
+      this.root,
+      0,
+      g.torso.y,
+      0,
+    );
+    add(
+      MeshBuilder.CreateBox(
+        `${p}-chest-plate`,
+        { width: g.chestPlate.width, height: g.chestPlate.height, depth: g.chestPlate.depth },
+        scene,
+      ),
+      hardware,
+      upperBody,
+      0,
+      g.chestPlate.y,
+      g.chestPlate.z,
+    );
+    // Low-profile flush telemetry slate integrated onto the breastplate.
+    add(
+      MeshBuilder.CreateBox(
+        `${p}-telemetry-pad`,
+        { width: g.telemetry.width, height: g.telemetry.height, depth: g.telemetry.depth },
+        scene,
+      ),
+      accent,
+      upperBody,
+      0,
+      g.telemetry.y,
+      g.telemetry.z,
+    );
+    // Waist compression band (trim ring around the hips).
+    add(
+      MeshBuilder.CreateCylinder(
+        `${p}-waist-band`,
+        { diameter: g.waistBand.diameter, height: g.waistBand.height },
+        scene,
+      ),
+      hardware,
+      this.root,
+      0,
+      g.waistBand.y,
+      0,
+    );
+
+    // -- helmet & panoramic gold visor ----------------------------------------
+    add(
+      MeshBuilder.CreateSphere(
+        `${p}-helmet`,
+        { diameter: g.helmet.diameter, segments: 20 },
+        scene,
+      ),
+      fabric,
+      upperBody,
+      0,
+      g.helmet.y,
+      0,
+    );
+    const visor = add(
+      MeshBuilder.CreateSphere(
+        `${p}-visor`,
+        { diameter: g.visor.diameter, segments: 20 },
+        scene,
+      ),
+      gold,
+      upperBody,
+      0,
+      g.visor.y,
+      g.visor.z,
+    );
+    visor.scaling.set(g.visor.sx, g.visor.sy, g.visor.sz);
+    this.visor = visor;
+
+    // -- PLSS: contour pack, twin cryo-cylinders, cowl, nozzles --------------
+    add(
+      MeshBuilder.CreateBox(
+        `${p}-plss-panel`,
+        { width: g.plss.panel.width, height: g.plss.panel.height, depth: g.plss.panel.depth },
+        scene,
+      ),
+      fabric,
+      upperBody,
+      0,
+      g.plss.panel.y,
+      g.plss.panel.z,
+    );
+    const tank = g.plss.tank;
+    add(
+      MeshBuilder.CreateCylinder(
+        `${p}-plss-tank-l`,
+        { diameter: tank.radius * 2, height: tank.height, tessellation: 16 },
+        scene,
+      ),
+      hardware,
+      upperBody,
+      -tank.dx,
+      tank.y,
+      tank.z,
+    );
+    add(
+      MeshBuilder.CreateCylinder(
+        `${p}-plss-tank-r`,
+        { diameter: tank.radius * 2, height: tank.height, tessellation: 16 },
+        scene,
+      ),
+      hardware,
+      upperBody,
+      tank.dx,
+      tank.y,
+      tank.z,
+    );
+    add(
+      MeshBuilder.CreateBox(
+        `${p}-plss-radiator-cowl`,
+        { width: g.plss.cowl.width, height: g.plss.cowl.height, depth: g.plss.cowl.depth },
+        scene,
+      ),
+      hardware,
+      upperBody,
+      0,
+      g.plss.cowl.y,
+      g.plss.cowl.z,
+    );
+    const noz = g.plss.nozzle;
+    const nozzleL = add(
+      MeshBuilder.CreateCylinder(
+        `${p}-plss-nozzle-l`,
+        { diameter: noz.diameter, height: noz.length, tessellation: 12 },
+        scene,
+      ),
+      hardware,
+      upperBody,
+      -noz.dx,
+      noz.y,
+      noz.z,
+    );
+    nozzleL.rotation.x = noz.tilt; // canted down-and-aft
+    const nozzleR = add(
+      MeshBuilder.CreateCylinder(
+        `${p}-plss-nozzle-r`,
+        { diameter: noz.diameter, height: noz.length, tessellation: 12 },
+        scene,
+      ),
+      hardware,
+      upperBody,
+      noz.dx,
+      noz.y,
+      noz.z,
+    );
+    nozzleR.rotation.x = noz.tilt;
+
+    // -- arms: shoulder → upper arm → elbow → forearm + cuff + gauntlet ------
+    const buildArm = (side: 'l' | 'r'): {
+      shoulder: TransformNode;
+      elbow: TransformNode;
+    } => {
+      const sign = side === 'l' ? -1 : 1;
+      const shoulder = new TransformNode(`${p}-shoulder-${side}`, scene);
+      shoulder.parent = upperBody;
+      shoulder.position.set(sign * g.arm.shoulderDx, g.arm.shoulderY, 0);
+      add(
+        MeshBuilder.CreateCapsule(
+          `${p}-arm-upper-${side}`,
+          { radius: g.arm.upperRadius, height: g.arm.upperHeight },
+          scene,
+        ),
+        fabric,
+        shoulder,
+        0,
+        -g.arm.upperHeight / 2,
+        0,
+      );
+      const elbow = new TransformNode(`${p}-elbow-${side}`, scene);
+      elbow.parent = shoulder;
+      elbow.position.set(0, -g.arm.upperHeight, 0);
+      elbow.rotation.x = ELBOW_REST_RAD; // relaxed hang, never locked straight
+      add(
+        MeshBuilder.CreateCapsule(
+          `${p}-arm-forearm-${side}`,
+          { radius: g.arm.forearmRadius, height: g.arm.forearmHeight },
+          scene,
+        ),
+        fabric,
+        elbow,
+        0,
+        -g.arm.forearmHeight / 2,
+        0,
+      );
+      add(
+        MeshBuilder.CreateCylinder(
+          `${p}-arm-cuff-${side}`,
+          { diameter: g.arm.cuffDiameter, height: g.arm.cuffHeight },
+          scene,
+        ),
+        accent,
+        elbow,
+        0,
+        -(g.arm.forearmHeight - g.arm.cuffHeight / 2 - 0.005),
+        0,
+      );
+      add(
+        MeshBuilder.CreateBox(
+          `${p}-arm-glove-${side}`,
+          { width: g.arm.glove.width, height: g.arm.glove.height, depth: g.arm.glove.depth },
+          scene,
+        ),
+        fabric,
+        elbow,
+        0,
+        -(g.arm.forearmHeight + g.arm.glove.height / 2 - g.arm.cuffHeight),
+        0.005,
+      );
+      return { shoulder, elbow };
+    };
+    const armL = buildArm('l');
+    const armR = buildArm('r');
+    this.shoulderL = armL.shoulder;
+    this.elbowL = armL.elbow;
+    this.shoulderR = armR.shoulder;
+    this.elbowR = armR.elbow;
+
+    // -- legs: hip → thigh + knee armour → knee pivot → calf + boot ----------
+    const buildLeg = (side: 'l' | 'r'): {
+      hip: TransformNode;
+      knee: TransformNode;
+    } => {
+      const sign = side === 'l' ? -1 : 1;
+      const hip = new TransformNode(`${p}-hip-${side}`, scene);
+      hip.parent = this.root;
+      hip.position.set(sign * g.leg.hipDx, g.leg.hipY, 0);
+      add(
+        MeshBuilder.CreateCapsule(
+          `${p}-leg-thigh-${side}`,
+          { radius: g.leg.thighRadius, height: g.leg.thighHeight },
+          scene,
+        ),
+        fabric,
+        hip,
+        0,
+        -g.leg.thighHeight / 2,
+        0,
+      );
+      // Armoured knee articulator (x-axis drum), carried with the thigh.
+      const kneeCap = add(
+        MeshBuilder.CreateCylinder(
+          `${p}-leg-knee-${side}`,
+          { diameter: g.leg.kneeDiameter, height: g.leg.kneeWidth },
+          scene,
+        ),
+        hardware,
+        hip,
+        0,
+        -g.leg.thighHeight,
+        0,
+      );
+      kneeCap.rotation.z = Math.PI / 2; // drum axis across the body
+      const knee = new TransformNode(`${p}-kneejoint-${side}`, scene);
+      knee.parent = hip;
+      knee.position.set(0, -g.leg.thighHeight, 0);
+      add(
+        MeshBuilder.CreateCapsule(
+          `${p}-leg-calf-${side}`,
+          { radius: g.leg.calfRadius, height: g.leg.calfHeight },
+          scene,
+        ),
+        fabric,
+        knee,
+        0,
+        -g.leg.calfHeight / 2,
+        0,
+      );
+      // Treaded lunar boot (0.11 m across, 0.22 m long), toe forward.
+      add(
+        MeshBuilder.CreateBox(
+          `${p}-leg-boot-${side}`,
+          { width: g.leg.boot.width, height: g.leg.boot.height, depth: g.leg.boot.depth },
+          scene,
+        ),
+        hardware,
+        knee,
+        0,
+        -(g.leg.calfHeight + g.leg.boot.height / 2 - g.leg.calfRadius),
+        0.02,
+      );
+      return { hip, knee };
+    };
+    const legL = buildLeg('l');
+    const legR = buildLeg('r');
+    this.hipL = legL.hip;
+    this.kneeL = legL.knee;
+    this.hipR = legR.hip;
+    this.kneeR = legR.knee;
+
+    this.torso = torso;
+    this.parts = meshes;
 
     // Headlamp: parented for bookkeeping, but its world position and
     // direction are also written every frame in applyLamp(), so the beam is
@@ -675,16 +996,25 @@ export class EvaSuitAvatar {
   }
 
   /**
-   * Procedural walking articulation (TASK-PLAY-060, spec §3.6): counter-phase
-   * leg swing and torso counter-bob driven by a locomotion clock. Visual only
-   * — physics stays in `LunarEvaSuit`. Stopped or airborne the pose snaps back
-   * to neutral standing.
+   * Procedural walking articulation (TASK-PLAY-060; Spec 28 §2.2/§2.3):
+   * counter-phase hip swing with knee flex on the recovery half-cycle, arms
+   * swinging in natural opposition to the legs (elbows tracking the forward
+   * sweep), and a torso/upper-body counter-bob at twice the leg frequency.
+   * Visual only — physics stays in `LunarEvaSuit`. Stopped or airborne the
+   * pose snaps back to neutral standing.
    */
   private applyWalkCycle(state: SuitState): void {
     const torso = this.torso;
-    const legL = this.legL;
-    const legR = this.legR;
-    if (torso === null || legL === null || legR === null) return;
+    const upper = this.upperBody;
+    const hipL = this.hipL;
+    const hipR = this.hipR;
+    if (torso === null || upper === null || hipL === null || hipR === null) return;
+    const kneeL = this.kneeL;
+    const kneeR = this.kneeR;
+    const shoulderL = this.shoulderL;
+    const shoulderR = this.shoulderR;
+    const elbowL = this.elbowL;
+    const elbowR = this.elbowR;
 
     const speed = Math.hypot(state.vx, state.vy);
     if (speed > WALK_MIN_SPEED && state.isGrounded) {
@@ -692,16 +1022,37 @@ export class EvaSuitAvatar {
       const rate = speed > SPRINT_MIN_SPEED ? SPRINT_CYCLE_RATE : WALK_CYCLE_RATE;
       this.walkCycleTime += rate * WALK_CYCLE_FRAME_S;
       const swing = Math.sin(this.walkCycleTime) * LEG_SWING_RAD;
-      legL.rotation.x = swing;
-      legR.rotation.x = -swing;
-      // Torso counter-bob at twice the leg frequency (heel-strike impacts).
-      torso.position.y = GEO.torso.y + Math.abs(Math.sin(this.walkCycleTime * 2)) * TORSO_BOB_M;
+      // Positive rotation.x drives a limb aft: hips counter-swing in phase.
+      hipL.rotation.x = swing;
+      hipR.rotation.x = -swing;
+      // Knees flex on the recovery (forward-thigh) half-cycle only — a leg
+      // thrusting aft stays straight for toe-off.
+      if (kneeL !== null) kneeL.rotation.x = Math.max(0, -swing) * KNEE_FLEX_WALK;
+      if (kneeR !== null) kneeR.rotation.x = Math.max(0, swing) * KNEE_FLEX_WALK;
+      // Arms swing in natural opposition to the legs on the same clock.
+      const armSwing = swing * ARM_SWING_SCALE;
+      if (shoulderL !== null) shoulderL.rotation.x = -armSwing;
+      if (shoulderR !== null) shoulderR.rotation.x = armSwing;
+      // Elbows add a touch of flex as their arm comes forward.
+      if (elbowL !== null) elbowL.rotation.x = ELBOW_REST_RAD + Math.max(0, armSwing) * 0.3;
+      if (elbowR !== null) elbowR.rotation.x = ELBOW_REST_RAD + Math.max(0, -armSwing) * 0.3;
+      // Torso + upper-body counter-bob at twice the leg frequency (heel-strike).
+      const bob = Math.abs(Math.sin(this.walkCycleTime * 2)) * TORSO_BOB_M;
+      torso.position.y = GEO.torso.y + bob;
+      upper.position.y = bob;
     } else {
       // Stopped or airborne: neutral standing pose, clock parked for next start.
       this.walkCycleTime = 0;
-      legL.rotation.x = 0;
-      legR.rotation.x = 0;
+      hipL.rotation.x = 0;
+      hipR.rotation.x = 0;
+      if (kneeL !== null) kneeL.rotation.x = 0;
+      if (kneeR !== null) kneeR.rotation.x = 0;
+      if (shoulderL !== null) shoulderL.rotation.x = 0;
+      if (shoulderR !== null) shoulderR.rotation.x = 0;
+      if (elbowL !== null) elbowL.rotation.x = ELBOW_REST_RAD;
+      if (elbowR !== null) elbowR.rotation.x = ELBOW_REST_RAD;
       torso.position.y = GEO.torso.y;
+      upper.position.y = 0;
     }
   }
 

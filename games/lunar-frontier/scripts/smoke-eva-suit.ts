@@ -24,9 +24,14 @@
  */
 
 import { NullEngine } from '@babylonjs/core/Engines/nullEngine.js';
+import { PBRMaterial } from '@babylonjs/core/Materials/PBR/pbrMaterial.js';
+import type { Mesh } from '@babylonjs/core/Meshes/mesh.js';
+import type { TransformNode } from '@babylonjs/core/Meshes/transformNode.js';
 
 import {
+  ARM_SWING_SCALE,
   EvaSuitAvatar,
+  GEO,
   HEADLIGHT_INTENSITY,
   HEADLIGHT_ANGLE_DEG,
   HEADLIGHT_RANGE_M,
@@ -76,12 +81,72 @@ check('no meshes before init', avatar.isBuilt() === false && avatar.getMeshes().
 avatar.init(); // no args → self-owned NullEngine fallback
 check('init() builds under NullEngine', avatar.isBuilt() === true);
 check('init() is idempotent', avatar.init().isBuilt() === true);
-check('7 procedural meshes', avatar.getMeshes().length === 7, `got ${avatar.getMeshes().length}`);
+// Spec 28 Phase 3 re-cut: the retro-modern slimmer suit (torso + chest plate
+// + waist band, helmet + visor, twin-tank PLSS panel/cowl/nozzles, telemetry
+// pad, 2×4 arm meshes, 2×4 leg meshes) replaces the old 7-mesh blocky build.
+check('28 procedural meshes (Spec 28 §2.2 build)', avatar.getMeshes().length === 28, `got ${avatar.getMeshes().length}`);
 check('all meshes named eva-*', avatar.getMeshes().every((m) => m.name.startsWith('eva-')));
 check('root transform node present', avatar.getRootNode() !== null);
 check('helmet spotlight present', avatar.getHeadlight() !== null);
 check('lit at spawn by default', avatar.isHeadlightOn() === true);
 check('scene exposed', avatar.getScene() !== null);
+
+// ---------------------------------------------------------------------------
+// 1b. Spec 28 §2.2 retro-modern suit contract (Phase 3)
+// ---------------------------------------------------------------------------
+section('1b. Spec 28 §2.2 retro-modern geometry & materials');
+
+{
+  const meshes = avatar.getMeshes();
+  const byName = (n: string): Mesh | undefined => meshes.find((m) => m.name === `eva-${n}`);
+  check('slim tapered torso r 0.20 (gate ≤ 0.22), h 0.92, y 0.84',
+    GEO.torso.radius === 0.2 && GEO.torso.radius <= 0.22 && GEO.torso.height === 0.92 && GEO.torso.y === 0.84
+    && byName('torso') !== undefined && byName('chest-plate') !== undefined && byName('waist-band') !== undefined,
+    `r=${GEO.torso.radius} h=${GEO.torso.height} y=${GEO.torso.y}`);
+  check('left + right arm assemblies (upper, forearm, glove) present',
+    ['arm-upper-l', 'arm-forearm-l', 'arm-glove-l', 'arm-upper-r', 'arm-forearm-r', 'arm-glove-r']
+      .every((n) => byName(n) !== undefined));
+  check('bubble helmet d 0.38 + panoramic visor d 0.36 (gate ≥ 0.34)',
+    GEO.helmet.diameter === 0.38 && GEO.visor.diameter === 0.36 && GEO.visor.diameter >= 0.34
+    && byName('helmet') !== undefined && byName('visor') !== undefined);
+  const visorMesh = byName('visor')!;
+  check('visor ellipsoid scaling sx 0.92, sy 0.65, sz 0.95',
+    Math.abs(visorMesh.scaling.x - 0.92) < 1e-9 && Math.abs(visorMesh.scaling.y - 0.65) < 1e-9
+    && Math.abs(visorMesh.scaling.z - 0.95) < 1e-9);
+  check('twin cryo-cylinder PLSS r 0.08 h 0.52 replaces monolithic box',
+    GEO.plss.tank.radius === 0.08 && GEO.plss.tank.height === 0.52
+    && byName('plss-tank-l') !== undefined && byName('plss-tank-r') !== undefined
+    && byName('backpack') === undefined);
+  check('central radiator cowl + twin lower thruster nozzles present',
+    byName('plss-radiator-cowl') !== undefined && byName('plss-nozzle-l') !== undefined
+    && byName('plss-nozzle-r') !== undefined);
+  check('flush chest telemetry slate 0.16 × 0.12 × 0.03',
+    GEO.telemetry.width === 0.16 && GEO.telemetry.height === 0.12 && GEO.telemetry.depth === 0.03
+    && byName('telemetry-pad') !== undefined);
+  check('slender legs: knee articulators + 0.11 × 0.22 treaded lunar boots',
+    ['leg-thigh-l', 'leg-knee-l', 'leg-calf-l', 'leg-boot-l',
+      'leg-thigh-r', 'leg-knee-r', 'leg-calf-r', 'leg-boot-r'].every((n) => byName(n) !== undefined)
+    && GEO.leg.boot.width === 0.11 && GEO.leg.boot.depth === 0.22);
+  const suitScene = avatar.getScene()!;
+  const fab = suitScene.getMaterialByName('eva-fabric-white') as PBRMaterial | null;
+  const trim = suitScene.getMaterialByName('eva-trim-hardware') as PBRMaterial | null;
+  const acc = suitScene.getMaterialByName('eva-trim-accent') as PBRMaterial | null;
+  const goldM = suitScene.getMaterialByName('eva-visor-gold') as PBRMaterial | null;
+  check('fabric-white PBR: albedo (0.88,0.88,0.86), rough 0.65, metal 0.02',
+    fab !== null && Math.abs(fab.albedoColor.r - 0.88) < 1e-6 && Math.abs(fab.albedoColor.g - 0.88) < 1e-6
+    && Math.abs(fab.albedoColor.b - 0.86) < 1e-6 && Math.abs(fab.roughness! - 0.65) < 1e-9
+    && Math.abs(fab.metallic! - 0.02) < 1e-9);
+  check('trim-hardware slate (0.25,0.26,0.28) + safety-orange accent (0.92,0.42,0.12)',
+    trim !== null && acc !== null
+    && Math.abs(trim.albedoColor.r - 0.25) < 1e-6 && Math.abs(trim.albedoColor.g - 0.26) < 1e-6
+    && Math.abs(trim.albedoColor.b - 0.28) < 1e-6
+    && Math.abs(acc.albedoColor.r - 0.92) < 1e-6 && Math.abs(acc.albedoColor.g - 0.42) < 1e-6
+    && Math.abs(acc.albedoColor.b - 0.12) < 1e-6);
+  check('visor-gold mirror: metal 0.98, rough 0.08, amber emissive (0.12,0.08,0.02)',
+    goldM !== null && Math.abs(goldM.metallic! - 0.98) < 1e-9 && Math.abs(goldM.roughness! - 0.08) < 1e-9
+    && Math.abs(goldM.emissiveColor.r - 0.12) < 1e-6 && Math.abs(goldM.emissiveColor.g - 0.08) < 1e-6
+    && Math.abs(goldM.emissiveColor.b - 0.02) < 1e-6);
+}
 
 // ---------------------------------------------------------------------------
 // 2. Physics delegation — the wrapper must not add its own physics
@@ -115,6 +180,21 @@ const root = walkAvatar.getRootNode()!;
 const bpos = walkAvatar.getBabylonPosition();
 check('mesh root follows worldToBabylon', Math.abs(root.position.y - bpos.y) < 1e-9 && Math.abs(root.position.z - bpos.z) < 1e-9);
 check('rotation.y = PI/2 + heading', Math.abs(root.rotation.y - (Math.PI / 2 + last.heading)) < 1e-9);
+
+// Spec 28 Phase 3: arms swing in NATURAL OPPOSITION to the legs mid-stride
+// (walkAvatar has been stepping forward: hip swing is non-zero right now).
+{
+  const find = (n: string): Mesh => walkAvatar.getMeshes().find((m) => m.name === n)!;
+  const hip = find('eva-leg-thigh-l').parent as TransformNode;
+  const shoulderL = find('eva-arm-upper-l').parent as TransformNode;
+  const shoulderR = find('eva-arm-upper-r').parent as TransformNode;
+  check('hip swing non-zero while walking', Math.abs(hip.rotation.x) > 1e-6, `hip=${hip.rotation.x}`);
+  check('left arm opposes left leg', hip.rotation.x * shoulderL.rotation.x < 0,
+    `hip=${hip.rotation.x} shoulder=${shoulderL.rotation.x}`);
+  check('arm amplitude = ARM_SWING_SCALE × leg swing',
+    Math.abs(Math.abs(shoulderL.rotation.x) - ARM_SWING_SCALE * Math.abs(hip.rotation.x)) < 1e-12);
+  check('left and right arms counter-phase', shoulderL.rotation.x * shoulderR.rotation.x < 0);
+}
 
 // ---------------------------------------------------------------------------
 // 3. Low-G jump
