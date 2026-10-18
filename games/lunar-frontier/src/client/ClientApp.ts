@@ -416,6 +416,7 @@ export const ACTION_KEYS: Readonly<Record<string, string>> = {
   // Spec 21 §2.5: [M] raises the holographic topographic map. The geo-drill
   // keeps (RB)/RB, the proximity prompt, and `mineNearestVein()` (public API).
   KeyM: 'map',
+  KeyX: 'mine',
   KeyC: 'claim',
   KeyT: 'trade',
   // Spec 17 Phase 4: environment toggle — Earth Proving Grounds ⇄ Lunar.
@@ -2553,10 +2554,21 @@ export class ClientApp {
       case 'mine':
         this.mineNearestVein();
         break;
-      case 'map':
-        // Spec 21 §2.5: [M] raises/lower the holographic topo overlay.
+      case 'map': {
+        // Spec 21 §2.5: [M] raises/lowers the holographic topo overlay.
+        if (this.hud?.isMapVisible() ?? false) {
+          this.toggleMap();
+          break;
+        }
+        // When within reach of a vein, [M] fires the geo-drill as indicated by the prompt.
+        const target = this.getNearestVein();
+        if (target !== null && target.rangeM <= MINE_RANGE_M) {
+          this.mineNearestVein();
+          break;
+        }
         this.toggleMap();
         break;
+      }
       case 'claim':
         this.stakeClaimAtCurrentPosition();
         break;
