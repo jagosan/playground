@@ -232,6 +232,16 @@ export const GAMEPAD_DEADZONE = 0.15;
 export const GAMEPAD_STICK_DEADZONE = GAMEPAD_DEADZONE;
 
 /**
+ * Spec 28 §2.4 — radial deadzone applied to the MAGNITUDE of each analog
+ * stick pair (0.12). Replaces the per-axis deadzone cut on the four stick
+ * channels: the cut happens once on ‖(x, y)‖ via
+ * {@link gamepadRadialDeadzone} and the surviving deflection is
+ * re-normalised to full scale along the original direction, so diagonals
+ * reach full magnitude and the dead-zone edge no longer pops per axis.
+ */
+export const GAMEPAD_RADIAL_DEADZONE = 0.12;
+
+/**
  * Steering deadzone for the exponential stick curve (Spec 17 §2.2.2). Axis
  * magnitudes at or below this read as centred; beyond it the response is
  * re-normalised to (0..1) before the exponent, so a slightly-drifting pad
@@ -326,9 +336,11 @@ export const RUMBLE_MIN_INTERVAL_MS = 40;
  *
  * Spec 19 §2.1.2 adds the Linux/XInput/DirectInput trigger slots: on Linux
  * (xpad) and DirectInput pads the analog triggers report on `axes[4]` (LT)
- * and `axes[5]` (RT) — and some DirectInput pads double-map RT to `axes[2]`,
- * the standard right-stick-X slot. Axis 2 is therefore only trusted as a
- * trigger once rest-calibration has seen it parked off-centre.
+ * and `axes[5]` (RT). Spec 28 §2.4 rectifies the rail-latch: only axes 4
+ * and 5 are ever scanned as bipolar trigger sliders; `axes[2]`/`axes[3]`
+ * are ALWAYS trusted as the right stick (yaw / look pitch) and can never
+ * be latched away. `altTrigger` remains as the historical alias of the
+ * DirectInput RT double-map slot and is no longer read as a trigger.
  */
 export const GAMEPAD_AXES: Readonly<{
   strafe: number;
@@ -589,6 +601,15 @@ export interface GamepadLike {
   readonly axes: readonly number[];
   readonly buttons: readonly { readonly value: number; readonly pressed: boolean }[];
   /**
+   * W3C Gamepad API mapping identifier (Spec 28 §2.4). `'standard'`
+   * guarantees left stick on axes[0/1], right stick on axes[2/3], and
+   * LT/RT on buttons[6/7]; a pad reporting it skips the heuristic
+   * trigger-rail scan entirely. Optional and duck-typed: anonymous pads
+   * (and the headless harness) fall through to the Linux heuristics on
+   * axes 4/5 only.
+   */
+  readonly mapping?: string;
+  /**
    * Dual-rumble haptics (Spec 17 Phase 2): the structural slice of
    * `GamepadHapticActuator` the client calls. Optional and duck-typed — the
    * harness hands in a recorder, real pads hand in the browser actuator, and
@@ -662,6 +683,46 @@ export function gamepadLookCurve(raw: number): number {
   if (abs <= GAMEPAD_LOOK_DEADZONE) return 0;
   const norm = (abs - GAMEPAD_LOOK_DEADZONE) / (1 - GAMEPAD_LOOK_DEADZONE);
   return sign * Math.pow(norm, GAMEPAD_LOOK_GAMMA);
+}
+
+/**
+ * Spec 28 §2.4 — radial deadzone & re-normalisation for one analog stick
+ * pair:
+ *
+ *   a_norm = max(0, ‖a‖ − dz) / (1 − dz) · a / ‖a‖,  dz = 0.12
+ *
+ * The dead cut happens ONCE on the pair magnitude (not per axis), the
+ * survivor is re-normalised to full scale along the original direction, and
+ * the unit vector keeps the output magnitude at most 1 even on corner
+ * deflections (‖a‖ is clamped to 1 first). A stick pushed to the edge of
+ * the unit circle reads magnitude exactly 1.0 in every direction — the
+ * per-axis deadzone "popping" at the diagonal is gone. Pure; exported for
+ * the harness.
+ */
+export function gamepadRadialDeadzone(
+  x: number,
+  y: number,
+  dz: number = GAMEPAD_RADIAL_DEADZONE,
+): { x: number; y: number } {
+  const cx = Number.isFinite(x) ? clamp(x, -1, 1) : 0;
+  const cy = Number.isFinite(y) ? clamp(y, -1, 1) : 0;
+  const mag = Math.hypot(cx, cy);
+  if (mag <= dz) return { x: 0, y: 0 };
+  const reach = Math.min(1, (Math.min(mag, 1) - dz) / (1 - dz));
+  return { x: (cx / mag) * reach, y: (cy / mag) * reach };
+}
+
+/**
+ * Spec 28 §2.4 — pure gamma ease `sign(v)·|v|^γ` for stick channels whose
+ * deadzone was already applied upstream by {@link gamepadRadialDeadzone}
+ * (steering γ 1.6, look γ 1.5). It must NOT re-apply a per-axis deadband:
+ * a deflection just off the radial edge (0.15 → 0.0341) stays a small,
+ * smooth, non-zero command. Pure; exported for the harness.
+ */
+export function gamepadEase(raw: number, gamma: number): number {
+  if (!Number.isFinite(raw)) return 0;
+  const abs = clamp(Math.abs(raw), 0, 1);
+  return Math.sign(raw) * Math.pow(abs, gamma);
 }
 
 /**
@@ -905,27 +966,25 @@ export class ClientApp {
   private activeGamepadIndex = -1;
 
   /**
-   * Per-pad trigger rest calibration (Spec 19 §2.1.2): Linux xpad and
-   * DirectInput report analog triggers on bipolar axes resting at −1
-   * (xpad's axes[4]/axes[5]; some DirectInput pads park RT on axes[2]).
-   * An axis observed parked on its negative rail is flagged and remapped
-   * [−1, +1] → [0, 1]; unflagged axes read standard unipolar (negative
-   * travel = released). `altRt` additionally suppresses the right-stick-yaw
-   * reading of axes[2] — it is a trigger slider on that pad, not a stick —
-   * and `pitchRail` suppresses look-pitch on axes[3]. Keyed by pad OBJECT
-   * (WeakMap), not slot index: a driver hot-swapping controllers mid-run
-   * keeps calibration on the device that earned it, and a phantom device
-   * re-appearing in a slot never inherits its predecessor's profile.
+   * Per-pad trigger rest calibration (Spec 19 §2.1.2, rectified by Spec 28
+   * §2.4): Linux xpad and DirectInput report analog triggers on bipolar
+   * axes resting at −1 (xpad's axes[4]/axes[5]). An axis observed parked on
+   * its negative rail is flagged and remapped [−1, +1] → [0, 1]; unflagged
+   * axes read standard unipolar (negative travel = released). Only axes 4/5
+   * are ever scanned — the historical `altRt`/`pitchRail` flags that could
+   * mute axes[2]/axes[3] are gone (a stick is never a trigger) — and pads
+   * reporting `mapping === 'standard'` skip the heuristic entirely. Keyed
+   * by pad OBJECT (WeakMap), not slot index: a driver hot-swapping
+   * controllers mid-run keeps calibration on the device that earned it, and
+   * a phantom device re-appearing in a slot never inherits its
+   * predecessor's profile.
    */
-  private readonly padProfiles = new WeakMap<
-    object,
-    { ltBipolar: boolean; rtBipolar: boolean; altRt: boolean; pitchRail: boolean }
-  >();
+  private readonly padProfiles = new WeakMap<object, { ltBipolar: boolean; rtBipolar: boolean }>();
 
   /**
    * Per-pad, per-axis consecutive idle-rail frames driving the latch above
-   * (slot order: axes 2, 3, 4, 5). {@link PAD_RAIL_REST_FRAMES} frames of
-   * rail rest (with buttons up and the left stick centred) confirm a slider.
+   * (slot order: axes 4, 5). {@link PAD_RAIL_REST_FRAMES} frames of rail
+   * rest (with buttons up and the left stick centred) confirm a slider.
    */
   private readonly padRailStreaks = new WeakMap<object, number[]>();
 
@@ -2203,10 +2262,19 @@ export class ClientApp {
       if (typeof v !== 'number' || !Number.isFinite(v)) return 0;
       return clamp(v, -1, 1);
     };
-    const axis = (index: number): number => {
-      const v = rawAxis(index);
-      return Math.abs(v) <= GAMEPAD_DEADZONE ? 0 : v;
-    };
+    // Spec 28 §2.4 — radial deadzone & re-normalisation on BOTH stick pairs
+    // (dz 0.12, direction-preserving). Every stick channel below consumes the
+    // re-normalised pair, so the dead cut happens once on the pair magnitude
+    // instead of per axis, and a full push to the unit circle reads
+    // magnitude 1.0 in every direction (diagonals included).
+    const leftStick = gamepadRadialDeadzone(
+      rawAxis(GAMEPAD_AXES.strafe),
+      rawAxis(GAMEPAD_AXES.throttle),
+    );
+    const rightStick = gamepadRadialDeadzone(
+      rawAxis(GAMEPAD_AXES.yaw),
+      rawAxis(GAMEPAD_AXES.pitch),
+    );
     const buttonValue = (index: number): number => {
       const v = pad.buttons[index]?.value;
       if (typeof v !== 'number' || !Number.isFinite(v)) return 0;
@@ -2233,12 +2301,12 @@ export class ClientApp {
       return clamp(v - TRIGGER_REST_BASELINE, 0, 1);
     };
 
-    // Spec 19 §2.1.2: RT spans buttons[7].value, axes[5] AND (calibrated
-    // DirectInput pads) axes[2]; LT spans buttons[6].value and axes[4].
+    // Spec 19 §2.1.2 / Spec 28 §2.4: RT spans buttons[7].value and axes[5];
+    // LT spans buttons[6].value and axes[4]. The historical axes[2] alt-RT
+    // branch is gone — right-stick X is a stick, never a trigger.
     const rawThrottleTrigger = Math.max(
       buttonValue(GAMEPAD_BUTTONS.throttle),
       triggerFromAxis(GAMEPAD_AXES.linuxRtTrigger, profile?.rtBipolar),
-      profile?.altRt === true ? triggerFromAxis(GAMEPAD_AXES.altTrigger, true) : 0,
     );
     const rawBrakeTrigger = Math.max(
       buttonValue(GAMEPAD_BUTTONS.brake),
@@ -2246,12 +2314,11 @@ export class ClientApp {
     );
 
     // Spec 19 §2.1.6: any above-deadband pad command claims the HUD glyphs.
-    // Rail-parked pseudo-axes (calibrated sliders) never count as activity.
+    // The radial output (Spec 28 §2.4) is non-zero exactly outside the dead
+    // zone, so a zero-test on the re-normalised pairs IS the above-deadband
+    // predicate — rail-parked pseudo-axes no longer count either.
     const stickActivity =
-      Math.abs(rawAxis(GAMEPAD_AXES.strafe)) > GAMEPAD_DEADZONE ||
-      Math.abs(rawAxis(GAMEPAD_AXES.throttle)) > GAMEPAD_DEADZONE ||
-      (profile?.altRt !== true && Math.abs(rawAxis(GAMEPAD_AXES.yaw)) > GAMEPAD_DEADZONE) ||
-      (profile?.pitchRail !== true && Math.abs(rawAxis(GAMEPAD_AXES.pitch)) > GAMEPAD_DEADZONE);
+      leftStick.x !== 0 || leftStick.y !== 0 || rightStick.x !== 0 || rightStick.y !== 0;
     const anyButton = pad.buttons.some((b) => b.pressed === true || b.value > GAMEPAD_DEADZONE);
     if (stickActivity || anyButton) this.inputSource = 'gamepad';
 
@@ -2262,15 +2329,11 @@ export class ClientApp {
     this.lastThrottleDemand = gamepadThrottleCurve(rawThrottleTrigger);
     this.lastBrakeDemand = gamepadBrakeCurve(rawBrakeTrigger);
 
-    // Spec 25 §2.2.3: strict 0.15 deadzone on the throttle stick-Y axis
-    // enforced BEFORE the drive channel is computed (see `axisThrottle` —
-    // magnitudes at or below GAMEPAD_STICK_DEADZONE read exactly 0, never a
-    // scaled creep value feeding the physics throttle).
-    const axisThrottle = (index: number): number => {
-      const v = rawAxis(index);
-      return Math.abs(v) <= GAMEPAD_STICK_DEADZONE ? 0 : v;
-    };
-    const baseForward = frame.forward + axisThrottle(GAMEPAD_AXES.throttle) * -1;
+    // Spec 25 §2.2.3 / Spec 28 §2.4: the throttle demand reads the radially
+    // re-normalised left-stick pair — inside the radial dead zone it is
+    // exactly 0 (never a scaled creep value feeding the physics throttle),
+    // outside it is the re-normalised stick-Y (raw up is negative).
+    const baseForward = frame.forward + leftStick.y * -1;
 
     // Spec 19 §2.1.3 / ADR-2 — brake-to-reverse (buggy only): stopped with a
     // held LT, LT pressure becomes proportional REVERSE throttle instead of
@@ -2306,29 +2369,27 @@ export class ClientApp {
       frame.brake = this.lastBrakeDemand;
     }
 
-    // Spec 17 §2.2.2: exponential steering curve (dz 0.12, γ 1.6) on the
-    // left stick — dead-band, re-normalise, ease. The curve carries its OWN
-    // (tighter) deadzone, so it reads the raw clamped axis rather than the
-    // 0.15-cut generic one; keyboard steering is digital and never passes
-    // through it.
+    // Spec 17 §2.2.2 / Spec 28 §2.4: exponential steering ease (γ 1.6) on the
+    // radially re-normalised left-stick X — the dead-band cut already
+    // happened upstream on the PAIR magnitude, so this stage is pure ease.
+    // Keyboard steering is digital and never passes through it.
     frame.strafe = clamp(
-      frame.strafe + (keyStrafe === 0 ? gamepadSteerCurve(rawAxis(GAMEPAD_AXES.strafe)) : 0),
+      frame.strafe + (keyStrafe === 0 ? gamepadEase(leftStick.x, GAMEPAD_STEER_GAMMA) : 0),
       -1,
       1,
     );
-    // On a calibrated DirectInput pad axes[2] is the RT slider, not the
-    // right-stick X — its yaw reading would be pure trigger leakage.
-    frame.yaw = clamp(
-      frame.yaw + (profile?.altRt === true ? 0 : axis(GAMEPAD_AXES.yaw)),
-      -1,
-      1,
-    );
-    // Spec 19 §2.1.4 — right-stick look pitch: exponential curve behind a
-    // 0.15 deadband; stick-back (axes[3] negative) looks UP (+pitch), the
-    // same sign ArrowUp produces. A rail-parked axes[3] (calibrated slider)
-    // never contributes.
+    // Right-stick yaw (Spec 14 §3.1, Spec 28 §2.4): the re-normalised X
+    // passes through linearly. axes[2] is ALWAYS a stick — the historical
+    // alt-RT mute is gone, a full-left hold is a real yaw command, not a
+    // resting trigger.
+    frame.yaw = clamp(frame.yaw + rightStick.x, -1, 1);
+    // Spec 19 §2.1.4 / Spec 28 §2.4 — right-stick look pitch: exponential
+    // ease (γ 1.5) on the radially re-normalised Y (deadband handled
+    // upstream at 0.12 on the pair magnitude); stick-back (axes[3] negative)
+    // looks UP (+pitch), the same sign ArrowUp produces. axes[3] is ALWAYS a
+    // stick — the historical pitchRail mute is gone.
     frame.pitch = clamp(
-      frame.pitch + (profile?.pitchRail === true ? 0 : -gamepadLookCurve(rawAxis(GAMEPAD_AXES.pitch))),
+      frame.pitch - gamepadEase(rightStick.y, GAMEPAD_LOOK_GAMMA),
       -1,
       1,
     );
@@ -2404,20 +2465,31 @@ export class ClientApp {
 
   /**
    * Above-deadband activity on a pad (Spec 19 §2.1.1). Only the four stick
-   * axes are magnitude-checked — bipolar trigger rails (xpad rests at −1)
-   * would read as permanent activity, so an axis already calibrated to a
-   * slider (alt-RT on axes[2], rail-pitch on axes[3]) is skipped: a parked
-   * Linux pad must never out-shout a genuinely moving controller for the
-   * active-slot lock. Trigger pulls still surface through `buttons[6/7]`
-   * pressed/value on the same frame.
+   * axes are magnitude-checked (against the Spec 28 §2.4 radial threshold) —
+   * bipolar trigger rails (xpad rests at −1) would read as permanent
+   * activity, so on NON-standard pads an axes[2]/axes[3] parked hard on its
+   * negative rail is treated as a slider for the active-slot scan ONLY: it
+   * never mutes anything (`sampleInput()` still reads it as a stick). A pad
+   * reporting W3C standard mapping never skips stick axes — a right stick
+   * held full-over is real activity and claims the lock. Trigger pulls
+   * still surface through `buttons[6/7]` pressed/value on the same frame.
    */
   private gamepadHasActivity(pad: GamepadLike): boolean {
-    const profile = this.padProfiles.get(pad);
+    const standard = pad.mapping === 'standard';
     for (let i = 0; i <= GAMEPAD_AXES.pitch; i++) {
-      if (i === GAMEPAD_AXES.yaw && profile?.altRt === true) continue;
-      if (i === GAMEPAD_AXES.pitch && profile?.pitchRail === true) continue;
+      if (
+        !standard &&
+        (i === GAMEPAD_AXES.yaw || i === GAMEPAD_AXES.pitch) &&
+        this.rawAxisAt(pad, i) <= -0.9
+      ) {
+        continue;
+      }
       const v = pad.axes[i];
-      if (typeof v === 'number' && Number.isFinite(v) && Math.abs(v) > GAMEPAD_DEADZONE) {
+      if (
+        typeof v === 'number' &&
+        Number.isFinite(v) &&
+        Math.abs(v) > GAMEPAD_RADIAL_DEADZONE
+      ) {
         return true;
       }
     }
@@ -2425,30 +2497,39 @@ export class ClientApp {
   }
 
   /**
-   * Trigger rest rest-calibration (Spec 19 §2.1.2). On a frame with no
-   * button presses and the left stick centred, any of axes[2..5] parked on
-   * its negative rail for {@link PAD_RAIL_REST_FRAMES} consecutive idle
-   * frames is a bipolar trigger slider, not a stick: axes[4]→LT, axes[5]→RT,
-   * axes[2]→alt-RT (DirectInput) and axes[3]→rail (suppress look pitch).
-   * Left stick only — it is the one axis guaranteed to rest centred on every
-   * pad class, so a slider at −1 can never block its own detection.
+   * Trigger rest rest-calibration (Spec 19 §2.1.2, rectified by Spec 28
+   * §2.4). On a frame with no button presses and the left stick centred,
+   * `axes[4]` (Linux LT) or `axes[5]` (Linux RT) parked on its negative rail
+   * for {@link PAD_RAIL_REST_FRAMES} consecutive idle frames is a bipolar
+   * trigger slider, not a stick. Axes 2 and 3 (right-stick yaw / look pitch)
+   * are NEVER scanned and NEVER latched — extreme deflections there are
+   * player commands, not resting positions, and latching them used to mute
+   * the camera. Pads reporting `mapping === 'standard'` skip the heuristic
+   * scan entirely: W3C standard mapping already guarantees LT/RT on
+   * buttons[6/7] and both sticks on axes[0..3]. Left stick centredness is
+   * the idle gate for anonymous pads — it is the one axis guaranteed to rest
+   * centred on every pad class, so a slider at −1 can never block its own
+   * detection.
    */
   private calibratePadTriggers(pad: GamepadLike): void {
+    const entry = this.padProfiles.get(pad) ?? {
+      ltBipolar: false,
+      rtBipolar: false,
+    };
+    // Spec 28 §2.4 — W3C standard-mapping protection: trust the contract,
+    // run no heuristic scanning at all on a standard pad.
+    if (pad.mapping === 'standard') {
+      this.padProfiles.set(pad, entry);
+      return;
+    }
     const buttonsUp = pad.buttons.every((b) => !b.pressed && b.value <= 0.2);
     const leftStickCentred =
       Math.abs(this.rawAxisAt(pad, GAMEPAD_AXES.strafe)) <= 0.2 &&
       Math.abs(this.rawAxisAt(pad, GAMEPAD_AXES.throttle)) <= 0.2;
-    const entry = this.padProfiles.get(pad) ?? {
-      ltBipolar: false,
-      rtBipolar: false,
-      altRt: false,
-      pitchRail: false,
-    };
-    const railStreak = (this.padRailStreaks.get(pad) ?? [0, 0, 0, 0]).slice();
+    const stored = this.padRailStreaks.get(pad);
+    const railStreak = stored !== undefined && stored.length === 2 ? stored.slice() : [0, 0];
     if (buttonsUp && leftStickCentred) {
       const checks = [
-        { axis: GAMEPAD_AXES.yaw, latch: (): void => { entry.altRt = true; } },
-        { axis: GAMEPAD_AXES.pitch, latch: (): void => { entry.pitchRail = true; } },
         { axis: GAMEPAD_AXES.linuxLtTrigger, latch: (): void => { entry.ltBipolar = true; } },
         { axis: GAMEPAD_AXES.linuxRtTrigger, latch: (): void => { entry.rtBipolar = true; } },
       ];

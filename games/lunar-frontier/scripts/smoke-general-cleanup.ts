@@ -516,11 +516,16 @@ section('3. input pipeline — deadzones & stick/camera decoupling (Spec 25 §2.
       f.forward === 0 && f.strafe === 0 && f.yaw === 0 && f.pitch === 0 && f.brake === 0 && f.reverse === false);
   }
 
-  // Strict 0.15 deadzone on the stick-Y (throttle) axis.
-  currentPad = makePad([0, -0.15, 0, 0, 0, 0]);
-  check('stick-Y at exactly 0.15 reads 0 forward (strict deadzone)', app.sampleInput().forward === 0);
+  // Strict deadzone on the stick-Y (throttle) axis. Spec 28 §2.4 superseded
+  // the per-axis 0.15 cut with a RADIAL dz 0.12 on the stick PAIR, so the
+  // centred edge moved to 0.12 and outside values read (|y| − 0.12) / 0.88.
+  currentPad = makePad([0, -0.12, 0, 0, 0, 0]);
+  check('stick-Y at exactly the radial dz edge reads 0 forward', app.sampleInput().forward === 0);
   currentPad = makePad([0, -0.16, 0, 0, 0, 0]);
-  check('stick-Y past 0.15 produces drive demand', app.sampleInput().forward > 0.15);
+  check(
+    'stick-Y past the radial dz produces re-normalised drive demand',
+    Math.abs(app.sampleInput().forward - (0.16 - 0.12) / 0.88) < 1e-12,
+  );
   currentPad = makePad([0.12, 0, 0, 0, 0, 0]);
   check('stick-X at the 0.12 steer deadband → exactly 0 strafe', app.sampleInput().strafe === 0);
 

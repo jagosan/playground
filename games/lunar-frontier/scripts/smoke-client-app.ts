@@ -52,6 +52,7 @@ import {
   GAMEPAD_LOOK_GAMMA,
   GAMEPAD_MIN_AXES,
   GAMEPAD_MIN_BUTTONS,
+  GAMEPAD_RADIAL_DEADZONE,
   GAMEPAD_STEER_DEADZONE,
   GAMEPAD_STEER_GAMMA,
   GAMEPAD_THROTTLE_GAMMA,
@@ -62,7 +63,9 @@ import {
   VAULT_TERMINAL_RANGE_M,
   computeBuggyRumble,
   gamepadBrakeCurve,
+  gamepadEase,
   gamepadLookCurve,
+  gamepadRadialDeadzone,
   gamepadSteerCurve,
   gamepadThrottleCurve,
 } from '../src/client/ClientApp.ts';
@@ -1181,13 +1184,27 @@ section('D. input routing & hotkeys');
   fakePad.axes[0] = 0;
 
   fakePad.axes[1] = -0.8; // raw stick-up is negative
-  check('left stick Y → forward (up = +0.8)', app.sampleInput().forward === 0.8);
+  // Spec 28 §2.4 superseded the raw per-axis passthrough: the throttle reads
+  // the radially re-normalised pair, dz 0.12 → (|y| − 0.12) / 0.88.
+  check(
+    'left stick Y → forward (up = +0.7727, Spec 28 radial renorm)',
+    Math.abs(app.sampleInput().forward - (0.8 - 0.12) / 0.88) < 1e-12,
+    `f=${app.sampleInput().forward}`,
+  );
   fakePad.axes[1] = 0.8;
-  check('left stick Y down → reverse', app.sampleInput().forward === -0.8);
+  check(
+    'left stick Y down → reverse',
+    Math.abs(app.sampleInput().forward + (0.8 - 0.12) / 0.88) < 1e-12,
+    `f=${app.sampleInput().forward}`,
+  );
   fakePad.axes[1] = 0;
 
   fakePad.axes[2] = 0.6;
-  check('right stick X → yaw (+right)', app.sampleInput().yaw === 0.6);
+  check(
+    'right stick X → yaw (+right, Spec 28 radial renorm)',
+    Math.abs(app.sampleInput().yaw - (0.6 - 0.12) / 0.88) < 1e-12,
+    `yaw=${app.sampleInput().yaw}`,
+  );
   fakePad.axes[2] = 0;
 
   pressPad(7, true, 0.4);
@@ -1696,13 +1713,14 @@ section('D3. spec 19 gamepad subsystem & driving rectification');
   linuxPad.axes[4] = -1;
   step(1);
 
-  // D3-3 — right-stick look pitch (spec 2.1.4): axes[3] behind the 0.15
-  // deadband with exponential ease; stick-back (negative) looks up (+pitch).
+  // D3-3 — right-stick look pitch (spec 2.1.4, Spec 28 §2.4 radial dz): the
+  // pair magnitude is cut at 0.12 and re-normalised upstream, then eased
+  // with γ 1.5; stick-back (negative) looks up (+pitch).
   const lookPad = mkPad([0, 0, 0, -0.6, 0, 0]);
   usePads(lookPad);
   check(
-    'right stick Y → pitch curve ((0.45/0.85)^1.5, pull-back = +)',
-    Math.abs(app.sampleInput().pitch - Math.pow((0.6 - 0.15) / 0.85, 1.5)) < 1e-12,
+    'right stick Y → pitch curve (((0.6−0.12)/0.88)^1.5, pull-back = +, Spec 28 radial dz)',
+    Math.abs(app.sampleInput().pitch - Math.pow((0.6 - 0.12) / 0.88, 1.5)) < 1e-12,
     `p=${app.sampleInput().pitch}`,
   );
   lookPad.axes[3] = 0.6;
@@ -1861,6 +1879,172 @@ section('D3. spec 19 gamepad subsystem & driving rectification');
   });
   step(1);
   check('pad teardown returns the app to keyboard-only', app.getActiveGamepadIndex() === -1);
+}
+
+// ===========================================================================
+// LAYER D3-P5 — Spec 28 §2.4: gamepad stick rectification, W3C standard
+// mapping protection, radial deadzone re-normalisation (Acceptance Gate 4:
+// holding the right stick at (−1, −1) for ≥ 30 frames must NEVER mute yaw
+// or pitch — the old calibratePadTriggers() latched axes[2]/axes[3] as
+// trigger rails after PAD_RAIL_REST_FRAMES idle frames and zeroed both).
+// ===========================================================================
+
+section('D3-P5. spec 28 stick rectification, standard mapping & radial deadzone');
+{
+  const realNav = (globalThis as { navigator?: unknown }).navigator;
+  const mkPad5 = (mapping?: string): {
+    axes: number[];
+    buttons: { value: number; pressed: boolean }[];
+    mapping?: string;
+  } => ({
+    axes: [0, 0, 0, 0, 0, 0],
+    buttons: Array.from({ length: 16 }, () => ({ value: 0, pressed: false })),
+    ...(mapping === undefined ? {} : { mapping }),
+  });
+  type P5Pad = ReturnType<typeof mkPad5>;
+  const use5 = (...pads: Array<P5Pad | null>): void => {
+    Object.defineProperty(globalThis, 'navigator', {
+      configurable: true,
+      writable: true,
+      value: { getGamepads: () => pads },
+    });
+  };
+  const step5 = (n: number): void => {
+    for (let i = 0; i < n; i++) {
+      nowMs += 16;
+      app.update(nowMs);
+    }
+  };
+  const idle5 = (pad: P5Pad): void => {
+    pad.axes.fill(0);
+    for (const b of pad.buttons) {
+      b.pressed = false;
+      b.value = 0;
+    }
+  };
+
+  // (a) Acceptance Gate 4 — STANDARD pad, right stick pinned (−1, −1) for
+  // 30 frames (≥ PAD_RAIL_REST_FRAMES): yaw AND pitch stay alive AND stable
+  // across the whole streak (frame 1 vs frame 30, no late latch).
+  const rsPad = mkPad5('standard');
+  use5(rsPad);
+  rsPad.axes[2] = -1;
+  rsPad.axes[3] = -1;
+  const firstFrame = app.sampleInput();
+  step5(30);
+  const heldFrame = app.sampleInput();
+  check(
+    'Gate 4a: standard RS(−1,−1) held 30 frames keeps YAW alive & stable',
+    heldFrame.yaw < -0.5 && Math.abs(heldFrame.yaw - firstFrame.yaw) < 1e-9,
+    JSON.stringify({ first: firstFrame.yaw, held: heldFrame.yaw }),
+  );
+  check(
+    'Gate 4b: standard RS(−1,−1) held 30 frames keeps PITCH alive & stable (pull-back = +)',
+    heldFrame.pitch > 0.3 && Math.abs(heldFrame.pitch - firstFrame.pitch) < 1e-9,
+    JSON.stringify({ first: firstFrame.pitch, held: heldFrame.pitch }),
+  );
+  // The diagonal deflection keeps its direction: yaw sits at −1/√2, i.e.
+  // the unit-vector diagonal is preserved (no per-axis clipping pop).
+  check(
+    'Gate 4d: RS(−1,−1) diagonal keeps direction, yaw at −1/√2',
+    Math.abs(heldFrame.yaw + Math.SQRT1_2) < 1e-9,
+    `yaw=${heldFrame.yaw}`,
+  );
+  idle5(rsPad);
+  step5(1);
+
+  // (b) Same hold on an ANONYMOUS (heuristic) pad: axes 2/3 are never
+  // scanned, never latched — stick channels stay alive after well past
+  // PAD_RAIL_REST_FRAMES idle frames.
+  const heurPad = mkPad5();
+  use5(heurPad);
+  heurPad.axes[2] = -1;
+  heurPad.axes[3] = -1;
+  step5(PAD_RAIL_REST_FRAMES * 4);
+  const heurFrame = app.sampleInput();
+  check(
+    'Gate 4c: anonymous pad axes2/3 full-left-up hold never mutes yaw/pitch',
+    heurFrame.yaw < -0.5 && heurFrame.pitch > 0.3,
+    JSON.stringify({ yaw: heurFrame.yaw, pitch: heurFrame.pitch }),
+  );
+  idle5(heurPad);
+  step5(1);
+
+  // (c) W3C standard-mapping protection: axes[4]/[5] parked at −1 for many
+  // frames on a STANDARD pad must NOT latch bipolar sliders (heuristic scan
+  // skipped entirely) — mid-travel reads unipolar, i.e. exactly 0 demand.
+  const stdTrig = mkPad5('standard');
+  use5(stdTrig);
+  stdTrig.axes[4] = -1;
+  stdTrig.axes[5] = -1;
+  step5(PAD_RAIL_REST_FRAMES * 3);
+  stdTrig.axes[4] = 0;
+  stdTrig.axes[5] = 0;
+  const stdFrame = app.sampleInput();
+  check(
+    'standard pad skips rail heuristic: parked axes[4]/[5] never latch bipolar',
+    stdFrame.brake === 0 && stdFrame.forward === 0,
+    JSON.stringify({ brake: stdFrame.brake, forward: stdFrame.forward }),
+  );
+  // …and buttons[6/7] stay the analog triggers on a standard pad.
+  stdTrig.buttons[6]!.pressed = true;
+  stdTrig.buttons[6]!.value = 0.5;
+  stdTrig.buttons[7]!.pressed = true;
+  stdTrig.buttons[7]!.value = 0.4;
+  const stdBtn = app.sampleInput();
+  check(
+    'standard pad keeps buttons[6]/[7] as LT/RT (brake 0.5^0.8 / throttle 0.4^1.4)',
+    Math.abs(stdBtn.brake - Math.pow(0.5, 0.8)) < 1e-12 &&
+      Math.abs(stdBtn.forward - Math.pow(0.4, 1.4)) < 1e-12,
+    JSON.stringify({ brake: stdBtn.brake, forward: stdBtn.forward }),
+  );
+  idle5(stdTrig);
+  step5(1);
+
+  // (d) Radial deadzone pure-function invariants (Spec 28 §2.4).
+  check(
+    'radial dz constant 0.12',
+    GAMEPAD_RADIAL_DEADZONE === 0.12,
+  );
+  check(
+    'radial deadzone: inside cut, edge zero, axis full-scale, re-normalised, unit out',
+    (() => {
+      const inside = gamepadRadialDeadzone(0, 0.06);
+      const edge = gamepadRadialDeadzone(0, 0.12);
+      const full = gamepadRadialDeadzone(0, 1);
+      const off = gamepadRadialDeadzone(0.15, 0);
+      const diag = gamepadRadialDeadzone(Math.SQRT1_2, Math.SQRT1_2);
+      const corner = gamepadRadialDeadzone(-1, -1);
+      return (
+        inside.x === 0 &&
+        inside.y === 0 &&
+        edge.x === 0 &&
+        edge.y === 0 &&
+        full.x === 0 &&
+        Math.abs(full.y - 1) < 1e-12 &&
+        Math.abs(off.x - (0.15 - 0.12) / 0.88) < 1e-12 &&
+        Math.abs(Math.hypot(diag.x, diag.y) - 1) < 1e-12 &&
+        Math.abs(Math.hypot(corner.x, corner.y) - 1) < 1e-12 &&
+        corner.x < 0 &&
+        corner.y < 0
+      );
+    })(),
+  );
+  check(
+    'gamma ease is pure (no second deadzone): 0.0341 → 0.0341^1.6, sign kept',
+    Math.abs(gamepadEase((0.15 - 0.12) / 0.88, 1.6) - Math.pow((0.15 - 0.12) / 0.88, 1.6)) <
+      1e-12 &&
+      gamepadEase(0, 1.6) === 0 &&
+      gamepadEase(1, 1.5) === 1 &&
+      Math.abs(gamepadEase(-0.5, 1.5) + Math.pow(0.5, 1.5)) < 1e-12,
+  );
+
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    writable: true,
+    value: realNav,
+  });
+  step5(1);
 }
 
 // ===========================================================================
