@@ -150,6 +150,14 @@ export const INTRO_DEV_PHASE_KEYS: Readonly<Record<string, IntroPhase>> = {
   Digit5: 'ramp',
 };
 
+/**
+ * Spec 28 Phase 2 §2.1 — the arrival lander touches down this far (world m)
+ * due east of the spawn beacon with heading 0, so the fully-deployed stern
+ * ramp (≈9 m west of the hull root) foots clear of the beacon, the parked
+ * buggy and the walkout path.
+ */
+export const INTRO_LANDING_OFFSET_M = 16;
+
 /** Handheld scanner sweep radius (vein surface distance), metres. */
 export const SCAN_RANGE_M = 80;
 
@@ -527,6 +535,17 @@ export interface ClientAppOptions {
    * directly to orbit / burn / touchdown / depressurize / ramp.
    */
   devMode?: boolean;
+  /**
+   * Spec 28 Phase 2 §2.1 — FTUE production boot pipeline. When true, `init()`
+   * mounts the {@link TransportLander} in WorldScene at the landing site and
+   * attaches an {@link IntroDirector} (unless one was already handed in), then
+   * resolves the launch decision via {@link ClientApp.launchIntroFromUrl}:
+   * a first visit (no `lunar_frontier_intro_completed` flag) or `?intro=1`
+   * plays the orbital descent; otherwise the player spawns directly on the
+   * surface and Quest 1 starts immediately. Default false keeps the headless
+   * smoke harnesses on their manual director attachment and timelines.
+   */
+  autoAttachIntroDirector?: boolean;
 }
 
 export interface ClientInputFrame {
@@ -1236,9 +1255,24 @@ export class ClientApp {
       scene: this.world.getScene(),
       onHudUpdate: (payload) => this.hud?.updateHintArrow(payload),
     });
+    // Spec 28 Phase 2 §2.1 — FTUE production boot pipeline. When configured
+    // (the browser entry point passes `autoAttachIntroDirector: true`), mount
+    // the transport lander in WorldScene, attach the arrival director, and
+    // resolve the URL/storage launch decision through `launchIntroFromUrl()`:
+    // first visit (no completion flag) or `?intro=1` → orbit cinematic;
+    // otherwise spawn directly on the surface.
+    const introAutoAttached = this.autoAttachIntroArrival();
+    const introLaunch: 'intro' | 'skipped' | 'manual' = introAutoAttached
+      ? this.launchIntroFromUrl()
+      : 'manual';
     // Spec 24 Phase 4 §2.6: when the intro director owns the first moments,
-    // defer the tutorial quest until boots touch regolith (`deferQuestUntilIntroComplete`).
-    const questDeferred = this.options.deferQuestUntilIntroComplete === true;
+    // defer the tutorial quest until boots touch regolith — either via the
+    // explicit `deferQuestUntilIntroComplete` option (harness wiring) or an
+    // auto-booted cinematic (production FTUE). The boots-on-regolith handoff
+    // (`handleIntroCompleted`) bridges Quest 1 with the dispatch comms and
+    // the 3D hint arrow the moment the ramp walkout lands.
+    const questDeferred =
+      this.options.deferQuestUntilIntroComplete === true || introLaunch === 'intro';
     if (this.options.startQuest !== false && !questDeferred) {
       this.questEngine.startQuest(this.buildTutorialQuestOptions());
     }
@@ -1809,6 +1843,45 @@ export class ClientApp {
     return true;
   }
 
+  /**
+   * Spec 28 Phase 2 §2.1 — production FTUE boot: mount the CEC transport
+   * lander in WorldScene at the landing site (east of the spawn beacon, ramp
+   * facing back across it) and attach an {@link IntroDirector} wired to the
+   * lander, the CameraRig and the HUD. Idempotent, and a deliberate no-op
+   * when a director has already been handed in via {@link setIntroDirector}
+   * (manual / harness wiring always wins). Returns true when this call
+   * performed the attachment.
+   */
+  private autoAttachIntroArrival(): boolean {
+    if (this.options.autoAttachIntroDirector !== true) return false;
+    if (this.disposed || this.introDirector !== null) return false;
+    const spawn = this.resolveSpawn();
+    // World frame (x, y, z-up) maps into the Babylon y-up frame as
+    // (x, z, −y) — the inverse of CameraRig.babylonToWorld. The root is
+    // planted exactly on the sampled terrain elevation so the deployed ramp
+    // foot rests on the regolith datum.
+    const lx = spawn.x + INTRO_LANDING_OFFSET_M;
+    const ly = spawn.y;
+    const lander = this.world.mountTransportLander({
+      position: new Vector3(lx, this.groundAt(lx, ly), -ly),
+      headingRad: 0,
+    });
+    const director = new IntroDirector({
+      scene: this.world.getScene(),
+      cameraRig: this.world.getCameraRig(),
+      lander,
+      ...(this.hud !== null ? { hud: this.hud as unknown } : {}),
+      ...(this.options.introStorage !== undefined
+        ? { storage: this.options.introStorage }
+        : {}),
+    });
+    // setIntroDirector also arms the live avatar reader, so the walkout beat
+    // completes on boots-on-regolith contact (WALKOUT_REACHED_REGOLITH_M).
+    this.setIntroDirector(director);
+    this.log('FTUE boot — transport lander mounted, intro director attached');
+    return true;
+  }
+
   getNetwork(): NetworkClient | null {
     return this.network;
   }
@@ -1986,19 +2059,26 @@ export class ClientApp {
     if (this.disposed || typeof code !== 'string') return false;
     if (!this.initialized) return false;
 
-    // Spec 24 Phase 5 §3.4 — dev hotkeys (only when `devMode`): [F8] wipes
-    // the intro-completion flag and restarts from Beat 1; [1]–[5] jump to a
-    // specific beat. Honoured on key-down, before any gameplay routing.
+    // Spec 28 Phase 2 §2.1 — [F8] is an always-available accessibility
+    // hotkey (paired with the HUD [🔄 Replay] button): it wipes the intro
+    // completion flag and replays the arrival from Beat 1 (orbit) with a
+    // clean teardown, honouring the replay button's `replayIntro()` path.
+    if (code === 'F8' && phase === 'down') {
+      this.clearIntroCompletion();
+      const d = this.introDirector;
+      if (d !== null && !this.replayIntro()) {
+        // Defensive fallback: `replayIntro` only refuses with no attached
+        // loop state — restart the orbit beat by hand if it ever does.
+        d.reset();
+        d.start('orbit');
+      }
+      return true;
+    }
+    // Spec 24 Phase 5 §3.4 — beat-jump dev hotkeys (only when `devMode`):
+    // `[1]`–`[5]` jump directly to orbit / burn / touchdown / depressurize /
+    // ramp. Honoured on key-down, before any gameplay routing.
     if (this.options.devMode === true && phase === 'down') {
       const d = this.introDirector;
-      if (code === 'F8') {
-        this.clearIntroCompletion();
-        if (d !== null) {
-          d.reset();
-          d.start('orbit');
-        }
-        return true;
-      }
       const jumpPhase = INTRO_DEV_PHASE_KEYS[code];
       if (jumpPhase !== undefined) {
         if (d !== null) d.jumpToPhase(jumpPhase);

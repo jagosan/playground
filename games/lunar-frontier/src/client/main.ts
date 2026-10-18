@@ -53,6 +53,12 @@ function boot(): ClientApp | null {
     username: config.username ?? `prospect-${Math.random().toString(16).slice(2, 6)}`,
     faction: config.faction ?? 'unaffiliated',
     role: config.role ?? 'surveyor',
+    // Spec 28 Phase 2 §2.1 — production FTUE: on every browser boot the
+    // client inspects `localStorage['lunar_frontier_intro_completed']` and
+    // the `?intro=1` / `?skip_intro=1` URL flags; when the arrival cinematic
+    // is required, `init()` mounts the TransportLander in WorldScene and
+    // attaches the IntroDirector before launching the descent.
+    autoAttachIntroDirector: true,
     ...(config.seed !== undefined ? { seed: config.seed } : {}),
     ...(config.wsUrl !== undefined && config.wsUrl.length > 0
       ? { wsUrl: config.wsUrl }
