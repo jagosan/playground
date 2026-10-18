@@ -39,6 +39,10 @@ import {
 import {
   IDLE_SUIT_INPUT,
   LunarEvaSuit,
+  SUIT_BOUND_LAUNCH_VZ,
+  SUIT_BOUND_MIN_SPEED,
+  SUIT_BOUND_RESTITUTION,
+  SUIT_BOUND_SPEED,
   SUIT_JUMP_VELOCITY,
   SUIT_MAX_OXYGEN,
   SUIT_MAX_BATTERY,
@@ -64,7 +68,7 @@ function section(title: string): void {
 const DT = 1 / 60;
 
 /** Run `frames` steps of forward-walking on a bare suit (reference oracle). */
-function referenceWalk(frames: number, input = { ...IDLE_SUIT_INPUT, forward: 1 }) {
+function referenceWalk(frames: number, input = { ...IDLE_SUIT_INPUT, forward: 0.55 }) {
   const oracle = new LunarEvaSuit({ x: 0, y: 0, z: 0, isGrounded: true });
   for (let i = 0; i < frames; i++) oracle.step(DT, input, () => 0);
   return oracle.getState();
@@ -154,7 +158,11 @@ section('1b. Spec 28 §2.2 retro-modern geometry & materials');
 section('2. update() delegates to LunarEvaSuit physics');
 
 const walkAvatar = new EvaSuitAvatar({ initial: { x: 0, y: 0, z: 0, isGrounded: true } }).init();
-const forwardInput = { ...IDLE_SUIT_INPUT, forward: 1 };
+// Spec 28 §2.3: forward past 0.6 (or sprint held) now erupts into the
+// automatic lunar bound, so the pure-walk delegation / datum / stride-pose
+// probes ride the production non-sprint throttle scale (ClientApp walks at
+// 0.55). The bounding loop gets its own dedicated section below.
+const forwardInput = { ...IDLE_SUIT_INPUT, forward: 0.55 };
 let last = walkAvatar.getState();
 for (let i = 0; i < 120; i++) last = walkAvatar.update(DT, forwardInput);
 
@@ -233,6 +241,155 @@ const arc = new EvaSuitAvatar({ initial: { x: 0, y: 0, z: 0, isGrounded: true } 
 arc.update(DT, hop);
 for (let i = 0; i < 600; i++) apex = Math.max(apex, arc.update(DT, IDLE_SUIT_INPUT).z);
 check(`apex matches 1/6-g ballistics (${apex.toFixed(2)} m)`, apex > 1.9 && apex < 2.3);
+
+// ---------------------------------------------------------------------------
+// 3b. Spec 28 §2.3 — lunar low-G bounding & ballistic looping
+// ---------------------------------------------------------------------------
+section('3b. Spec 28 §2.3 lunar bounding sprint');
+
+{
+  check(
+    'bound constants: vz 1.35, cruise 5.0, restitution 0.88, gate 1.8',
+    SUIT_BOUND_LAUNCH_VZ === 1.35 && SUIT_BOUND_SPEED === 5.0
+    && SUIT_BOUND_RESTITUTION === 0.88 && SUIT_BOUND_MIN_SPEED === 1.8,
+  );
+
+  const bSuit = new LunarEvaSuit({ x: 0, y: 0, z: 0, isGrounded: true });
+  check('idle suit reports gaitMode "idle"', bSuit.getState().gaitMode === 'idle');
+
+  // Regular walking (forward ≤ 0.6, sprint off) stays grounded on the stride.
+  const walkOnly = { ...IDLE_SUIT_INPUT, forward: 0.55 };
+  let bs = bSuit.getState();
+  for (let i = 0; i < 180; i++) bs = bSuit.step(DT, walkOnly, () => 0);
+  check(
+    'walking (fwd 0.55, sprint off): gaitMode walk, grounded on datum, hangtime 0',
+    bs.gaitMode === 'walk' && bs.isGrounded === true && Math.abs(bs.z) < 1e-9
+    && bs.hangtime === 0,
+    `gait=${bs.gaitMode} z=${bs.z}`,
+  );
+
+  // Bury the sprint throttle: the stride erupts into ballistic bounds.
+  const sprintBound = { ...IDLE_SUIT_INPUT, forward: 1, sprint: true };
+  let apex = 0;
+  let maxSpeed = 0;
+  let maxHang = 0;
+  let leaps = 0;
+  let wasAir = false;
+  let boundingSeen = false;
+  for (let i = 0; i < 1200; i++) {
+    bs = bSuit.step(DT, sprintBound, () => 0);
+    apex = Math.max(apex, bs.z);
+    maxSpeed = Math.max(maxSpeed, Math.hypot(bs.vx, bs.vy));
+    maxHang = Math.max(maxHang, bs.hangtime);
+    if (bs.gaitMode === 'bounding') boundingSeen = true;
+    if (!bs.isGrounded && !wasAir) leaps += 1;
+    wasAir = !bs.isGrounded;
+  }
+  check('gaitMode reaches "bounding"', boundingSeen);
+  check(`bound apex clears the 0.35 m gate (${apex.toFixed(2)} m, ~0.56 expected)`, apex >= 0.35);
+  check(`bound hangtime clears the 0.6 s gate (${maxHang.toFixed(2)} s)`, maxHang >= 0.6);
+  check(`forward speed clears the 4.5 m/s gate (${maxSpeed.toFixed(2)} m/s)`, maxSpeed >= 4.5);
+  check(`ballistic looping: alternating airborne leaps (${leaps} in 20 s)`, leaps >= 3);
+  check(
+    'bounding keeps a rhythmic cadence (multiple distinct airtime arcs)',
+    leaps * 1.4 <= 20 / 0.8, // ≤ ~14 leaps in 20 s at ≥ 0.8 s per cycle
+    `leaps=${leaps}`,
+  );
+
+  // Manual [Space]/A leap stays the high escape hatch cut from the loop.
+  const bJump = new LunarEvaSuit({ x: 0, y: 0, z: 0, isGrounded: true });
+  let js = bJump.getState();
+  let launchVz = 0;
+  let manualApex = 0;
+  let jumped = false;
+  for (let i = 0; i < 1800; i++) {
+    if (!jumped && js.isGrounded && js.gaitMode === 'bounding') {
+      js = bJump.step(DT, { ...sprintBound, jump: true }, () => 0);
+      launchVz = js.vz;
+      jumped = true;
+    } else {
+      js = bJump.step(DT, sprintBound, () => 0);
+    }
+    if (jumped) manualApex = Math.max(manualApex, js.z);
+  }
+  check('manual leap from a bound launches at SUIT_JUMP_VELOCITY minus gravity',
+    jumped && Math.abs(launchVz - (SUIT_JUMP_VELOCITY - 1.62 * DT)) < 1e-9,
+    `vz=${launchVz.toFixed(3)}`);
+  check(`manual leap out of the bound is the high arc (${manualApex.toFixed(2)} m > bound apex)`,
+    manualApex > 1.8);
+
+  // Throttle lifted → the loop settles back into a grounded walk stride.
+  const bCool = new LunarEvaSuit({ x: 0, y: 0, z: 0, isGrounded: true });
+  let cs = bCool.getState();
+  for (let i = 0; i < 600; i++) cs = bCool.step(DT, sprintBound, () => 0);
+  for (let i = 0; i < 300; i++) cs = bCool.step(DT, walkOnly, () => 0);
+  check(
+    'throttle lifted: back to grounded walk stride (gaitMode walk, hangtime 0)',
+    cs.gaitMode === 'walk' && cs.isGrounded === true && cs.hangtime === 0
+    && Math.abs(cs.z) < 1e-9,
+    `gait=${cs.gaitMode} grounded=${cs.isGrounded} z=${cs.z}`,
+  );
+
+  // The avatar wrapper adds no physics of its own under the bound loop.
+  const bBare = new LunarEvaSuit({ x: 0, y: 0, z: 0, isGrounded: true });
+  const bWrap = new EvaSuitAvatar({ initial: { x: 0, y: 0, z: 0, isGrounded: true } }).init();
+  let xs = bBare.getState();
+  let ys2 = bWrap.getState();
+  for (let i = 0; i < 420; i++) {
+    xs = bBare.step(DT, sprintBound, () => 0);
+    ys2 = bWrap.update(DT, sprintBound);
+  }
+  check(
+    'bounding bit-identical between avatar and bare suit (x, z, hangtime, oxygen)',
+    Object.is(ys2.x, xs.x) && Object.is(ys2.z, xs.z) && Object.is(ys2.hangtime, xs.hangtime)
+    && Object.is(ys2.oxygen, xs.oxygen),
+  );
+
+  // -- AstronautSuit articulation on the arc ----------------------------------
+  const bndAvatar = new EvaSuitAvatar({ initial: { x: 0, y: 0, z: 0, isGrounded: true } }).init();
+  const node = (n: string): TransformNode => (bndAvatar.getMeshes().find((m) => m.name === n)!).parent as TransformNode;
+  const mesh = (n: string): Mesh => bndAvatar.getMeshes().find((m) => m.name === n)!;
+  let as = bndAvatar.getState();
+  for (let i = 0; i < 900 && (as.isGrounded || as.gaitMode !== 'bounding'); i++) {
+    as = bndAvatar.update(DT, sprintBound);
+  }
+  const hipFL = node('eva-leg-thigh-l');
+  const hipFR = node('eva-leg-thigh-r');
+  const slF = node('eva-arm-upper-l');
+  const srF = node('eva-arm-upper-r');
+  check('flight pose: legs trail aft in knee flexion',
+    !as.isGrounded && as.gaitMode === 'bounding'
+    && hipFL.rotation.x > 0.3 && hipFR.rotation.x > 0.3
+    && Math.abs(hipFL.rotation.x - hipFR.rotation.x) < 1e-12,
+    `hipL=${hipFL.rotation.x} hipR=${hipFR.rotation.x}`);
+  check('flight pose: arms spread outward for balance',
+    slF.rotation.z < -0.1 && srF.rotation.z > 0.1
+    && Math.abs(slF.rotation.z + srF.rotation.z) < 1e-12,
+    `zL=${slF.rotation.z} zR=${srF.rotation.z}`);
+
+  // Touchdown: boot-dust puff + landing crouch compression.
+  const puffsBefore = bndAvatar.getBootDustPuffCount();
+  for (let i = 0; i < 400 && as.isGrounded !== true; i++) as = bndAvatar.update(DT, sprintBound);
+  check('bounding touchdown kicks regolith boot dust', bndAvatar.getBootDustPuffCount() > puffsBefore,
+    `${puffsBefore} → ${bndAvatar.getBootDustPuffCount()}`);
+  let crouched = false;
+  let lowest = 0;
+  for (let i = 0; i < 8; i++) {
+    as = bndAvatar.update(DT, sprintBound);
+    const ty = mesh('eva-torso').position.y - GEO.torso.y;
+    lowest = Math.min(lowest, ty);
+    if (ty < -0.03) crouched = true;
+  }
+  check(`landing crouch compresses the torso (-${(-lowest).toFixed(3)} m ≤ -0.03)`, crouched);
+
+  // Walking after bounding parks the flight pose back to the stride.
+  for (let i = 0; i < 300; i++) as = bndAvatar.update(DT, walkOnly);
+  check('post-bound walk: flight spread cleared, arms back in the stride plane',
+    Math.abs(slF.rotation.z) < 1e-12 && Math.abs(srF.rotation.z) < 1e-12);
+
+  bndAvatar.dispose();
+  bWrap.dispose();
+}
 
 // ---------------------------------------------------------------------------
 // 4. Consumables deplete over time

@@ -138,6 +138,24 @@ export const SUIT_AIR_ACCEL = 0.6;
 export const SUIT_JUMP_VELOCITY = 2.6;
 /** Horizontal boost multiplier applied while hopping. */
 export const SUIT_HOP_BOOST = 1.35;
+
+// -- Lunar low-g bounding sprint (Spec 28 §2.3) -------------------------------
+/**
+ * Vertical launch impulse of one rhythmic lunar bound (m/s). Under lunar
+ * gravity this opens a ballistic arc with apex Δz = v²/2g ≈ 0.56 m and a
+ * true hang time of 2v/g ≈ 1.67 s — the prospector hangs, floats, and lands,
+ * Apollo 11–17 style (the spec's quoted 0.83 s hangtime figure drops a
+ * factor of two; the physics here is exact for the mandated 1.35 m/s).
+ */
+export const SUIT_BOUND_LAUNCH_VZ = 1.35;
+/** Forward cruise speed the bounding loop accelerates toward (m/s). */
+export const SUIT_BOUND_SPEED = 5.0;
+/** Ground speed below which bounding cannot engage (m/s, spec §2.3 v > 1.8). */
+export const SUIT_BOUND_MIN_SPEED = 1.8;
+/** Forward momentum retained across a bound touchdown (restitution η). */
+export const SUIT_BOUND_RESTITUTION = 0.88;
+/** Forward kick the legs add at each bound launch (m/s per leap). */
+export const SUIT_BOUND_PUSH = 1.2;
 /** RCS translational acceleration during a burst (m/s²). */
 export const SUIT_RCS_ACCEL = 2.4;
 /** RCS attitude rates (rad/s). */
@@ -190,6 +208,13 @@ export interface SuitInput {
   pitch: number;
   /** Rising edge while grounded triggers a hop. */
   jump: boolean;
+  /**
+   * Spec 28 §2.3: sprint latch (LB / Left Bumper). Ground contact with the
+   * sprint held — or `forward` past 0.6 with ground speed over
+   * {@link SUIT_BOUND_MIN_SPEED} — engages the lunar bounding loop. Optional
+   * so pre-Spec-28 callers stay source-compatible.
+   */
+  sprint?: boolean;
   /** Master RCS enable for the frame (thruster burst). */
   rcs: boolean;
   /** -1..1 RCS thrust along heading. */
@@ -228,6 +253,18 @@ export interface SuitState {
   isGrounded: boolean;
   /** Last applied vertical launch impulse (diagnostics / animation). */
   jumpImpulse: number;
+  /**
+   * Spec 28 §2.3: locomotion gait band for animation authoring — the suited
+   * propector idles, strides on the regolith, or loops down the surface in
+   * ballistic low-g bounds.
+   */
+  gaitMode: 'idle' | 'walk' | 'bounding';
+  /**
+   * Spec 28 §2.3: seconds spent airborne in the current bounding leap. Zero
+   * through the walk/idle cycle and at launch; on a touchdown frame it
+   * reports the completed leap's hangtime for the animation layer.
+   */
+  hangtime: number;
   oxygen: number;
   battery: number;
   rcsFuel: number;
@@ -281,6 +318,14 @@ export class LunarEvaSuit {
   private state: SuitState;
   private jumpWasHeld = false;
   /**
+   * Spec 28 §2.3 bounding state machine phase: `walk` (surface stride),
+   * `bound_launch` (grounded frame queuing the next leap), `bound_flight`
+   * (ballistic arc), `bound_land` (touchdown frame, momentum restitution).
+   */
+  private boundPhase: 'walk' | 'bound_launch' | 'bound_flight' | 'bound_land' = 'walk';
+  /** Airtime accumulator of the current bounding leap (s). */
+  private boundClock = 0;
+  /**
    * Spec 21 §2.4 vault loot ("Advanced Prospector EVA Suit"): an instance
    * rebreather ceiling, at or above the base {@link SUIT_MAX_OXYGEN}. The
    * step() clamp reads this, so an upgrade persists across frames.
@@ -301,6 +346,8 @@ export class LunarEvaSuit {
       pitch: initial.pitch ?? 0,
       isGrounded: initial.isGrounded ?? false,
       jumpImpulse: initial.jumpImpulse ?? 0,
+      gaitMode: initial.gaitMode ?? 'idle',
+      hangtime: initial.hangtime ?? 0,
       oxygen: initial.oxygen ?? SUIT_MAX_OXYGEN,
       battery: initial.battery ?? SUIT_MAX_BATTERY,
       rcsFuel: initial.rcsFuel ?? SUIT_MAX_RCS_FUEL,
@@ -354,12 +401,38 @@ export class LunarEvaSuit {
     const groundZ = ground(s.x, s.y);
     const wasGrounded = s.isGrounded;
 
+    // -- Bounding state machine (Spec 28 §2.3) -------------------------------
+    // walk → bound_launch → bound_flight (ballistic arc) → bound_land →
+    // bound_launch …: each footfall at sprint throttle immediately rebounds
+    // into the next leap while forward throttle is maintained.
+    const horizSpeed = Math.hypot(s.vx, s.vy);
+    const boundThrottle = input.sprint === true || fwd > 0.6;
+    if (this.boundPhase === 'walk') {
+      if (s.isGrounded && boundThrottle && horizSpeed > SUIT_BOUND_MIN_SPEED) {
+        this.boundPhase = 'bound_launch';
+      }
+    } else if (this.boundPhase === 'bound_land' && s.isGrounded) {
+      // Single grounded frame at the trough of the arc: rebound immediately
+      // if the throttle is still buried, else settle back into the stride.
+      this.boundPhase =
+        boundThrottle && horizSpeed > SUIT_BOUND_MIN_SPEED ? 'bound_launch' : 'walk';
+    } else if (this.boundPhase === 'bound_launch' && s.isGrounded && !boundThrottle) {
+      this.boundPhase = 'walk';
+    }
+    const bounding = this.boundPhase !== 'walk';
+
     // -- Heading ------------------------------------------------------------
     s.heading = wrapAngle(s.heading + clamp(input.yaw, -1, 1) * SUIT_TURN_RATE * (wasGrounded ? 1 : 0.15) * step);
 
     // -- Body-frame desired velocity ---------------------------------------
     const magnitude = clamp(Math.hypot(fwd, strafe), 0, 1);
-    const gaitSpeed = Math.abs(fwd) > 0.6 ? SUIT_RUN_SPEED : SUIT_WALK_SPEED;
+    // Bounding commits to the ballistic cruise target; otherwise the classic
+    // walk/run gait split at |forward| = 0.6 stays byte-for-byte (Spec 28).
+    const gaitSpeed = bounding
+      ? SUIT_BOUND_SPEED
+      : Math.abs(fwd) > 0.6
+        ? SUIT_RUN_SPEED
+        : SUIT_WALK_SPEED;
     let targetLocalX = 0;
     let targetLocalY = 0;
     if (magnitude > 1e-4) {
@@ -376,14 +449,17 @@ export class LunarEvaSuit {
     const targetVy = targetLocalX * sh + targetLocalY * ch;
 
     // -- Horizontal drive ----------------------------------------------------
+    // While bounding the leap owns the horizontal channel: momentum carries
+    // through the flight arc (restitution at touchdown, push at launch), so
+    // the surface chase/friction laws stand down for the committed stride.
     const accel = s.isGrounded ? SUIT_GROUND_ACCEL : SUIT_AIR_ACCEL;
-    if (magnitude > 1e-4) {
+    if (magnitude > 1e-4 && !bounding) {
       s.vx = approach(s.vx, targetVx, accel / Math.max(1, Math.abs(targetVx)), step)
         + (targetVx - s.vx) * 0 + accel * step * Math.sign(targetVx - s.vx) * 0;
       // Explicit first-order chase (the line above keeps approach() semantics):
       s.vx = approach(s.vx, targetVx, accel / Math.max(1.2, Math.abs(targetVx)), step);
       s.vy = approach(s.vy, targetVy, accel / Math.max(1.2, Math.abs(targetVy)), step);
-    } else if (s.isGrounded) {
+    } else if (s.isGrounded && !bounding) {
       // Regolith friction while coasting: exponential decay, but loose grit
       // keeps lateral momentum partly alive (the slip prospectors curse).
       const decay = Math.exp(-2.6 * step);
@@ -430,8 +506,31 @@ export class LunarEvaSuit {
         s.vx *= Math.min(boost, SUIT_HOP_BOOST);
         s.vy *= Math.min(boost, SUIT_HOP_BOOST);
       }
+      // Spec 28 §2.3: a manual high leap cut out of the bounding loop rides
+      // the same ballistic-loop bookkeeping and rejoins it on touchdown.
+      if (bounding) this.boundPhase = 'bound_flight';
     }
     this.jumpWasHeld = input.jump;
+
+    // -- Bound launch (Spec 28 §2.3): the rhythmic low-g leap -----------------
+    if (this.boundPhase === 'bound_launch' && s.isGrounded) {
+      s.vz = SUIT_BOUND_LAUNCH_VZ;
+      s.jumpImpulse = SUIT_BOUND_LAUNCH_VZ;
+      s.isGrounded = false;
+      // The legs kick along the heading toward the bounding cruise speed,
+      // keeping any surviving lateral momentum from the approach stride.
+      const bh = Math.cos(s.heading);
+      const bsh = Math.sin(s.heading);
+      const alongOld = s.vx * bh + s.vy * bsh;
+      const latX = s.vx - alongOld * bh;
+      const latY = s.vy - alongOld * bsh;
+      const alongNew = Math.min(SUIT_BOUND_SPEED, Math.max(alongOld, 0) + SUIT_BOUND_PUSH);
+      s.vx = alongNew * bh + latX;
+      s.vy = alongNew * bsh + latY;
+      this.boundClock = 0;
+      s.hangtime = 0;
+      this.boundPhase = 'bound_flight';
+    }
 
     // -- Ballistics -----------------------------------------------------------
     s.vz -= LUNAR_GRAVITY * step;
@@ -445,12 +544,35 @@ export class LunarEvaSuit {
     const floorZ = newGround; // suit centre rides `floorZ` when crouched on surface
     if (s.z <= floorZ) {
       s.z = floorZ;
+      const touchdown = !s.isGrounded;
       if (s.vz < 0) s.vz = 0;
       s.isGrounded = true;
+      if (touchdown && this.boundPhase === 'bound_flight') {
+        // Spec 28 §2.3: forward momentum conserved across the footfall with
+        // restitution η; the machine queues the next leap (or walks away if
+        // the throttle lifted) and the animation layer dusts the boots.
+        s.vx *= SUIT_BOUND_RESTITUTION;
+        s.vy *= SUIT_BOUND_RESTITUTION;
+        s.hangtime = this.boundClock; // report the completed leap's hangtime
+        this.boundPhase = 'bound_land';
+      }
     } else if (s.z - floorZ > 0.08) {
       s.isGrounded = false;
     }
     void wasGrounded;
+
+    // -- Gait bookkeeping (Spec 28 §2.3) ---------------------------------------
+    if (this.boundPhase === 'bound_flight' && !s.isGrounded) {
+      this.boundClock += step;
+      s.hangtime = this.boundClock;
+    } else if (this.boundPhase === 'walk' && s.isGrounded) {
+      s.hangtime = 0;
+    }
+    s.gaitMode = bounding
+      ? 'bounding'
+      : Math.hypot(s.vx, s.vy) > 0.08
+        ? 'walk'
+        : 'idle';
 
     // -- Life support ----------------------------------------------------------
     const speed = Math.hypot(s.vx, s.vy);

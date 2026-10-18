@@ -85,6 +85,22 @@ export const KNEE_FLEX_WALK = 0.5;
 /** Resting elbow flex of a relaxed hanging arm (rad). */
 export const ELBOW_REST_RAD = 0.18;
 
+// -- Lunar bounding articulation (Spec 28 §2.3) -------------------------------
+/** Landing crouch compression before launch extension (m). */
+export const BOUND_CROUCH_M = 0.06;
+/** Crouch compress→release animation duration (s). */
+export const BOUND_CROUCH_DURATION_S = 0.28;
+/** Hips trailing aft during the ballistic flight arc (rad, + = aft). */
+export const BOUND_TRAIL_HIP_RAD = 0.45;
+/** Knee flexion carried while airborne (rad). */
+export const BOUND_TRAIL_KNEE_RAD = 0.9;
+/** Arms spread outward from the hull for balance in flight (rad). */
+export const BOUND_ARM_SPREAD_RAD = 0.5;
+/** Slight shoulder set-forward in flight (rad; applied as -x rotation). */
+export const BOUND_SHOULDER_SET_RAD = 0.2;
+/** Knee flex held on the single grounded trough frame between bounds (rad). */
+export const BOUND_TROUGH_KNEE_RAD = 0.6;
+
 /**
  * Spec 19 §2.3 / ADR-4: the suit backpack hauls at most this many kilograms
  * of ore. The 50 kg ceiling is the logistical argument for deploying the
@@ -211,6 +227,14 @@ export class EvaSuitAvatar {
   private elbowR: TransformNode | null = null;
   /** Locomotion walk-cycle clock (radians of phase), advanced in syncTransform. */
   private walkCycleTime = 0;
+  /** True while the ballistic bound flight pose is in force (Spec 28 §2.3). */
+  private boundingFlight = false;
+  /**
+   * Landing-crouch animation clock (s). Armed at half its duration on each
+   * bounding touchdown — the torso reads FULL compression on the impact
+   * frame and eases back out along the half-sine before the next launch.
+   */
+  private boundCrouchClock = 0;
   private lamp: SpotLight | null = null;
   private materials: PBRMaterial[] = [];
 
@@ -1000,8 +1024,12 @@ export class EvaSuitAvatar {
    * counter-phase hip swing with knee flex on the recovery half-cycle, arms
    * swinging in natural opposition to the legs (elbows tracking the forward
    * sweep), and a torso/upper-body counter-bob at twice the leg frequency.
-   * Visual only — physics stays in `LunarEvaSuit`. Stopped or airborne the
-   * pose snaps back to neutral standing.
+   * While the physics gait is `bounding`, the pose instead rides the
+   * ballistic arc (Spec 28 §2.3): trailing legs in knee flexion and arms
+   * spread outward for balance through flight, a knee-flexed trough pose on
+   * the single grounded frame, each touchdown kicking a regolith boot-dust
+   * puff and arming the -0.06 m landing crouch. Visual only — physics stays
+   * in `LunarEvaSuit`. Stopped the pose snaps back to neutral standing.
    */
   private applyWalkCycle(state: SuitState): void {
     const torso = this.torso;
@@ -1016,6 +1044,61 @@ export class EvaSuitAvatar {
     const elbowL = this.elbowL;
     const elbowR = this.elbowR;
 
+    // Landing-crouch envelope (compress→release), advanced once per frame.
+    const crouch = this.advanceBoundCrouch();
+    const gait = state.gaitMode ?? 'walk';
+
+    if (gait === 'bounding') {
+      // Spec 28 §2.3 ballistic looping — the stride clock parks while the
+      // arc owns the frame.
+      this.walkCycleTime = 0;
+      if (!state.isGrounded) {
+        this.boundingFlight = true;
+        // Trailing legs in slight knee flexion ...
+        hipL.rotation.x = BOUND_TRAIL_HIP_RAD;
+        hipR.rotation.x = BOUND_TRAIL_HIP_RAD;
+        if (kneeL !== null) kneeL.rotation.x = BOUND_TRAIL_KNEE_RAD;
+        if (kneeR !== null) kneeR.rotation.x = BOUND_TRAIL_KNEE_RAD;
+        // ... arms spread outward for balance, set slightly forward, curled.
+        if (shoulderL !== null) {
+          shoulderL.rotation.x = -BOUND_SHOULDER_SET_RAD;
+          shoulderL.rotation.z = -BOUND_ARM_SPREAD_RAD; // left arm opens -x
+        }
+        if (shoulderR !== null) {
+          shoulderR.rotation.x = -BOUND_SHOULDER_SET_RAD;
+          shoulderR.rotation.z = BOUND_ARM_SPREAD_RAD; // right arm opens +x
+        }
+        if (elbowL !== null) elbowL.rotation.x = ELBOW_REST_RAD + 0.35;
+        if (elbowR !== null) elbowR.rotation.x = ELBOW_REST_RAD + 0.35;
+      } else {
+        // The single grounded trough frame between bounds.
+        if (this.boundingFlight) {
+          // Touchdown edge: kick regolith dust, arm the compression crouch.
+          this.boundingFlight = false;
+          this.boundCrouchClock = BOUND_CROUCH_DURATION_S / 2;
+          this.triggerBootDustPuff();
+        }
+        hipL.rotation.x = 0;
+        hipR.rotation.x = 0;
+        if (kneeL !== null) kneeL.rotation.x = BOUND_TROUGH_KNEE_RAD;
+        if (kneeR !== null) kneeR.rotation.x = BOUND_TROUGH_KNEE_RAD;
+        if (shoulderL !== null) {
+          shoulderL.rotation.x = 0.1;
+          shoulderL.rotation.z = -BOUND_ARM_SPREAD_RAD * 0.5;
+        }
+        if (shoulderR !== null) {
+          shoulderR.rotation.x = 0.1;
+          shoulderR.rotation.z = BOUND_ARM_SPREAD_RAD * 0.5;
+        }
+        if (elbowL !== null) elbowL.rotation.x = ELBOW_REST_RAD + 0.5;
+        if (elbowR !== null) elbowR.rotation.x = ELBOW_REST_RAD + 0.5;
+      }
+      torso.position.y = GEO.torso.y + crouch;
+      upper.position.y = crouch;
+      return;
+    }
+
+    this.boundingFlight = false;
     const speed = Math.hypot(state.vx, state.vy);
     if (speed > WALK_MIN_SPEED && state.isGrounded) {
       // Sprint cadence above SPRINT_MIN_SPEED, brisk lunar walk below.
@@ -1031,15 +1114,21 @@ export class EvaSuitAvatar {
       if (kneeR !== null) kneeR.rotation.x = Math.max(0, swing) * KNEE_FLEX_WALK;
       // Arms swing in natural opposition to the legs on the same clock.
       const armSwing = swing * ARM_SWING_SCALE;
-      if (shoulderL !== null) shoulderL.rotation.x = -armSwing;
-      if (shoulderR !== null) shoulderR.rotation.x = armSwing;
+      if (shoulderL !== null) {
+        shoulderL.rotation.x = -armSwing;
+        shoulderL.rotation.z = 0;
+      }
+      if (shoulderR !== null) {
+        shoulderR.rotation.x = armSwing;
+        shoulderR.rotation.z = 0;
+      }
       // Elbows add a touch of flex as their arm comes forward.
       if (elbowL !== null) elbowL.rotation.x = ELBOW_REST_RAD + Math.max(0, armSwing) * 0.3;
       if (elbowR !== null) elbowR.rotation.x = ELBOW_REST_RAD + Math.max(0, -armSwing) * 0.3;
       // Torso + upper-body counter-bob at twice the leg frequency (heel-strike).
       const bob = Math.abs(Math.sin(this.walkCycleTime * 2)) * TORSO_BOB_M;
-      torso.position.y = GEO.torso.y + bob;
-      upper.position.y = bob;
+      torso.position.y = GEO.torso.y + bob + crouch;
+      upper.position.y = bob + crouch;
     } else {
       // Stopped or airborne: neutral standing pose, clock parked for next start.
       this.walkCycleTime = 0;
@@ -1047,13 +1136,37 @@ export class EvaSuitAvatar {
       hipR.rotation.x = 0;
       if (kneeL !== null) kneeL.rotation.x = 0;
       if (kneeR !== null) kneeR.rotation.x = 0;
-      if (shoulderL !== null) shoulderL.rotation.x = 0;
-      if (shoulderR !== null) shoulderR.rotation.x = 0;
+      if (shoulderL !== null) {
+        shoulderL.rotation.x = 0;
+        shoulderL.rotation.z = 0;
+      }
+      if (shoulderR !== null) {
+        shoulderR.rotation.x = 0;
+        shoulderR.rotation.z = 0;
+      }
       if (elbowL !== null) elbowL.rotation.x = ELBOW_REST_RAD;
       if (elbowR !== null) elbowR.rotation.x = ELBOW_REST_RAD;
-      torso.position.y = GEO.torso.y;
-      upper.position.y = 0;
+      torso.position.y = GEO.torso.y + crouch;
+      upper.position.y = crouch;
     }
+  }
+
+  /**
+   * Advance the landing-crouch envelope one frame and return this frame's
+   * vertical torso offset (m). Armed by a bounding touchdown at half its
+   * duration — the half-sine reads full -{@link BOUND_CROUCH_M} compression
+   * immediately and releases smoothly to zero before the next launch
+   * extension (Spec 28 §2.3).
+   */
+  private advanceBoundCrouch(): number {
+    if (this.boundCrouchClock <= 0) return 0;
+    this.boundCrouchClock += WALK_CYCLE_FRAME_S;
+    if (this.boundCrouchClock >= BOUND_CROUCH_DURATION_S) {
+      this.boundCrouchClock = 0;
+      return 0;
+    }
+    const phase = this.boundCrouchClock / BOUND_CROUCH_DURATION_S;
+    return -BOUND_CROUCH_M * Math.sin(Math.PI * phase);
   }
 
   /** Push lamp on/off and battery fade into the SpotLight. */
