@@ -120,6 +120,14 @@ import { MassAccelerator } from '../infrastructure/MassAccelerator.ts';
 // Spec 27 §3.2: Orbital Transport System (deterministic 90–120 s transit
 // schedule, firing windows and capture-cone kinematics answer before the mesh build).
 import { OrbitalTransportSystem } from '../infrastructure/OrbitalTransportSystem.ts';
+// Spec 29 §3: Frontier Radio Tower "X-Corp Transmission Relay 04" (52 m lattice
+// spire; ladder bounds, proximity envelopes and beacon pulse law answer before
+// the mesh build; Phase 3's CLIMBING anchor).
+import {
+  RadioTower,
+  RADIO_TOWER_DEFAULTS,
+  type RadioTowerOptions,
+} from '../infrastructure/RadioTower.ts';
 
 // ---------------------------------------------------------------------------
 // Options & tuning
@@ -807,6 +815,8 @@ export class WorldScene {
   private massAccelerator: MassAccelerator | null = null;
   /** Spec 27 §3.2: orbital freight traffic (null before {@link buildOrbitalTransportSystem} / after dispose). */
   private orbitalTransport: OrbitalTransportSystem | null = null;
+  /** Spec 29: Frontier Radio Tower (null before {@link buildRadioTower} / after dispose). */
+  private radioTower: RadioTower | null = null;
 
   constructor(options: WorldSceneOptions = {}) {
     this.options = {
@@ -908,6 +918,11 @@ export class WorldScene {
       const dtMs = this.engine?.getDeltaTime() ?? 16.7;
       this.orbitalTransport.update(dtMs / 1000);
     }
+    // Spec 29: dual-strobe aviation beacon pulse on the radio tower.
+    if (this.radioTower !== null) {
+      const dtMs = this.engine?.getDeltaTime() ?? 16.7;
+      this.radioTower.update(dtMs / 1000);
+    }
     // Spec 23 §2.1.4: re-evaluate the Hapke opposition surge against the
     // current camera view before every frame is submitted.
     this.updateOppositionSurge();
@@ -934,6 +949,9 @@ export class WorldScene {
     }
     if (this.orbitalTransport !== null) {
       this.orbitalTransport.update(dtMs / 1000);
+    }
+    if (this.radioTower !== null) {
+      this.radioTower.update(dtMs / 1000);
     }
     if (this.xcorpCitadel === null) return null;
     return this.xcorpCitadel.update(dtMs / 1000, playerWorldPos);
@@ -1147,6 +1165,16 @@ export class WorldScene {
         /* already gone */
       }
       this.orbitalTransport = null;
+    }
+
+    // Spec 29: tear down the Frontier Radio Tower.
+    if (this.radioTower !== null) {
+      try {
+        this.radioTower.dispose();
+      } catch {
+        /* already gone */
+      }
+      this.radioTower = null;
     }
 
     for (const mesh of this.entities) mesh.parent = null;
@@ -1516,6 +1544,48 @@ export class WorldScene {
   /** The Orbital Transport System, or null before build / after dispose. */
   getOrbitalTransportSystem(): OrbitalTransportSystem | null {
     return this.disposed ? null : this.orbitalTransport;
+  }
+
+  // -- Spec 29: Frontier Radio Tower "X-Corp Transmission Relay 04" --------------
+
+  /**
+   * Build the Frontier Radio Tower (Spec 29): the 52 m tapered four-leg
+   * titanium lattice spire with a 137-rung access ladder and safety hoops, the
+   * hexagonal observation deck at +48 m with perimeter railings and trapdoor,
+   * dual microwave dishes at +38 / +46 m, and the dual-strobe red/white
+   * aviation beacon on the +52 m antenna spire.
+   *
+   * Seated at the canonical highland-basin coordinates (-1550, 2320) unless
+   * `options.worldPosition` says otherwise; the foundation z is clamped to the
+   * local terrain elevation (never below ground) so the pad reads as
+   * bedrock-anchored rather than floating. Idempotent (a second call returns
+   * the existing system). Meshes register as shadow casters (glow-only parts
+   * excepted); teardown runs from `dispose()`. The ladder bounds, proximity
+   * envelopes and beacon pulse law answer even before this call via
+   * `new RadioTower(options)`.
+   */
+  buildRadioTower(options: Partial<RadioTowerOptions> = {}): RadioTower {
+    if (this.radioTower !== null) return this.radioTower;
+    const scene = this.requireScene();
+    const seatX = options.worldPosition?.x ?? RADIO_TOWER_DEFAULTS.worldPosition.x;
+    const seatY = options.worldPosition?.y ?? RADIO_TOWER_DEFAULTS.worldPosition.y;
+    // Terrain clamp: an explicit z may raise the seat, never bury it.
+    const ground = this.getGroundHeightAt(seatX, seatY);
+    const seatZ = Math.max(options.worldPosition?.z ?? ground, ground);
+    const tower = new RadioTower({
+      ...options,
+      worldPosition: { x: seatX, y: seatY, z: seatZ },
+    }).init(scene);
+    const rootNode = tower.getRootNode();
+    if (rootNode !== null) rootNode.parent = this.terrainRoot ?? null;
+    this.registerShadowCasters(tower.getShadowCasterMeshes());
+    this.radioTower = tower;
+    return tower;
+  }
+
+  /** The Frontier Radio Tower, or null before build / after dispose. */
+  getRadioTower(): RadioTower | null {
+    return this.disposed ? null : this.radioTower;
   }
 
   // -- surface detritus & salvage (Spec 21 §2.1) -------------------------------
