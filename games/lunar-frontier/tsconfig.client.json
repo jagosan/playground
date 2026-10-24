@@ -28,6 +28,7 @@
     "src/infrastructure/HighSpeedMaglev.ts",
     "src/infrastructure/MassAccelerator.ts",
     "src/infrastructure/OrbitalTransportSystem.ts",
+    "src/infrastructure/RadioTower.ts",
     "src/quests/TrainHeistDirector.ts",
     "src/quests/ExportMinigameDirector.ts",
     "src/physics/TraversalPhysics.ts",

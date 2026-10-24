@@ -56,7 +56,7 @@
 - `games/lunar-frontier/src/economy/`: Automated market pricing, commodity liquidity pools (`MarketEngine.ts`).
 - `games/lunar-frontier/src/engine/`: Babylon.js scene manager, lighting, vacuum shadows (`WorldScene.ts`, `CameraRig.ts`).
 - `games/lunar-frontier/src/entities/`: Astronaut suit EVA controller, open-top buggy, dock mechs (`AstronautSuit.ts`, `OpenBuggy.ts`, `LoadingDockMech.ts`).
-- `games/lunar-frontier/src/infrastructure/`: Procedural tunnel mesh builder, rail line spline renderer, ore cart runner, X-Corp citadel monolith, high-speed maglev, 180m Mare mass accelerator, Keplerian orbital transports, and Frontier radio tower (`TunnelNetwork.ts`, `RailSystem.ts`, `XCorpCitadel.ts`, `HighSpeedMaglev.ts`, `MassAccelerator.ts`, `OrbitalTransportSystem.ts`, `RadioTower.ts`).
+- `games/lunar-frontier/src/infrastructure/`: Procedural tunnel mesh builder, rail line spline renderer, ore cart runner, X-Corp citadel monolith, high-speed maglev, 180m Mare mass accelerator, Keplerian orbital transports, and 52m Frontier radio tower lattice relay with ladder-proximity math and observation deck (`TunnelNetwork.ts`, `RailSystem.ts`, `XCorpCitadel.ts`, `HighSpeedMaglev.ts`, `MassAccelerator.ts`, `OrbitalTransportSystem.ts`, `RadioTower.ts`).
 - `games/lunar-frontier/src/physics/`: Vacuum ballistics, 60Hz lead solver, closed-form intercept math (`BallisticTrajectoryEngine.ts`).
 - `games/lunar-frontier/src/quests/`: High-speed train heist director, export minigame director, USP intercept threat engine (`TrainHeistDirector.ts`, `ExportMinigameDirector.ts`).
 - `games/lunar-frontier/src/network/`: WebSocket client, state delta interpolator, player manager (`NetworkClient.ts`).
