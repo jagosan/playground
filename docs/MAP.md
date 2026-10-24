@@ -25,6 +25,7 @@
 - `docs/architecture/26-x-corp-citadel-and-rail-heist.md`: X-Corp Citadel monolith, impenetrable kinetic shield defense grid, 3.5km elevated high-speed maglev guideway, Apex Express train consist, and high-speed train heist director.
 - `docs/architecture/27-mass-accelerator-export-minigame.md`: Mare Mass Accelerator 180m coilgun, orbital Keplerian transport traffic, vacuum ballistics & lead calculator, contraband laundering, and USP heat countdown.
 - `docs/architecture/28-lunar-frontier-ftue-eva-mechanics-and-controls.md`: FTUE arrival boot pipeline, retro-modern slimmer EVA suit avatar, low-g bounding kinematics, and gamepad stick rectification.
+- `docs/architecture/29-lunar-frontier-radio-tower-and-climbing.md`: 52m titanium lattice radio tower landmark, vertical ladder kinematics, observation deck at +48.0m, panoramic Citadel/maglev vista, and procedural climbing audio.
 - `docs/architecture/15-subagent-context-pruning-and-turn-budgeting.md`: Subagent context pruning, N-3 turn-budget circuit breaker, AST extraction, and Beehive Neo4j symbol discovery.
 - `specs/`:
   - `specs/00-system-overview.md`: Project vision, minigame architecture, rendering stack.
@@ -48,13 +49,14 @@
   - `specs/26-x-corp-citadel-and-rail-heist.md`: X-Corp Citadel monolith, impenetrable kinetic shield defense grid, 3.5km elevated high-speed maglev guideway, Apex Express train consist, and high-speed train heist director.
   - `specs/27-mass-accelerator-export-minigame.md`: Mare Mass Accelerator 180m coilgun, orbital Keplerian transport traffic, vacuum ballistics & lead calculator, contraband laundering, and USP heat countdown.
   - `specs/28-lunar-frontier-ftue-eva-mechanics-and-controls.md`: First-time user experience (FTUE) boot pipeline, retro-modern slimmer EVA suit avatar, low-g bounding locomotion, and gamepad stick rectification.
+  - `specs/29-lunar-frontier-radio-tower-and-climbing.md`: Frontier Radio Tower landmark, vertical ladder climbing kinematics, summit observation platform & panoramic vista.
 
 ## Lunar Frontier Multiplayer & Economy Subsystem (Spec 12)
 - `games/lunar-frontier/server/`: Fastify + `ws` server, SQLite schema, market pricing, 20Hz tick (`LunarServer.ts`, `Database.ts`).
 - `games/lunar-frontier/src/economy/`: Automated market pricing, commodity liquidity pools (`MarketEngine.ts`).
 - `games/lunar-frontier/src/engine/`: Babylon.js scene manager, lighting, vacuum shadows (`WorldScene.ts`, `CameraRig.ts`).
 - `games/lunar-frontier/src/entities/`: Astronaut suit EVA controller, open-top buggy, dock mechs (`AstronautSuit.ts`, `OpenBuggy.ts`, `LoadingDockMech.ts`).
-- `games/lunar-frontier/src/infrastructure/`: Procedural tunnel mesh builder, rail line spline renderer, ore cart runner, X-Corp citadel monolith, high-speed maglev, 180m Mare mass accelerator, and Keplerian orbital transports (`TunnelNetwork.ts`, `RailSystem.ts`, `XCorpCitadel.ts`, `HighSpeedMaglev.ts`, `MassAccelerator.ts`, `OrbitalTransportSystem.ts`).
+- `games/lunar-frontier/src/infrastructure/`: Procedural tunnel mesh builder, rail line spline renderer, ore cart runner, X-Corp citadel monolith, high-speed maglev, 180m Mare mass accelerator, Keplerian orbital transports, and Frontier radio tower (`TunnelNetwork.ts`, `RailSystem.ts`, `XCorpCitadel.ts`, `HighSpeedMaglev.ts`, `MassAccelerator.ts`, `OrbitalTransportSystem.ts`, `RadioTower.ts`).
 - `games/lunar-frontier/src/physics/`: Vacuum ballistics, 60Hz lead solver, closed-form intercept math (`BallisticTrajectoryEngine.ts`).
 - `games/lunar-frontier/src/quests/`: High-speed train heist director, export minigame director, USP intercept threat engine (`TrainHeistDirector.ts`, `ExportMinigameDirector.ts`).
 - `games/lunar-frontier/src/network/`: WebSocket client, state delta interpolator, player manager (`NetworkClient.ts`).
