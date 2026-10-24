@@ -197,6 +197,52 @@ export const SUIT_SOFT_LANDING_VY = -0.5;
 /** When oxygen or battery bottoms out, muscles still work — slowly. */
 export const SUIT_INCAPACITATED_SCALE = 0.35;
 
+// -- Spec 29 §3: CLIMBING locomotion (ladder kinematics) -----------------------
+
+/**
+ * Spec 29 §3.1: the explicit locomotion state-machine band reported on
+ * {@link SuitState.locomotionMode} for animation, HUD and audio authoring.
+ * `CLIMBING` is the magnetically-latched rung regime (Spec 29 §3.2); the
+ * others cover the classic surface gaits and ballistic coast.
+ */
+export type LocomotionMode = 'WALK' | 'SPRINT' | 'BOUND' | 'AIRBORNE' | 'CLIMBING';
+
+/**
+ * Ladder rail contract consumed by {@link LunarEvaSuit.mountLadder}. This is
+ * the structural twin of `RadioTower.LadderBounds` (Spec 29 §4.2.2) — it is
+ * intentionally NOT imported there so this simulation module stays framework-
+ * free; a `tower.getLadderBounds()` answer satisfies this shape verbatim.
+ * `basePosition`/`topPosition` are the tapered rung-line endpoints in world
+ * metres (z up); `facingNormal` is the unit outward ladder normal in x-y.
+ */
+export interface LadderBounds {
+  basePosition: { x: number; y: number; z: number };
+  topPosition: { x: number; y: number; z: number };
+  facingNormal: { x: number; y: number };
+  rungWidthM: number;
+  totalRungs: number;
+  climbHeightM: number;
+}
+
+/** Spec 29 §3.2.2: standard rung-over-rung climb speed (m/s). */
+export const LADDER_CLIMB_SPEED = 2.2;
+/** Spec 29 §3.2.2: sprint-held boosted climb speed (m/s). */
+export const LADDER_CLIMB_SPRINT_SPEED = 3.6;
+/** Spec 29 §3.2.3: low-g rung-hop vertical impulse (m/s). */
+export const LADDER_HOP_VZ = 3.2;
+/** Spec 29 §3.2.4: outward push along the ladder normal on release (m/s). */
+export const LADDER_DISENGAGE_PUSH_MPS = 0.8;
+/** Spec 29 §3.2.1: climber body rail offset outward from the rung line (m). */
+export const LADDER_BODY_RAIL_OFFSET_M = 0.3;
+/** Spec 29 §3.2.5: summit threshold band — z_deck − 0.1 m with vz > 0 (m). */
+export const LADDER_SUMMIT_EPS_M = 0.1;
+/** Spec 29 §3.2.5: step-in along −n onto the observation deck (m). */
+export const LADDER_DECK_STEP_IN_M = 1.2;
+/** Spec 29 §3.2: ground hand-off threshold band at the ladder base (m). */
+export const LADDER_BASE_EPS_M = 0.1;
+/** Spec 29 §3.2: step-back along +n onto the regolith (m). */
+export const LADDER_GROUND_STEP_BACK_M = 1.0;
+
 export interface SuitInput {
   /** -1..1 throttle along heading. */
   forward: number;
@@ -265,6 +311,21 @@ export interface SuitState {
    * reports the completed leap's hangtime for the animation layer.
    */
   hangtime: number;
+  /**
+   * Spec 29 §3.1: locomotion state-machine band (`WALK` / `SPRINT` / `BOUND`
+   * / `AIRBORNE` / `CLIMBING`). Optional so pre-Spec-29 callers stay source-
+   * compatible; every {@link LunarEvaSuit.step} refreshes it.
+   */
+  locomotionMode?: LocomotionMode;
+  /**
+   * Spec 29 §4.2.2: vertical metres above the active ladder's base datum
+   * (clamped to [0, climbHeightM]); 0 whenever the suit is not latched.
+   */
+  climbProgressM?: number;
+  /** Spec 29 §4.2.2: signed climb rate (m/s, + up). vz while latched, 0 off ladder. */
+  climbRate?: number;
+  /** Spec 29 §3.2: magnetic boot-clamp engaged on a ladder's rung rail. */
+  ladderLatchActive?: boolean;
   oxygen: number;
   battery: number;
   rcsFuel: number;
@@ -331,6 +392,12 @@ export class LunarEvaSuit {
    * step() clamp reads this, so an upgrade persists across frames.
    */
   private oxygenCap: number = SUIT_MAX_OXYGEN;
+  /**
+   * Spec 29 §3.2: the ladder the magnetic boots are latched to (null while
+   * free-roaming). The latch owns the horizontal plane and suppresses
+   * gravity — see {@link stepLadder}.
+   */
+  private ladder: LadderBounds | null = null;
   /** Accumulated RCS valve-open time across the whole session (s). */
   public rcsPulseSeconds = 0;
 
@@ -348,6 +415,10 @@ export class LunarEvaSuit {
       jumpImpulse: initial.jumpImpulse ?? 0,
       gaitMode: initial.gaitMode ?? 'idle',
       hangtime: initial.hangtime ?? 0,
+      locomotionMode: initial.locomotionMode ?? 'WALK',
+      climbProgressM: initial.climbProgressM ?? 0,
+      climbRate: initial.climbRate ?? 0,
+      ladderLatchActive: initial.ladderLatchActive ?? false,
       oxygen: initial.oxygen ?? SUIT_MAX_OXYGEN,
       battery: initial.battery ?? SUIT_MAX_BATTERY,
       rcsFuel: initial.rcsFuel ?? SUIT_MAX_RCS_FUEL,
@@ -381,6 +452,214 @@ export class LunarEvaSuit {
     return this.oxygenCap;
   }
 
+  // -- Ladder latch (Spec 29 §3.2) ------------------------------------------------
+
+  /** True while the magnetic boots hold the suit on a ladder's rung rail. */
+  public isOnLadder(): boolean {
+    return this.ladder !== null && this.state.ladderLatchActive === true;
+  }
+
+  /** Copy of the active ladder bounds (null when free-roaming). */
+  public getLadderBounds(): LadderBounds | null {
+    return this.ladder === null ? null : { ...this.ladder };
+  }
+
+  /**
+   * Snap the boots onto `bounds`' climbing rail at `startZ` (defaults to the
+   * suit's current elevation, clamped to the climb span). Horizontal position
+   * locks to the tapered rung line + {@link LADDER_BODY_RAIL_OFFSET_M} body
+   * rail, momenta are absorbed by the latch, and the state machine enters
+   * `CLIMBING`. Refuses (false) on a garbage contract or while already
+   * latched — re-mount first. Answers the Spec 29 §3.2.6 deck-to-ladder and
+   * §3.1 base-to-ladder mounts.
+   */
+  public mountLadder(bounds: LadderBounds, startZ?: number): boolean {
+    if (this.ladder !== null) return false;
+    if (bounds === null || bounds === undefined) return false;
+    const bp = bounds.basePosition;
+    const tp = bounds.topPosition;
+    const fn = bounds.facingNormal;
+    if (
+      !Number.isFinite(bp.x) || !Number.isFinite(bp.y) || !Number.isFinite(bp.z) ||
+      !Number.isFinite(tp.x) || !Number.isFinite(tp.y) || !Number.isFinite(tp.z) ||
+      !Number.isFinite(fn.x) || !Number.isFinite(fn.y) ||
+      !(tp.z > bp.z)
+    ) {
+      return false;
+    }
+    const s = this.state;
+    const z = clamp(Number.isFinite(startZ) ? (startZ as number) : s.z, bp.z, tp.z);
+    this.ladder = {
+      basePosition: { ...bp },
+      topPosition: { ...tp },
+      facingNormal: { ...fn },
+      rungWidthM: bounds.rungWidthM,
+      totalRungs: bounds.totalRungs,
+      climbHeightM: bounds.climbHeightM,
+    };
+    const rail = this.ladderRailAt(z);
+    s.x = rail.x;
+    s.y = rail.y;
+    s.z = z;
+    s.vx = 0;
+    s.vy = 0;
+    s.vz = 0;
+    s.isGrounded = false;
+    s.jumpImpulse = 0;
+    s.locomotionMode = 'CLIMBING';
+    s.ladderLatchActive = true;
+    s.climbRate = 0;
+    s.climbProgressM = z - bp.z;
+    // A committed bounding leap never survives a boot-clamp.
+    this.boundPhase = 'walk';
+    this.boundClock = 0;
+    s.hangtime = 0;
+    return true;
+  }
+
+  /**
+   * Emergency release / cancel (Spec 29 §3.2.4): unlatch, push
+   * `kickMps` (default 0.8 m/s) outward along the ladder normal to clear the
+   * rungs, and hand the suit back to the normal low-g parabolic descent
+   * (`AIRBORNE`). The vertical velocity carried at release is preserved
+   * (mechanical hold means that is usually 0). False when not latched.
+   */
+  public dismountLadder(kickMps: number = LADDER_DISENGAGE_PUSH_MPS): boolean {
+    if (!this.isOnLadder()) return false;
+    const s = this.state;
+    const fn = (this.ladder as LadderBounds).facingNormal;
+    const kick = Number.isFinite(kickMps) ? Math.abs(kickMps) : LADDER_DISENGAGE_PUSH_MPS;
+    s.vx = fn.x * kick;
+    s.vy = fn.y * kick;
+    s.isGrounded = false;
+    s.locomotionMode = 'AIRBORNE';
+    s.ladderLatchActive = false;
+    s.climbRate = 0;
+    s.climbProgressM = 0;
+    this.ladder = null;
+    return true;
+  }
+
+  /**
+   * Climber body-rail plan datum at world height z: the rung centre-line
+   * linearly interpolated between the ladder's tapered base/top endpoints,
+   * offset a further {@link LADDER_BODY_RAIL_OFFSET_M} outward along the
+   * facing normal (matches `RadioTower.getClimbOffsetPosition` on the
+   * canonical linear taper). Heights outside the span clamp to their end.
+   */
+  private ladderRailAt(z: number): { x: number; y: number } {
+    const b = this.ladder as LadderBounds;
+    const span = Math.max(1e-6, b.topPosition.z - b.basePosition.z);
+    const t = clamp((z - b.basePosition.z) / span, 0, 1);
+    return {
+      x:
+        b.basePosition.x + (b.topPosition.x - b.basePosition.x) * t +
+        b.facingNormal.x * LADDER_BODY_RAIL_OFFSET_M,
+      y:
+        b.basePosition.y + (b.topPosition.y - b.basePosition.y) * t +
+        b.facingNormal.y * LADDER_BODY_RAIL_OFFSET_M,
+    };
+  }
+
+  /**
+   * One frame on the ladder (Spec 29 §3.2). The latch owns the horizontal
+   * channel (§3.2.1 strafe muting — (x, y) are re-clamped to the rail every
+   * frame) and cancels gravity (mechanical hold: neutral input means vz = 0,
+   * zero slide). Forward input drives vz at 2.2 m/s (3.6 sprint). Rising-edge
+   * jump executes the +3.2 m/s low-g rung hop (unlatches into a ballistic
+   * arc); crossing the deck threshold with vz > 0 hands off to a grounded
+   * WALK 1.2 m inboard on the observation deck, and reaching the base with
+   * vz < 0 hands off 1.0 m out along the normal onto the regolith.
+   */
+  private stepLadder(dt: number, input: SuitInput, options: SuitStepOptions): SuitState {
+    const s = this.state;
+    const b = this.ladder as LadderBounds;
+
+    // Look/look-around survives the latch; strafe deliberately does not.
+    s.heading = wrapAngle(s.heading + clamp(input.yaw, -1, 1) * SUIT_TURN_RATE * dt);
+    s.pitch = approach(s.pitch, 0, 2, dt);
+
+    // §3.2.2 vertical channel (neutral input → hard mechanical hold).
+    const climbRate =
+      clamp(input.forward, -1, 1) *
+      (input.sprint === true ? LADDER_CLIMB_SPRINT_SPEED : LADDER_CLIMB_SPEED);
+    s.vz = climbRate;
+
+    // §3.2.3 low-g rung hop: explosive release straight up the rail face.
+    if (input.jump && !this.jumpWasHeld) {
+      this.jumpWasHeld = true;
+      this.ladder = null;
+      s.jumpImpulse = LADDER_HOP_VZ;
+      s.vz = LADDER_HOP_VZ;
+      s.isGrounded = false;
+      s.locomotionMode = 'AIRBORNE';
+      s.ladderLatchActive = false;
+      s.climbRate = 0;
+      s.climbProgressM = 0;
+      return this.getState();
+    }
+    this.jumpWasHeld = input.jump;
+
+    // Integrate the rail; the horizontal lock re-asserts every frame.
+    s.z += s.vz * dt;
+    const rail = this.ladderRailAt(s.z);
+    s.x = rail.x;
+    s.y = rail.y;
+
+    // §3.2.5 deck summit hand-off.
+    if (s.z >= b.topPosition.z - LADDER_SUMMIT_EPS_M && s.vz > 0) {
+      s.z = b.topPosition.z;
+      s.x -= b.facingNormal.x * LADDER_DECK_STEP_IN_M;
+      s.y -= b.facingNormal.y * LADDER_DECK_STEP_IN_M;
+      s.vx = 0;
+      s.vy = 0;
+      s.vz = 0;
+      s.isGrounded = true;
+      s.locomotionMode = 'WALK';
+      s.ladderLatchActive = false;
+      s.climbRate = 0;
+      s.climbProgressM = 0;
+      this.ladder = null;
+      return this.getState();
+    }
+
+    // Base hand-off onto the regolith.
+    if (s.z <= b.basePosition.z + LADDER_BASE_EPS_M && s.vz < 0) {
+      s.z = b.basePosition.z;
+      s.x += b.facingNormal.x * LADDER_GROUND_STEP_BACK_M;
+      s.y += b.facingNormal.y * LADDER_GROUND_STEP_BACK_M;
+      s.vx = 0;
+      s.vy = 0;
+      s.vz = 0;
+      s.isGrounded = true;
+      s.locomotionMode = 'WALK';
+      s.ladderLatchActive = false;
+      s.climbRate = 0;
+      s.climbProgressM = 0;
+      this.ladder = null;
+      return this.getState();
+    }
+
+    // Latched bookkeeping + life support (boots loaded → treat as contact).
+    s.locomotionMode = 'CLIMBING';
+    s.ladderLatchActive = true;
+    s.climbRate = s.vz;
+    s.climbProgressM = clamp(s.z - b.basePosition.z, 0, b.climbHeightM);
+    const exertion = clamp(Math.abs(s.vz) / LADDER_CLIMB_SPRINT_SPEED, 0, 1);
+    const metabolic = metabolicMultiplier(Math.abs(s.vz), true, options.mounted === true);
+    s.oxygen = clamp(
+      s.oxygen - (SUIT_O2_BASE * metabolic + SUIT_O2_EXERTION * exertion) * dt,
+      0,
+      this.oxygenCap,
+    );
+    s.battery = clamp(
+      s.battery - (SUIT_BAT_LIFE_SUPPORT + SUIT_BAT_EXERTION * exertion) * dt,
+      0,
+      SUIT_MAX_BATTERY,
+    );
+    return this.getState();
+  }
+
   /** Advance the suit one timestep. `ground` is surface elevation underfoot. */
   public step(
     dt: number,
@@ -390,6 +669,14 @@ export class LunarEvaSuit {
   ): SuitState {
     const s = this.state;
     const step = clamp(dt, 0, 0.25);
+
+    // Spec 29 §3.2: while the boots are clamped, the ladder kinematics own
+    // the frame entirely — gravity off, horizontal channel locked to the
+    // rail, terrain sampler unused (the climber hangs on the truss, not the
+    // ground beneath it).
+    if (this.ladder !== null && s.ladderLatchActive === true) {
+      return this.stepLadder(step, input, options);
+    }
 
     const incapacitated = s.oxygen <= 0 || s.battery <= 0;
     const authority = incapacitated ? SUIT_INCAPACITATED_SCALE : 1;
@@ -573,6 +860,19 @@ export class LunarEvaSuit {
       : Math.hypot(s.vx, s.vy) > 0.08
         ? 'walk'
         : 'idle';
+
+    // Spec 29 §3.1: refresh the locomotion state-machine band. Free-roaming
+    // frames always park the ladder fields (the latch owns them elsewhere).
+    s.locomotionMode = !s.isGrounded
+      ? bounding
+        ? 'BOUND'
+        : 'AIRBORNE'
+      : input.sprint === true && Math.hypot(s.vx, s.vy) > SUIT_METABOLIC_WALK_V
+        ? 'SPRINT'
+        : 'WALK';
+    s.climbRate = 0;
+    s.climbProgressM = 0;
+    s.ladderLatchActive = false;
 
     // -- Life support ----------------------------------------------------------
     const speed = Math.hypot(s.vx, s.vy);
@@ -2318,6 +2618,24 @@ export class TraversalPhysics {
     if (this.rail.getState().speed > 0.05) return false;
     this.mode = 'rail';
     return true;
+  }
+
+  // -- Ladder latch pass-throughs (Spec 29 Phase 3) --------------------------------
+
+  /** Latch the on-foot suit onto a ladder rail (see {@link LunarEvaSuit.mountLadder}). */
+  public mountLadder(bounds: LadderBounds, startZ?: number): boolean {
+    if (this.mode !== 'suit' || this.mountKind !== null) return false;
+    return this.suit.mountLadder(bounds, startZ);
+  }
+
+  /** Release the ladder latch into a low-g arc (see {@link LunarEvaSuit.dismountLadder}). */
+  public dismountLadder(kickMps: number = LADDER_DISENGAGE_PUSH_MPS): boolean {
+    return this.suit.dismountLadder(kickMps);
+  }
+
+  /** True while the suit's boots are clamped to a ladder. */
+  public isClimbing(): boolean {
+    return this.suit.isOnLadder();
   }
 
   // -- Main step ------------------------------------------------------------------

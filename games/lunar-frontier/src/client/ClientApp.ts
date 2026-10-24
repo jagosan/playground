@@ -1628,6 +1628,37 @@ export class ClientApp {
       return this.provingGrounds.getTrackElevation(x, y);
     }
     const surface = this.world.getGroundHeightAt(x, y);
+    // Elevation of whichever physics body sits horizontally closest to the
+    // sampled point (the buggy and the suit share this single ground seam;
+    // `null` only before entities exist).
+    const probeBodyZ = (): number | null => {
+      const suit = this.suit;
+      const buggy = this.buggy;
+      if (suit !== null && buggy !== null) {
+        const sp = suit.getPosition();
+        const bp = buggy.getPosition();
+        return Math.hypot(sp.x - x, sp.y - y) <= Math.hypot(bp.x - x, bp.y - y) ? sp.z : bp.z;
+      }
+      if (suit !== null) return suit.getPosition().z;
+      if (buggy !== null) return buggy.getPosition().z;
+      return null;
+    };
+    // Spec 29 Phase 3: the radio tower's +48 m observation gantry is walkable
+    // floor while a body stands up at deck level — without it the summit
+    // step-off pops the suit off the steel grating on the next physics
+    // frame. The footprint is the 5 m hex deck (circumradius 2.5 + grate
+    // edge tolerance); a surface walker under the spire is never floored 48 m
+    // into the sky, and falling below the slab releases the floor so the
+    // hatch descent keeps working. (Phase 4 refines hatch pass-through.)
+    const tower = this.world.getRadioTower();
+    if (tower !== null) {
+      const seat = tower.getWorldPosition();
+      if (Math.hypot(x - seat.x, y - seat.y) <= 2.6) {
+        const deckZ = tower.getDeckElevation();
+        const bodyZ = probeBodyZ();
+        if (bodyZ !== null && bodyZ >= deckZ - 0.6) return Math.max(surface, deckZ);
+      }
+    }
     // Spec 21 §2.4: once a body has descended into the tunnel/bunker
     // interior, the walkable floor is the bore/chamber interior, not the
     // surface heightfield overhead — otherwise one physics frame pops the
@@ -1636,15 +1667,7 @@ export class ClientApp {
     // surface body never sees the interior floor of the column beneath it.
     const network = this.tunnelNetwork;
     if (network === null) return surface;
-    let z: number | null = null;
-    const suit = this.suit;
-    const buggy = this.buggy;
-    if (suit !== null && buggy !== null) {
-      const sp = suit.getPosition();
-      const bp = buggy.getPosition();
-      z = Math.hypot(sp.x - x, sp.y - y) <= Math.hypot(bp.x - x, bp.y - y) ? sp.z : bp.z;
-    } else if (suit !== null) z = suit.getPosition().z;
-    else if (buggy !== null) z = buggy.getPosition().z;
+    const z = probeBodyZ();
     if (z !== null && z < surface - 0.5) {
       const interior = network.getInteriorFloor({ x, y, z });
       if (interior !== null) return interior;
@@ -2648,11 +2671,15 @@ export class ClientApp {
           this.toggleMap();
         }
         if (rising(GAMEPAD_BUTTONS.mount)) {
+          // Spec 29 Phase 3: a radio-tower ladder latch/release under the
+          // thumb outranks all (mirrors the keyboard [E] routing).
           // Spec 21 §2.4: a security terminal under the thumb outranks all.
           // Spec 19 §2.1.5/§2.3.3: otherwise (X) stows a loaded backpack into
           // a nearby rover first; with an empty pack (or no rover) it mounts.
           const padSuit = this.suit;
-          if (this.mode === 'suit' && this.nearestVaultTerminal !== null) {
+          if (this.tryLadderInteraction()) {
+            // ladder handled — no other action this press
+          } else if (this.mode === 'suit' && this.nearestVaultTerminal !== null) {
             this.interfaceVaultTerminal(this.nearestVaultTerminal.vaultId);
           } else if (
             this.mode === 'suit' &&
@@ -2666,7 +2693,15 @@ export class ClientApp {
           }
         }
         if (rising(GAMEPAD_BUTTONS.headlight)) this.toggleHeadlights();
-        if (rising(GAMEPAD_BUTTONS.trade)) this.toggleTradeTerminal();
+        // Spec 29 §3.2.4: (B) is the climbing cancel — it releases the boot
+        // latch instead of opening the trade terminal while on the ladder.
+        if (rising(GAMEPAD_BUTTONS.trade)) {
+          if (this.mode === 'suit' && this.suit !== null && this.suit.getState().ladderLatchActive === true) {
+            this.tryLadderInteraction();
+          } else {
+            this.toggleTradeTerminal();
+          }
+        }
         if (rising(GAMEPAD_BUTTONS.mine)) this.mineNearestVein();
         if (rising(GAMEPAD_BUTTONS.camera)) this.cycleCamera();
         if (rising(GAMEPAD_BUTTONS.comms)) this.toggleCommsLog();
@@ -2689,6 +2724,9 @@ export class ClientApp {
             break;
           }
         } else {
+          // Spec 29 Phase 3: a radio-tower ladder at the player's boots
+          // outranks everything on [E] — latch on, or release while climbing.
+          if (this.tryLadderInteraction()) break;
           const terminal = this.mode === 'suit' ? this.nearestVaultTerminal : null;
           if (terminal !== null) {
             this.interfaceVaultTerminal(terminal.vaultId);
@@ -2731,6 +2769,12 @@ export class ClientApp {
         break;
       }
       case 'claim':
+        // Spec 29 §3.2.4: [C] is the climbing cancel — releasing the boot
+        // latch takes precedence over staking a claim.
+        if (this.mode === 'suit' && this.suit !== null && this.suit.getState().ladderLatchActive === true) {
+          this.tryLadderInteraction();
+          break;
+        }
         this.stakeClaimAtCurrentPosition();
         break;
       case 'trade':
@@ -2754,6 +2798,46 @@ export class ClientApp {
   }
 
   // -- gameplay actions ----------------------------------------------------------------
+
+  /**
+   * Spec 29 Phase 3 — radio-tower ladder edge for `[E]` / Gamepad `(X)`
+   * (mount / release) and `[C]` / Gamepad `(B)` (climbing cancel). While the
+   * boots are clamped the press releases the latch into the low-g push-off
+   * arc; on foot beside the base cylinder (`isNearLadderBase`, 1.8 m) it
+   * latches at ground datum; on the observation deck inside the hatch radius
+   * (`isNearTopHatch`, 1.0 m) it latches at deck − 0.2 m facing the tower
+   * (Spec 29 §3.2.6). Returns true when the press was consumed by the
+   * ladder, false → the caller falls through to its legacy action (buggy
+   * mount, claim, trade ...).
+   */
+  private tryLadderInteraction(): boolean {
+    if (this.disposed) return false;
+    const suit = this.suit;
+    if (this.mode !== 'suit' || suit === null) return false;
+    const physics = suit.getPhysics();
+    if (physics.isOnLadder()) {
+      physics.dismountLadder();
+      this.hudSay('ladder released');
+      return true;
+    }
+    const tower = this.world.getRadioTower();
+    if (tower === null) return false;
+    const pos = suit.getPosition();
+    if (tower.isNearLadderBase(pos)) {
+      if (physics.mountLadder(tower.getLadderBounds(), tower.getLadderBounds().basePosition.z)) {
+        this.hudSay('ladder latched');
+        return true;
+      }
+      return false;
+    }
+    if (tower.isNearTopHatch(pos)) {
+      if (physics.mountLadder(tower.getLadderBounds(), tower.getDeckElevation() - 0.2)) {
+        this.hudSay('ladder latched — descending');
+        return true;
+      }
+    }
+    return false;
+  }
 
   /** `[E]` — climb into the buggy when near it, climb out when mounted. */
   toggleMount(): boolean {
@@ -3146,18 +3230,26 @@ export class ClientApp {
     } else {
       // EVA path is untouched by the trigger filter (no analog triggers on
       // foot — keep the legacy digital keyboard feel byte-for-byte).
-      const speedScale = frame.sprint ? 1 : 0.55;
       const suit = this.requireSuit();
+      // Spec 29 Phase 3: while latched to a radio-tower ladder the rungs own
+      // the vertical channel — the keyboard speed-scale must not throttle
+      // the climb (physics drives vz from the raw input), the sprint latch
+      // passes through for the 3.6 m/s boost, and the RCS/jump softening
+      // channel stands down (Space is the rung-hop, not a thruster).
+      const latched = suit.getState().ladderLatchActive === true;
+      const speedScale = frame.sprint ? 1 : 0.55;
+      const moveScale = latched ? 1 : speedScale;
       const input: SuitInput = {
-        forward: clamp(frame.forward, -1, 1) * speedScale,
-        strafe: clamp(frame.strafe, -1, 1) * speedScale,
+        forward: clamp(frame.forward, -1, 1) * moveScale,
+        strafe: clamp(frame.strafe, -1, 1) * moveScale,
         yaw: clamp(frame.yaw, -1, 1),
         pitch: clamp(frame.pitch, -1, 1),
         jump: frame.jump,
-        rcs: frame.jump && !suit.getState().isGrounded,
+        sprint: latched ? frame.sprint : undefined,
+        rcs: frame.jump && !latched && !suit.getState().isGrounded,
         rcsForward: 0,
         rcsStrafe: 0,
-        rcsUp: frame.jump ? 0.5 : 0,
+        rcsUp: frame.jump && !latched ? 0.5 : 0,
       };
       suit.update(dt, input);
       // Parked buggy still settles on its suspension while abandoned.
@@ -3560,6 +3652,18 @@ export class ClientApp {
       // Spec 21 §2.4: security terminal beside a vault bulkhead.
       if (this.nearestVaultTerminal !== null) {
         prompts.push({ key: 'E', kind: 'vault' });
+      }
+      // Spec 29 Phase 3: radio tower ladder proximity — Climb at the base
+      // cylinder, Descend at the summit hatch, Release while latched.
+      const radioTower = this.world.getRadioTower();
+      if (radioTower !== null) {
+        if (suit.getState().ladderLatchActive === true) {
+          prompts.push({ key: 'C', label: 'Release Ladder', order: 11 });
+        } else if (radioTower.isNearLadderBase(suit.getPosition())) {
+          prompts.push({ key: 'E', label: 'Climb Ladder', order: 11 });
+        } else if (radioTower.isNearTopHatch(suit.getPosition())) {
+          prompts.push({ key: 'E', label: 'Descend Ladder', order: 11 });
+        }
       }
     }
     const target = this.getNearestVein();
