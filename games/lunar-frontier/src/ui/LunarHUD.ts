@@ -119,6 +119,74 @@ export const HUD_CAP_MAX_MPS = 420;
 /** USP intercept clock full scale (s) — mirror of `USP_INTERCEPT_COUNTDOWN_S`. */
 export const HUD_EXPORT_USP_FULL_S = 45.0;
 
+// -- Spec 29 Phase 5: climbing altimeter + comms landmark banner ----------------
+
+/**
+ * Spec 29 §4.2 — climbing telemetry strip (`#lunar-hud-climb`): the vertical
+ * altimeter tape a climber reads on the rungs (`ALT +42.5m [DECK 48m]`) plus
+ * the vertical-speed channel (`+2.2 m/s`, or `HOLD` on the mechanical brake).
+ * Painted while the suit is latched to a ladder or standing near the tower;
+ * retracts cleanly (`is-hidden`) on `null`.
+ */
+export const HUD_CLIMB_ID = 'lunar-hud-climb';
+
+/**
+ * Spec 29 Phase 5 — comms landmark banner (`#lunar-hud-landmark`): the
+ * "FRONTIER RELAY 04" arrival notification floated when the player first
+ * reaches the radio tower / steps onto the observation deck.
+ */
+export const HUD_LANDMARK_ID = 'lunar-hud-landmark';
+
+/** Landmark banner auto-dismiss window (ms). */
+export const HUD_LANDMARK_DISMISS_MS = 4500;
+
+/** |climbRate| at or below this reads as the mechanical hold (`HOLD`). */
+export const HUD_CLIMB_HOLD_EPS = 0.05;
+
+/**
+ * Spec 29 Phase 5 — one frame of vertical-traversal telemetry handed to
+ * {@link LunarHUD.setClimbingTelemetry}. Elevations are metres above the
+ * tower's ground datum (altitude ≈ 0 at the base, 48 on the deck).
+ */
+export interface ClimbingTelemetry {
+  /** Current elevation above the tower base ground (m). */
+  altitudeM: number;
+  /** Observation-deck elevation above the same datum (m, e.g. 48). */
+  deckElevationM: number;
+  /** Signed climb rate (m/s, + up). 0 while mechanically held. */
+  climbRateMps: number;
+  /** True while the magnetic boot clamp owns the frame. */
+  isLatched: boolean;
+}
+
+/** Signed one-decimal metre readout: `+42.5` / `-3.2` / `+0.0`. */
+function signed1(value: number): string {
+  const v = Number.isFinite(value) ? value : 0;
+  return `${v < 0 ? '-' : '+'}${Math.abs(v).toFixed(1)}`;
+}
+
+/**
+ * Altimeter-tape law (Spec 29 §4.2): `ALT +42.5m [DECK 48m]`. Non-finite
+ * inputs collapse to 0; the deck number drops its `.0` tail.
+ */
+export function formatClimbAltitude(altitudeM: number, deckElevationM: number): string {
+  const alt = Number.isFinite(altitudeM) ? altitudeM : 0;
+  const deckRaw = Number.isFinite(deckElevationM) ? deckElevationM : 0;
+  const deck = Math.round(deckRaw * 10) / 10;
+  const deckText = Number.isInteger(deck) ? String(deck) : deck.toFixed(1);
+  return `ALT ${signed1(alt)}m [DECK ${deckText}m]`;
+}
+
+/**
+ * Vertical-speed law (Spec 29 §4.2): `+2.2 m/s` / `-1.5 m/s`, collapsing to
+ * `HOLD` inside ±{@link HUD_CLIMB_HOLD_EPS} (the mechanical rung brake).
+ */
+export function formatClimbRate(climbRateMps: number): string {
+  const v = Number.isFinite(climbRateMps) ? climbRateMps : 0;
+  if (Math.abs(v) <= HUD_CLIMB_HOLD_EPS) return 'HOLD';
+  return `${signed1(v)} m/s`;
+}
+
 /** Crimson threshold (s) on the USP banner — amber above, blinking below. */
 export const HUD_EXPORT_USP_CRITICAL_S = 15.0;
 
@@ -803,6 +871,11 @@ export class LunarHUD {
   /** Sky-track radar pip pool (`make`n once, rewritten per frame). */
   private gunnerRadarPips: Elementish[] = [];
 
+  /** Spec 29 Phase 5 — last climbing telemetry painted (harness readback). */
+  private lastClimbingTelemetry: ClimbingTelemetry | null = null;
+  /** Spec 29 Phase 5 — landmark banner auto-dismiss timer. */
+  private landmarkTimer: ReturnType<typeof setTimeout> | null = null;
+
   /** Spec 21 §2.5 — holographic topographic map overlay state. */
   private mapVisible = false;
   /** Last map frame handed to `updateMap` (harness readback). */
@@ -851,6 +924,7 @@ export class LunarHUD {
     this.buildIntroOverlay();
     this.buildHeistOverlay();
     this.buildGunnerOverlay();
+    this.buildClimbOverlay();
     this.buildToast();
     this.buildLifeSupport();
     this.buildBuggyPanel();
@@ -888,10 +962,15 @@ export class LunarHUD {
       clearTimeout(this.toastTimer);
       this.toastTimer = null;
     }
+    if (this.landmarkTimer !== null) {
+      clearTimeout(this.landmarkTimer);
+      this.landmarkTimer = null;
+    }
     this.clearCommsTimers();
     this.lastIntroTelemetry = null;
     this.lastHeistTelemetry = null;
     this.lastExportGunnerTelemetry = null;
+    this.lastClimbingTelemetry = null;
     this.gunnerRadarPips = [];
     this.tradeRows.clear();
     this.tradeOptions.clear();
@@ -2294,6 +2373,105 @@ export class LunarHUD {
     return this.lastHeistTelemetry;
   }
 
+  // -- Spec 29 Phase 5: climbing altimeter & comms landmark banner --------------
+
+  /**
+   * Paint (or retract) the climbing telemetry strip (`#lunar-hud-climb`).
+   * The altimeter reads `ALT +42.5m [DECK 48m]`; the vertical-speed channel
+   * shows `+2.2 m/s` / `-1.5 m/s`, collapsing to `HOLD` on the mechanical
+   * rung brake (|rate| ≤ {@link HUD_CLIMB_HOLD_EPS}); the latch chip marks
+   * `LATCHED` while the magnetic boots own the frame. `null` hides the
+   * whole strip behind `is-hidden`. Every value mirrors into `data-*`
+   * attributes so headless DOMs can assert without CSS. Idempotent per
+   * frame — safe to call from `ClientApp`'s climbing pump every tick.
+   */
+  setClimbingTelemetry(telemetry: ClimbingTelemetry | null): void {
+    if (this.disposed) return;
+    this.lastClimbingTelemetry = telemetry;
+
+    const panel = this.els.get('climb-panel');
+    if (panel === undefined) return;
+
+    if (telemetry === null) {
+      this.setClass('climb-panel', 'is-hidden', true);
+      this.setClass('climb-vs-value', 'is-hold', false);
+      this.setClass('climb-latch', 'is-latched', false);
+      panel.setAttribute('data-alt', '');
+      panel.setAttribute('data-deck', '');
+      panel.setAttribute('data-vs', '');
+      panel.setAttribute('data-latched', '');
+      return;
+    }
+
+    const alt = Number.isFinite(telemetry.altitudeM) ? telemetry.altitudeM : 0;
+    const deck = Number.isFinite(telemetry.deckElevationM) ? telemetry.deckElevationM : 0;
+    const rate = Number.isFinite(telemetry.climbRateMps) ? telemetry.climbRateMps : 0;
+    const latched = telemetry.isLatched === true;
+
+    this.setClass('climb-panel', 'is-hidden', false);
+    this.setText('climb-alt-value', formatClimbAltitude(alt, deck));
+    const hold = Math.abs(rate) <= HUD_CLIMB_HOLD_EPS;
+    this.setText('climb-vs-value', formatClimbRate(rate));
+    this.setClass('climb-vs-value', 'is-hold', hold);
+    this.setText('climb-latch', latched ? 'LATCHED' : 'FREE');
+    this.setClass('climb-latch', 'is-latched', latched);
+    // Near-summit glow band: within 2 m of the deck line.
+    this.setClass('climb-panel', 'is-near-deck', Math.abs(alt - deck) <= 2.0);
+
+    panel.setAttribute('data-alt', alt.toFixed(1));
+    panel.setAttribute('data-deck', deck.toFixed(1));
+    panel.setAttribute('data-vs', rate.toFixed(1));
+    panel.setAttribute('data-latched', latched ? '1' : '0');
+  }
+
+  /** Last climbing telemetry painted (null when retracted) — harness readback. */
+  getClimbingTelemetry(): ClimbingTelemetry | null {
+    return this.lastClimbingTelemetry;
+  }
+
+  /**
+   * Float the comms landmark banner (`#lunar-hud-landmark`) — Spec 29
+   * "FRONTIER RELAY 04" recognition on arrival at the tower or its
+   * observation deck. Re-arming a fresh name replaces the visible banner
+   * and restarts the auto-dismiss window.
+   */
+  showLandmarkArrival(name: string): void {
+    if (this.disposed) return;
+    const banner = this.els.get('landmark-banner');
+    if (banner === undefined) return;
+    const title = name.trim().length > 0 ? name.trim().toUpperCase() : 'LANDMARK';
+    this.setText('landmark-title', title);
+    banner.setAttribute('data-landmark', title);
+    this.setClass('landmark-banner', 'is-hidden', false);
+    if (this.landmarkTimer !== null) clearTimeout(this.landmarkTimer);
+    this.landmarkTimer = setTimeout(() => {
+      this.landmarkTimer = null;
+      if (!this.disposed) this.clearLandmarkArrival();
+    }, HUD_LANDMARK_DISMISS_MS);
+    const handle = this.landmarkTimer as unknown as { unref?: () => void };
+    if (typeof handle.unref === 'function') handle.unref();
+  }
+
+  /** Retract the landmark banner (cancels its auto-dismiss timer). */
+  clearLandmarkArrival(): void {
+    if (this.landmarkTimer !== null) {
+      clearTimeout(this.landmarkTimer);
+      this.landmarkTimer = null;
+    }
+    if (this.disposed) return;
+    const banner = this.els.get('landmark-banner');
+    if (banner === undefined) return;
+    this.setText('landmark-title', '');
+    banner.setAttribute('data-landmark', '');
+    this.setClass('landmark-banner', 'is-hidden', true);
+  }
+
+  /** Current landmark banner text ('' when retracted) — harness readback. */
+  landmarkText(): string {
+    if (this.disposed) return '';
+    return this.textOf('landmark-title');
+  }
+
   // -- Spec 27 §3.5.1: Gauss Needle gunner fire-control overlay ------------------
 
   /**
@@ -2661,6 +2839,54 @@ export class LunarHUD {
     inflight.textContent = 'CANISTER IN FLIGHT';
     chips.appendChild(inflight);
     panel.appendChild(chips);
+  }
+
+  /**
+   * Spec 29 Phase 5 — climbing telemetry strip + comms landmark banner.
+   *
+   * `#lunar-hud-climb`: a compact vertical altimeter floating right of the
+   * life-support stack while the player is on/near the radio-tower ladder —
+   * altimeter tape (`ALT +42.5m [DECK 48m]`), vertical speed (`+2.2 m/s` /
+   * `HOLD`), and a magnetic-boot latch chip. Both widgets hide behind
+   * `is-hidden` until telemetry / a landmark arrival paints them.
+   */
+  private buildClimbOverlay(): void {
+    const panel = this.make(
+      'section',
+      HUD_CLIMB_ID,
+      'hud-panel climb-altimeter is-hidden',
+      'climb-panel',
+    );
+    panel.setAttribute('data-alt', '');
+    panel.setAttribute('data-deck', '');
+    panel.setAttribute('data-vs', '');
+    panel.setAttribute('data-latched', '');
+    panel.appendChild(this.heading('CLIMB TELEMETRY'));
+
+    const alt = this.make('div', 'hud-climb-alt-value', 'climb-alt-value', 'climb-alt-value');
+    alt.textContent = 'ALT +0.0m [DECK 48m]';
+    panel.appendChild(alt);
+
+    const vs = this.make('div', 'hud-climb-vs-value', 'climb-vs-value is-hold', 'climb-vs-value');
+    vs.textContent = 'HOLD';
+    panel.appendChild(vs);
+
+    const latch = this.make('div', 'hud-climb-latch', 'climb-latch', 'climb-latch');
+    latch.textContent = 'FREE';
+    panel.appendChild(latch);
+
+    this.root.appendChild(panel);
+
+    // -- comms landmark banner (Spec 29 Phase 5 arrival recognition) ------------
+    const banner = this.make('div', HUD_LANDMARK_ID, 'lunar-hud-landmark is-hidden', 'landmark-banner');
+    banner.setAttribute('data-landmark', '');
+    const title = this.make('div', 'hud-landmark-title', 'landmark-title', 'landmark-title');
+    title.textContent = '';
+    banner.appendChild(title);
+    const sub = this.make('div', undefined, 'landmark-sub');
+    sub.textContent = 'X-CORP TRANSMISSION RELAY 04';
+    banner.appendChild(sub);
+    this.root.appendChild(banner);
   }
 
   /**

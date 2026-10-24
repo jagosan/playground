@@ -218,6 +218,23 @@ const USP_KLAXON_SWING_HZ = (USP_KLAXON_HIGH_HZ - USP_KLAXON_LOW_HZ) / 2; // 73.
 const USP_KLAXON_ALTERNATION_HZ = 1.25;
 const USP_KLAXON_BASE_LEVEL = 0.17;
 
+// -- Spec 29 §4.2.3: radio-tower vertical traversal voices ---------------------
+
+/**
+ * Magnetic boot-clamp latch (Spec 29 §4.2.3): a heavy metallic
+ * 180 Hz clang damped over ~300 ms, topped by a ceramic click (3.2 kHz
+ * high-passed noise tick riding on the strike). Rides the sfx bus directly
+ * — boot-conducted acoustics survive the vacuum cut like footsteps.
+ */
+export const LADDER_LATCH_CLANG_HZ = 180;
+/** Periodic boot-on-rung contact click (Spec 29 §4.2.3: 240 Hz). */
+export const LADDER_STEP_CLICK_HZ = 240;
+/** Canonical rung-contact cadence while climbing (s, Spec 29 §4.2.3). */
+export const LADDER_STEP_CADENCE_S = 0.35;
+/** Summit chime sweep (Spec 29 §4.2.3): 880 Hz → 1320 Hz atmospheric ping. */
+export const SUMMIT_CHIME_LOW_HZ = 880;
+export const SUMMIT_CHIME_HIGH_HZ = 1320;
+
 /** Noise buffer length baked once per context (seconds). */
 const NOISE_BUFFER_SECONDS = 2;
 
@@ -465,6 +482,13 @@ export class LunarAudioSystem {
   private lastCaptureChimeAt = Number.NEGATIVE_INFINITY;
   /** Context time of the last mag-lock disengage impulse (−∞ before first). */
   private lastMagLockAt = Number.NEGATIVE_INFINITY;
+  // -- Spec 29 Phase 5: climbing cue bookkeeping (context times + counts). -----
+  private lastLadderLatchAt = Number.NEGATIVE_INFINITY;
+  private lastLadderStepAt = Number.NEGATIVE_INFINITY;
+  private lastSummitChimeAt = Number.NEGATIVE_INFINITY;
+  private ladderLatchCount = 0;
+  private ladderStepCount = 0;
+  private summitChimeCount = 0;
   /** Last flyby record (null before the first pass). */
   private lastFlyby: MaglevFlybyRecord | null = null;
 
@@ -590,6 +614,12 @@ export class LunarAudioSystem {
     this.lastCaptureChimeAt = Number.NEGATIVE_INFINITY;
     this.lastFlyby = null;
     this.lastMagLockAt = Number.NEGATIVE_INFINITY;
+    this.lastLadderLatchAt = Number.NEGATIVE_INFINITY;
+    this.lastLadderStepAt = Number.NEGATIVE_INFINITY;
+    this.lastSummitChimeAt = Number.NEGATIVE_INFINITY;
+    this.ladderLatchCount = 0;
+    this.ladderStepCount = 0;
+    this.summitChimeCount = 0;
     this.musicFilter = null;
     this.noiseBuffer = null;
   }
@@ -1256,6 +1286,152 @@ export class LunarAudioSystem {
   /** Context time of the last mag-lock disengage impulse (−∞ before first). */
   getLastMagLockDisengageAt(): number {
     return this.lastMagLockAt;
+  }
+
+  // -- Spec 29 §4.2.3: radio-tower vertical traversal one-shots ------------------
+
+  /**
+   * Magnetic boot-clamp latch (Spec 29 §4.2.3): the heavy metallic clang of
+   * the rungs grabbing the suit — a 180 Hz triangular strike biting in from
+   * above pitch, damped over 300 ms through a resonant band — topped by a
+   * ceramic click (35 ms of 3.2 kHz high-passed noise on the strike edge).
+   * Rides the sfx bus directly (boot-conducted, survives the vacuum cut).
+   * Safe to call headlessly (mock context) and before `init()` / after
+   * `dispose()` (silent no-op).
+   */
+  playLadderLatch(): void {
+    if (!this.ready()) return;
+    const ctx = this.ctx!;
+    const t0 = ctx.currentTime + 0.005;
+    this.lastLadderLatchAt = t0;
+    this.ladderLatchCount++;
+
+    // Metallic clang: strikes above pitch, slams onto 180 Hz, damped fast.
+    const clang = ctx.createOscillator();
+    clang.type = 'triangle';
+    clang.frequency.setValueAtTime(LADDER_LATCH_CLANG_HZ * 1.6, t0);
+    clang.frequency.exponentialRampToValueAtTime(LADDER_LATCH_CLANG_HZ, t0 + 0.06);
+    const clangBand = ctx.createBiquadFilter();
+    clangBand.type = 'bandpass';
+    clangBand.frequency.value = LADDER_LATCH_CLANG_HZ;
+    clangBand.Q.value = 6;
+    const clangGain = ctx.createGain();
+    clangGain.gain.setValueAtTime(0, t0);
+    clangGain.gain.linearRampToValueAtTime(BASE_LEVEL.oneShot * 0.85, t0 + 0.004);
+    clangGain.gain.exponentialRampToValueAtTime(SILENT, t0 + 0.3);
+    clang.connect(clangBand);
+    clangBand.connect(clangGain);
+    clangGain.connect(this.sfxBus!);
+    clang.start(t0);
+    clang.stop(t0 + 0.35);
+
+    // Ceramic click: the latch pawl's high tick over the clang's attack.
+    const click = this.createNoiseSource();
+    if (click !== null) {
+      const tick = ctx.createBiquadFilter();
+      tick.type = 'highpass';
+      tick.frequency.value = 3200;
+      const tickGain = ctx.createGain();
+      tickGain.gain.setValueAtTime(BASE_LEVEL.oneShot * 0.35, t0);
+      tickGain.gain.exponentialRampToValueAtTime(SILENT, t0 + 0.035);
+      click.connect(tick);
+      tick.connect(tickGain);
+      tickGain.connect(this.sfxBus!);
+      click.start(t0);
+      click.stop(t0 + 0.05);
+    }
+
+    void this.resumeIfSuspended();
+  }
+
+  /**
+   * Periodic boot-on-rung contact click (Spec 29 §4.2.3): a soft 240 Hz
+   * triangle knock with a fast decay, fired by `ClientApp` on the canonical
+   * 0.35 s climb cadence while |vz| > 0.1 m/s. The cadence clock lives in
+   * the caller — this voice has no internal rate gate, so harnesses can
+   * fire it freely. Safe headlessly / pre-init / post-dispose (no-op).
+   */
+  playLadderStep(): void {
+    if (!this.ready()) return;
+    const ctx = this.ctx!;
+    const t0 = ctx.currentTime + 0.005;
+    this.lastLadderStepAt = t0;
+    this.ladderStepCount++;
+
+    const knock = ctx.createOscillator();
+    knock.type = 'triangle';
+    knock.frequency.setValueAtTime(LADDER_STEP_CLICK_HZ * 1.3, t0);
+    knock.frequency.exponentialRampToValueAtTime(LADDER_STEP_CLICK_HZ, t0 + 0.04);
+    const knockGain = ctx.createGain();
+    knockGain.gain.setValueAtTime(0, t0);
+    knockGain.gain.linearRampToValueAtTime(BASE_LEVEL.oneShot * 0.3, t0 + 0.004);
+    knockGain.gain.exponentialRampToValueAtTime(SILENT, t0 + 0.12);
+    knock.connect(knockGain);
+    knockGain.connect(this.sfxBus!);
+    knock.start(t0);
+    knock.stop(t0 + 0.15);
+
+    void this.resumeIfSuspended();
+  }
+
+  /**
+   * Summit chime (Spec 29 §4.2.3): the subtle high-frequency atmospheric
+   * ping when the climber steps onto the +48 m observation deck — an
+   * 880 Hz → 1320 Hz sine sweep (an ascending fifth) with a shimmer octave
+   * tail, rung through the helmet comms at a restrained level.
+   * Safe headlessly / pre-init / post-dispose (silent no-op).
+   */
+  playSummitChime(): void {
+    if (!this.ready()) return;
+    const ctx = this.ctx!;
+    const t0 = ctx.currentTime + 0.01;
+    this.lastSummitChimeAt = t0;
+    this.summitChimeCount++;
+
+    const tone = (freqStart: number, start: number, sweepEnd: number | null, decay: number, level: number): void => {
+      const osc = ctx.createOscillator();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(freqStart, start);
+      if (sweepEnd !== null) {
+        osc.frequency.exponentialRampToValueAtTime(sweepEnd, start + 0.22);
+      }
+      const gain = ctx.createGain();
+      gain.gain.setValueAtTime(0, start);
+      gain.gain.linearRampToValueAtTime(level, start + 0.01);
+      gain.gain.exponentialRampToValueAtTime(SILENT, start + decay);
+      osc.connect(gain);
+      gain.connect(this.sfxBus!);
+      osc.start(start);
+      osc.stop(start + decay + 0.05);
+    };
+    // Fundamental sweep 880 → 1320 Hz, then the octave shimmer on its tail.
+    tone(SUMMIT_CHIME_LOW_HZ, t0, SUMMIT_CHIME_HIGH_HZ, 0.9, BASE_LEVEL.oneShot * 0.42);
+    tone(SUMMIT_CHIME_HIGH_HZ * 1.5, t0 + 0.16, null, 1.1, BASE_LEVEL.oneShot * 0.14);
+
+    void this.resumeIfSuspended();
+  }
+
+  /**
+   * Context times of the last Spec 29 climbing cues (−∞ before the first of
+   * each) — harness readback. Counts are lifetime totals since `init()`
+   * (zeroed again by `dispose()`).
+   */
+  getClimbingCueTimes(): {
+    latchAt: number;
+    stepAt: number;
+    chimeAt: number;
+    latchCount: number;
+    stepCount: number;
+    chimeCount: number;
+  } {
+    return {
+      latchAt: this.lastLadderLatchAt,
+      stepAt: this.lastLadderStepAt,
+      chimeAt: this.lastSummitChimeAt,
+      latchCount: this.ladderLatchCount,
+      stepCount: this.ladderStepCount,
+      chimeCount: this.summitChimeCount,
+    };
   }
 
   // -- internals ---------------------------------------------------------------------

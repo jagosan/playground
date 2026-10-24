@@ -2090,3 +2090,117 @@
   writing-mode: vertical-rl;
   text-orientation: mixed;
 }
+
+/* ==========================================================================
+   Spec 29 Phase 5 — climbing altimeter (#lunar-hud-climb) & comms landmark
+   banner (#lunar-hud-landmark).
+
+   The altimeter strip rides the right-hand column above the life-support
+   stack while the climber owns the rungs: cyan tape law, amber HOLD state
+   on the mechanical rung brake, and a green near-summit glow band inside
+   2 m of the observation deck. The landmark banner is the comms-flavoured
+   "FRONTIER RELAY 04" arrival notification — a wide glass pill below the
+   compass with a scanning rule sweep.
+   ========================================================================== */
+
+#lunar-hud-climb {
+  right: 16px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 208px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border-color: rgba(86, 224, 255, 0.35);
+}
+
+#lunar-hud-climb.is-hidden {
+  opacity: 0;
+  visibility: hidden;
+}
+
+.climb-alt-value {
+  font-family: var(--lf-mono);
+  font-size: 15px;
+  letter-spacing: 0.06em;
+  color: var(--lf-cyan);
+  text-shadow: 0 0 10px rgba(86, 224, 255, 0.45);
+}
+
+.climb-vs-value {
+  font-family: var(--lf-mono);
+  font-size: 12.5px;
+  letter-spacing: 0.08em;
+  color: var(--lf-good);
+}
+
+.climb-vs-value.is-hold {
+  color: var(--lf-warn);
+}
+
+.climb-latch {
+  align-self: flex-start;
+  font-size: 9.5px;
+  letter-spacing: 0.14em;
+  color: var(--lf-dim);
+  border: 1px solid var(--lf-rule);
+  border-radius: 999px;
+  padding: 2px 8px;
+}
+
+.climb-latch.is-latched {
+  color: var(--lf-good);
+  border-color: rgba(92, 230, 164, 0.6);
+  box-shadow: 0 0 8px rgba(92, 230, 164, 0.35);
+}
+
+/* Within 2 m of the deck line the whole strip breathes green. */
+#lunar-hud-climb.is-near-deck {
+  border-color: rgba(92, 230, 164, 0.55);
+  animation: climb-near-deck-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes climb-near-deck-pulse {
+  0%,
+  100% {
+    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.45);
+  }
+  50% {
+    box-shadow: 0 0 18px rgba(92, 230, 164, 0.45);
+  }
+}
+
+/* --- comms landmark banner ------------------------------------------------ */
+
+#lunar-hud-landmark {
+  top: 118px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  padding: 10px 26px;
+  border-color: rgba(86, 224, 255, 0.4);
+  background: var(--lf-glass-solid);
+  text-align: center;
+}
+
+#lunar-hud-landmark.is-hidden {
+  display: none;
+}
+
+.landmark-title {
+  font-family: var(--lf-mono);
+  font-size: 16px;
+  letter-spacing: 0.28em;
+  color: var(--lf-cyan);
+  text-shadow: 0 0 14px rgba(86, 224, 255, 0.6);
+}
+
+.landmark-sub {
+  font-size: 9.5px;
+  letter-spacing: 0.18em;
+  color: var(--lf-dim);
+  text-transform: uppercase;
+}

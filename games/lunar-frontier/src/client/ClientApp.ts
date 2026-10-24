@@ -122,7 +122,7 @@ import type { TopoMapPOI, TopoMapState } from '../ui/LunarHUD.ts';
 // Spec 25 §2.5: 100% procedural Web Audio engine (zero assets; the module
 // imports nothing and falls back to an internal mock context headless, so
 // NullEngine smoke suites never touch a real AudioContext).
-import { LunarAudioSystem } from '../audio/LunarAudioSystem.ts';
+import { LunarAudioSystem, LADDER_STEP_CADENCE_S } from '../audio/LunarAudioSystem.ts';
 
 // ---------------------------------------------------------------------------
 // Tunables
@@ -202,6 +202,26 @@ export const DECK_BOUNDARY_BAND_M = 0.5;
  * climber cross the railing line without being pushed back inside.
  */
 export const HATCH_SECTOR_HALF_ANGLE_RAD = 0.35;
+
+// -- Spec 29 Phase 5: climbing audio / HUD telemetry pump tunables --------------
+
+/**
+ * Summit announcement band (m below the deck line): a boot latch released
+ * with upward momentum while the suit sits within this band of the deck is
+ * announced as a Relay 04 observation-deck arrival (chime + banner).
+ */
+export const SUMMIT_ANNOUNCE_BAND_M = 2.0;
+/**
+ * Landmark-recognition hysteresis (m, 2D to the tower seat): the comms
+ * banner fires once inside {@link LANDMARK_ARRIVAL_RADIUS_M} and re-arms
+ * only after the player has left the {@link LANDMARK_REARM_RADIUS_M} circle.
+ */
+export const LANDMARK_ARRIVAL_RADIUS_M = 25.0;
+export const LANDMARK_REARM_RADIUS_M = 40.0;
+/** Radius (m) widening the ladder-hatch envelopes for HUD altimeter visibility. */
+export const CLIMB_HUD_PROXIMITY_M = 8.0;
+/** |vz| floor (m/s) below which the rung-step cadence stays silent (Spec 29 §4.2.3). */
+export const CLIMB_STEP_MIN_VZ_MPS = 0.1;
 
 export interface DeckPerimeterClampResult {
   x: number;
@@ -1210,6 +1230,14 @@ export class ClientApp {
   /** Wall-clock ms until which the mining-laser loop keeps burning. */
   private miningAudioUntilMs = Number.NEGATIVE_INFINITY;
 
+  // -- Spec 29 Phase 5: climbing cadence / summit / landmark state --------------
+  /** Ms elapsed since the last `playLadderStep()` rung-contact click. */
+  private climbCadenceMs = 0;
+  /** Previous frame's latch state — the summit hand-off is an edge. */
+  private climbWasLatched = false;
+  /** Landmark banner armed until the player next arrives at Relay 04. */
+  private climbLandmarkArmed = true;
+
   /** Scratch vector for remote-avatar placement (no per-frame allocation). */
   private readonly scratch = new Vector3(0, 0, 0);
 
@@ -1489,6 +1517,9 @@ export class ClientApp {
     // Spec 25 §2.5: frame-boundary audio pump — cabin↔vacuum acoustics,
     // motor/crunch driving loop, mining-laser tail, suit footfall cadence.
     this.pumpAudio(dt);
+    // Spec 29 Phase 5: ladder rung-step cadence, summit chime, Relay 04
+    // landmark recognition, and the climbing altimeter tape.
+    this.pumpClimbingTelemetry(dt);
     // Spec 24 §3.2: hold-to-skip — [Space] or Gamepad (B) accumulates a
     // radial skip meter; crossing the 1.2 s threshold skips to the next beat.
     this.pumpIntroSkipInput(dt);
@@ -2891,6 +2922,10 @@ export class ClientApp {
     const physics = suit.getPhysics();
     if (physics.isOnLadder()) {
       physics.dismountLadder();
+      // Spec 29 Phase 5: the magnetic clamp breaking open is the same heavy
+      // 180 Hz boot-clamp voice as the latch-on strike.
+      this.audio?.playLadderLatch();
+      this.climbCadenceMs = 0;
       this.hudSay('ladder released');
       return true;
     }
@@ -2903,6 +2938,9 @@ export class ClientApp {
         // with it the first-person camera) snaps opposite the ladder's
         // outward normal so the first frame reads "hands on the rungs".
         suit.setState({ heading: climbInwardHeadingRad(tower.getLadderBounds().facingNormal) });
+        // Spec 29 Phase 5: magnetic boot-clamp clang + fresh step cadence.
+        this.audio?.playLadderLatch();
+        this.climbCadenceMs = 0;
         this.hudSay('ladder latched');
         return true;
       }
@@ -2912,6 +2950,9 @@ export class ClientApp {
       if (physics.mountLadder(tower.getLadderBounds(), tower.getDeckElevation() - 0.2)) {
         // Spec 29 §3.2.6 / Phase 4: deck-to-ladder mount faces the tower.
         suit.setState({ heading: climbInwardHeadingRad(tower.getLadderBounds().facingNormal) });
+        // Spec 29 Phase 5: deck-side latch clang + fresh step cadence.
+        this.audio?.playLadderLatch();
+        this.climbCadenceMs = 0;
         this.hudSay('ladder latched — descending');
         return true;
       }
@@ -3491,6 +3532,104 @@ export class ClientApp {
       this.audioFootTravelled = 0;
       audio.playFootstep();
     }
+  }
+
+  /**
+   * Spec 29 Phase 5 — vertical-traversal audio & altimeter pump, one call
+   * per frame while the suit mode is active:
+   *
+   *   • Rung-contact cadence — while latched with |vz| > 0.1 m/s,
+   *     `playLadderStep()` fires on the canonical 0.35 s boot rhythm
+   *     (the clock resets on every latch, release, and neutral hold).
+   *   • Summit hand-off — the frame where the latch let go *upward* into a
+   *     grounded WALK inside {@link SUMMIT_ANNOUNCE_BAND_M} of the deck
+   *     rings `playSummitChime()` and floats the Relay 04 observation-deck
+   *     landmark banner (chirped through the helmet comms).
+   *   • Landmark recognition — first entry of the
+   *     {@link LANDMARK_ARRIVAL_RADIUS_M} circle around the tower seat
+   *     announces "FRONTIER RELAY 04" once per visit (hysteresis re-arm
+   *     past {@link LANDMARK_REARM_RADIUS_M}).
+   *   • Altimeter — every frame the suit is latched or near the tower, a
+   *     fresh {@link ClimbingTelemetry} frame feeds
+   *     `LunarHUD.setClimbingTelemetry`; leaving the tower retracts it.
+   */
+  private pumpClimbingTelemetry(dt: number): void {
+    if (this.disposed) return;
+    if (this.mode !== 'suit' || this.suit === null) {
+      this.climbWasLatched = false;
+      return;
+    }
+    const tower = this.world.getRadioTower();
+    if (tower === null) {
+      this.climbWasLatched = false;
+      return;
+    }
+    const audio = this.audio;
+    const hud = this.hud;
+    const state = this.suit.getState();
+    const pos = this.suit.getPosition();
+    const latched = state.ladderLatchActive === true;
+    const seat = tower.getWorldPosition();
+    const deckZ = tower.getDeckElevation();
+
+    // Rung-contact cadence: one 240 Hz boot click per 0.35 s of climb.
+    if (latched && Math.abs(state.vz) > CLIMB_STEP_MIN_VZ_MPS) {
+      this.climbCadenceMs += dt * 1000;
+      if (this.climbCadenceMs >= LADDER_STEP_CADENCE_S * 1000) {
+        this.climbCadenceMs = 0;
+        audio?.playLadderStep();
+      }
+    } else {
+      // Neutral mechanical hold / off-ladder frames never click.
+      this.climbCadenceMs = 0;
+    }
+
+    // Summit hand-off edge: last frame on the rails, this frame free and
+    // grounded at deck height (§3.2.5 step-to-deck only fires with vz > 0;
+    // a mid-ladder dismount lands in AIRBORNE, never WALK).
+    if (
+      this.climbWasLatched &&
+      !latched &&
+      state.isGrounded &&
+      state.locomotionMode === 'WALK' &&
+      pos.z >= deckZ - SUMMIT_ANNOUNCE_BAND_M
+    ) {
+      audio?.playSummitChime();
+      audio?.playCommsChirp('incoming');
+      hud?.showLandmarkArrival('FRONTIER RELAY 04 — OBSERVATION DECK');
+      this.climbLandmarkArmed = false;
+      this.hudSay('summit — observation deck');
+    }
+
+    // Landmark recognition: announce the spire once per approach.
+    const distToSeat = Math.hypot(pos.x - seat.x, pos.y - seat.y);
+    if (this.climbLandmarkArmed && !latched && distToSeat <= LANDMARK_ARRIVAL_RADIUS_M) {
+      this.climbLandmarkArmed = false;
+      audio?.playCommsChirp('incoming');
+      hud?.showLandmarkArrival('FRONTIER RELAY 04');
+    } else if (distToSeat > LANDMARK_REARM_RADIUS_M) {
+      this.climbLandmarkArmed = true;
+    }
+
+    // Altimeter tape: live while on the ladder or near the tower, retracted
+    // the frame the player walks out of the envelopes.
+    const nearTower =
+      latched ||
+      tower.isNearLadderBase(pos, CLIMB_HUD_PROXIMITY_M) ||
+      tower.isNearTopHatch(pos, CLIMB_HUD_PROXIMITY_M) ||
+      tower.isWithinClimbEnvelope(pos);
+    if (nearTower) {
+      hud?.setClimbingTelemetry({
+        altitudeM: pos.z - seat.z,
+        deckElevationM: deckZ - seat.z,
+        climbRateMps: state.climbRate ?? 0,
+        isLatched: latched,
+      });
+    } else {
+      hud?.setClimbingTelemetry(null);
+    }
+
+    this.climbWasLatched = latched;
   }
 
   /**
