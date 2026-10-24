@@ -101,6 +101,112 @@ export const BOUND_SHOULDER_SET_RAD = 0.2;
 /** Knee flex held on the single grounded trough frame between bounds (rad). */
 export const BOUND_TROUGH_KNEE_RAD = 0.6;
 
+// -- Climbing articulation (Spec 29 Phase 4) ----------------------------------
+/**
+ * Base shoulder flexion while the magnetic boots are clamped to the rung
+ * rail (rad; negative `rotation.x` swings the arm forward/up the ladder
+ * face, the same sign convention the walk cycle uses in reverse).
+ */
+export const CLIMB_SHOULDER_FLEX_RAD = -1.1;
+/** Base elbow flexion of a hand gripping a rung (rad). */
+export const CLIMB_ELBOW_FLEX_RAD = 0.85;
+/** Shoulder reach amplitude of the alternating cycle (rad). */
+export const CLIMB_REACH_AMPLITUDE_RAD = 0.22;
+/** Elbow straightening the reaching arm carries at full reach (rad). */
+export const CLIMB_REACH_ELBOW_RELIEF_RAD = 0.2;
+/** Hip lift on the stepping half-cycle (rad; − = forward/up toward rung). */
+export const CLIMB_STEP_HIP_RAD = 0.38;
+/** Knee flex held with both boots pressed on rungs (mechanical hold). */
+export const CLIMB_KNEE_HOLD_RAD = 0.25;
+/** Extra knee flex as a boot lifts to the next rung (rad). */
+export const CLIMB_STEP_KNEE_RAD = 0.75;
+/**
+ * Alternating limb-cycle wavelength (m) — two rungs at the Spec 29 §2.3
+ * 0.35 m rung pitch: one full sin cycle = one left-arm-high + one
+ * right-arm-high stroke.
+ */
+export const CLIMB_CYCLE_WAVELENGTH_M = 0.7;
+
+/**
+ * One frame of the Spec 29 Phase 4 climb grip pose, expressed as the
+ * `rotation.x` targets for the six limb pivots (same radian convention as
+ * the walk cycle: positive swings a limb aft, negative forward).
+ */
+export interface ClimbLimbPose {
+  shoulderLx: number;
+  shoulderRx: number;
+  elbowLx: number;
+  elbowRx: number;
+  hipLx: number;
+  hipRx: number;
+  kneeLx: number;
+  kneeRx: number;
+  /** False on the mechanical hold (vz = 0) — frozen, jitter-free grip. */
+  moving: boolean;
+}
+
+/**
+ * Pure climbing articulation law (Spec 29 Phase 4 §3). While the climber
+ * moves, the stroke clock rides `climbProgressM` directly (wavelength
+ * {@link CLIMB_CYCLE_WAVELENGTH_M} = 2 rungs), so the pose is a deterministic
+ * function of height — ascending runs it one way, descending reverses it,
+ * and a mid-span mount lands in the matching phase. Left arm reaches high
+ * while the right leg steps up, and vice versa; legs never swing aft of the
+ * ladder face (the lift is gated at 0). With vz = 0 the pose collapses to
+ * the canonical symmetric grip hold — no time term, zero jitter.
+ */
+export function climbGripPose(climbProgressM: number, climbRateMps: number): ClimbLimbPose {
+  if (climbRateMps === 0 || !Number.isFinite(climbRateMps)) {
+    return {
+      shoulderLx: CLIMB_SHOULDER_FLEX_RAD,
+      shoulderRx: CLIMB_SHOULDER_FLEX_RAD,
+      elbowLx: CLIMB_ELBOW_FLEX_RAD,
+      elbowRx: CLIMB_ELBOW_FLEX_RAD,
+      hipLx: 0,
+      hipRx: 0,
+      kneeLx: CLIMB_KNEE_HOLD_RAD,
+      kneeRx: CLIMB_KNEE_HOLD_RAD,
+      moving: false,
+    };
+  }
+  const progress = Number.isFinite(climbProgressM) ? climbProgressM : 0;
+  const theta = (progress / CLIMB_CYCLE_WAVELENGTH_M) * Math.PI * 2;
+  const reach = Math.sin(theta);
+  // Left arm high ↔ right leg up (and the mirror): the arm pair runs on
+  // ±reach, the leg pair on max(0, ∓reach) so a boot only ever lifts
+  // forward toward the next rung, never back into the truss.
+  const liftL = Math.max(0, -reach);
+  const liftR = Math.max(0, reach);
+  return {
+    shoulderLx: CLIMB_SHOULDER_FLEX_RAD - CLIMB_REACH_AMPLITUDE_RAD * reach,
+    shoulderRx: CLIMB_SHOULDER_FLEX_RAD + CLIMB_REACH_AMPLITUDE_RAD * reach,
+    elbowLx: CLIMB_ELBOW_FLEX_RAD - CLIMB_REACH_ELBOW_RELIEF_RAD * reach,
+    elbowRx: CLIMB_ELBOW_FLEX_RAD + CLIMB_REACH_ELBOW_RELIEF_RAD * reach,
+    hipLx: -CLIMB_STEP_HIP_RAD * liftL,
+    hipRx: -CLIMB_STEP_HIP_RAD * liftR,
+    kneeLx: CLIMB_KNEE_HOLD_RAD + (CLIMB_STEP_KNEE_RAD - CLIMB_KNEE_HOLD_RAD) * liftL,
+    kneeRx: CLIMB_KNEE_HOLD_RAD + (CLIMB_STEP_KNEE_RAD - CLIMB_KNEE_HOLD_RAD) * liftR,
+    moving: true,
+  };
+}
+
+/**
+ * Avatar heading (radians, physics frame, 0 = +x) that faces the climber
+ * inward toward the ladder rungs — i.e. opposite the ladder's outward
+ * {@link LadderBounds.facingNormal}. Applied on mount so the first latched
+ * frame already reads "hands on the rungs, face to the truss" for both the
+ * avatar mesh and the first-person camera (Spec 29 §3.2.6).
+ */
+export function climbInwardHeadingRad(facingNormal: { x: number; y: number }): number {
+  const nx = facingNormal?.x;
+  const ny = facingNormal?.y;
+  if (typeof nx !== 'number' || typeof ny !== 'number' || !Number.isFinite(nx) || !Number.isFinite(ny)) {
+    return 0;
+  }
+  if (nx === 0 && ny === 0) return 0;
+  return Math.atan2(-ny, -nx);
+}
+
 /**
  * Spec 19 §2.3 / ADR-4: the suit backpack hauls at most this many kilograms
  * of ore. The 50 kg ceiling is the logistical argument for deploying the
@@ -1047,6 +1153,33 @@ export class EvaSuitAvatar {
     // Landing-crouch envelope (compress→release), advanced once per frame.
     const crouch = this.advanceBoundCrouch();
     const gait = state.gaitMode ?? 'walk';
+
+    // Spec 29 Phase 4: the rung rail owns the frame while the boots are
+    // clamped — alternating arm/leg stroke clocked by climbProgressM, or a
+    // frozen mechanical-hold grip when vz = 0. The stride clock parks.
+    if (state.locomotionMode === 'CLIMBING') {
+      this.walkCycleTime = 0;
+      this.boundingFlight = false;
+      const pose = climbGripPose(state.climbProgressM ?? 0, state.vz);
+      hipL.rotation.x = pose.hipLx;
+      hipR.rotation.x = pose.hipRx;
+      if (kneeL !== null) kneeL.rotation.x = pose.kneeLx;
+      if (kneeR !== null) kneeR.rotation.x = pose.kneeRx;
+      if (shoulderL !== null) {
+        shoulderL.rotation.x = pose.shoulderLx;
+        shoulderL.rotation.z = 0;
+      }
+      if (shoulderR !== null) {
+        shoulderR.rotation.x = pose.shoulderRx;
+        shoulderR.rotation.z = 0;
+      }
+      if (elbowL !== null) elbowL.rotation.x = pose.elbowLx;
+      if (elbowR !== null) elbowR.rotation.x = pose.elbowRx;
+      // Torso rides level on the rail — no stride bob while hanging.
+      torso.position.y = GEO.torso.y;
+      upper.position.y = 0;
+      return;
+    }
 
     if (gait === 'bounding') {
       // Spec 28 §2.3 ballistic looping — the stride clock parks while the

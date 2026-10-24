@@ -43,7 +43,7 @@ import type { Mesh } from '@babylonjs/core/Meshes/mesh.js';
 
 import { WorldScene, worldToBabylon, babylonToWorld, type CameraMode, type MiningBeamEffect } from '../engine/index.ts';
 import { ProvingGroundsScene, type LapTelemetry } from '../engine/ProvingGroundsScene.ts';
-import { EvaSuitAvatar, SUIT_MAX_CARGO_KG } from '../entities/AstronautSuit.ts';
+import { EvaSuitAvatar, SUIT_MAX_CARGO_KG, climbInwardHeadingRad } from '../entities/AstronautSuit.ts';
 import { OpenBuggy, MOUNT_RADIUS_M, type BuggyDashTelemetry } from '../entities/OpenBuggy.ts';
 import { TraversalController } from './TraversalController.ts';
 import {
@@ -184,6 +184,80 @@ export const VAULT_TERMINAL_RANGE_M = 3.5;
  */
 export const GAMEPAD_MIN_BUTTONS = 6;
 export const GAMEPAD_MIN_AXES = 2;
+
+// -- Spec 29 Phase 4: observation-deck perimeter collision ---------------------
+
+/** Deck-edge railing radius: 5 m hex steel-grate deck circumradius (m). */
+export const DECK_EDGE_RADIUS_M = 2.5;
+/**
+ * Vertical band below the deck surface where the railing law applies (m):
+ * a suit standing on the +48 m gantry sits at deck z, and the law keeps
+ * watching for half a metre below the grate so a hop off the edge is
+ * railed, not launched. Below the band the regolith owns the fall.
+ */
+export const DECK_BOUNDARY_BAND_M = 0.5;
+/**
+ * Half-angle of the ladder-hatch pass-through sector measured around the
+ * ladder outward normal (rad): the 0.9 m hatch on the ladder face lets the
+ * climber cross the railing line without being pushed back inside.
+ */
+export const HATCH_SECTOR_HALF_ANGLE_RAD = 0.35;
+
+export interface DeckPerimeterClampResult {
+  x: number;
+  y: number;
+  /** True when the railing law moved the point back inside the deck edge. */
+  clamped: boolean;
+}
+
+/**
+ * Pure observation-deck railing law (Spec 29 Phase 4): a suit standing on
+ * the gantry (z at/above `seat.z − DECK_BOUNDARY_BAND_M`) may not leave the
+ * planar disc of radius {@link DECK_EDGE_RADIUS_M} around the tower seat —
+ * the perimeter railing stops it — EXCEPT inside the ladder-hatch sector
+ * (`|angle(pos − seat) − atan2(ladderNormal)| ≤ HATCH_SECTOR_HALF_ANGLE_RAD`)
+ * where the 0.9 m hatch opening opens the railing and stepping outward
+ * reaches the ladder. Points already inside, points below the elevation
+ * band, and degenerate geometry pass through untouched.
+ */
+export function deckPerimeterClamp(
+  pos: { x: number; y: number; z: number },
+  seat: { x: number; y: number; z: number },
+  ladderNormal: { x: number; y: number },
+  opts: {
+    edgeRadiusM?: number;
+    hatchHalfAngleRad?: number;
+    minZ?: number;
+  } = {},
+): DeckPerimeterClampResult {
+  const edge = opts.edgeRadiusM ?? DECK_EDGE_RADIUS_M;
+  const half = opts.hatchHalfAngleRad ?? HATCH_SECTOR_HALF_ANGLE_RAD;
+  const minZ = opts.minZ ?? seat.z - DECK_BOUNDARY_BAND_M;
+  const pass: DeckPerimeterClampResult = { x: pos.x, y: pos.y, clamped: false };
+  if (!Number.isFinite(pos.x) || !Number.isFinite(pos.y) || !Number.isFinite(pos.z)) return pass;
+  if (pos.z < minZ) return pass;
+  const dx = pos.x - seat.x;
+  const dy = pos.y - seat.y;
+  const r = Math.hypot(dx, dy);
+  if (!Number.isFinite(r) || r <= edge) return pass;
+  if (
+    typeof ladderNormal?.x === 'number' &&
+    typeof ladderNormal?.y === 'number' &&
+    (ladderNormal.x !== 0 || ladderNormal.y !== 0)
+  ) {
+    const ladderAngle = Math.atan2(ladderNormal.y, ladderNormal.x);
+    let d = (Math.atan2(dy, dx) - ladderAngle) % (Math.PI * 2);
+    if (d > Math.PI) d -= Math.PI * 2;
+    if (d < -Math.PI) d += Math.PI * 2;
+    // Hatch sector: the railing has a gap; the climber crosses freely.
+    // (1e-9 rad tolerance keeps the exact ±half boundary inside the gap
+    // despite atan2/cos rounding noise.)
+    if (Math.abs(d) <= half + 1e-9) return pass;
+  }
+  const scale = edge / r;
+  return { x: seat.x + dx * scale, y: seat.y + dy * scale, clamped: true };
+}
+
 
 /** Spec 21 §2.5: tactical map refresh cadence (seconds between POI rebuilds). */
 export const MAP_REFRESH_INTERVAL_S = 0.5;
@@ -2825,6 +2899,10 @@ export class ClientApp {
     const pos = suit.getPosition();
     if (tower.isNearLadderBase(pos)) {
       if (physics.mountLadder(tower.getLadderBounds(), tower.getLadderBounds().basePosition.z)) {
+        // Spec 29 Phase 4: face the truss on latch — the avatar heading (and
+        // with it the first-person camera) snaps opposite the ladder's
+        // outward normal so the first frame reads "hands on the rungs".
+        suit.setState({ heading: climbInwardHeadingRad(tower.getLadderBounds().facingNormal) });
         this.hudSay('ladder latched');
         return true;
       }
@@ -2832,11 +2910,39 @@ export class ClientApp {
     }
     if (tower.isNearTopHatch(pos)) {
       if (physics.mountLadder(tower.getLadderBounds(), tower.getDeckElevation() - 0.2)) {
+        // Spec 29 §3.2.6 / Phase 4: deck-to-ladder mount faces the tower.
+        suit.setState({ heading: climbInwardHeadingRad(tower.getLadderBounds().facingNormal) });
         this.hudSay('ladder latched — descending');
         return true;
       }
     }
     return false;
+  }
+
+  /**
+   * Spec 29 Phase 4 — observation-deck railing boundary. Once per physics
+   * frame while the suit mode is active: a climber who stepped off onto the
+   * +48 m gantry (z at/above deck − 0.5 m) is held inside the 2.5 m deck
+   * radius by the perimeter railing, EXCEPT in the ±0.35 rad ladder-hatch
+   * sector where the 0.9 m opening lets them walk out to the rungs (see
+   * {@link deckPerimeterClamp} for the pure law). A latched suit is skipped
+   * — the ladder kinematics own that frame's position outright.
+   */
+  private clampToDeckBoundary(): void {
+    if (this.mode !== 'suit' || this.suit === null) return;
+    const tower = this.world.getRadioTower();
+    if (tower === null) return;
+    const state = this.suit.getState();
+    if (state.ladderLatchActive === true) return;
+    const deckZ = tower.getDeckElevation();
+    if (state.z < deckZ - DECK_BOUNDARY_BAND_M) return;
+    const fixed = deckPerimeterClamp(
+      state,
+      tower.getWorldPosition(),
+      tower.getLadderBounds().facingNormal,
+      { minZ: deckZ - DECK_BOUNDARY_BAND_M },
+    );
+    if (fixed.clamped) this.suit.setState({ x: fixed.x, y: fixed.y });
   }
 
   /** `[E]` — climb into the buggy when near it, climb out when mounted. */
@@ -3252,6 +3358,9 @@ export class ClientApp {
         rcsUp: frame.jump && !latched ? 0.5 : 0,
       };
       suit.update(dt, input);
+      // Spec 29 Phase 4: after the step, the gantry railing holds the
+      // climber on the deck (hatch sector excepted). Latched frames skip.
+      this.clampToDeckBoundary();
       // Parked buggy still settles on its suspension while abandoned.
       this.buggy?.update(dt, { ...IDLE_BUGGY_INPUT, parkBrake: true });
       this.rumbleClockMs += dt * 1000;

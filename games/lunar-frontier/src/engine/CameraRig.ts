@@ -77,6 +77,37 @@ export const INTRO_CABIN_YAW_CLAMP_RAD = Math.PI / 3;
 /** Intro cabin free-look pitch clamp: ±35° (spec 24 §4.3). */
 export const INTRO_CABIN_PITCH_CLAMP_RAD = (35 * Math.PI) / 180;
 
+// -- Spec 29 Phase 4: EVA look-pitch freedom -----------------------------------
+
+/**
+ * Spec 29 Phase 4: the EVA look-pitch freedom band (rad, ±77.3°) the rig
+ * passes through to the active camera. The band is deliberately wider than
+ * the suit's own ±1.2 rad look attitude so the 52 m radio tower observation
+ * deck's two signature framings are always reachable: down at the maglev
+ * guideway (blueprint §3.2: −50.2°, {@link DECK_GUIDEWAY_VIEW_PITCH_RAD})
+ * and up along the antenna spire into open sky. Clamping the GOAL (not the
+ * smoothed value) keeps the camera easing into the stop instead of
+ * overshooting past it.
+ */
+export const EVA_LOOK_PITCH_CLAMP_RAD = 1.35;
+/**
+ * Blueprint §3.2: the dramatic raking down-angle from the +48 m gantry to
+ * the maglev guideway 35 m away at 6 m elevation (−50.2°). Must always sit
+ * inside {@link EVA_LOOK_PITCH_CLAMP_RAD}.
+ */
+export const DECK_GUIDEWAY_VIEW_PITCH_RAD = (-50.2 * Math.PI) / 180;
+/**
+ * True when the given look pitch (rad, + up) is reachable inside the rig's
+ * EVA freedom band — used by the acceptance suite to assert the deck's
+ * down-look at the tracks and up-look at the spire never hit the clamp.
+ */
+export function evaLookPitchReachable(
+  pitchRad: number,
+  clampRad: number = EVA_LOOK_PITCH_CLAMP_RAD,
+): boolean {
+  return Number.isFinite(pitchRad) && Math.abs(pitchRad) <= clampRad + 1e-9;
+}
+
 // -- Spec 17 §2.4 chase-camera constants -------------------------------------
 
 /** Chase nose-down pitch tilt: −18° toward the hood, radians (≈ PI/2 − 1.2566). */
@@ -493,8 +524,8 @@ export class CameraRig {
       this.mode === 'intro_cabin'
         ? clamp(targetPitch, -INTRO_CABIN_PITCH_CLAMP_RAD, INTRO_CABIN_PITCH_CLAMP_RAD)
         : targetPitch,
-      -1.35,
-      1.35,
+      -EVA_LOOK_PITCH_CLAMP_RAD,
+      EVA_LOOK_PITCH_CLAMP_RAD,
     );
     this.currentYaw = approachAngle(this.currentYaw, lookYawGoal, rotT);
     this.currentPitch = approach(this.currentPitch, lookPitchGoal, rotT);
