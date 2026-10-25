@@ -60,6 +60,75 @@ export const HUD_TOAST_ID = 'lunar-hud-toast';
 /** Auto-dismiss window for the toast banner (spec 19 §2.2.2: 3.5 s). */
 export const HUD_TOAST_DISMISS_MS = 3500;
 
+// ---------------------------------------------------------------------------
+// Spec 30 §2.3 — HUD visibility mode machine
+// ---------------------------------------------------------------------------
+
+/**
+ * Spec 30 §2.3.3 tri-state HUD visibility lifecycle:
+ * - `standard`: full glassmorphic HUD (telemetry, comms, gauges, compass).
+ * - `minimal`: stripped tactical HUD — bulky comms cards, the tutorial /
+ *   quest checklist, and the lap panel are suppressed; compact life-support
+ *   pills, the digital speed readout, and the center crosshair reticle stay.
+ * - `hidden`: cinematic mode — the overlay renders at `opacity: 0` with
+ *   `pointer-events: none`, so mouse look and mining laser fall straight
+ *   through to the 3D canvas.
+ */
+export type HUDMode = 'standard' | 'minimal' | 'hidden';
+
+/** Canonical cycle order: standard → minimal → hidden → standard. */
+export const HUD_MODES: readonly HUDMode[] = ['standard', 'minimal', 'hidden'];
+
+/**
+ * Session persistence key (Spec 30 §2.3.4). Every access goes through the
+ * guarded helpers below — Safari private mode / headless Node throw on touch.
+ */
+export const HUD_MODE_STORAGE_KEY = 'lunar_frontier_hud_mode';
+
+/** Mode-switch toast (`#lunar-hud-mode-toast`, upper-right corner). */
+export const HUD_MODE_TOAST_ID = 'lunar-hud-mode-toast';
+/** Toast auto-fade window (Spec 30 §2.3.3: 1.5 s). */
+export const HUD_MODE_TOAST_MS = 1500;
+
+/** Exact toast copy per mode (Spec 30 §2.3.3 — verbatim contract strings). */
+export const HUD_MODE_TOAST_TEXT: Readonly<Record<HUDMode, string>> = {
+  standard: 'UI: STANDARD',
+  minimal: 'UI: MINIMAL [Press U for Standard]',
+  hidden: 'UI: CINEMATIC HIDDEN [Press U to Restore]',
+};
+
+/** Narrow an arbitrary value (e.g. a localStorage read) to a HUDMode. */
+export function isHudMode(value: unknown): value is HUDMode {
+  return value === 'standard' || value === 'minimal' || value === 'hidden';
+}
+
+/** Safe localStorage read — undefined on absent / throwing / bad value. */
+function readStoredHudMode(): HUDMode | undefined {
+  try {
+    const ls = (globalThis as {
+      localStorage?: { getItem?: (key: string) => string | null };
+    }).localStorage;
+    if (ls === undefined || typeof ls.getItem !== 'function') return undefined;
+    const value = ls.getItem(HUD_MODE_STORAGE_KEY);
+    return isHudMode(value) ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Safe localStorage write — silently inert when storage is hostile. */
+function writeStoredHudMode(mode: HUDMode): void {
+  try {
+    const ls = (globalThis as {
+      localStorage?: { setItem?: (key: string, value: string) => void };
+    }).localStorage;
+    if (ls === undefined || typeof ls.setItem !== 'function') return;
+    ls.setItem(HUD_MODE_STORAGE_KEY, mode);
+  } catch {
+    /* private mode / quota — persistence is best-effort, never fatal */
+  }
+}
+
 /**
  * Spec 24 Phase 3 — intro flight-telemetry overlay (`#lunar-hud-intro`).
  * Hosts the descent altimeter, cabin-pressure gauge + staging beacon, and the
@@ -836,6 +905,21 @@ export class LunarHUD {
 
   private tradeOpen = false;
   private hudHidden = false;
+  /**
+   * Spec 30 §2.3.3 — active HUD visibility mode. Boot order: constructor
+   * restores `localStorage['lunar_frontier_hud_mode']` (guarded), defaulting
+   * to `standard`. Mutated only through {@link setHUDMode} /
+   * {@link cycleHUDMode}.
+   */
+  private hudMode: HUDMode = 'standard';
+  /**
+   * Spec 30 §2.3.3 — mode-switch toast element. Deliberately parented to the
+   * mount point as a SIBLING of `#lunar-hud`, never a descendant: the root's
+   * cinematic `opacity: 0` would otherwise swallow the very toast that tells
+   * the player how to restore the UI.
+   */
+  private modeToastEl: Elementish | null = null;
+  private modeToastTimer: ReturnType<typeof setTimeout> | null = null;
   private feedbackTimer: ReturnType<typeof setTimeout> | null = null;
   /** Spec 19 §2.2.2 — toast auto-dismiss timer (independent of trade line). */
   private toastTimer: ReturnType<typeof setTimeout> | null = null;
@@ -909,6 +993,7 @@ export class LunarHUD {
     // A fresh HUD always wins: drop any previous overlay (HMR / re-init).
     this.disposeExisting(HUD_ROOT_ID);
     this.disposeExisting(HUD_TRADE_ID);
+    this.disposeExisting(HUD_MODE_TOAST_ID);
 
     this.root = this.make('div', HUD_ROOT_ID, 'lunar-hud', HUD_ROOT_ID);
     this.tradeRoot = this.make('div', HUD_TRADE_ID, 'lunar-hud trade-terminal is-hidden', HUD_TRADE_ID);
@@ -918,6 +1003,13 @@ export class LunarHUD {
       mount.appendChild(this.root);
       mount.appendChild(this.tradeRoot);
     }
+
+    // Spec 30 §2.3.4 — restore the persisted visibility mode before any
+    // widget paints, so a refresh into cinematic mode never flashes the HUD.
+    const storedHudMode = readStoredHudMode();
+    if (storedHudMode !== undefined) this.hudMode = storedHudMode;
+    this.applyHudModeClasses();
+    this.buildModeToast(mount);
 
     this.buildStatusStrip();
     this.buildCompass();
@@ -962,6 +1054,14 @@ export class LunarHUD {
       clearTimeout(this.toastTimer);
       this.toastTimer = null;
     }
+    if (this.modeToastTimer !== null) {
+      clearTimeout(this.modeToastTimer);
+      this.modeToastTimer = null;
+    }
+    if (this.modeToastEl !== null) {
+      this.modeToastEl.remove();
+      this.modeToastEl = null;
+    }
     if (this.landmarkTimer !== null) {
       clearTimeout(this.landmarkTimer);
       this.landmarkTimer = null;
@@ -999,6 +1099,83 @@ export class LunarHUD {
 
   isHidden(): boolean {
     return this.hudHidden;
+  }
+
+  // -- Spec 30 §2.3 — HUD visibility mode machine ------------------------------
+
+  /**
+   * Active HUD visibility mode. Pointer-lock immune: every mutation below is
+   * a pure DOM class toggle inside the overlay — this file never calls
+   * `document.exitPointerLock()`, never blurs, never touches focus, so the
+   * browser keeps the mouse locked through a mode switch.
+   */
+  getHUDMode(): HUDMode {
+    return this.hudMode;
+  }
+
+  /**
+   * Apply a visibility mode (Spec 30 §2.3.3): toggles `.hud-mode-minimal` /
+   * `.hud-mode-hidden` on the root `#lunar-hud`, persists the choice to
+   * `localStorage['lunar_frontier_hud_mode']` (guarded), and floats the
+   * 1.5 s upper-right status toast. Unknown values fall back to `standard`.
+   */
+  setHUDMode(mode: HUDMode): void {
+    if (this.disposed) return;
+    this.hudMode = isHudMode(mode) ? mode : 'standard';
+    this.applyHudModeClasses();
+    writeStoredHudMode(this.hudMode);
+    this.showModeToast(HUD_MODE_TOAST_TEXT[this.hudMode]);
+  }
+
+  /**
+   * Cycle standard → minimal → hidden → standard (Spec 30 §2.3.2 keyboard
+   * `[U]`/`[H]`, gamepad double-tap R3 / long-press View all land here).
+   * Returns the mode the HUD is now in.
+   */
+  cycleHUDMode(): HUDMode {
+    const index = HUD_MODES.indexOf(this.hudMode);
+    const next = HUD_MODES[(index + 1) % HUD_MODES.length];
+    this.setHUDMode(next);
+    return this.hudMode;
+  }
+
+  /** True while the stripped tactical layout is active. */
+  isMinimal(): boolean {
+    return this.hudMode === 'minimal';
+  }
+
+  /** True while cinematic hidden mode suppresses the whole overlay. */
+  isCinematicHidden(): boolean {
+    return this.hudMode === 'hidden';
+  }
+
+  /** Sync root class state with `this.hudMode` (idempotent). */
+  private applyHudModeClasses(): void {
+    this.setClassEl(this.root, 'hud-mode-minimal', this.hudMode === 'minimal');
+    this.setClassEl(this.root, 'hud-mode-hidden', this.hudMode === 'hidden');
+  }
+
+  /**
+   * Float the mode-switch toast (upper-right, auto-fades after
+   * {@link HUD_MODE_TOAST_MS}). Mirrors its text into `data-mode-toast` for
+   * headless assertions (fake DOMs have no CSS cadence). Re-calling
+   * re-arms the timer on the same element.
+   */
+  private showModeToast(message: string): void {
+    const toast = this.modeToastEl;
+    if (toast === null) return;
+    toast.textContent = message;
+    toast.setAttribute('data-mode-toast', message);
+    this.setClassEl(toast, 'is-hidden', false);
+    if (this.modeToastTimer !== null) clearTimeout(this.modeToastTimer);
+    this.modeToastTimer = setTimeout(() => {
+      this.modeToastTimer = null;
+      if (!this.disposed && this.modeToastEl !== null) {
+        this.setClassEl(this.modeToastEl, 'is-hidden', true);
+      }
+    }, HUD_MODE_TOAST_MS);
+    const handle = this.modeToastTimer as unknown as { unref?: () => void };
+    if (typeof handle.unref === 'function') handle.unref();
   }
 
   /**
@@ -1309,12 +1486,16 @@ export class LunarHUD {
 
   private paintLegend(): void {
     if (this.legendEl === null) return;
+    // Spec 30 §2.3.1 — [Esc] is modal dismissal ONLY (close dialog / map).
+    // The UI-mode cycle moved to [U]/[H] (pad: 2× R3) so hiding the HUD can
+    // never release the browser pointer lock.
     this.legendEl.textContent =
       this.inputSource === 'gamepad'
         ? '(L-Stick) move · (A) hop / handbrake · (LB) sprint · (X) buggy · (Y) lamps · ' +
-          '(R3) camera · (RB) mine · (C) claim · (B) trade · (D-Up) comms · (LT) brake / reverse'
+          '(R3) camera · (2×R3) UI · (RB) mine · (C) claim · (B) trade · (D-Up) comms · ' +
+          '(LT) brake / reverse'
         : '[WASD] move · [Space] hop · [Shift] sprint · [E] buggy · [F] lamps · ' +
-          '[V] camera · [M] mine · [C] claim · [T] trade · [Esc] close UI';
+          '[V] camera · [M] mine · [C] claim · [T] trade · [U]/[H] UI · [Esc] close';
   }
 
   private orderOf(prompt: HudPrompt): number {
@@ -2899,6 +3080,23 @@ export class LunarHUD {
     const toast = this.make('div', HUD_TOAST_ID, 'hud-toast is-hidden', 'toast');
     toast.setAttribute('data-toast', '');
     this.root.appendChild(toast);
+  }
+
+  /**
+   * Spec 30 §2.3.3 — mode-switch toast host. Parented to the mount point as
+   * a SIBLING of `#lunar-hud`: cinematic hidden mode zeroes the root's
+   * opacity, and a child of the root would fade with it — the "Press U to
+   * Restore" hint is exactly the message that must survive suppression.
+   * `mount` may be null (headless documents without a body): the element is
+   * still built so `setHUDMode()` keeps its mirror, it just never paints.
+   */
+  private buildModeToast(mount: Elementish | null): void {
+    const toast = this.make('div', HUD_MODE_TOAST_ID, 'hud-mode-toast is-hidden', 'mode-toast');
+    toast.setAttribute('data-mode-toast', '');
+    this.modeToastEl = toast;
+    if (mount !== null && typeof mount.appendChild === 'function') {
+      mount.appendChild(toast);
+    }
   }
 
   private buildLifeSupport(): void {

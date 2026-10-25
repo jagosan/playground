@@ -116,6 +116,7 @@ import LunarHUD, {
   type HudRadarContact,
   type HudScannerReadout,
   type HudTradeRequest,
+  type HUDMode,
 } from '../ui/LunarHUD.ts';
 import type { ResourceVein, ScrapSite } from '../world/LunarWorldGenerator.ts';
 import type { TopoMapPOI, TopoMapState } from '../ui/LunarHUD.ts';
@@ -495,6 +496,18 @@ export const GAMEPAD_BUTTONS: Readonly<{
   mapDown: 13, // D-Pad Down (spec 21 §2.5)
 };
 
+/**
+ * Spec 30 §2.3.2 — gamepad HUD-toggle lanes. A second R3 click landing
+ * within this window (ms, `update()`-clock domain) cycles the HUD mode; a
+ * single click still runs the Spec 19 camera cycle.
+ */
+export const GAMEPAD_HUD_DOUBLE_TAP_MS = 350;
+/**
+ * Spec 30 §2.3.2 — accessible fallback: hold View/Back (buttons[8]) this
+ * long (ms) to cycle the HUD. A short tap keeps its Spec 21 map duty.
+ */
+export const GAMEPAD_HUD_VIEW_HOLD_MS = 500;
+
 /** Buggy parks this far from the spawn collar, metres. */
 export const BUGGY_PARK_OFFSET: readonly [number, number] = [9, 4];
 
@@ -537,6 +550,11 @@ export const ACTION_KEYS: Readonly<Record<string, string>> = {
   KeyR: 'track',
   // Spec 18 §6.2: comms log toggle — hide/re-open the last transmission.
   KeyL: 'comms',
+  // Spec 30 §2.3.2: HUD visibility cycle (standard → minimal → hidden).
+  // [U] = User Interface (primary mnemonic), [H] = Heads-Up Display (alias).
+  // Escape keeps its modal-only duty — it NEVER toggles the HUD.
+  KeyU: 'toggle-ui',
+  KeyH: 'toggle-hud',
   Escape: 'close-ui',
 };
 
@@ -1047,6 +1065,19 @@ export class ClientApp {
    */
   private prevGamepadButtons: boolean[] = [];
   private lastGamepadButtons: boolean[] = [];
+  /**
+   * Spec 30 §2.3.2 — HUD-toggle gamepad bookkeeping. `hudTogglePrevButtons`
+   * is pumpGamepadActions' OWN fresh-poll snapshot (deliberately NOT the
+   * sampleInput stash: the stash lags a frame and can double-count a single
+   * press+release as a double-tap). `lastR3TapAtMs` stamps the first R3
+   * click in the `update(timestamp)`-clock domain, so harnesses advance the
+   * window deterministically. View/Back hold accumulates in `hudViewHoldMs`
+   * (frame-counted via dt) and fires once per hold via `hudViewHoldFired`.
+   */
+  private hudTogglePrevButtons: boolean[] = [];
+  private lastR3TapAtMs = Number.NEGATIVE_INFINITY;
+  private hudViewHoldMs = 0;
+  private hudViewHoldFired = false;
   /** Spec 21 §2.6: hot-plug listener attach flag (attach/detach guard). */
   private gamepadHotplugAttached = false;
 
@@ -1489,7 +1520,7 @@ export class ClientApp {
     // this frame rather than the next (stepEntities → sampleInput refreshes
     // the button snapshot for the following frame).
     this.pumpGamepadLatch(dt);
-    this.pumpGamepadActions();
+    this.pumpGamepadActions(dt, timestamp);
     // Spec 24 Phase 4 §2.6: during cinematic beats (orbit → ramp) the player
     // is not yet free — avatar input is locked and the suit is tethered to the
     // cabin interior so it rides down with the hull instead of walking off.
@@ -2276,6 +2307,11 @@ export class ClientApp {
     const tradeOpen = this.hud?.isTradeDialogOpen() ?? false;
 
     if (code === 'Escape') {
+      // Spec 30 §2.3.1 — Escape is DECOUPLED from HUD duty for good: browsers
+      // cancel pointer lock on Escape, so an Escape-driven UI toggle could
+      // never work while looking around. It stays strictly modal dismissal
+      // (intro skip, trade dialog, topo map, prompt clear). The HUD cycle
+      // lives on [U]/[H] and the gamepad lanes below.
       if (phase === 'down') {
         // Spec 24 §3.2 — Escape immediately skips straight to Beat 6 /
         // completed while the intro is running.
@@ -2712,7 +2748,7 @@ export class ClientApp {
    * open only B responds (it closes) — the console "back" convention,
    * mirroring how the keyboard parks every key except Escape.
    */
-  private pumpGamepadActions(): void {
+  private pumpGamepadActions(dt: number, timestamp: number): void {
     const now = this.lastGamepadButtons;
     const prev = this.prevGamepadButtons;
     const rising = (index: number): boolean =>
@@ -2732,7 +2768,55 @@ export class ClientApp {
       // must never fire the action sheet — its phantom presses used to open
       // the trade dialog behind the player's back before any real pad latch.
       if (!this.gamepadLatched || !ClientApp.qualifiesAsGamepad(mapPad)) {
+        // Spec 30: no qualified pad → no stale HUD-toggle bookkeeping.
+        this.hudTogglePrevButtons = [];
+        this.hudViewHoldMs = 0;
+        this.hudViewHoldFired = false;
         return;
+      }
+      // Spec 30 §2.3.2 — HUD visibility-toggle lanes (double-tap R3, long-
+      // press View/Back). Runs BEFORE the map branch so a held View answers
+      // regardless of overlay state, but parks while the trade terminal owns
+      // the screen (mirrors the keyboard Escape-only convention). Both lanes
+      // only touch LunarHUD DOM classes — pointer lock and window focus are
+      // never released (Gate 4).
+      if (!tradeOpen) {
+        const prevHud = this.hudTogglePrevButtons;
+        if (
+          mapNow[GAMEPAD_BUTTONS.camera] === true &&
+          prevHud[GAMEPAD_BUTTONS.camera] !== true
+        ) {
+          if (timestamp - this.lastR3TapAtMs <= GAMEPAD_HUD_DOUBLE_TAP_MS) {
+            // Second click inside the window: cycle the HUD, re-arm cold so
+            // a third click starts a fresh pair instead of chaining cycles.
+            this.lastR3TapAtMs = Number.NEGATIVE_INFINITY;
+            this.inputSource = 'gamepad';
+            this.hud?.cycleHUDMode();
+          } else {
+            this.lastR3TapAtMs = timestamp;
+          }
+        }
+        if (mapNow[GAMEPAD_BUTTONS.map] === true) {
+          this.hudViewHoldMs += Math.max(0, dt) * 1000;
+          if (
+            !this.hudViewHoldFired &&
+            this.hudViewHoldMs >= GAMEPAD_HUD_VIEW_HOLD_MS
+          ) {
+            this.hudViewHoldFired = true;
+            this.inputSource = 'gamepad';
+            this.hud?.cycleHUDMode();
+          }
+        } else {
+          this.hudViewHoldMs = 0;
+          this.hudViewHoldFired = false;
+        }
+        this.hudTogglePrevButtons = mapNow.slice();
+      } else {
+        // Terminal open: drop bookkeeping so the close frame cannot inherit
+        // a half-pressed tap or hold from behind the dialog.
+        this.hudTogglePrevButtons = [];
+        this.hudViewHoldMs = 0;
+        this.hudViewHoldFired = false;
       }
       if (tradeOpen) {
         if (rising(GAMEPAD_BUTTONS.trade)) {
@@ -2894,12 +2978,36 @@ export class ClientApp {
         // Spec 18 §6.2: [L] toggles the narrative comms terminal.
         this.toggleCommsLog();
         break;
+      case 'toggle-ui':
+      case 'toggle-hud':
+        // Spec 30 §2.3.2: [U]/[H] cycle standard → minimal → hidden.
+        this.cycleHudMode();
+        break;
       case 'close-ui':
         this.hud?.hideTradeDialog();
         break;
       default:
         break;
     }
+  }
+
+  /**
+   * Spec 30 §2.3 — cycle the HUD visibility mode
+   * (standard → minimal → hidden → standard). Keyboard `[U]`/`[H]`, gamepad
+   * double-tap R3, and long-press View/Back all funnel here. This is a pure
+   * DOM-class toggle on the `#lunar-hud` overlay: it never calls
+   * `document.exitPointerLock()`, never blurs the canvas, and never moves
+   * focus — the browser pointer lock survives every mode switch (Gate 4).
+   * Returns the mode now active, or null with no HUD attached / disposed.
+   */
+  cycleHudMode(): HUDMode | null {
+    if (this.disposed) return null;
+    return this.hud?.cycleHUDMode() ?? null;
+  }
+
+  /** Active HUD visibility mode (harness readback), null with no HUD. */
+  getHudMode(): HUDMode | null {
+    return this.hud?.getHUDMode() ?? null;
   }
 
   // -- gameplay actions ----------------------------------------------------------------

@@ -2204,3 +2204,89 @@
   color: var(--lf-dim);
   text-transform: uppercase;
 }
+
+/* ==================================================================
+   Spec 30 §2.3 — HUD visibility mode machine
+   (`standard` | `minimal` | `hidden`; classes toggled by LunarHUD on
+   the root `#lunar-hud`, cycled by [U]/[H] and gamepad lanes).
+   ================================================================== */
+
+/* Smooth crossfades for every mode transition (Spec 30 §2.3.3). The
+   transition lives on the ROOT so the whole overlay breathes together;
+   hidden-mode suppression below overrides the resting opacity. */
+#lunar-hud {
+  transition: opacity 0.25s cubic-bezier(0.16, 1, 0.3, 1), transform 0.25s ease-out;
+}
+
+/* --- minimal: stripped tactical layout --------------------------------------
+   Suppress the bulky comms card, the tutorial/quest checklist, and the lap
+   panel; keep the compact life-support pills, the digital speed readout, and
+   the center crosshair / hint reticle (they carry no rule here, so they stay
+   painted exactly as their own widget states dictate). */
+#lunar-hud.hud-mode-minimal #lunar-hud-comms,
+#lunar-hud.hud-mode-minimal #lunar-hud-tutorial,
+#lunar-hud.hud-mode-minimal #lunar-hud-lap {
+  display: none;
+}
+
+/* Life support shrinks to a compact pill: drop the heading, tighten the
+   chrome; every O₂ / BAT / RCS / SPD readout stays live and legible. */
+#lunar-hud.hud-mode-minimal #lunar-hud-life {
+  padding: 8px 12px 4px;
+  width: 214px;
+  border-radius: 999px;
+  border-bottom-left-radius: 22px;
+  border-bottom-right-radius: 22px;
+}
+
+#lunar-hud.hud-mode-minimal #lunar-hud-life .hud-heading {
+  display: none;
+}
+
+/* --- hidden: cinematic mode --------------------------------------------------
+   Full visual suppression of the 2D overlay. `pointer-events: none !important`
+   (root AND descendants) guarantees mouse look and mining-laser fire fall
+   straight through into the WebGL canvas — no ghost hit-targets survive the
+   fade. The mode toast is a SIBLING of the root, so it never fades with it. */
+#lunar-hud.hud-mode-hidden {
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+
+#lunar-hud.hud-mode-hidden * {
+  pointer-events: none !important;
+}
+
+/* --- mode-switch toast (Spec 30 §2.3.3: upper-right, 1.5 s auto-fade) -------- */
+#lunar-hud-mode-toast {
+  position: fixed;
+  top: 20px;
+  right: 20px;
+  z-index: 40;
+  max-width: min(420px, 60vw);
+  padding: 9px 20px;
+  border-radius: 999px;
+  background: var(--lf-glass-solid);
+  backdrop-filter: blur(14px) saturate(130%);
+  -webkit-backdrop-filter: blur(14px) saturate(130%);
+  border: 1px solid var(--lf-rule);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.55);
+  color: var(--lf-text);
+  font-family: var(--lf-mono);
+  font-size: 13px;
+  letter-spacing: 0.05em;
+  text-align: right;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  opacity: 1;
+  pointer-events: none;
+  transition: opacity 0.25s cubic-bezier(0.16, 1, 0.3, 1), transform 0.25s ease-out;
+}
+
+#lunar-hud-mode-toast.is-hidden {
+  opacity: 0;
+  transform: translateY(-6px);
+  visibility: hidden;
+}
