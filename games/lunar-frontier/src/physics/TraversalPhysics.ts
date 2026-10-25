@@ -156,6 +156,41 @@ export const SUIT_BOUND_MIN_SPEED = 1.8;
 export const SUIT_BOUND_RESTITUTION = 0.88;
 /** Forward kick the legs add at each bound launch (m/s per leap). */
 export const SUIT_BOUND_PUSH = 1.2;
+
+// -- Spec 30 §2.2.1: unilateral "hurry" bounding & Mistborn Steelpush --------
+/**
+ * Velocity threshold where ground walk transitions to alternating bounding
+ * (m/s). Successor of the legacy {@link SUIT_BOUND_MIN_SPEED} gate (the
+ * Spec 28 values stay exported untouched for pre-Spec-30 authors; the live
+ * bounding loop now runs on the SUIT_HURRY_* set).
+ */
+export const SUIT_HURRY_MIN_SPEED = 1.8;
+/** Target forward velocity achieved during sustained hurry bounding (m/s). */
+export const SUIT_HURRY_TARGET_SPEED = 5.2;
+/** Vertical launch impulse delivered at each unilateral foot push-off (m/s). */
+export const SUIT_HURRY_LAUNCH_VZ = 1.55;
+/** Forward kinetic boost imparted per push-off step (m/s). */
+export const SUIT_HURRY_STEP_BOOST = 1.0;
+/** Momentum restitution retained across footfall touchdown (dimensionless). */
+export const SUIT_HURRY_RESTITUTION = 0.90;
+/** Knee compression displacement during foot brace phase (metres). */
+export const SUIT_HURRY_BRACE_COMPRESSION_M = 0.08;
+/** Duration of the grounded brace-and-launch transition window (seconds). */
+export const SUIT_HURRY_BRACE_DURATION_S = 0.12;
+
+/**
+ * Spec 30 §2.2.2: the stance/pushing leg of the alternating stride. Toggles
+ * on each successive Steelpush launch so the suit lands left → right → left,
+ * one footfall at a time (never the Spec 28 symmetric bunny-hop).
+ */
+export type HurryStrideLeg = 'left' | 'right';
+/**
+ * Spec 30 §2.2.2: phase inside one unilateral stride cycle — the grounded
+ * brace-and-anchor window (compression ramp) versus the ballistic low-g
+ * flight arc under {@link LUNAR_GRAVITY}.
+ */
+export type HurryStepPhase = 'ground_brace' | 'flight_arc';
+
 /** RCS translational acceleration during a burst (m/s²). */
 export const SUIT_RCS_ACCEL = 2.4;
 /** RCS attitude rates (rad/s). */
@@ -312,6 +347,28 @@ export interface SuitState {
    */
   hangtime: number;
   /**
+   * Spec 30 §2.2.2: active pushing/stance leg of the unilateral alternating
+   * stride. Flips on every Steelpush launch so footfalls land left → right.
+   */
+  hurryStrideLeg?: HurryStrideLeg;
+  /**
+   * Spec 30 §2.2.2: phase inside the current stride cycle — grounded
+   * `ground_brace` (anchor + compression ramp) versus ballistic `flight_arc`.
+   */
+  hurryStepPhase?: HurryStepPhase;
+  /**
+   * Spec 30 §2.2.2: seconds elapsed in the current ballistic flight arc.
+   * Reset at each Steelpush launch; on a touchdown frame it reports the
+   * completed arc's hangtime for the animation layer.
+   */
+  hurryAirTime?: number;
+  /**
+   * Spec 30 §2.2.2: knee/ankle compression (m) during the grounded brace
+   * window, ramping to {@link SUIT_HURRY_BRACE_COMPRESSION_M} across
+   * {@link SUIT_HURRY_BRACE_DURATION_S}; 0 outside the brace.
+   */
+  hurryBraceCompression?: number;
+  /**
    * Spec 29 §3.1: locomotion state-machine band (`WALK` / `SPRINT` / `BOUND`
    * / `AIRBORNE` / `CLIMBING`). Optional so pre-Spec-29 callers stay source-
    * compatible; every {@link LunarEvaSuit.step} refreshes it.
@@ -387,6 +444,14 @@ export class LunarEvaSuit {
   /** Airtime accumulator of the current bounding leap (s). */
   private boundClock = 0;
   /**
+   * Spec 30 §2.2.2: elapsed seconds inside the current ground-brace window.
+   * Zeroed at every touchdown; the Steelpush launch arms once it exceeds
+   * {@link SUIT_HURRY_BRACE_DURATION_S}.
+   */
+  private boundBraceClock = 0;
+  /** Spec 30 §2.2.2: stance leg of the alternating stride (starts 'left'). */
+  private hurryLeg: HurryStrideLeg = 'left';
+  /**
    * Spec 21 §2.4 vault loot ("Advanced Prospector EVA Suit"): an instance
    * rebreather ceiling, at or above the base {@link SUIT_MAX_OXYGEN}. The
    * step() clamp reads this, so an upgrade persists across frames.
@@ -415,6 +480,10 @@ export class LunarEvaSuit {
       jumpImpulse: initial.jumpImpulse ?? 0,
       gaitMode: initial.gaitMode ?? 'idle',
       hangtime: initial.hangtime ?? 0,
+      hurryStrideLeg: initial.hurryStrideLeg ?? 'left',
+      hurryStepPhase: initial.hurryStepPhase ?? 'ground_brace',
+      hurryAirTime: initial.hurryAirTime ?? 0,
+      hurryBraceCompression: initial.hurryBraceCompression ?? 0,
       locomotionMode: initial.locomotionMode ?? 'WALK',
       climbProgressM: initial.climbProgressM ?? 0,
       climbRate: initial.climbRate ?? 0,
@@ -427,6 +496,8 @@ export class LunarEvaSuit {
       // Unset vertical velocity while airborne would fake a hover; drop freely.
       this.state.vz = 0;
     }
+    // Spec 30 §2.2.2: the stride machine owns the stance leg from here on.
+    this.hurryLeg = this.state.hurryStrideLeg ?? 'left';
   }
 
   public getState(): SuitState {
@@ -435,6 +506,11 @@ export class LunarEvaSuit {
 
   public setState(patch: Partial<SuitState>): void {
     this.state = { ...this.state, ...patch };
+    // Spec 30 §2.2.2: keep the private stride machine in step with an
+    // externally-authored stance leg (teleports, net-sync, test harnesses).
+    if (patch.hurryStrideLeg === 'left' || patch.hurryStrideLeg === 'right') {
+      this.hurryLeg = patch.hurryStrideLeg;
+    }
   }
 
   /** Current rebreather ceiling (base {@link SUIT_MAX_OXYGEN} units). */
@@ -513,7 +589,12 @@ export class LunarEvaSuit {
     // A committed bounding leap never survives a boot-clamp.
     this.boundPhase = 'walk';
     this.boundClock = 0;
+    this.boundBraceClock = 0;
     s.hangtime = 0;
+    // Spec 30 §2.2.2: the latch parks the stride fields (boots braced).
+    s.hurryAirTime = 0;
+    s.hurryBraceCompression = 0;
+    s.hurryStepPhase = 'ground_brace';
     return true;
   }
 
@@ -688,21 +769,27 @@ export class LunarEvaSuit {
     const groundZ = ground(s.x, s.y);
     const wasGrounded = s.isGrounded;
 
-    // -- Bounding state machine (Spec 28 §2.3) -------------------------------
-    // walk → bound_launch → bound_flight (ballistic arc) → bound_land →
-    // bound_launch …: each footfall at sprint throttle immediately rebounds
+    // -- Bounding state machine (Spec 28 §2.3 cadence, Spec 30 §2.2 stride) --
+    // walk → bound_launch → bound_flight (ballistic arc) → bound_land (the
+    // Spec 30 ground-brace window) → bound_launch …: each footfall holds the
+    // stance foot braced for SUIT_HURRY_BRACE_DURATION_S, then Steelpushes
     // into the next leap while forward throttle is maintained.
     const horizSpeed = Math.hypot(s.vx, s.vy);
     const boundThrottle = input.sprint === true || fwd > 0.6;
     if (this.boundPhase === 'walk') {
-      if (s.isGrounded && boundThrottle && horizSpeed > SUIT_BOUND_MIN_SPEED) {
+      if (s.isGrounded && boundThrottle && horizSpeed > SUIT_HURRY_MIN_SPEED) {
         this.boundPhase = 'bound_launch';
       }
     } else if (this.boundPhase === 'bound_land' && s.isGrounded) {
-      // Single grounded frame at the trough of the arc: rebound immediately
-      // if the throttle is still buried, else settle back into the stride.
-      this.boundPhase =
-        boundThrottle && horizSpeed > SUIT_BOUND_MIN_SPEED ? 'bound_launch' : 'walk';
+      // Spec 30 §2.2.2: touchdown opens the ground_brace window. The launch
+      // only arms once the brace window closes; a lifted throttle settles
+      // straight back into the stride at any point.
+      if (!boundThrottle) {
+        this.boundPhase = 'walk';
+      } else if (this.boundBraceClock >= SUIT_HURRY_BRACE_DURATION_S) {
+        this.boundPhase =
+          horizSpeed > SUIT_HURRY_MIN_SPEED ? 'bound_launch' : 'walk';
+      }
     } else if (this.boundPhase === 'bound_launch' && s.isGrounded && !boundThrottle) {
       this.boundPhase = 'walk';
     }
@@ -713,10 +800,11 @@ export class LunarEvaSuit {
 
     // -- Body-frame desired velocity ---------------------------------------
     const magnitude = clamp(Math.hypot(fwd, strafe), 0, 1);
-    // Bounding commits to the ballistic cruise target; otherwise the classic
-    // walk/run gait split at |forward| = 0.6 stays byte-for-byte (Spec 28).
+    // Bounding commits to the ballistic cruise target (Spec 30 §2.2.1 hurry
+    // speed); otherwise the classic walk/run gait split at |forward| = 0.6
+    // stays byte-for-byte (Spec 28).
     const gaitSpeed = bounding
-      ? SUIT_BOUND_SPEED
+      ? SUIT_HURRY_TARGET_SPEED
       : Math.abs(fwd) > 0.6
         ? SUIT_RUN_SPEED
         : SUIT_WALK_SPEED;
@@ -795,27 +883,42 @@ export class LunarEvaSuit {
       }
       // Spec 28 §2.3: a manual high leap cut out of the bounding loop rides
       // the same ballistic-loop bookkeeping and rejoins it on touchdown.
-      if (bounding) this.boundPhase = 'bound_flight';
+      // Spec 30 §2.2.2: it also cancels any in-flight brace window.
+      if (bounding) {
+        this.boundPhase = 'bound_flight';
+        this.boundBraceClock = 0;
+      }
     }
     this.jumpWasHeld = input.jump;
 
-    // -- Bound launch (Spec 28 §2.3): the rhythmic low-g leap -----------------
+    // -- Steelpush launch (Spec 28 §2.3 cadence, Spec 30 §2.2.2 push-off) ----
     if (this.boundPhase === 'bound_launch' && s.isGrounded) {
-      s.vz = SUIT_BOUND_LAUNCH_VZ;
-      s.jumpImpulse = SUIT_BOUND_LAUNCH_VZ;
+      // Explosive unilateral push-off: the braced stance leg extends
+      // violently downward/aft, launching the suit up and forward.
+      s.vz = SUIT_HURRY_LAUNCH_VZ;
+      s.jumpImpulse = SUIT_HURRY_LAUNCH_VZ;
       s.isGrounded = false;
-      // The legs kick along the heading toward the bounding cruise speed,
+      // The legs kick along the heading toward the hurry cruise speed,
       // keeping any surviving lateral momentum from the approach stride.
       const bh = Math.cos(s.heading);
       const bsh = Math.sin(s.heading);
       const alongOld = s.vx * bh + s.vy * bsh;
       const latX = s.vx - alongOld * bh;
       const latY = s.vy - alongOld * bsh;
-      const alongNew = Math.min(SUIT_BOUND_SPEED, Math.max(alongOld, 0) + SUIT_BOUND_PUSH);
+      const alongNew = Math.min(
+        SUIT_HURRY_TARGET_SPEED,
+        Math.max(alongOld, 0) + SUIT_HURRY_STEP_BOOST,
+      );
       s.vx = alongNew * bh + latX;
       s.vy = alongNew * bsh + latY;
       this.boundClock = 0;
+      this.boundBraceClock = 0;
       s.hangtime = 0;
+      s.hurryAirTime = 0;
+      s.hurryBraceCompression = 0;
+      // Spec 30 §2.2.2: the push-off foot just spent itself — the next
+      // touchdown lands on the opposite leg, then flips back for its turn.
+      this.hurryLeg = this.hurryLeg === 'left' ? 'right' : 'left';
       this.boundPhase = 'bound_flight';
     }
 
@@ -835,12 +938,15 @@ export class LunarEvaSuit {
       if (s.vz < 0) s.vz = 0;
       s.isGrounded = true;
       if (touchdown && this.boundPhase === 'bound_flight') {
-        // Spec 28 §2.3: forward momentum conserved across the footfall with
-        // restitution η; the machine queues the next leap (or walks away if
-        // the throttle lifted) and the animation layer dusts the boots.
-        s.vx *= SUIT_BOUND_RESTITUTION;
-        s.vy *= SUIT_BOUND_RESTITUTION;
+        // Spec 30 §2.2.2: forward momentum conserved across the footfall
+        // with restitution η (≥ 88 % of the approach speed survives into
+        // the next push-off); the stance foot anchors, opening the
+        // ground_brace window, and the animation layer dusts the boots.
+        s.vx *= SUIT_HURRY_RESTITUTION;
+        s.vy *= SUIT_HURRY_RESTITUTION;
         s.hangtime = this.boundClock; // report the completed leap's hangtime
+        s.hurryAirTime = this.boundClock;
+        this.boundBraceClock = 0;
         this.boundPhase = 'bound_land';
       }
     } else if (s.z - floorZ > 0.08) {
@@ -848,13 +954,27 @@ export class LunarEvaSuit {
     }
     void wasGrounded;
 
-    // -- Gait bookkeeping (Spec 28 §2.3) ---------------------------------------
+    // -- Gait bookkeeping (Spec 28 §2.3 cadence, Spec 30 §2.2.2 stride) ------
     if (this.boundPhase === 'bound_flight' && !s.isGrounded) {
       this.boundClock += step;
       s.hangtime = this.boundClock;
+      s.hurryAirTime = this.boundClock;
+    } else if (this.boundPhase === 'bound_land' && s.isGrounded) {
+      // Brace window advances; the knee/ankle compress toward the target
+      // displacement across the SUIT_HURRY_BRACE_DURATION_S window.
+      this.boundBraceClock += step;
+      s.hurryBraceCompression =
+        SUIT_HURRY_BRACE_COMPRESSION_M *
+        clamp(this.boundBraceClock / SUIT_HURRY_BRACE_DURATION_S, 0, 1);
     } else if (this.boundPhase === 'walk' && s.isGrounded) {
       s.hangtime = 0;
+      s.hurryAirTime = 0;
+      s.hurryBraceCompression = 0;
     }
+    // Spec 30 §2.2.2: the stride fields are always reported — grounded
+    // frames are the stance/brace phase, airborne frames the flight arc.
+    s.hurryStrideLeg = this.hurryLeg;
+    s.hurryStepPhase = s.isGrounded ? 'ground_brace' : 'flight_arc';
     s.gaitMode = bounding
       ? 'bounding'
       : Math.hypot(s.vx, s.vy) > 0.08
