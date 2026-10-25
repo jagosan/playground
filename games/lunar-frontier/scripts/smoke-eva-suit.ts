@@ -409,23 +409,92 @@ section('3b. Spec 28 §2.3 lunar bounding sprint');
   }
   const hipFL = node('eva-leg-thigh-l');
   const hipFR = node('eva-leg-thigh-r');
+  const kneeFL = bndAvatar.getScene()!.transformNodes.find((n) => n.name === 'eva-kneejoint-l')!;
+  const kneeFR = bndAvatar.getScene()!.transformNodes.find((n) => n.name === 'eva-kneejoint-r')!;
   const slF = node('eva-arm-upper-l');
   const srF = node('eva-arm-upper-r');
-  check('flight pose: legs trail aft in knee flexion',
+  // Spec 30 §2.2.3: hurryStrideLeg is the leg RECEIVING the next touchdown —
+  // mid-flight it is the LEADING leg, so the opposite hip is the pushing one.
+  const strideIsLeftF = (as.hurryStrideLeg ?? 'left') === 'left';
+  const pushHipF = strideIsLeftF ? hipFR.rotation.x : hipFL.rotation.x;
+  const leadHipF = strideIsLeftF ? hipFL.rotation.x : hipFR.rotation.x;
+  const leadKneeF = strideIsLeftF ? kneeFL.rotation.x : kneeFR.rotation.x;
+  const pushKneeF = strideIsLeftF ? kneeFR.rotation.x : kneeFL.rotation.x;
+  const stanceArmF = strideIsLeftF ? srF.rotation.x : slF.rotation.x;
+  const recoveryArmF = strideIsLeftF ? slF.rotation.x : srF.rotation.x;
+  check(
+    'flight pose: pushing leg extends aft in toe-off follow-through (gate hip ≥ 0.40)',
     !as.isGrounded && as.gaitMode === 'bounding'
-    && hipFL.rotation.x > 0.3 && hipFR.rotation.x > 0.3
-    && Math.abs(hipFL.rotation.x - hipFR.rotation.x) < 1e-12,
-    `hipL=${hipFL.rotation.x} hipR=${hipFR.rotation.x}`);
-  check('flight pose: arms spread outward for balance',
-    slF.rotation.z < -0.1 && srF.rotation.z > 0.1
-    && Math.abs(slF.rotation.z + srF.rotation.z) < 1e-12,
-    `zL=${slF.rotation.z} zR=${srF.rotation.z}`);
+      && pushHipF >= 0.40 && pushKneeF <= 0.1,
+    `stride=${as.hurryStrideLeg} pushHip=${pushHipF} pushKnee=${pushKneeF}`,
+  );
+  check(
+    'flight pose: leading leg swings forward with flexed knee (gate hip fwd ≥ 0.35, knee ≥ 0.60)',
+    leadHipF <= -0.35 && leadKneeF >= 0.60,
+    `leadHip=${leadHipF} leadKnee=${leadKneeF}`,
+  );
+  check(
+    'flight pose: arms sprint in opposition — stance side drives fwd (−0.45), recovery aft (+0.35)',
+    stanceArmF <= -0.35 && recoveryArmF >= 0.25
+      && Math.sign(stanceArmF) === -Math.sign(recoveryArmF),
+    `stanceArm=${stanceArmF} recoveryArm=${recoveryArmF}`,
+  );
+  check(
+    'flight pose: torso leans 7° into thrust + 1.5° roll toward the stance hip',
+    (() => {
+      const upper = bndAvatar.getScene()!.transformNodes.find((n) => n.name === 'eva-upper-body')!;
+      const pushIsLeft = !strideIsLeftF;
+      return Math.abs(upper.rotation.x - 0.12) < 1e-12
+        && Math.abs(Math.abs(upper.rotation.z) - 0.026) < 1e-12
+        && Math.sign(upper.rotation.z) === (pushIsLeft ? 1 : -1);
+    })(),
+  );
+  check('flight pose: arms held in the sagittal plane (no Spec 28 balance spread)',
+    Math.abs(slF.rotation.z) < 1e-12 && Math.abs(srF.rotation.z) < 1e-12);
 
   // Touchdown: boot-dust puff + landing crouch compression.
   const puffsBefore = bndAvatar.getBootDustPuffCount();
   for (let i = 0; i < 400 && as.isGrounded !== true; i++) as = bndAvatar.update(DT, sprintBound);
   check('bounding touchdown kicks regolith boot dust', bndAvatar.getBootDustPuffCount() > puffsBefore,
     `${puffsBefore} → ${bndAvatar.getBootDustPuffCount()}`);
+  // Spec 30 §2.2.3: consecutive footfalls must alternate left/right sole
+  // coordinates (heading ≈ 0 → lateral offset rides on physics y, ±d_hip).
+  const puffPos1 = bndAvatar.getLastBootDustPuffPos();
+  const strideAtPuff1 = as.hurryStrideLeg;
+  for (let i = 0; i < 600 && bndAvatar.getBootDustPuffCount() === puffsBefore + 1; i++) {
+    as = bndAvatar.update(DT, sprintBound);
+  }
+  const puffPos2 = bndAvatar.getLastBootDustPuffPos();
+  const strideAtPuff2 = as.hurryStrideLeg;
+  check(
+    'footfall dust alternates left/right sole coordinates on successive landings',
+    puffPos1 !== null && puffPos2 !== null
+      && Math.sign(puffPos1.y - as.y) === -Math.sign(puffPos2.y - (puffPos1.y + puffPos2.y) / 2)
+      && strideAtPuff1 !== strideAtPuff2,
+    `y1=${puffPos1?.y.toFixed(3)} y2=${puffPos2?.y.toFixed(3)} legs=${strideAtPuff1}/${strideAtPuff2}`,
+  );
+  check(
+    'footfall dust sits at hip width d_hip ≈ 0.13 m lateral of the suit centreline',
+    puffPos1 !== null && puffPos2 !== null
+      && Math.abs(Math.abs(puffPos1.y - as.y) - 0.13) < 0.02
+      && Math.abs(Math.abs(puffPos2.y - as.y) - 0.13) < 0.02,
+    `|Δy|=${puffPos1 ? Math.abs(puffPos1.y - as.y).toFixed(3) : 'n/a'}`,
+  );
+  // Brace phase (grounded): stride leg IS the stance spring, recovery reaches fwd.
+  for (let i = 0; i < 3 && as.isGrounded !== true; i++) as = bndAvatar.update(DT, sprintBound);
+  if (as.isGrounded && as.gaitMode === 'bounding') {
+    const strideIsLeftB = (as.hurryStrideLeg ?? 'left') === 'left';
+    const stanceHipB = strideIsLeftB ? hipFL.rotation.x : hipFR.rotation.x;
+    const stanceKneeB = strideIsLeftB ? kneeFL.rotation.x : kneeFR.rotation.x;
+    const recHipB = strideIsLeftB ? hipFR.rotation.x : hipFL.rotation.x;
+    check(
+      'ground_brace pose: stance spring loaded (knee ~0.5), recovery hip reaching forward',
+      stanceKneeB >= 0.4 && stanceHipB >= 0.1 && recHipB <= -0.25,
+      `stanceKnee=${stanceKneeB} stanceHip=${stanceHipB} recHip=${recHipB}`,
+    );
+  } else {
+    check('ground_brace pose sampled (missed grounded window — skipped)', true, 'skipped');
+  }
   let crouched = false;
   let lowest = 0;
   for (let i = 0; i < 8; i++) {

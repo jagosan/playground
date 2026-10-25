@@ -49,6 +49,7 @@ import {
   IDLE_SUIT_INPUT,
   LunarEvaSuit,
   type GroundElevationFn,
+  type HurryStrideLeg,
   type SuitInput,
   type SuitState,
 } from '../physics/TraversalPhysics.ts';
@@ -104,8 +105,124 @@ export const BOUND_TRAIL_KNEE_RAD = 0.9;
 export const BOUND_ARM_SPREAD_RAD = 0.5;
 /** Slight shoulder set-forward in flight (rad; applied as -x rotation). */
 export const BOUND_SHOULDER_SET_RAD = 0.2;
-/** Knee flex held on the single grounded trough frame between bounds (rad). */
+/** Knee flex held on the single grounded trough frame between bounds (rad).
+ *  @deprecated Superseded by Spec 30 §2.2.3 {@link HURRY_BRACE_STANCE_KNEE_RAD}
+ *  — the brace window is now leg-specific; kept only for legacy readers. */
 export const BOUND_TROUGH_KNEE_RAD = 0.6;
+
+// -- Unilateral Steelpush stride articulation (Spec 30 §2.2.3 / Phase 4) ------
+/*
+ * All mesh-frame constants below follow the avatar pivot convention
+ * (positive `rotation.x` swings a hanging limb AFT / leans the torso
+ * FORWARD; positive `rotation.z` tilts the torso top toward the mesh-left
+ * hip). The spec quotes hips in the anatomical convention (θ negative =
+ * aft extension); the conversion is hip_mesh_x = −θ_anatomical, while knee
+ * flexion keeps the spec sign directly.
+ */
+/** Pushing (stance) leg hip aft extension at launch, rad (spec θ_hip −0.55). */
+export const HURRY_PUSH_HIP_AFT_RAD = 0.55;
+/** Pushing leg knee near full straightening, rad (spec θ_knee +0.05). */
+export const HURRY_PUSH_KNEE_RAD = 0.05;
+/** Leading (recovery) leg hip forward lift, rad (spec θ_hip +0.48). */
+export const HURRY_LEAD_HIP_FWD_RAD = 0.48;
+/** Leading leg deep knee flex, rad (spec θ_knee +0.85). */
+export const HURRY_LEAD_KNEE_RAD = 0.85;
+/** Torso pitch forward into the thrust vector, rad (7°, spec 0.12). */
+export const HURRY_TORSO_PITCH_FWD_RAD = 0.12;
+/** Torso lateral roll sway toward the stance hip, rad (1.5°, spec 0.026). */
+export const HURRY_TORSO_ROLL_RAD = 0.026;
+/** Arm on the stance side drives forward, rad (spec θ_shoulder −0.45). */
+export const HURRY_ARM_STANCE_FWD_RAD = 0.45;
+/** Arm on the recovery side swings aft, rad (spec θ_shoulder +0.35). */
+export const HURRY_ARM_RECOVERY_AFT_RAD = 0.35;
+/** Elbow flex carried by the forward-driving sprint arm (rad). */
+export const HURRY_ARM_ELBOW_FWD_FLEX_RAD = 0.5;
+/** Elbow flex carried by the aft-swinging sprint arm (rad). */
+export const HURRY_ARM_ELBOW_AFT_FLEX_RAD = 0.25;
+/** Brace phase: stance-hip load angle, slightly aft as the spring compresses (rad). */
+export const HURRY_BRACE_STANCE_HIP_RAD = 0.18;
+/** Brace phase: stance knee spring flexion (rad). */
+export const HURRY_BRACE_STANCE_KNEE_RAD = 0.5;
+/** Brace phase: recovery hip reaching forward for the next datum (rad). */
+export const HURRY_BRACE_LEAD_HIP_FWD_RAD = 0.32;
+/** Brace phase: recovery knee flex ahead of the next flight arc (rad). */
+export const HURRY_BRACE_LEAD_KNEE_RAD = 0.55;
+/** Footfall dust burst lateral offset from the suit centre along the
+ *  perpendicular to heading — one hip width (d_hip ≈ 0.13 m, Spec 30 §2.2.3). */
+export const BOOT_DUST_HIP_OFFSET_M = 0.13;
+
+/**
+ * One frame of the Spec 30 §2.2.3 unilateral Steelpush stride pose in the
+ * mesh pivot convention (same `rotation.x` sign law as the walk cycle:
+ * positive swings a hanging limb aft).
+ */
+export interface HurryStridePose {
+  hipLx: number;
+  hipRx: number;
+  kneeLx: number;
+  kneeRx: number;
+  shoulderLx: number;
+  shoulderRx: number;
+  elbowLx: number;
+  elbowRx: number;
+  /** Torso pitch forward into the thrust vector (rad, upperBody.rotation.x). */
+  torsoPitchRad: number;
+  /** Torso roll toward the stance hip (rad, upperBody.rotation.z; + = toward left hip). */
+  torsoRollRad: number;
+  /** True on the ballistic `flight_arc` half, false on `ground_brace`. */
+  airborne: boolean;
+  /** The power side of this frame: pushing leg in flight, bracing leg braced. */
+  powerIsLeft: boolean;
+  /** Physics `hurryStrideLeg` this pose was built for (next leg to land). */
+  strideLegIsLeft: boolean;
+}
+
+/**
+ * Pure Spec 30 §2.2.3 stride articulation law. `strideLeg` is the physics
+ * `hurryStrideLeg`: the leg that RECEIVES the next touchdown. So on the
+ * flight arc it is the leading leg (hip lifted +0.48, knee flexed 0.85)
+ * while the opposite pushing leg trails aft in toe-off follow-through
+ * (hip 0.55 aft, knee straightened to 0.05); on the grounded brace frame it
+ * is the braced stance leg (spring flex 0.5) while the recovery leg reaches
+ * forward for the next datum. Arms run athletic sprint opposition — the arm
+ * on the stance/pushing side drives forward (−0.45), the recovery-side arm
+ * swings aft (+0.35) — and the torso leans 7° into the thrust vector with a
+ * 1.5° roll sway toward the stance hip.
+ */
+export function hurryStridePose(
+  strideLeg: HurryStrideLeg | undefined,
+  airborne: boolean,
+): HurryStridePose {
+  const strideLegIsLeft = strideLeg !== 'right';
+  // In flight the stride leg is the LEADING leg, so the pushing side is the
+  // opposite hip; on the brace frame the stride leg is the planted STANCE
+  // leg that will deliver the next Steelpush, i.e. the power side itself.
+  const powerIsLeft = airborne ? !strideLegIsLeft : strideLegIsLeft;
+  const hipPower = airborne ? HURRY_PUSH_HIP_AFT_RAD : HURRY_BRACE_STANCE_HIP_RAD;
+  const kneePower = airborne ? HURRY_PUSH_KNEE_RAD : HURRY_BRACE_STANCE_KNEE_RAD;
+  const hipRecovery = airborne ? -HURRY_LEAD_HIP_FWD_RAD : -HURRY_BRACE_LEAD_HIP_FWD_RAD;
+  const kneeRecovery = airborne ? HURRY_LEAD_KNEE_RAD : HURRY_BRACE_LEAD_KNEE_RAD;
+  return {
+    hipLx: powerIsLeft ? hipPower : hipRecovery,
+    hipRx: powerIsLeft ? hipRecovery : hipPower,
+    kneeLx: powerIsLeft ? kneePower : kneeRecovery,
+    kneeRx: powerIsLeft ? kneeRecovery : kneePower,
+    shoulderLx: powerIsLeft ? -HURRY_ARM_STANCE_FWD_RAD : HURRY_ARM_RECOVERY_AFT_RAD,
+    shoulderRx: powerIsLeft ? HURRY_ARM_RECOVERY_AFT_RAD : -HURRY_ARM_STANCE_FWD_RAD,
+    elbowLx: ELBOW_REST_RAD + (powerIsLeft
+      ? HURRY_ARM_ELBOW_FWD_FLEX_RAD
+      : HURRY_ARM_ELBOW_AFT_FLEX_RAD),
+    elbowRx: ELBOW_REST_RAD + (powerIsLeft
+      ? HURRY_ARM_ELBOW_AFT_FLEX_RAD
+      : HURRY_ARM_ELBOW_FWD_FLEX_RAD),
+    torsoPitchRad: HURRY_TORSO_PITCH_FWD_RAD,
+    // +rotation.z tips the torso top toward the mesh-left hip.
+    torsoRollRad: powerIsLeft ? HURRY_TORSO_ROLL_RAD : -HURRY_TORSO_ROLL_RAD,
+    airborne,
+    powerIsLeft,
+    strideLegIsLeft,
+  };
+}
 
 // -- Climbing articulation (Spec 29 Phase 4) ----------------------------------
 /**
@@ -389,6 +506,13 @@ export class EvaSuitAvatar {
   private bootDustFallback?: TransformNode;
   /** Number of boot-dust puffs emitted since init (smoke readback). */
   private bootDustPuffCount = 0;
+  /**
+   * Spec 30 §2.2.3: physics-frame world coordinates of the most recent
+   * boot-dust burst (the exact planting boot sole, offset d_hip along the
+   * perpendicular to heading). Null until the first puff. Smoke harnesses
+   * assert consecutive bounding footfalls alternate left/right through this.
+   */
+  private lastBootDustPuffPos: { x: number; y: number; z: number } | null = null;
   /** Most recently stepped state — keeps getters honest across scene life. */
   private last: SuitState;
 
@@ -696,17 +820,24 @@ export class EvaSuitAvatar {
    * with no GPU context we only bump the emitted-puff counter and track a
    * fallback node, so smoke harnesses exercise the trigger without WebGL.
    * Returns the cumulative number of puffs emitted since init (≥ 1 after a
-   * successful call).
+   * successful call). Every puff records its physics-frame origin on
+   * {@link getLastBootDustPuffPos} (Spec 30 §2.2.3 alternating footfalls).
    */
   triggerBootDustPuff(at?: { x: number; y: number; z: number }): number {
     if (this.disposed) return this.bootDustPuffCount;
     const scene = this.scene;
     if (scene === null || scene.isDisposed) return this.bootDustPuffCount;
+    const p = at ?? { x: this.last.x, y: this.last.y, z: this.last.z };
+    this.lastBootDustPuffPos = { x: p.x, y: p.y, z: p.z };
     const isNull = scene.getEngine().name === 'NullEngine';
     if (isNull) {
       if (this.bootDustFallback === undefined) {
         this.bootDustFallback = new TransformNode('eva-boot-dust-fallback', scene);
       }
+      // Park the fallback node at the puff origin so headless consumers can
+      // read the alternating left/right boot coordinates off the scene too.
+      const fb = worldToBabylon(p);
+      this.bootDustFallback.position.set(fb.x, fb.y + 0.15, fb.z);
       this.bootDustPuffCount += 1;
       return this.bootDustPuffCount;
     }
@@ -725,7 +856,6 @@ export class EvaSuitAvatar {
       ps.direction2 = new Vector3(0.9, 0.95, 0.75);
       this.bootDust = ps;
     }
-    const p = at ?? { x: this.last.x, y: this.last.y, z: this.last.z };
     const b = worldToBabylon(p);
     (this.bootDust.emitter as Vector3).set(b.x, b.y + 0.15, b.z);
     try {
@@ -740,6 +870,16 @@ export class EvaSuitAvatar {
   /** Cumulative boot-dust puffs emitted since init (smoke readback). */
   getBootDustPuffCount(): number {
     return this.bootDustPuffCount;
+  }
+
+  /**
+   * Spec 30 §2.2.3: physics-frame coordinates of the most recent boot-dust
+   * burst (the planting boot sole), or null before the first puff.
+   */
+  getLastBootDustPuffPos(): { x: number; y: number; z: number } | null {
+    return this.lastBootDustPuffPos === null
+      ? null
+      : { ...this.lastBootDustPuffPos };
   }
 
   // -- internals --------------------------------------------------------------
@@ -1379,6 +1519,27 @@ export class EvaSuitAvatar {
     this.lamp = lamp;
   }
 
+  /**
+   * Spec 30 §2.2.3: physics-frame world coordinates of a boot sole at rest
+   * on the regolith datum under the current suit — the suit centre offset by
+   * ±d_hip along the perpendicular to heading (left leg on the −side, right
+   * on the +side of travel; heading 0 = +x so the lateral unit vector is
+   * (−sin h, cos h)). Footfall dust bursts fired from these exact points
+   * trace the alternating left/right regolith trail down the surface.
+   */
+  private bootSoleWorldPos(
+    state: SuitState,
+    leg: HurryStrideLeg,
+  ): { x: number; y: number; z: number } {
+    const sign = leg === 'left' ? -1 : 1;
+    const h = state.heading ?? 0;
+    return {
+      x: state.x - sign * BOOT_DUST_HIP_OFFSET_M * Math.sin(h),
+      y: state.y + sign * BOOT_DUST_HIP_OFFSET_M * Math.cos(h),
+      z: state.z,
+    };
+  }
+
   /** Copy physics state onto the avatar transform + headlamp. */
   private syncTransform(state: SuitState): void {
     const root = this.root;
@@ -1408,12 +1569,15 @@ export class EvaSuitAvatar {
    * counter-phase hip swing with knee flex on the recovery half-cycle, arms
    * swinging in natural opposition to the legs (elbows tracking the forward
    * sweep), and a torso/upper-body counter-bob at twice the leg frequency.
-   * While the physics gait is `bounding`, the pose instead rides the
-   * ballistic arc (Spec 28 §2.3): trailing legs in knee flexion and arms
-   * spread outward for balance through flight, a knee-flexed trough pose on
-   * the single grounded frame, each touchdown kicking a regolith boot-dust
-   * puff and arming the -0.06 m landing crouch. Visual only — physics stays
-   * in `LunarEvaSuit`. Stopped the pose snaps back to neutral standing.
+   * While the physics gait is `bounding`, the pose instead rides the Spec 30
+   * §2.2.3 unilateral Steelpush stride ({@link hurryStridePose}): pushing
+   * leg extended aft in toe-off follow-through, leading leg swung forward
+   * with deeply flexed knee, arms in athletic sprint opposition, and the
+   * torso leaning 7° into the thrust vector with a 1.5° roll sway toward the
+   * stance hip. Each touchdown kicks a regolith boot-dust puff from the
+   * exact planting-sole coordinates and arms the −0.06 m landing crouch.
+   * Visual only — physics stays in `LunarEvaSuit`. Stopped the pose snaps
+   * back to neutral standing.
    */
   private applyWalkCycle(state: SuitState): void {
     const torso = this.torso;
@@ -1431,6 +1595,10 @@ export class EvaSuitAvatar {
     // Landing-crouch envelope (compress→release), advanced once per frame.
     const crouch = this.advanceBoundCrouch();
     const gait = state.gaitMode ?? 'walk';
+    // Stride torso lean/roll is bounding-only — every other branch below
+    // owns a level torso, so park it before dispatching on the gait band.
+    upper.rotation.x = 0;
+    upper.rotation.z = 0;
 
     // Spec 29 Phase 4: the rung rail owns the frame while the boots are
     // clamped — alternating arm/leg stroke clocked by climbProgressM, or a
@@ -1460,52 +1628,49 @@ export class EvaSuitAvatar {
     }
 
     if (gait === 'bounding') {
-      // Spec 28 §2.3 ballistic looping — the stride clock parks while the
-      // arc owns the frame.
+      // Spec 30 §2.2.3 unilateral Steelpush articulation — the stride clock
+      // parks while the alternating arc owns the frame. `hurryStrideLeg` is
+      // the leg that RECEIVES the next touchdown: on the flight arc it is
+      // the leading leg (hip lifted, knee deeply flexed) while the opposite
+      // pushing leg trails aft in toe-off follow-through; on the grounded
+      // brace frame it is the planted stance leg loading the spring.
       this.walkCycleTime = 0;
-      if (!state.isGrounded) {
+      const strideLeg = state.hurryStrideLeg ?? 'left';
+      const airborne = !state.isGrounded;
+      if (airborne) {
         this.boundingFlight = true;
-        // Trailing legs in slight knee flexion ...
-        hipL.rotation.x = BOUND_TRAIL_HIP_RAD;
-        hipR.rotation.x = BOUND_TRAIL_HIP_RAD;
-        if (kneeL !== null) kneeL.rotation.x = BOUND_TRAIL_KNEE_RAD;
-        if (kneeR !== null) kneeR.rotation.x = BOUND_TRAIL_KNEE_RAD;
-        // ... arms spread outward for balance, set slightly forward, curled.
-        if (shoulderL !== null) {
-          shoulderL.rotation.x = -BOUND_SHOULDER_SET_RAD;
-          shoulderL.rotation.z = -BOUND_ARM_SPREAD_RAD; // left arm opens -x
-        }
-        if (shoulderR !== null) {
-          shoulderR.rotation.x = -BOUND_SHOULDER_SET_RAD;
-          shoulderR.rotation.z = BOUND_ARM_SPREAD_RAD; // right arm opens +x
-        }
-        if (elbowL !== null) elbowL.rotation.x = ELBOW_REST_RAD + 0.35;
-        if (elbowR !== null) elbowR.rotation.x = ELBOW_REST_RAD + 0.35;
-      } else {
-        // The single grounded trough frame between bounds.
-        if (this.boundingFlight) {
-          // Touchdown edge: kick regolith dust, arm the compression crouch.
-          this.boundingFlight = false;
-          this.boundCrouchClock = BOUND_CROUCH_DURATION_S / 2;
-          this.triggerBootDustPuff();
-        }
-        hipL.rotation.x = 0;
-        hipR.rotation.x = 0;
-        if (kneeL !== null) kneeL.rotation.x = BOUND_TROUGH_KNEE_RAD;
-        if (kneeR !== null) kneeR.rotation.x = BOUND_TROUGH_KNEE_RAD;
-        if (shoulderL !== null) {
-          shoulderL.rotation.x = 0.1;
-          shoulderL.rotation.z = -BOUND_ARM_SPREAD_RAD * 0.5;
-        }
-        if (shoulderR !== null) {
-          shoulderR.rotation.x = 0.1;
-          shoulderR.rotation.z = BOUND_ARM_SPREAD_RAD * 0.5;
-        }
-        if (elbowL !== null) elbowL.rotation.x = ELBOW_REST_RAD + 0.5;
-        if (elbowR !== null) elbowR.rotation.x = ELBOW_REST_RAD + 0.5;
+      } else if (this.boundingFlight) {
+        // Touchdown edge: kick regolith dust at the EXACT world coordinates
+        // of the planting boot sole, and arm the compression crouch.
+        this.boundingFlight = false;
+        this.boundCrouchClock = BOUND_CROUCH_DURATION_S / 2;
+        this.triggerBootDustPuff(this.bootSoleWorldPos(state, strideLeg));
       }
-      torso.position.y = GEO.torso.y + crouch;
-      upper.position.y = crouch;
+      const pose = hurryStridePose(strideLeg, airborne);
+      hipL.rotation.x = pose.hipLx;
+      hipR.rotation.x = pose.hipRx;
+      if (kneeL !== null) kneeL.rotation.x = pose.kneeLx;
+      if (kneeR !== null) kneeR.rotation.x = pose.kneeRx;
+      // Arms in athletic sprint opposition, held in the sagittal plane
+      // (rotation.z parked — the Spec 28 balance spread is retired).
+      if (shoulderL !== null) {
+        shoulderL.rotation.x = pose.shoulderLx;
+        shoulderL.rotation.z = 0;
+      }
+      if (shoulderR !== null) {
+        shoulderR.rotation.x = pose.shoulderRx;
+        shoulderR.rotation.z = 0;
+      }
+      if (elbowL !== null) elbowL.rotation.x = pose.elbowLx;
+      if (elbowR !== null) elbowR.rotation.x = pose.elbowRx;
+      // Torso dynamics: 7° pitch into the thrust vector + 1.5° roll sway
+      // toward the stance hip; the upper body dips through the brace ramp
+      // (physics-reported compression) and the landing crouch envelope.
+      upper.rotation.x = pose.torsoPitchRad;
+      upper.rotation.z = pose.torsoRollRad;
+      const dip = crouch - (airborne ? 0 : (state.hurryBraceCompression ?? 0));
+      torso.position.y = GEO.torso.y + dip;
+      upper.position.y = dip;
       return;
     }
 
