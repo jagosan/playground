@@ -206,8 +206,8 @@ async function gateSuitAesthetic(): Promise<void> {
     `r=${GEO.torso.radius}`,
   );
   check(
-    'tapered build: chest plate + waist compression band present',
-    byName('chest-plate') !== undefined && byName('waist-band') !== undefined,
+    'composite build: pectoral carapace + tactical utility belt present (Spec 30 §2.1)',
+    byName('chest-carapace') !== undefined && byName('utility-belt') !== undefined,
   );
 
   // Articulated L/R arms: upper arm, forearm, cuff, gauntlet on each side.
@@ -242,19 +242,19 @@ async function gateSuitAesthetic(): Promise<void> {
   const tankL = byName('plss-tank-l');
   const tankR = byName('plss-tank-r');
   check(
-    `twin cryo-cylinder PLSS present (r ${GEO.plss.tank.radius}, h ${GEO.plss.tank.height})`,
+    `twin cryo-cylinder PLSS present (r ${GEO.plss.tank.radius}, h ${GEO.plss.tank.height}) — Spec 30 §2.1.1`,
     tankL !== undefined && tankR !== undefined
-      && GEO.plss.tank.radius === 0.08 && GEO.plss.tank.height === 0.52,
+      && GEO.plss.tank.radius === 0.085 && GEO.plss.tank.height === 0.5,
   );
   check(
-    'PLSS contour panel + radiator cowl + twin thruster nozzles',
-    byName('plss-panel') !== undefined && byName('plss-radiator-cowl') !== undefined
+    'PLSS contour pack + radiator cowl + twin thruster nozzles',
+    byName('plss-pack') !== undefined && byName('plss-radiator-cowl') !== undefined
       && byName('plss-nozzle-l') !== undefined && byName('plss-nozzle-r') !== undefined,
   );
   check(
-    'PLSS panel is a flush contour contour (depth 0.1 m, no monolithic box)',
-    GEO.plss.panel.depth === 0.1,
-    `depth=${GEO.plss.panel.depth}`,
+    'PLSS pack is a contour cowling into the back yoke (depth 0.14 m, no monolithic box)',
+    GEO.plss.pack.depth === 0.14,
+    `depth=${GEO.plss.pack.depth}`,
   );
 
   // Arm counter-swing active: walk the avatar, shoulders must move in

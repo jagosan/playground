@@ -7,14 +7,20 @@
  * integration, no duplicated SUIT_* constants. `update(dt, input)` steps the
  * owned suit once and copies the resulting `SuitState` onto the meshes.
  *
- * Meshes (procedural only, no GLB — Spec 28 §2.2 retro-modern slimmer
- * silhouette): tapered torso capsule with chest plate and waist compression
- * band, aerodynamic bubble helmet with panoramic gold-sputtered visor,
- * contour PLSS pack with twin oxygen cryo-cylinders, central radiator cowl
- * and lower thruster nozzles, flush chest telemetry pad, dual arm
- * assemblies (upper arm, forearm, gauntlet + cuff) and slender leg
- * assemblies (thigh, knee armour, calf, boot), hung on shoulder/elbow/hip/
- * knee pivots, plus the helmet SpotLight — 28 meshes in `getMeshes()`.
+ * Meshes (procedural only, no GLB — Spec 30 §2.1 Stormtrooper stylized
+ * composite armor carapace): muscular gasket undersuit core under a flared
+ * pectoral chestplate with chiseled facets and trapezoidal sternum relief, a
+ * 4-tier segmented abdominal rib cuirass, tactical utility belt with buckle,
+ * codpiece and twin flank O2 canisters, an integrated PLSS backpack contouring
+ * into the back yoke with twin cryo-cylinders, radiator cowl and downward
+ * vector nozzles, a spherical helmet with raked brow rim, twin chin aerator
+ * pods and vocoder grille over the panoramic gold visor, flared pauldron
+ * shoulder bells on a 0.52 m shoulder stance, bicep cuffs, vambraces, heavy
+ * magnetic gauntlet cuffs and articulated gloves, thigh cuirasses with
+ * angular knee cops and strike plates, sculpted shin greaves and chunky
+ * treaded magnetic boots with widened soles and aft heel spurs — 56
+ * meshes in `getMeshes()`, bound to the four-material Spec 30 two-tone PBR
+ * palette.
  *
  * Frame convention matches TraversalPhysics / CameraRig: world metres
  * (x, y lateral, z up) map to Babylon (x, z↑, -y) via the shared
@@ -263,37 +269,56 @@ export interface EvaSuitTelemetry {
 }
 
 /**
- * Body geometry, metres. Local frame: +y up, +z is the helmet facing.
- * Spec 28 §2.2 retro-modern slimmer silhouette — exported so smoke
- * harnesses assert the aesthetic gates (torso r ≤ 0.22, visor d ≥ 0.34,
- * twin cryo-cylinder r 0.08 / h 0.52) against the live build.
+ * Body geometry, metres (Spec 30 §2.1 Stormtrooper stylized armor contract —
+ * blueprint §2.2). Local frame: +y up, +z is the helmet facing. Exported so
+ * smoke harnesses assert the aesthetic gates against the live build:
+ * pectoral carapace 0.38 × 0.32 × 0.16, abdominal cuirass tapering
+ * 0.32 → 0.28, belt h 0.08 / d 0.32, pauldron bells r 0.09 flared 15° on a
+ * shoulderDx 0.26 (0.52 m) stance, thigh cuirass r 0.115 / h 0.34, knee cop
+ * 0.14 × 0.12 × 0.12, greave r 0.10 / h 0.26, boot 0.14 × 0.11 × 0.26,
+ * twin cryo-cylinders r 0.085 / h 0.50, visor aperture w 0.34 / h 0.22.
  */
 export const GEO = {
-  torso: { radius: 0.2, height: 0.92, y: 0.84 },
-  chestPlate: { y: 1.02, z: 0.185, width: 0.3, height: 0.28, depth: 0.07 },
-  waistBand: { y: 0.6, diameter: 0.44, height: 0.09 },
-  helmet: { y: 1.56, diameter: 0.38 },
-  visor: { y: 1.575, z: 0.075, diameter: 0.36, sx: 0.92, sy: 0.65, sz: 0.95 },
-  telemetry: { y: 1.04, z: 0.235, width: 0.16, height: 0.12, depth: 0.03 },
+  torso: { y: 0.98, radius: 0.18, height: 0.58 },
+  pectoralPlate: { y: 1.12, z: 0.09, width: 0.38, height: 0.32, depth: 0.16 },
+  pectoralFacet: { y: 1.17, z: 0.168, dx: 0.105, width: 0.14, height: 0.1, depth: 0.05 },
+  sternumPlate: { y: 1.12, z: 0.148, diameterTop: 0.075, diameterBottom: 0.13, height: 0.2, depthScale: 0.62 },
+  abdominalRibs: { y: 0.92, z: 0.055, width: 0.32, waistWidth: 0.28, height: 0.22, depth: 0.15, tiers: 4 },
+  utilityBelt: { y: 0.74, width: 0.34, height: 0.08, depth: 0.32 },
+  beltBuckle: { y: 0.74, z: 0.176, width: 0.09, height: 0.06, depth: 0.035 },
+  codpiece: { y: 0.68, z: 0.11, width: 0.16, height: 0.16, depth: 0.1 },
+  beltCanister: { y: 0.74, dx: 0.18, radius: 0.045, height: 0.14 },
+  helmet: { y: 1.48, diameter: 0.38, browRakeDeg: 5 },
+  browRim: { y: 1.565, z: 0.035, diameter: 0.33, tube: 0.03 },
+  visor: { y: 1.46, z: 0.075, diameter: 0.36, width: 0.34, height: 0.22, sx: 0.944, sy: 0.611, sz: 0.96 },
+  chinAerator: { y: 1.35, z: 0.128, dx: 0.085, radius: 0.035, length: 0.06 },
+  vocoder: { y: 1.315, z: 0.105, width: 0.06, height: 0.05, depth: 0.04 },
   plss: {
-    panel: { y: 1.06, z: -0.26, width: 0.36, height: 0.66, depth: 0.1 },
-    tank: { y: 1.08, z: -0.4, dx: 0.115, radius: 0.08, height: 0.52 },
-    cowl: { y: 1.08, z: -0.44, width: 0.14, height: 0.46, depth: 0.14 },
-    nozzle: { y: 0.8, z: -0.38, dx: 0.09, diameter: 0.09, length: 0.12, tilt: 0.7 },
+    pack: { y: 1.06, z: -0.24, width: 0.38, height: 0.6, depth: 0.14 },
+    tank: { y: 1.08, z: -0.395, dx: 0.12, radius: 0.085, height: 0.5 },
+    cowl: { y: 1.08, z: -0.46, width: 0.16, height: 0.46, depth: 0.15 },
+    nozzle: { y: 0.78, z: -0.4, dx: 0.1, diameter: 0.09, length: 0.12, tilt: 0.7 },
   },
   arm: {
-    shoulderY: 1.22, shoulderDx: 0.235,
-    upperRadius: 0.07, upperHeight: 0.32,
-    forearmRadius: 0.065, forearmHeight: 0.28,
-    cuffDiameter: 0.13, cuffHeight: 0.055,
-    glove: { width: 0.1, height: 0.16, depth: 0.085 },
+    shoulderY: 1.22, shoulderDx: 0.26,
+    pauldron: { radius: 0.09, height: 0.14, flareDeg: 15 },
+    upperRadius: 0.062, upperHeight: 0.3,
+    bicepRadius: 0.08, bicepHeight: 0.18,
+    forearmRadius: 0.06, forearmHeight: 0.28,
+    vambraceRadius: 0.075, vambraceHeight: 0.18,
+    cuffDiameter: 0.14, cuffHeight: 0.06,
+    glove: { width: 0.11, height: 0.16, depth: 0.09 },
   },
   leg: {
-    hipY: 0.66, hipDx: 0.105,
-    thighRadius: 0.095, thighHeight: 0.36,
-    kneeDiameter: 0.13, kneeWidth: 0.11,
-    calfRadius: 0.08, calfHeight: 0.24,
-    boot: { width: 0.11, height: 0.1, depth: 0.22 },
+    hipY: 0.66, hipDx: 0.12,
+    thighRadius: 0.115, thighTopRadius: 0.105, thighHeight: 0.34,
+    kneeCop: { y: 0.01, z: 0.055, width: 0.14, height: 0.12, depth: 0.12 },
+    strikePlate: { y: 0.01, z: 0.13, width: 0.1, height: 0.09, depth: 0.035 },
+    greaveRadius: 0.1, greaveTopRadius: 0.0925, greaveHeight: 0.26,
+    calfRadius: 0.08, calfHeight: 0.26,
+    boot: { y: -0.235, z: 0.02, width: 0.14, height: 0.11, depth: 0.26 },
+    sole: { y: -0.305, z: 0.02, width: 0.16, height: 0.03, depth: 0.28 },
+    spur: { y: -0.27, z: -0.135, width: 0.09, height: 0.05, depth: 0.07 },
   },
 } as const;
 
@@ -315,7 +340,7 @@ export class EvaSuitAvatar {
   private ownedEngine: AbstractEngine | null = null;
 
   private root: TransformNode | null = null;
-  /** Upper-body pivot (helmet, visor, chest plate, PLSS, arms) — takes the walk bob. */
+  /** Upper-body pivot (helmet, visor, chest carapace, PLSS, arms) — takes the walk bob. */
   private upperBody: TransformNode | null = null;
   private parts: Mesh[] = [];
   private visor: Mesh | null = null;
@@ -323,7 +348,7 @@ export class EvaSuitAvatar {
   /** Hip pivots swing the leg assemblies in counter-phase (Spec 28 §2.2/§2.3). */
   private hipL: TransformNode | null = null;
   private hipR: TransformNode | null = null;
-  /** Knee pivots flex the calf+boot during the swing phase. */
+  /** Knee pivots flex the greave+boot stack during the swing phase. */
   private kneeL: TransformNode | null = null;
   private kneeR: TransformNode | null = null;
   /** Shoulder pivots swing the arms in natural opposition to the legs. */
@@ -720,44 +745,54 @@ export class EvaSuitAvatar {
   // -- internals --------------------------------------------------------------
 
   /**
-   * Procedural retro-modern astronaut (Spec 28 §2.2): slim tapered torso +
-   * chest plate + waist band, bubble helmet + panoramic gold visor, twin-tank
-   * contour PLSS, flush telemetry pad, dual arms and slender legs on
-   * shoulder/elbow/hip/knee pivots, plus the helmet projector lamp.
+   * Procedural Stormtrooper composite armor (Spec 30 §2.1): muscular gasket
+   * core under a flared pectoral carapace with sternum relief and chiseled
+   * facets, 4-tier abdominal rib cuirass, tactical belt + buckle + codpiece +
+   * twin flank canisters, contour PLSS pack with twin cryo-cylinders, cowl
+   * and downward vector nozzles, raked-brow helmet with chin aerators and
+   * vocoder grille over the panoramic gold visor, flared pauldrons on a
+   * 0.52 m shoulder stance, bicep cuffs / vambraces / magnetic gauntlets /
+   * gloves, thigh cuirasses with knee cops and strike plates, greaves and
+   * heavy treaded magnetic boots with widened soles and aft heel spurs —
+   * bound to the two-tone armor-white / undersuit-gasket / trim-hardware /
+   * visor-gold PBR palette.
    */
   private buildAvatar(scene: Scene): void {
     const p = this.prefix;
     const g = GEO;
 
-    // -- three-tier PBR material system (Spec 28 §2.2) ------------------------
-    const fabric = new PBRMaterial(`${p}-fabric-white`, scene);
-    fabric.albedoColor = new Color3(0.88, 0.88, 0.86); // high-density composite weave
-    fabric.metallic = 0.02;
-    fabric.roughness = 0.65;
-    fabric.environmentIntensity = 0.05; // vacuum: almost nothing to reflect
+    // -- Spec 30 §2.1.4 two-tone high-contrast PBR material system -----------
+    const armor = new PBRMaterial(`${p}-armor-white`, scene);
+    // High-gloss composite ceramic armor plating.
+    armor.albedoColor = new Color3(0.95, 0.95, 0.96);
+    armor.metallic = 0.08;
+    armor.roughness = 0.22;
+    armor.environmentIntensity = 0.05; // vacuum: almost nothing to reflect
+
+    const gasket = new PBRMaterial(`${p}-undersuit-gasket`, scene);
+    // Matte charcoal ribbed flexible joint seal.
+    gasket.albedoColor = new Color3(0.12, 0.12, 0.14);
+    gasket.metallic = 0.02;
+    gasket.roughness = 0.85;
+    gasket.environmentIntensity = 0.05;
 
     const hardware = new PBRMaterial(`${p}-trim-hardware`, scene);
-    hardware.albedoColor = new Color3(0.25, 0.26, 0.28); // matte slate titanium
-    hardware.metallic = 0.72;
-    hardware.roughness = 0.42;
+    // Dark titanium latches, aerators and belt hardware.
+    hardware.albedoColor = new Color3(0.22, 0.23, 0.25);
+    hardware.metallic = 0.8;
+    hardware.roughness = 0.35;
     hardware.environmentIntensity = 0.05;
-
-    const accent = new PBRMaterial(`${p}-trim-accent`, scene);
-    accent.albedoColor = new Color3(0.92, 0.42, 0.12); // mission safety orange
-    accent.metallic = 0.35;
-    accent.roughness = 0.4;
-    accent.environmentIntensity = 0.05;
 
     const gold = new PBRMaterial(`${p}-visor-gold`, scene);
     // Apollo EVA gold-sputtered sun visor: high-reflectivity mirror metal
-    // with a subtle amber interior glow (TASK-PLAY-060 / Spec 28 §2.2).
-    gold.albedoColor = new Color3(0.95, 0.78, 0.25);
+    // with a subtle amber interior glow (TASK-PLAY-060 / Spec 30 §2.1.4).
+    gold.albedoColor = new Color3(0.96, 0.8, 0.28);
     gold.metallic = 0.98;
-    gold.roughness = 0.08;
+    gold.roughness = 0.06;
     gold.emissiveColor = new Color3(0.12, 0.08, 0.02);
     gold.environmentIntensity = 0.05;
 
-    this.materials = [fabric, hardware, accent, gold];
+    this.materials = [armor, gasket, hardware, gold];
     this.root = new TransformNode(`${p}-avatar`, scene);
     const upperBody = new TransformNode(`${p}-upper-body`, scene);
     upperBody.parent = this.root;
@@ -781,71 +816,205 @@ export class EvaSuitAvatar {
       return mesh;
     };
 
-    // -- torso: slender tapered capsule + articulated chest plate + band -----
+    // -- torso core: muscular gasket body under the composite carapace ------
     const torso = add(
       MeshBuilder.CreateCapsule(
         `${p}-torso`,
         { radius: g.torso.radius, height: g.torso.height },
         scene,
       ),
-      fabric,
+      gasket,
       this.root,
       0,
       g.torso.y,
       0,
     );
+
+    // Flared pectoral chestplate carapace (0.38 × 0.32 × 0.16, Spec 30 §2.1.1).
     add(
       MeshBuilder.CreateBox(
-        `${p}-chest-plate`,
-        { width: g.chestPlate.width, height: g.chestPlate.height, depth: g.chestPlate.depth },
+        `${p}-chest-carapace`,
+        { width: g.pectoralPlate.width, height: g.pectoralPlate.height, depth: g.pectoralPlate.depth },
         scene,
       ),
-      hardware,
+      armor,
       upperBody,
       0,
-      g.chestPlate.y,
-      g.chestPlate.z,
+      g.pectoralPlate.y,
+      g.pectoralPlate.z,
     );
-    // Low-profile flush telemetry slate integrated onto the breastplate.
-    add(
-      MeshBuilder.CreateBox(
-        `${p}-telemetry-pad`,
-        { width: g.telemetry.width, height: g.telemetry.height, depth: g.telemetry.depth },
-        scene,
-      ),
-      accent,
-      upperBody,
-      0,
-      g.telemetry.y,
-      g.telemetry.z,
-    );
-    // Waist compression band (trim ring around the hips).
-    add(
+    // Chiseled pectoral facets — angled slivers over each breast plate.
+    for (const side of ['l', 'r'] as const) {
+      const sign = side === 'l' ? -1 : 1;
+      const facet = add(
+        MeshBuilder.CreateBox(
+          `${p}-chest-facet-${side}`,
+          { width: g.pectoralFacet.width, height: g.pectoralFacet.height, depth: g.pectoralFacet.depth },
+          scene,
+        ),
+        armor,
+        upperBody,
+        sign * g.pectoralFacet.dx,
+        g.pectoralFacet.y,
+        g.pectoralFacet.z,
+      );
+      facet.rotation.x = -0.16; // chiseled outward bevel
+      facet.rotation.z = sign * -0.14;
+    }
+    // Central trapezoidal sternum relief — square-frustum ridge tapering
+    // upward, diamond-cut along the facing axis (Spec 30 §2.1.1).
+    const sternum = add(
       MeshBuilder.CreateCylinder(
-        `${p}-waist-band`,
-        { diameter: g.waistBand.diameter, height: g.waistBand.height },
+        `${p}-sternum-plate`,
+        {
+          diameterTop: g.sternumPlate.diameterTop,
+          diameterBottom: g.sternumPlate.diameterBottom,
+          height: g.sternumPlate.height,
+          tessellation: 4,
+        },
+        scene,
+      ),
+      armor,
+      upperBody,
+      0,
+      g.sternumPlate.y,
+      g.sternumPlate.z,
+    );
+    sternum.scaling.z = g.sternumPlate.depthScale;
+
+    // 4-tier segmented abdominal rib gasket cuirass, tapering 0.32 → 0.28
+    // toward the waist for the athletic V-taper (Spec 30 §2.1.1).
+    const ribs = g.abdominalRibs;
+    const tierH = ribs.height / ribs.tiers - 0.01; // 0.01 m segmented gap
+    for (let i = 0; i < ribs.tiers; i++) {
+      const w = ribs.width - (ribs.width - ribs.waistWidth) * (i / (ribs.tiers - 1));
+      add(
+        MeshBuilder.CreateBox(
+          `${p}-abdomen-rib-${i + 1}`,
+          { width: w, height: tierH, depth: ribs.depth },
+          scene,
+        ),
+        gasket,
+        upperBody,
+        0,
+        ribs.y + ribs.height / 2 - ribs.height * ((i + 0.5) / ribs.tiers),
+        ribs.z,
+      );
+    }
+
+    // -- tactical utility belt, buckle, codpiece, flank canisters ----------
+    add(
+      MeshBuilder.CreateBox(
+        `${p}-utility-belt`,
+        { width: g.utilityBelt.width, height: g.utilityBelt.height, depth: g.utilityBelt.depth },
+        scene,
+      ),
+      armor,
+      this.root,
+      0,
+      g.utilityBelt.y,
+      0,
+    );
+    add(
+      MeshBuilder.CreateBox(
+        `${p}-belt-buckle`,
+        { width: g.beltBuckle.width, height: g.beltBuckle.height, depth: g.beltBuckle.depth },
         scene,
       ),
       hardware,
       this.root,
       0,
-      g.waistBand.y,
-      0,
+      g.beltBuckle.y,
+      g.beltBuckle.z,
     );
+    add(
+      MeshBuilder.CreateBox(
+        `${p}-codpiece`,
+        { width: g.codpiece.width, height: g.codpiece.height, depth: g.codpiece.depth },
+        scene,
+      ),
+      armor,
+      this.root,
+      0,
+      g.codpiece.y,
+      g.codpiece.z,
+    );
+    // Twin flank utility canisters — emergency O2 reserves (r 0.045, h 0.14).
+    for (const side of ['l', 'r'] as const) {
+      const sign = side === 'l' ? -1 : 1;
+      add(
+        MeshBuilder.CreateCylinder(
+          `${p}-belt-canister-${side}`,
+          { diameter: g.beltCanister.radius * 2, height: g.beltCanister.height, tessellation: 12 },
+          scene,
+        ),
+        hardware,
+        this.root,
+        sign * g.beltCanister.dx,
+        g.beltCanister.y,
+        0,
+      );
+    }
 
-    // -- helmet & panoramic gold visor ----------------------------------------
+    // -- helmet: raked brow dome, chin aerators, vocoder, gold visor --------
     add(
       MeshBuilder.CreateSphere(
         `${p}-helmet`,
         { diameter: g.helmet.diameter, segments: 20 },
         scene,
       ),
-      fabric,
+      armor,
       upperBody,
       0,
       g.helmet.y,
       0,
     );
+    // Extended downward-slanted brow rim, 5° forward rake (Spec 30 §2.1.3).
+    const brow = add(
+      MeshBuilder.CreateTorus(
+        `${p}-helmet-brow`,
+        { diameter: g.browRim.diameter, thickness: g.browRim.tube, tessellation: 24 },
+        scene,
+      ),
+      armor,
+      upperBody,
+      0,
+      g.browRim.y,
+      g.browRim.z,
+    );
+    brow.rotation.x = (g.helmet.browRakeDeg * Math.PI) / 180;
+    // Twin cylindrical respirator aerator pods at the lower chin flanks.
+    for (const side of ['l', 'r'] as const) {
+      const sign = side === 'l' ? -1 : 1;
+      const aerator = add(
+        MeshBuilder.CreateCylinder(
+          `${p}-helmet-aerator-${side}`,
+          { diameter: g.chinAerator.radius * 2, height: g.chinAerator.length, tessellation: 14 },
+          scene,
+        ),
+        hardware,
+        upperBody,
+        sign * g.chinAerator.dx,
+        g.chinAerator.y,
+        g.chinAerator.z,
+      );
+      aerator.rotation.x = Math.PI / 2; // nozzle axis along the facing axis
+    }
+    // Central dark vocoder speaker grille between the aerators.
+    add(
+      MeshBuilder.CreateBox(
+        `${p}-helmet-vocoder`,
+        { width: g.vocoder.width, height: g.vocoder.height, depth: g.vocoder.depth },
+        scene,
+      ),
+      hardware,
+      upperBody,
+      0,
+      g.vocoder.y,
+      g.vocoder.z,
+    );
+    // Panoramic gold-sputtered visor aperture w 0.34 / h 0.22, recessed
+    // beneath the armored brow.
     const visor = add(
       MeshBuilder.CreateSphere(
         `${p}-visor`,
@@ -861,18 +1030,18 @@ export class EvaSuitAvatar {
     visor.scaling.set(g.visor.sx, g.visor.sy, g.visor.sz);
     this.visor = visor;
 
-    // -- PLSS: contour pack, twin cryo-cylinders, cowl, nozzles --------------
+    // -- PLSS: contour pack into the back yoke, twin cryo-cylinders ---------
     add(
       MeshBuilder.CreateBox(
-        `${p}-plss-panel`,
-        { width: g.plss.panel.width, height: g.plss.panel.height, depth: g.plss.panel.depth },
+        `${p}-plss-pack`,
+        { width: g.plss.pack.width, height: g.plss.pack.height, depth: g.plss.pack.depth },
         scene,
       ),
-      fabric,
+      armor,
       upperBody,
       0,
-      g.plss.panel.y,
-      g.plss.panel.z,
+      g.plss.pack.y,
+      g.plss.pack.z,
     );
     const tank = g.plss.tank;
     add(
@@ -939,7 +1108,7 @@ export class EvaSuitAvatar {
     );
     nozzleR.rotation.x = noz.tilt;
 
-    // -- arms: shoulder → upper arm → elbow → forearm + cuff + gauntlet ------
+    // -- arms: pauldron → bicep → elbow → vambrace + gauntlet cuff + glove --
     const buildArm = (side: 'l' | 'r'): {
       shoulder: TransformNode;
       elbow: TransformNode;
@@ -948,16 +1117,49 @@ export class EvaSuitAvatar {
       const shoulder = new TransformNode(`${p}-shoulder-${side}`, scene);
       shoulder.parent = upperBody;
       shoulder.position.set(sign * g.arm.shoulderDx, g.arm.shoulderY, 0);
+      // Curved shoulder bell (pauldron), flared 15° outward off the pivot.
+      const pauldronFlare = (g.arm.pauldron.flareDeg * Math.PI) / 180;
+      const pauldron = add(
+        MeshBuilder.CreateCylinder(
+          `${p}-pauldron-${side}`,
+          {
+            diameterTop: (g.arm.pauldron.radius - Math.tan(pauldronFlare) * g.arm.pauldron.height) * 2,
+            diameterBottom: g.arm.pauldron.radius * 2,
+            height: g.arm.pauldron.height,
+            tessellation: 20,
+          },
+          scene,
+        ),
+        armor,
+        shoulder,
+        0,
+        -0.015,
+        0,
+      );
+      pauldron.rotation.z = -sign * pauldronFlare; // bell opens down-and-out
       add(
         MeshBuilder.CreateCapsule(
           `${p}-arm-upper-${side}`,
           { radius: g.arm.upperRadius, height: g.arm.upperHeight },
           scene,
         ),
-        fabric,
+        gasket,
         shoulder,
         0,
         -g.arm.upperHeight / 2,
+        0,
+      );
+      // Armored bicep cuff cuff (r 0.08).
+      add(
+        MeshBuilder.CreateCylinder(
+          `${p}-arm-bicep-${side}`,
+          { diameter: g.arm.bicepRadius * 2, height: g.arm.bicepHeight, tessellation: 16 },
+          scene,
+        ),
+        armor,
+        shoulder,
+        0,
+        -0.10,
         0,
       );
       const elbow = new TransformNode(`${p}-elbow-${side}`, scene);
@@ -970,35 +1172,50 @@ export class EvaSuitAvatar {
           { radius: g.arm.forearmRadius, height: g.arm.forearmHeight },
           scene,
         ),
-        fabric,
+        gasket,
         elbow,
         0,
         -g.arm.forearmHeight / 2,
         0,
       );
+      // Contoured forearm vambrace (r 0.075).
+      add(
+        MeshBuilder.CreateCylinder(
+          `${p}-arm-vambrace-${side}`,
+          { diameter: g.arm.vambraceRadius * 2, height: g.arm.vambraceHeight, tessellation: 16 },
+          scene,
+        ),
+        armor,
+        elbow,
+        0,
+        -0.18,
+        0.004,
+      );
+      // Heavy magnetic gauntlet cuff (d 0.14).
       add(
         MeshBuilder.CreateCylinder(
           `${p}-arm-cuff-${side}`,
-          { diameter: g.arm.cuffDiameter, height: g.arm.cuffHeight },
+          { diameter: g.arm.cuffDiameter, height: g.arm.cuffHeight, tessellation: 16 },
           scene,
         ),
-        accent,
+        hardware,
         elbow,
         0,
-        -(g.arm.forearmHeight - g.arm.cuffHeight / 2 - 0.005),
+        -(g.arm.forearmHeight - 0.02),
         0,
       );
+      // Articulated glove mesh below the gauntlet cuff.
       add(
         MeshBuilder.CreateBox(
           `${p}-arm-glove-${side}`,
           { width: g.arm.glove.width, height: g.arm.glove.height, depth: g.arm.glove.depth },
           scene,
         ),
-        fabric,
+        armor,
         elbow,
         0,
-        -(g.arm.forearmHeight + g.arm.glove.height / 2 - g.arm.cuffHeight),
-        0.005,
+        -(g.arm.forearmHeight + g.arm.glove.height / 2 - 0.06),
+        0.01,
       );
       return { shoulder, elbow };
     };
@@ -1009,7 +1226,7 @@ export class EvaSuitAvatar {
     this.shoulderR = armR.shoulder;
     this.elbowR = armR.elbow;
 
-    // -- legs: hip → thigh + knee armour → knee pivot → calf + boot ----------
+    // -- legs: hip → thigh cuirass + knee cop/strike → knee → greave + boot -
     const buildLeg = (side: 'l' | 'r'): {
       hip: TransformNode;
       knee: TransformNode;
@@ -1018,32 +1235,49 @@ export class EvaSuitAvatar {
       const hip = new TransformNode(`${p}-hip-${side}`, scene);
       hip.parent = this.root;
       hip.position.set(sign * g.leg.hipDx, g.leg.hipY, 0);
+      // Flared thigh cuirass sleeve (r 0.115, h 0.34) over the upper leg.
       add(
-        MeshBuilder.CreateCapsule(
+        MeshBuilder.CreateCylinder(
           `${p}-leg-thigh-${side}`,
-          { radius: g.leg.thighRadius, height: g.leg.thighHeight },
+          {
+            diameterTop: g.leg.thighTopRadius * 2,
+            diameterBottom: g.leg.thighRadius * 2,
+            height: g.leg.thighHeight,
+            tessellation: 18,
+          },
           scene,
         ),
-        fabric,
+        armor,
         hip,
         0,
         -g.leg.thighHeight / 2,
         0,
       );
-      // Armoured knee articulator (x-axis drum), carried with the thigh.
-      const kneeCap = add(
-        MeshBuilder.CreateCylinder(
-          `${p}-leg-knee-${side}`,
-          { diameter: g.leg.kneeDiameter, height: g.leg.kneeWidth },
+      // Prominent angular knee cop with forward strike plate (Spec 30 §2.1.2).
+      add(
+        MeshBuilder.CreateBox(
+          `${p}-leg-kneecop-${side}`,
+          { width: g.leg.kneeCop.width, height: g.leg.kneeCop.height, depth: g.leg.kneeCop.depth },
+          scene,
+        ),
+        armor,
+        hip,
+        0,
+        -g.leg.thighHeight + g.leg.kneeCop.y,
+        g.leg.kneeCop.z,
+      );
+      add(
+        MeshBuilder.CreateBox(
+          `${p}-leg-strikeplate-${side}`,
+          { width: g.leg.strikePlate.width, height: g.leg.strikePlate.height, depth: g.leg.strikePlate.depth },
           scene,
         ),
         hardware,
         hip,
         0,
-        -g.leg.thighHeight,
-        0,
+        -g.leg.thighHeight + g.leg.strikePlate.y,
+        g.leg.strikePlate.z,
       );
-      kneeCap.rotation.z = Math.PI / 2; // drum axis across the body
       const knee = new TransformNode(`${p}-kneejoint-${side}`, scene);
       knee.parent = hip;
       knee.position.set(0, -g.leg.thighHeight, 0);
@@ -1053,24 +1287,68 @@ export class EvaSuitAvatar {
           { radius: g.leg.calfRadius, height: g.leg.calfHeight },
           scene,
         ),
-        fabric,
+        gasket,
         knee,
         0,
         -g.leg.calfHeight / 2,
         0,
       );
-      // Treaded lunar boot (0.11 m across, 0.22 m long), toe forward.
+      // Sculpted shin greave (r 0.10, h 0.26).
+      add(
+        MeshBuilder.CreateCylinder(
+          `${p}-leg-greave-${side}`,
+          {
+            diameterTop: g.leg.greaveTopRadius * 2,
+            diameterBottom: g.leg.greaveRadius * 2,
+            height: g.leg.greaveHeight,
+            tessellation: 18,
+          },
+          scene,
+        ),
+        armor,
+        knee,
+        0,
+        -g.leg.greaveHeight / 2 + 0.005,
+        0.008,
+      );
+      // Chunky treaded magnetic boot (0.14 × 0.11 × 0.26), toe forward.
       add(
         MeshBuilder.CreateBox(
           `${p}-leg-boot-${side}`,
           { width: g.leg.boot.width, height: g.leg.boot.height, depth: g.leg.boot.depth },
           scene,
         ),
+        armor,
+        knee,
+        0,
+        g.leg.boot.y,
+        g.leg.boot.z,
+      );
+      // Widened ground-contact sole.
+      add(
+        MeshBuilder.CreateBox(
+          `${p}-leg-sole-${side}`,
+          { width: g.leg.sole.width, height: g.leg.sole.height, depth: g.leg.sole.depth },
+          scene,
+        ),
         hardware,
         knee,
         0,
-        -(g.leg.calfHeight + g.leg.boot.height / 2 - g.leg.calfRadius),
-        0.02,
+        g.leg.sole.y,
+        g.leg.sole.z,
+      );
+      // Aft heel spur.
+      add(
+        MeshBuilder.CreateBox(
+          `${p}-leg-spur-${side}`,
+          { width: g.leg.spur.width, height: g.leg.spur.height, depth: g.leg.spur.depth },
+          scene,
+        ),
+        hardware,
+        knee,
+        0,
+        g.leg.spur.y,
+        g.leg.spur.z,
       );
       return { hip, knee };
     };

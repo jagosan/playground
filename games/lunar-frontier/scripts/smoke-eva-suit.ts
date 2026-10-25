@@ -4,7 +4,8 @@
  * Boots `EvaSuitAvatar` headless (self-owned NullEngine + explicit
  * NullEngine injection) and verifies:
  *
- *   1. Build: avatar constructs without a DOM, 7 procedural meshes, root
+ *   1. Build: avatar constructs without a DOM, 56 procedural meshes
+ *      (Spec 30 §2.1 Stormtrooper armor), root
  *      node + helmet SpotLight present, idempotent init.
  *   2. Physics delegation: identical inputs on the avatar and on a bare
  *      `LunarEvaSuit` produce bit-identical states (the wrapper adds no
@@ -85,10 +86,14 @@ check('no meshes before init', avatar.isBuilt() === false && avatar.getMeshes().
 avatar.init(); // no args → self-owned NullEngine fallback
 check('init() builds under NullEngine', avatar.isBuilt() === true);
 check('init() is idempotent', avatar.init().isBuilt() === true);
-// Spec 28 Phase 3 re-cut: the retro-modern slimmer suit (torso + chest plate
-// + waist band, helmet + visor, twin-tank PLSS panel/cowl/nozzles, telemetry
-// pad, 2×4 arm meshes, 2×4 leg meshes) replaces the old 7-mesh blocky build.
-check('28 procedural meshes (Spec 28 §2.2 build)', avatar.getMeshes().length === 28, `got ${avatar.getMeshes().length}`);
+// Spec 30 Phase 2 re-cut: the Stormtrooper composite armor build replaces the
+// Spec 28 retro-modern slim suit — gasket core + pectoral carapace/sternum/
+// facets + 4-tier abdominal cuirass + belt/buckle/codpiece/canisters, helmet
+// with brow rim/aerators/vocoder + gold visor, PLSS pack/tanks/cowl/nozzles,
+// 2×7 arm meshes (pauldron/bicep/vambrace/gauntlet) and 2×8 leg meshes
+// (cuirass/knee cop/strike plate/greave/boot/sole/spur). Gate 1: ≥ 32 parts.
+check('56 procedural meshes, gate ≥ 32 (Spec 30 §2.1 build)', avatar.getMeshes().length === 56
+  && avatar.getMeshes().length >= 32, `got ${avatar.getMeshes().length}`);
 check('all meshes named eva-*', avatar.getMeshes().every((m) => m.name.startsWith('eva-')));
 check('root transform node present', avatar.getRootNode() !== null);
 check('helmet spotlight present', avatar.getHeadlight() !== null);
@@ -96,58 +101,107 @@ check('lit at spawn by default', avatar.isHeadlightOn() === true);
 check('scene exposed', avatar.getScene() !== null);
 
 // ---------------------------------------------------------------------------
-// 1b. Spec 28 §2.2 retro-modern suit contract (Phase 3)
+// 1b. Spec 30 §2.1 Stormtrooper armor contract (Phase 2)
 // ---------------------------------------------------------------------------
-section('1b. Spec 28 §2.2 retro-modern geometry & materials');
+section('1b. Spec 30 §2.1 Stormtrooper armor geometry & materials');
 
 {
   const meshes = avatar.getMeshes();
   const byName = (n: string): Mesh | undefined => meshes.find((m) => m.name === `eva-${n}`);
-  check('slim tapered torso r 0.20 (gate ≤ 0.22), h 0.92, y 0.84',
-    GEO.torso.radius === 0.2 && GEO.torso.radius <= 0.22 && GEO.torso.height === 0.92 && GEO.torso.y === 0.84
-    && byName('torso') !== undefined && byName('chest-plate') !== undefined && byName('waist-band') !== undefined,
+  check('gasket torso core r 0.18 (gate ≤ 0.22), h 0.58, y 0.98 + carapace present',
+    GEO.torso.radius === 0.18 && GEO.torso.radius <= 0.22 && GEO.torso.height === 0.58 && GEO.torso.y === 0.98
+    && byName('torso') !== undefined && byName('chest-carapace') !== undefined
+    && byName('utility-belt') !== undefined && byName('codpiece') !== undefined,
     `r=${GEO.torso.radius} h=${GEO.torso.height} y=${GEO.torso.y}`);
-  check('left + right arm assemblies (upper, forearm, glove) present',
-    ['arm-upper-l', 'arm-forearm-l', 'arm-glove-l', 'arm-upper-r', 'arm-forearm-r', 'arm-glove-r']
-      .every((n) => byName(n) !== undefined));
-  check('bubble helmet d 0.38 + panoramic visor d 0.36 (gate ≥ 0.34)',
-    GEO.helmet.diameter === 0.38 && GEO.visor.diameter === 0.36 && GEO.visor.diameter >= 0.34
-    && byName('helmet') !== undefined && byName('visor') !== undefined);
+  check('pectoral carapace 0.38 × 0.32 × 0.16 + sternum relief + chiseled facets',
+    GEO.pectoralPlate.width === 0.38 && GEO.pectoralPlate.height === 0.32 && GEO.pectoralPlate.depth === 0.16
+    && byName('sternum-plate') !== undefined && byName('chest-facet-l') !== undefined
+    && byName('chest-facet-r') !== undefined);
+  check('4-tier abdominal rib cuirass tapering 0.32 → 0.28',
+    GEO.abdominalRibs.tiers === 4 && GEO.abdominalRibs.width === 0.32 && GEO.abdominalRibs.waistWidth === 0.28
+    && GEO.abdominalRibs.height === 0.22
+    && [1, 2, 3, 4].every((i) => byName(`abdomen-rib-${i}`) !== undefined));
+  check('tactical belt h 0.08 d 0.32 + buckle + twin flank canisters r 0.045 h 0.14',
+    GEO.utilityBelt.height === 0.08 && GEO.utilityBelt.depth === 0.32
+    && byName('belt-buckle') !== undefined
+    && GEO.beltCanister.radius === 0.045 && GEO.beltCanister.height === 0.14
+    && byName('belt-canister-l') !== undefined && byName('belt-canister-r') !== undefined);
+  check('flared pauldron bells r 0.09 h 0.14 @15° on a 0.52 m shoulder stance (gate ≥ 0.48)',
+    GEO.arm.pauldron.radius === 0.09 && GEO.arm.pauldron.height === 0.14 && GEO.arm.pauldron.flareDeg === 15
+    && GEO.arm.shoulderDx === 0.26 && 2 * GEO.arm.shoulderDx >= 0.48
+    && byName('pauldron-l') !== undefined && byName('pauldron-r') !== undefined,
+    `stance=${2 * GEO.arm.shoulderDx}`);
+  {
+    // Live-world check: outer edges of the two pauldron bells span the gate.
+    // The root yaws to PI/2 + heading, so measure the pairwise horizontal
+    // distance (heading-agnostic) rather than a world-x delta.
+    const pl = byName('pauldron-l')!;
+    const pr = byName('pauldron-r')!;
+    pl.computeWorldMatrix(true);
+    pr.computeWorldMatrix(true);
+    const al = pl.getAbsolutePosition();
+    const ar = pr.getAbsolutePosition();
+    const span = Math.hypot(ar.x - al.x, ar.z - al.z) + 2 * GEO.arm.pauldron.radius;
+    check(`pauldron outer silhouette span ${span.toFixed(3)} m ≥ 0.48 m gate`, span >= 0.48);
+  }
+  check('armored vambraces r 0.075, bicep cuffs r 0.08, gauntlet cuffs d 0.14 + gloves',
+    GEO.arm.vambraceRadius === 0.075 && GEO.arm.bicepRadius === 0.08 && GEO.arm.cuffDiameter === 0.14
+    && ['bicep', 'vambrace', 'cuff', 'glove'].every((part) => byName(`arm-${part}-l`) !== undefined
+      && byName(`arm-${part}-r`) !== undefined)
+    && byName('arm-upper-l') !== undefined && byName('arm-forearm-r') !== undefined);
+  check('helmet d 0.38 w/ 5° raked brow rim, chin aerators r 0.035 l 0.06 + vocoder grille',
+    GEO.helmet.diameter === 0.38 && GEO.helmet.browRakeDeg === 5
+    && GEO.chinAerator.radius === 0.035 && GEO.chinAerator.length === 0.06
+    && byName('helmet-brow') !== undefined && byName('helmet-aerator-l') !== undefined
+    && byName('helmet-aerator-r') !== undefined && byName('helmet-vocoder') !== undefined);
+  check('panoramic gold visor aperture w 0.34 h 0.22 (gate d ≥ 0.34), recessed under brow',
+    GEO.visor.width === 0.34 && GEO.visor.height === 0.22 && GEO.visor.diameter === 0.36
+    && GEO.visor.diameter >= 0.34 && byName('visor') !== undefined
+    && GEO.visor.y < GEO.browRim.y,
+    `aperture ${GEO.visor.width} × ${GEO.visor.height}`);
   const visorMesh = byName('visor')!;
-  check('visor ellipsoid scaling sx 0.92, sy 0.65, sz 0.95',
-    Math.abs(visorMesh.scaling.x - 0.92) < 1e-9 && Math.abs(visorMesh.scaling.y - 0.65) < 1e-9
-    && Math.abs(visorMesh.scaling.z - 0.95) < 1e-9);
-  check('twin cryo-cylinder PLSS r 0.08 h 0.52 replaces monolithic box',
-    GEO.plss.tank.radius === 0.08 && GEO.plss.tank.height === 0.52
+  check('visor ellipsoid scaling sx 0.944, sy 0.611, sz 0.96 (aperture 0.34 × 0.22)',
+    Math.abs(visorMesh.scaling.x - 0.944) < 1e-9 && Math.abs(visorMesh.scaling.y - 0.611) < 1e-9
+    && Math.abs(visorMesh.scaling.z - 0.96) < 1e-9
+    && Math.abs(GEO.visor.diameter * GEO.visor.sx - 0.34) < 2e-3
+    && Math.abs(GEO.visor.diameter * GEO.visor.sy - 0.22) < 2e-3);
+  check('integrated PLSS pack + twin cryo-cylinders r 0.085 h 0.50',
+    byName('plss-pack') !== undefined
+    && GEO.plss.tank.radius === 0.085 && GEO.plss.tank.height === 0.5
     && byName('plss-tank-l') !== undefined && byName('plss-tank-r') !== undefined
     && byName('backpack') === undefined);
-  check('central radiator cowl + twin lower thruster nozzles present',
+  check('central radiator cowl + twin lower vector nozzles present',
     byName('plss-radiator-cowl') !== undefined && byName('plss-nozzle-l') !== undefined
     && byName('plss-nozzle-r') !== undefined);
-  check('flush chest telemetry slate 0.16 × 0.12 × 0.03',
-    GEO.telemetry.width === 0.16 && GEO.telemetry.height === 0.12 && GEO.telemetry.depth === 0.03
-    && byName('telemetry-pad') !== undefined);
-  check('slender legs: knee articulators + 0.11 × 0.22 treaded lunar boots',
-    ['leg-thigh-l', 'leg-knee-l', 'leg-calf-l', 'leg-boot-l',
-      'leg-thigh-r', 'leg-knee-r', 'leg-calf-r', 'leg-boot-r'].every((n) => byName(n) !== undefined)
-    && GEO.leg.boot.width === 0.11 && GEO.leg.boot.depth === 0.22);
+  check('thigh cuirasses r 0.115 h 0.34 + knee cops 0.14 × 0.12 × 0.12 w/ strike plates',
+    GEO.leg.thighRadius === 0.115 && GEO.leg.thighHeight === 0.34
+    && GEO.leg.kneeCop.width === 0.14 && GEO.leg.kneeCop.height === 0.12 && GEO.leg.kneeCop.depth === 0.12
+    && ['leg-thigh-l', 'leg-kneecop-l', 'leg-strikeplate-l',
+      'leg-thigh-r', 'leg-kneecop-r', 'leg-strikeplate-r'].every((n) => byName(n) !== undefined));
+  check('greaves r 0.10 h 0.26 + heavy boots 0.14 × 0.11 × 0.26, widened soles + heel spurs',
+    GEO.leg.greaveRadius === 0.1 && GEO.leg.greaveHeight === 0.26
+    && GEO.leg.boot.width === 0.14 && GEO.leg.boot.height === 0.11 && GEO.leg.boot.depth === 0.26
+    && ['leg-greave-l', 'leg-boot-l', 'leg-sole-l', 'leg-spur-l',
+      'leg-greave-r', 'leg-boot-r', 'leg-sole-r', 'leg-spur-r'].every((n) => byName(n) !== undefined));
   const suitScene = avatar.getScene()!;
-  const fab = suitScene.getMaterialByName('eva-fabric-white') as PBRMaterial | null;
+  const armorM = suitScene.getMaterialByName('eva-armor-white') as PBRMaterial | null;
+  const gasketM = suitScene.getMaterialByName('eva-undersuit-gasket') as PBRMaterial | null;
   const trim = suitScene.getMaterialByName('eva-trim-hardware') as PBRMaterial | null;
-  const acc = suitScene.getMaterialByName('eva-trim-accent') as PBRMaterial | null;
   const goldM = suitScene.getMaterialByName('eva-visor-gold') as PBRMaterial | null;
-  check('fabric-white PBR: albedo (0.88,0.88,0.86), rough 0.65, metal 0.02',
-    fab !== null && Math.abs(fab.albedoColor.r - 0.88) < 1e-6 && Math.abs(fab.albedoColor.g - 0.88) < 1e-6
-    && Math.abs(fab.albedoColor.b - 0.86) < 1e-6 && Math.abs(fab.roughness! - 0.65) < 1e-9
-    && Math.abs(fab.metallic! - 0.02) < 1e-9);
-  check('trim-hardware slate (0.25,0.26,0.28) + safety-orange accent (0.92,0.42,0.12)',
-    trim !== null && acc !== null
-    && Math.abs(trim.albedoColor.r - 0.25) < 1e-6 && Math.abs(trim.albedoColor.g - 0.26) < 1e-6
-    && Math.abs(trim.albedoColor.b - 0.28) < 1e-6
-    && Math.abs(acc.albedoColor.r - 0.92) < 1e-6 && Math.abs(acc.albedoColor.g - 0.42) < 1e-6
-    && Math.abs(acc.albedoColor.b - 0.12) < 1e-6);
-  check('visor-gold mirror: metal 0.98, rough 0.08, amber emissive (0.12,0.08,0.02)',
-    goldM !== null && Math.abs(goldM.metallic! - 0.98) < 1e-9 && Math.abs(goldM.roughness! - 0.08) < 1e-9
+  check('armor-white PBR: albedo (0.95,0.95,0.96), rough 0.22, metal 0.08',
+    armorM !== null && Math.abs(armorM.albedoColor.r - 0.95) < 1e-6 && Math.abs(armorM.albedoColor.g - 0.95) < 1e-6
+    && Math.abs(armorM.albedoColor.b - 0.96) < 1e-6 && Math.abs(armorM.roughness! - 0.22) < 1e-9
+    && Math.abs(armorM.metallic! - 0.08) < 1e-9);
+  check('undersuit-gasket PBR: albedo (0.12,0.12,0.14), rough 0.85, metal 0.02',
+    gasketM !== null && Math.abs(gasketM.albedoColor.r - 0.12) < 1e-6 && Math.abs(gasketM.albedoColor.g - 0.12) < 1e-6
+    && Math.abs(gasketM.albedoColor.b - 0.14) < 1e-6 && Math.abs(gasketM.roughness! - 0.85) < 1e-9
+    && Math.abs(gasketM.metallic! - 0.02) < 1e-9);
+  check('trim-hardware PBR: albedo (0.22,0.23,0.25), rough 0.35, metal 0.80',
+    trim !== null && Math.abs(trim.albedoColor.r - 0.22) < 1e-6 && Math.abs(trim.albedoColor.g - 0.23) < 1e-6
+    && Math.abs(trim.albedoColor.b - 0.25) < 1e-6 && Math.abs(trim.roughness! - 0.35) < 1e-9
+    && Math.abs(trim.metallic! - 0.8) < 1e-9);
+  check('visor-gold mirror: metal 0.98, rough 0.06, amber emissive (0.12,0.08,0.02)',
+    goldM !== null && Math.abs(goldM.metallic! - 0.98) < 1e-9 && Math.abs(goldM.roughness! - 0.06) < 1e-9
     && Math.abs(goldM.emissiveColor.r - 0.12) < 1e-6 && Math.abs(goldM.emissiveColor.g - 0.08) < 1e-6
     && Math.abs(goldM.emissiveColor.b - 0.02) < 1e-6);
 }
