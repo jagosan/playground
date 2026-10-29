@@ -47,12 +47,18 @@ import {
   BOOT_DUST_HIP_OFFSET_M,
   EvaSuitAvatar,
   GEO,
+  HEAD_HORIZON_STABILITY_RATIO,
   HURRY_ARM_RECOVERY_AFT_RAD,
   HURRY_ARM_STANCE_FWD_RAD,
   HURRY_LEAD_HIP_FWD_RAD,
   HURRY_LEAD_KNEE_RAD,
+  HURRY_PUMP_RECOVERY_AMP_RAD,
+  HURRY_PUMP_STANCE_AMP_RAD,
   HURRY_PUSH_HIP_AFT_RAD,
   HURRY_PUSH_KNEE_RAD,
+  HURRY_SPRINT_RAKE_MAX_RAD,
+  HURRY_SPINE_PULSE_RAD,
+  HURRY_THORACIC_YAW_RAD,
   HURRY_TORSO_PITCH_FWD_RAD,
   HURRY_TORSO_ROLL_RAD,
   hurryStridePose,
@@ -561,6 +567,49 @@ function gate3Articulation(): void {
     const pb = hurryStridePose('left', false); // grounded brace frame
     check('brace frame: stride leg loads as planted stance spring, recovery reaches forward',
       pb.hipLx === 0.18 && pb.kneeLx === 0.5 && pb.hipRx === -0.32 && pb.kneeRx === 0.55);
+    check('brace frame (Spec 31): yaw parked 0, visor horizon-locked at −0.65 × 7° rake',
+      pb.torsoYawRad === 0 && Math.abs(pb.headPitchRad + 0.65 * 0.12) < 1e-15);
+  }
+
+  // -- Spec 31 §2 dynamic triple-jump phase-cycle law ------------------------
+  {
+    const at = (u: number) => hurryStridePose('left', true, u);
+    const a0 = at(0);
+    check('dynamic u=0 continues the brace: push hip 0.18/knee 0.50, lead −0.32/0.55',
+      Math.abs(a0.hipRx - 0.18) < 1e-12 && Math.abs(a0.kneeRx - 0.5) < 1e-12
+      && Math.abs(a0.hipLx + 0.32) < 1e-12 && Math.abs(a0.kneeLx - 0.55) < 1e-12);
+    const abIn = at(0.28); // evaluated exactly on the phase boundary
+    const abOut = at(0.28 - 1e-12); // left-hand limit (phase A at tA → 1)
+    check('phase A→B continuous at u = 0.28 (< 1e-9)',
+      Math.abs(abIn.hipRx - abOut.hipRx) < 1e-9 && Math.abs(abIn.hipLx - abOut.hipLx) < 1e-9
+      && Math.abs(abIn.kneeRx - abOut.kneeRx) < 1e-9 && Math.abs(abIn.kneeLx - abOut.kneeLx) < 1e-9);
+    const acIn = at(0.72);
+    const acOut = at(0.72 - 1e-12); // left-hand limit (phase B at tB → 1)
+    check('phase B→C continuous at u = 0.72 through the leg-role swap (< 1e-9)',
+      Math.abs(acIn.hipRx - acOut.hipRx) < 1e-9 && Math.abs(acIn.hipLx - acOut.hipLx) < 1e-9
+      && Math.abs(acIn.kneeRx - acOut.kneeRx) < 1e-9 && Math.abs(acIn.kneeLx - acOut.kneeLx) < 1e-9);
+    const c1 = at(1);
+    check('phase C claw end: landing hip −0.42/knee 0.35, recovery hip −0.50/knee 0.90',
+      Math.abs(c1.hipLx + 0.42) < 1e-12 && Math.abs(c1.kneeLx - 0.35) < 1e-12
+      && Math.abs(c1.hipRx + 0.5) < 1e-12 && Math.abs(c1.kneeRx - 0.9) < 1e-12);
+    const slow = hurryStridePose('left', true, 0, SUIT_HURRY_MIN_SPEED);
+    const fast = hurryStridePose('left', true, 0, SUIT_HURRY_TARGET_SPEED);
+    check(`dynamic sprint rake scales 7°→14° (${SUIT_HURRY_MIN_SPEED}→${SUIT_HURRY_TARGET_SPEED} m/s), head locks −0.65 × pitch`,
+      Math.abs(slow.torsoPitchRad - HURRY_TORSO_PITCH_FWD_RAD) < 1e-12
+      && Math.abs(fast.torsoPitchRad - HURRY_SPRINT_RAKE_MAX_RAD) < 1e-12
+      && Math.abs(fast.headPitchRad - HEAD_HORIZON_STABILITY_RATIO * HURRY_SPRINT_RAKE_MAX_RAD) < 1e-12);
+    check('counter-yaw ±0.07 rad & arm pump −0.55/+0.45 at u = 0 (left stride)',
+      Math.abs(fast.torsoYawRad - HURRY_THORACIC_YAW_RAD) < 1e-12
+      && Math.abs(fast.shoulderRx + HURRY_PUMP_STANCE_AMP_RAD) < 1e-12
+      && Math.abs(fast.shoulderLx - HURRY_PUMP_RECOVERY_AMP_RAD) < 1e-12);
+    const pc = hurryStridePose('right', true); // phaseless → canonical snapshot
+    check('phaseless flight call keeps canonical Spec 30 snapshot (push 0.55/0.05, lead −0.48/0.85, yaw 0)',
+      Math.abs(pc.hipLx - HURRY_PUSH_HIP_AFT_RAD) < 1e-12
+      && Math.abs(pc.kneeLx - HURRY_PUSH_KNEE_RAD) < 1e-12
+      && Math.abs(pc.hipRx + HURRY_LEAD_HIP_FWD_RAD) < 1e-12
+      && Math.abs(pc.kneeRx - HURRY_LEAD_KNEE_RAD) < 1e-12
+      && pc.torsoYawRad === 0
+      && Math.abs(pc.torsoPitchRad - HURRY_TORSO_PITCH_FWD_RAD) < 1e-12);
   }
 
   // -- Live avatar run: pivots track the law, dust alternates ----------------
@@ -581,6 +630,7 @@ function gate3Articulation(): void {
   const shoulderL = nodes.get('eva-shoulder-l')!;
   const shoulderR = nodes.get('eva-shoulder-r')!;
   const upper = nodes.get('eva-upper-body')!;
+  const head = nodes.get('eva-head')!;
 
   interface PuffRec { lat: number; side: string; z: number; x: number; y: number }
   const puffs: PuffRec[] = [];
@@ -589,19 +639,40 @@ function gate3Articulation(): void {
   let lawOk = 0;
   let oppositionOk = 0;
   let torsoOk = 0;
+  let headOk = 0;
+  let rakeMin = Infinity;
+  let rakeMax = 0;
 
   for (let i = 0; i < 1500; i++) {
     const s = avatar.update(DT, SPRINT);
     if (s.gaitMode === 'bounding' && !s.isGrounded) {
       flightSamples++;
-      const pose = hurryStridePose(s.hurryStrideLeg, true);
+      // Sample the law with the LIVE phase & speed, mirroring the avatar's
+      // own call (Spec 31 §2) — the pivots must match frame-for-frame.
+      const pose = hurryStridePose(
+        s.hurryStrideLeg,
+        true,
+        s.hurryAirPhase ?? 0,
+        Math.hypot(s.vx, s.vy),
+      );
       if (Math.abs(hipL.rotation.x - pose.hipLx) < 1e-9
         && Math.abs(hipR.rotation.x - pose.hipRx) < 1e-9
         && Math.abs(kneeL.rotation.x - pose.kneeLx) < 1e-9
         && Math.abs(kneeR.rotation.x - pose.kneeRx) < 1e-9) lawOk++;
       if (shoulderL.rotation.x * shoulderR.rotation.x < 0) oppositionOk++;
-      if (Math.abs(upper.rotation.x - HURRY_TORSO_PITCH_FWD_RAD) < 1e-9
-        && Math.abs(Math.abs(upper.rotation.z) - HURRY_TORSO_ROLL_RAD) < 1e-9) torsoOk++;
+      // Torso rides the live dynamic rake + roll sway, bounded inside the
+      // 7°…14° sprint-rake envelope plus the breathing pulse, and the visor
+      // law stays headPitch = −0.65 × torsoPitch.
+      if (Math.abs(upper.rotation.x - pose.torsoPitchRad) < 1e-9
+        && Math.abs(upper.rotation.z - pose.torsoRollRad) < 1e-9
+        && Math.abs(upper.rotation.z) <= HURRY_TORSO_ROLL_RAD + 1e-9
+        && pose.torsoPitchRad >= HURRY_TORSO_PITCH_FWD_RAD - 1e-9
+        && pose.torsoPitchRad <= HURRY_SPRINT_RAKE_MAX_RAD + HURRY_SPINE_PULSE_RAD + 1e-9
+        && Math.abs(head.rotation.x
+          - HEAD_HORIZON_STABILITY_RATIO * upper.rotation.x) < 1e-9) torsoOk++;
+      if (Math.abs(head.rotation.x - pose.headPitchRad) < 1e-9) headOk++;
+      rakeMin = Math.min(rakeMin, pose.torsoPitchRad);
+      rakeMax = Math.max(rakeMax, pose.torsoPitchRad);
     }
     const c = avatar.getBootDustPuffCount();
     if (c > puffsSeen) {
@@ -623,8 +694,13 @@ function gate3Articulation(): void {
     flightSamples > 200 && lawOk === flightSamples, `lawOk=${lawOk} of ${flightSamples}`);
   check('arms live in opposing sprint counter-torque (sign flip each side)',
     flightSamples > 0 && oppositionOk === flightSamples, `${oppositionOk}/${flightSamples}`);
-  check('torso 0.12 rad lean + 0.026 rad roll sway live on stride frames',
+  check('torso dynamic rake 7°→14° + roll sway + visor horizon lock live on stride frames',
     flightSamples > 0 && torsoOk === flightSamples, `${torsoOk}/${flightSamples}`);
+  check(`visor pitch tracks headPitchRad law every airborne frame (${headOk}/${flightSamples})`,
+    flightSamples > 0 && headOk === flightSamples, `${headOk}/${flightSamples}`);
+  check(`torso rake breathes dynamically over the arcs (span ${(rakeMax - rakeMin).toFixed(3)} rad ≥ 0.03, `
+    + `range ${rakeMin.toFixed(3)}…${rakeMax.toFixed(3)})`,
+    rakeMax - rakeMin >= 0.03);
 
   check(`boot-dust puffs dispatched on footfalls (${puffs.length} puffs ≥ 3)`, puffs.length >= 3);
   check('every puff lands at exactly ±0.13 m d_hip perpendicular to heading, sole z',

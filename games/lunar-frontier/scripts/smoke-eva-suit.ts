@@ -36,6 +36,7 @@ import {
   HEADLIGHT_INTENSITY,
   HEADLIGHT_ANGLE_DEG,
   HEADLIGHT_RANGE_M,
+  hurryStridePose,
 } from '../src/entities/AstronautSuit.ts';
 import {
   IDLE_SUIT_INPUT,
@@ -415,6 +416,15 @@ section('3b. Spec 28 §2.3 lunar bounding sprint');
   const srF = node('eva-arm-upper-r');
   // Spec 30 §2.2.3: hurryStrideLeg is the leg RECEIVING the next touchdown —
   // mid-flight it is the LEADING leg, so the opposite hip is the pushing one.
+  // Spec 31 §2: the airborne pose is now DYNAMIC on the normalized flight
+  // phase, so the gates compare against the live phase law (exact) plus the
+  // early-arc takeoff-drive envelope the phase A curves sweep through.
+  const phasePoseF = hurryStridePose(
+    as.hurryStrideLeg,
+    true,
+    as.hurryAirPhase ?? 0,
+    Math.hypot(as.vx, as.vy),
+  );
   const strideIsLeftF = (as.hurryStrideLeg ?? 'left') === 'left';
   const pushHipF = strideIsLeftF ? hipFR.rotation.x : hipFL.rotation.x;
   const leadHipF = strideIsLeftF ? hipFL.rotation.x : hipFR.rotation.x;
@@ -422,15 +432,23 @@ section('3b. Spec 28 §2.3 lunar bounding sprint');
   const pushKneeF = strideIsLeftF ? kneeFR.rotation.x : kneeFL.rotation.x;
   const stanceArmF = strideIsLeftF ? srF.rotation.x : slF.rotation.x;
   const recoveryArmF = strideIsLeftF ? slF.rotation.x : srF.rotation.x;
+  const expPushHipF = strideIsLeftF ? phasePoseF.hipRx : phasePoseF.hipLx;
+  const expLeadHipF = strideIsLeftF ? phasePoseF.hipLx : phasePoseF.hipRx;
+  const expPushKneeF = strideIsLeftF ? phasePoseF.kneeRx : phasePoseF.kneeLx;
+  const expLeadKneeF = strideIsLeftF ? phasePoseF.kneeLx : phasePoseF.kneeRx;
   check(
-    'flight pose: pushing leg extends aft in toe-off follow-through (gate hip ≥ 0.40)',
+    'flight pose: pushing leg drives aft through the takeoff arc (phase-law exact, hip ≥ 0.18)',
     !as.isGrounded && as.gaitMode === 'bounding'
-      && pushHipF >= 0.40 && pushKneeF <= 0.1,
-    `stride=${as.hurryStrideLeg} pushHip=${pushHipF} pushKnee=${pushKneeF}`,
+      && pushHipF >= 0.18 && pushKneeF <= 0.5 + 1e-12
+      && Math.abs(pushHipF - expPushHipF) < 1e-9
+      && Math.abs(pushKneeF - expPushKneeF) < 1e-9,
+    `u=${as.hurryAirPhase} stride=${as.hurryStrideLeg} pushHip=${pushHipF} pushKnee=${pushKneeF}`,
   );
   check(
-    'flight pose: leading leg swings forward with flexed knee (gate hip fwd ≥ 0.35, knee ≥ 0.60)',
-    leadHipF <= -0.35 && leadKneeF >= 0.60,
+    'flight pose: leading leg punches forward with flexed knee (phase-law exact, hip ≤ −0.32, knee ≥ 0.55)',
+    leadHipF <= -0.32 + 1e-12 && leadKneeF >= 0.55 - 1e-12
+      && Math.abs(leadHipF - expLeadHipF) < 1e-9
+      && Math.abs(leadKneeF - expLeadKneeF) < 1e-9,
     `leadHip=${leadHipF} leadKnee=${leadKneeF}`,
   );
   check(
@@ -440,13 +458,15 @@ section('3b. Spec 28 §2.3 lunar bounding sprint');
     `stanceArm=${stanceArmF} recoveryArm=${recoveryArmF}`,
   );
   check(
-    'flight pose: torso leans 7° into thrust + 1.5° roll toward the stance hip',
+    'flight pose: dynamic sprint rake 7°→14° + roll sway + visor horizon lock live',
     (() => {
       const upper = bndAvatar.getScene()!.transformNodes.find((n) => n.name === 'eva-upper-body')!;
-      const pushIsLeft = !strideIsLeftF;
-      return Math.abs(upper.rotation.x - 0.12) < 1e-12
-        && Math.abs(Math.abs(upper.rotation.z) - 0.026) < 1e-12
-        && Math.sign(upper.rotation.z) === (pushIsLeft ? 1 : -1);
+      const headN = bndAvatar.getScene()!.transformNodes.find((n) => n.name === 'eva-head')!;
+      return Math.abs(upper.rotation.x - phasePoseF.torsoPitchRad) < 1e-9
+        && Math.abs(upper.rotation.z - phasePoseF.torsoRollRad) < 1e-9
+        && upper.rotation.x >= 0.12 - 1e-9
+        && upper.rotation.x <= 0.24 + 0.026 + 1e-9
+        && Math.abs(headN.rotation.x + 0.65 * upper.rotation.x) < 1e-9;
     })(),
   );
   check('flight pose: arms held in the sagittal plane (no Spec 28 balance spread)',

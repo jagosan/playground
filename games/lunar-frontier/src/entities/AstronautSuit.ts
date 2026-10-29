@@ -48,6 +48,8 @@ import type { Mesh } from '@babylonjs/core/Meshes/mesh.js';
 import {
   IDLE_SUIT_INPUT,
   LunarEvaSuit,
+  SUIT_HURRY_MIN_SPEED,
+  SUIT_HURRY_TARGET_SPEED,
   type GroundElevationFn,
   type HurryStrideLeg,
   type SuitInput,
@@ -151,6 +153,30 @@ export const HURRY_BRACE_LEAD_KNEE_RAD = 0.55;
  *  perpendicular to heading — one hip width (d_hip ≈ 0.13 m, Spec 30 §2.2.3). */
 export const BOOT_DUST_HIP_OFFSET_M = 0.13;
 
+// -- Dynamic triple-jump airborne cycle (Spec 31 §2 / Phase 3) ----------------
+/*
+ * The leg curves below ride Blueprint 31 §2 directly on the normalized
+ * flight phase u = clamp(t_air / τ_flight, 0, 1) reported by physics as
+ * `hurryAirPhase`; see {@link hurryStridePose} for the phase table. These
+ * constants name the upper-body hustle amplitudes (Blueprint 31 §2.5).
+ */
+/** Dynamic sprint rake at the cruise cap, rad (14°; base rake stays Spec 30's 7°). */
+export const HURRY_SPRINT_RAKE_MAX_RAD = 0.24;
+/** Spinal breathing-pulse pitch amplitude riding sin(2πu), rad. */
+export const HURRY_SPINE_PULSE_RAD = 0.026;
+/** Peak thoracic counter-yaw against the pelvis, rad (≈4°). */
+export const HURRY_THORACIC_YAW_RAD = 0.07;
+/** Arm pump amplitude of the stance-side arm riding −cos(πu), rad. */
+export const HURRY_PUMP_STANCE_AMP_RAD = 0.55;
+/** Arm pump amplitude of the recovery-side arm riding +cos(πu), rad. */
+export const HURRY_PUMP_RECOVERY_AMP_RAD = 0.45;
+/** Extra elbow flex the pumping stance arm carries at full rear drive, rad. */
+export const HURRY_PUMP_ELBOW_STANCE_RAD = 0.5;
+/** Extra elbow flex the pumping recovery arm carries at full forward sweep, rad. */
+export const HURRY_PUMP_ELBOW_RECOVERY_RAD = 0.4;
+/** Visor horizon-lock gain: head pitch = −0.65 × torso pitch (Blueprint 31 §2.5). */
+export const HEAD_HORIZON_STABILITY_RATIO = -0.65;
+
 /**
  * One frame of the Spec 30 §2.2.3 unilateral Steelpush stride pose in the
  * mesh pivot convention (same `rotation.x` sign law as the walk cycle:
@@ -169,6 +195,10 @@ export interface HurryStridePose {
   torsoPitchRad: number;
   /** Torso roll toward the stance hip (rad, upperBody.rotation.z; + = toward left hip). */
   torsoRollRad: number;
+  /** Thoracic counter-yaw against the pelvis (rad, upperBody.rotation.y; Spec 31 §2.5). */
+  torsoYawRad: number;
+  /** Head/visor horizon-stabilization pitch (rad, `eva-head` node rotation.x; Spec 31 §2.5). */
+  headPitchRad: number;
   /** True on the ballistic `flight_arc` half, false on `ground_brace`. */
   airborne: boolean;
   /** The power side of this frame: pushing leg in flight, bracing leg braced. */
@@ -177,47 +207,178 @@ export interface HurryStridePose {
   strideLegIsLeft: boolean;
 }
 
+/** Linear interpolation on [t0, t1]. */
+const lerp = (from: number, to: number, t: number): number => from + (to - from) * t;
+
 /**
- * Pure Spec 30 §2.2.3 stride articulation law. `strideLeg` is the physics
+ * Pure stride articulation law — Spec 30 §2.2.3 baseline plus the Spec 31 §2
+ * dynamic Olympic triple-jump cycle. `strideLeg` is the physics
  * `hurryStrideLeg`: the leg that RECEIVES the next touchdown. So on the
- * flight arc it is the leading leg (hip lifted +0.48, knee flexed 0.85)
- * while the opposite pushing leg trails aft in toe-off follow-through
- * (hip 0.55 aft, knee straightened to 0.05); on the grounded brace frame it
- * is the braced stance leg (spring flex 0.5) while the recovery leg reaches
- * forward for the next datum. Arms run athletic sprint opposition — the arm
- * on the stance/pushing side drives forward (−0.45), the recovery-side arm
- * swings aft (+0.35) — and the torso leans 7° into the thrust vector with a
- * 1.5° roll sway toward the stance hip.
+ * flight arc it is the leading leg while the opposite pushing leg trails aft
+ * in toe-off follow-through; on the grounded brace frame it is the braced
+ * stance leg (spring flex 0.5) while the recovery leg reaches forward for
+ * the next datum.
+ *
+ * Airborne frames called WITHOUT `airPhase` return the canonical Spec 30
+ * takeoff snapshot exactly (push hip 0.55 aft / knee 0.05, lead hip −0.48 /
+ * knee 0.85, static 7° rake, ±1.5° roll) so legacy regression baselines stay
+ * bit-identical. Airborne frames WITH a phase evaluate the Blueprint 31
+ * three-phase hitch-kick on u = clamp(airPhase, 0, 1):
+ *
+ * - Phase A `u ∈ [0, 0.28)` — takeoff drive: pushing leg hyperextends aft to
+ *   0.62 and straightens to toe-off while the leading knee punches forward.
+ * - Phase B `u ∈ [0.28, 0.72)` — triple-jump stutter: the trailing (former
+ *   pushing) leg whips forward into a tight pelvic tuck while the leading
+ *   leg cycles downward toward the claw.
+ * - Phase C `u ∈ [0.72, 1]` — pre-landing claw: the leading leg reaches
+ *   down/aft to plant, pre-tensioning the knee, while the opposite leg is
+ *   held high for the counter-stride. (The phase endpoints are continuous
+ *   across the u = 0.72 role swap to floating-point precision.)
+ *
+ * The upper body hustles with forward `speed`: the sprint rake grows 7° → 14°
+ * across the SUIT_HURRY_MIN_SPEED…SUIT_HURRY_TARGET_SPEED band, the spine
+ * pulses at sin(2πu), the thorax counter-yaws ±4° against the pelvis, the
+ * arms actively pump in anti-phase on −cos(πu), and the visor locks the
+ * horizon at −0.65 × torso pitch (Blueprint 31 §2.5).
  */
 export function hurryStridePose(
   strideLeg: HurryStrideLeg | undefined,
   airborne: boolean,
+  airPhase?: number,
+  speed: number = SUIT_HURRY_TARGET_SPEED,
 ): HurryStridePose {
   const strideLegIsLeft = strideLeg !== 'right';
   // In flight the stride leg is the LEADING leg, so the pushing side is the
   // opposite hip; on the brace frame the stride leg is the planted STANCE
   // leg that will deliver the next Steelpush, i.e. the power side itself.
   const powerIsLeft = airborne ? !strideLegIsLeft : strideLegIsLeft;
-  const hipPower = airborne ? HURRY_PUSH_HIP_AFT_RAD : HURRY_BRACE_STANCE_HIP_RAD;
-  const kneePower = airborne ? HURRY_PUSH_KNEE_RAD : HURRY_BRACE_STANCE_KNEE_RAD;
-  const hipRecovery = airborne ? -HURRY_LEAD_HIP_FWD_RAD : -HURRY_BRACE_LEAD_HIP_FWD_RAD;
-  const kneeRecovery = airborne ? HURRY_LEAD_KNEE_RAD : HURRY_BRACE_LEAD_KNEE_RAD;
+
+  if (!airborne) {
+    // Grounded brace frame: stride leg loads as the planted stance spring,
+    // recovery reaches forward for the next datum; the phase clock is pinned
+    // on the ground, so the counter-yaw parks at 0 while the visor holds the
+    // horizon over the 7° base rake (Spec 31 §2.5).
+    return {
+      hipLx: powerIsLeft ? HURRY_BRACE_STANCE_HIP_RAD : -HURRY_BRACE_LEAD_HIP_FWD_RAD,
+      hipRx: powerIsLeft ? -HURRY_BRACE_LEAD_HIP_FWD_RAD : HURRY_BRACE_STANCE_HIP_RAD,
+      kneeLx: powerIsLeft ? HURRY_BRACE_STANCE_KNEE_RAD : HURRY_BRACE_LEAD_KNEE_RAD,
+      kneeRx: powerIsLeft ? HURRY_BRACE_LEAD_KNEE_RAD : HURRY_BRACE_STANCE_KNEE_RAD,
+      shoulderLx: powerIsLeft ? -HURRY_ARM_STANCE_FWD_RAD : HURRY_ARM_RECOVERY_AFT_RAD,
+      shoulderRx: powerIsLeft ? HURRY_ARM_RECOVERY_AFT_RAD : -HURRY_ARM_STANCE_FWD_RAD,
+      elbowLx: ELBOW_REST_RAD + (powerIsLeft
+        ? HURRY_ARM_ELBOW_FWD_FLEX_RAD
+        : HURRY_ARM_ELBOW_AFT_FLEX_RAD),
+      elbowRx: ELBOW_REST_RAD + (powerIsLeft
+        ? HURRY_ARM_ELBOW_AFT_FLEX_RAD
+        : HURRY_ARM_ELBOW_FWD_FLEX_RAD),
+      torsoPitchRad: HURRY_TORSO_PITCH_FWD_RAD,
+      torsoYawRad: 0,
+      // +rotation.z tips the torso top toward the mesh-left hip.
+      torsoRollRad: powerIsLeft ? HURRY_TORSO_ROLL_RAD : -HURRY_TORSO_ROLL_RAD,
+      headPitchRad: HEAD_HORIZON_STABILITY_RATIO * HURRY_TORSO_PITCH_FWD_RAD,
+      airborne,
+      powerIsLeft,
+      strideLegIsLeft,
+    };
+  }
+
+  if (airPhase === undefined) {
+    // Canonical Spec 30 §2.2.3 takeoff snapshot for phaseless calls: pushing
+    // leg aft in toe-off follow-through, leading leg punched forward with a
+    // deeply flexed knee, static 7° rake, no counter-yaw.
+    return {
+      hipLx: powerIsLeft ? HURRY_PUSH_HIP_AFT_RAD : -HURRY_LEAD_HIP_FWD_RAD,
+      hipRx: powerIsLeft ? -HURRY_LEAD_HIP_FWD_RAD : HURRY_PUSH_HIP_AFT_RAD,
+      kneeLx: powerIsLeft ? HURRY_PUSH_KNEE_RAD : HURRY_LEAD_KNEE_RAD,
+      kneeRx: powerIsLeft ? HURRY_LEAD_KNEE_RAD : HURRY_PUSH_KNEE_RAD,
+      shoulderLx: powerIsLeft ? -HURRY_ARM_STANCE_FWD_RAD : HURRY_ARM_RECOVERY_AFT_RAD,
+      shoulderRx: powerIsLeft ? HURRY_ARM_RECOVERY_AFT_RAD : -HURRY_ARM_STANCE_FWD_RAD,
+      elbowLx: ELBOW_REST_RAD + (powerIsLeft
+        ? HURRY_ARM_ELBOW_FWD_FLEX_RAD
+        : HURRY_ARM_ELBOW_AFT_FLEX_RAD),
+      elbowRx: ELBOW_REST_RAD + (powerIsLeft
+        ? HURRY_ARM_ELBOW_AFT_FLEX_RAD
+        : HURRY_ARM_ELBOW_FWD_FLEX_RAD),
+      torsoPitchRad: HURRY_TORSO_PITCH_FWD_RAD,
+      torsoYawRad: 0,
+      // +rotation.z tips the torso top toward the mesh-left hip.
+      torsoRollRad: powerIsLeft ? HURRY_TORSO_ROLL_RAD : -HURRY_TORSO_ROLL_RAD,
+      headPitchRad: HEAD_HORIZON_STABILITY_RATIO * HURRY_TORSO_PITCH_FWD_RAD,
+      airborne,
+      powerIsLeft,
+      strideLegIsLeft,
+    };
+  }
+
+  // -- Spec 31 §2 dynamic triple-jump cycle on the normalized phase ---------
+  const u = Math.min(1, Math.max(0, airPhase));
+  // Angles are tracked per physical leg: `Push` = the leg that pushed off at
+  // takeoff (opposite the stride leg), `Lead` = the stride leg reaching for
+  // the next touchdown. Phase C swaps their ROLES — the leading leg becomes
+  // the landing claw, the former pushing leg the high counter-stride — while
+  // the variables keep following the same limbs.
+  let hipPush: number;
+  let kneePush: number;
+  let hipLead: number;
+  let kneeLead: number;
+  if (u < 0.28) {
+    // Phase A — takeoff drive & hyperextension (Blueprint 31 §2.2).
+    const tA = u / 0.28;
+    hipPush = lerp(HURRY_BRACE_STANCE_HIP_RAD, 0.62, tA); // aft extension
+    kneePush = lerp(HURRY_BRACE_STANCE_KNEE_RAD, 0.04, tA); // straighten to toe-off
+    hipLead = lerp(-HURRY_BRACE_LEAD_HIP_FWD_RAD, -0.58, tA); // forward knee punch
+    kneeLead = lerp(HURRY_BRACE_LEAD_KNEE_RAD, 1.05, tA); // deep flexion
+  } else if (u < 0.72) {
+    // Phase B — Olympic triple-jump stutter step / hitch-kick (§2.3): the
+    // trailing leg cycles forward in a rapid pelvic tuck, the leading leg
+    // cycles downward into the claw, both riding a sin(π tB) velocity pulse.
+    const tB = (u - 0.28) / 0.44;
+    const s = Math.sin(Math.PI * tB);
+    hipPush = lerp(0.62, -0.35, tB) + 0.08 * s;
+    kneePush = lerp(0.04, 1.15, Math.sin((Math.PI * tB) / 2));
+    hipLead = lerp(-0.58, -0.15, tB) - 0.06 * s;
+    kneeLead = lerp(1.05, 0.5, tB);
+  } else {
+    // Phase C — pre-landing claw & hydraulic priming (§2.4): the landing leg
+    // reaches down/back under the hips with the knee pre-tensioned to absorb
+    // impact, the opposite recovery leg stays cocked high for the counter.
+    const tC = (u - 0.72) / 0.28;
+    hipLead = lerp(-0.15, -0.42, tC);
+    kneeLead = lerp(0.5, 0.35, tC);
+    hipPush = lerp(-0.35, -0.5, tC);
+    kneePush = lerp(1.15, 0.9, tC);
+  }
+
+  // Upper-body hustle (Blueprint 31 §2.5): speed-driven rake 7°→14° with a
+  // spinal breathing pulse, thoracic counter-yaw and roll sway against the
+  // pelvis, an active anti-phase arm pump with dynamic elbow flex, and the
+  // visor horizon lock.
+  const fwdRatio = Math.min(1, Math.max(0,
+    (speed - SUIT_HURRY_MIN_SPEED) / (SUIT_HURRY_TARGET_SPEED - SUIT_HURRY_MIN_SPEED)));
+  const cosU = Math.cos(Math.PI * u);
+  const torsoPitchRad =
+    lerp(HURRY_TORSO_PITCH_FWD_RAD, HURRY_SPRINT_RAKE_MAX_RAD, fwdRatio)
+    + HURRY_SPINE_PULSE_RAD * Math.sin(2 * Math.PI * u);
+  const torsoYawRad = (powerIsLeft ? -1 : 1) * HURRY_THORACIC_YAW_RAD * cosU;
+  const torsoRollRad = (powerIsLeft ? 1 : -1) * HURRY_TORSO_ROLL_RAD * cosU;
+  const armStance = -HURRY_PUMP_STANCE_AMP_RAD * cosU;
+  const armRecovery = HURRY_PUMP_RECOVERY_AMP_RAD * cosU;
+  const elbowStance = ELBOW_REST_RAD + HURRY_PUMP_ELBOW_STANCE_RAD * Math.max(0, -cosU);
+  const elbowRecovery = ELBOW_REST_RAD + HURRY_PUMP_ELBOW_RECOVERY_RAD * Math.max(0, cosU);
   return {
-    hipLx: powerIsLeft ? hipPower : hipRecovery,
-    hipRx: powerIsLeft ? hipRecovery : hipPower,
-    kneeLx: powerIsLeft ? kneePower : kneeRecovery,
-    kneeRx: powerIsLeft ? kneeRecovery : kneePower,
-    shoulderLx: powerIsLeft ? -HURRY_ARM_STANCE_FWD_RAD : HURRY_ARM_RECOVERY_AFT_RAD,
-    shoulderRx: powerIsLeft ? HURRY_ARM_RECOVERY_AFT_RAD : -HURRY_ARM_STANCE_FWD_RAD,
-    elbowLx: ELBOW_REST_RAD + (powerIsLeft
-      ? HURRY_ARM_ELBOW_FWD_FLEX_RAD
-      : HURRY_ARM_ELBOW_AFT_FLEX_RAD),
-    elbowRx: ELBOW_REST_RAD + (powerIsLeft
-      ? HURRY_ARM_ELBOW_AFT_FLEX_RAD
-      : HURRY_ARM_ELBOW_FWD_FLEX_RAD),
-    torsoPitchRad: HURRY_TORSO_PITCH_FWD_RAD,
+    hipLx: strideLegIsLeft ? hipLead : hipPush,
+    hipRx: strideLegIsLeft ? hipPush : hipLead,
+    kneeLx: strideLegIsLeft ? kneeLead : kneePush,
+    kneeRx: strideLegIsLeft ? kneePush : kneeLead,
+    shoulderLx: powerIsLeft ? armStance : armRecovery,
+    shoulderRx: powerIsLeft ? armRecovery : armStance,
+    elbowLx: powerIsLeft ? elbowStance : elbowRecovery,
+    elbowRx: powerIsLeft ? elbowRecovery : elbowStance,
+    torsoPitchRad,
+    torsoYawRad,
     // +rotation.z tips the torso top toward the mesh-left hip.
-    torsoRollRad: powerIsLeft ? HURRY_TORSO_ROLL_RAD : -HURRY_TORSO_ROLL_RAD,
+    torsoRollRad,
+    headPitchRad: HEAD_HORIZON_STABILITY_RATIO * torsoPitchRad,
     airborne,
     powerIsLeft,
     strideLegIsLeft,
@@ -459,6 +620,13 @@ export class EvaSuitAvatar {
   private root: TransformNode | null = null;
   /** Upper-body pivot (helmet, visor, chest carapace, PLSS, arms) — takes the walk bob. */
   private upperBody: TransformNode | null = null;
+  /**
+   * Neck pivot (Spec 31 §2.5) carrying the helmet group — helmet dome, brow,
+   * chin aerators, vocoder and visor. Identity at rest, so reparenting from
+   * the upper body changed no world transform; `hurryStridePose` pitches it
+   * for visor horizon stabilization.
+   */
+  private head: TransformNode | null = null;
   private parts: Mesh[] = [];
   private visor: Mesh | null = null;
   private torso: Mesh | null = null;
@@ -551,7 +719,15 @@ export class EvaSuitAvatar {
       // Foreign engine: wrap, but never dispose what is not ours.
       this.scene = new Scene(sceneOrEngine);
     } else if (typeof window === 'undefined') {
-      const engine = new NullEngine({ renderWidth: 1600, renderHeight: 900 });
+      // Babylon 9.26 NullEngineOptions requires the full deterministic set —
+      // a partial literal fails strict TS (TS2345).
+      const engine = new NullEngine({
+        renderWidth: 1600,
+        renderHeight: 900,
+        textureSize: 512,
+        deterministicLockstep: false,
+        lockstepMaxSteps: 4,
+      });
       this.ownedEngine = engine;
       this.scene = new Scene(engine);
     } else {
@@ -614,6 +790,7 @@ export class EvaSuitAvatar {
     this.visor = null;
     this.torso = null;
     this.upperBody = null;
+    this.head = null;
     this.hipL = null;
     this.hipR = null;
     this.kneeL = null;
@@ -937,6 +1114,12 @@ export class EvaSuitAvatar {
     const upperBody = new TransformNode(`${p}-upper-body`, scene);
     upperBody.parent = this.root;
     this.upperBody = upperBody;
+    // Spec 31 §2.5 neck pivot: identity at rest, so parenting the helmet
+    // group here instead of straight onto the upper body changes no world
+    // transform until the stride law pitches the visor to the horizon.
+    const head = new TransformNode(`${p}-head`, scene);
+    head.parent = upperBody;
+    this.head = head;
 
     const meshes: Mesh[] = [];
     const add = (
@@ -1097,6 +1280,7 @@ export class EvaSuitAvatar {
     }
 
     // -- helmet: raked brow dome, chin aerators, vocoder, gold visor --------
+    // (all six helmet-group parts ride the Spec 31 `eva-head` neck pivot)
     add(
       MeshBuilder.CreateSphere(
         `${p}-helmet`,
@@ -1104,7 +1288,7 @@ export class EvaSuitAvatar {
         scene,
       ),
       armor,
-      upperBody,
+      head,
       0,
       g.helmet.y,
       0,
@@ -1117,7 +1301,7 @@ export class EvaSuitAvatar {
         scene,
       ),
       armor,
-      upperBody,
+      head,
       0,
       g.browRim.y,
       g.browRim.z,
@@ -1133,7 +1317,7 @@ export class EvaSuitAvatar {
           scene,
         ),
         hardware,
-        upperBody,
+        head,
         sign * g.chinAerator.dx,
         g.chinAerator.y,
         g.chinAerator.z,
@@ -1148,7 +1332,7 @@ export class EvaSuitAvatar {
         scene,
       ),
       hardware,
-      upperBody,
+      head,
       0,
       g.vocoder.y,
       g.vocoder.z,
@@ -1162,7 +1346,7 @@ export class EvaSuitAvatar {
         scene,
       ),
       gold,
-      upperBody,
+      head,
       0,
       g.visor.y,
       g.visor.z,
@@ -1570,12 +1754,14 @@ export class EvaSuitAvatar {
    * swinging in natural opposition to the legs (elbows tracking the forward
    * sweep), and a torso/upper-body counter-bob at twice the leg frequency.
    * While the physics gait is `bounding`, the pose instead rides the Spec 30
-   * §2.2.3 unilateral Steelpush stride ({@link hurryStridePose}): pushing
-   * leg extended aft in toe-off follow-through, leading leg swung forward
-   * with deeply flexed knee, arms in athletic sprint opposition, and the
-   * torso leaning 7° into the thrust vector with a 1.5° roll sway toward the
-   * stance hip. Each touchdown kicks a regolith boot-dust puff from the
-   * exact planting-sole coordinates and arms the −0.06 m landing crouch.
+   * §2.2.3 unilateral Steelpush stride law on the Spec 31 §2 normalized
+   * flight phase ({@link hurryStridePose}): a three-phase Olympic
+   * triple-jump hitch-kick (takeoff drive → mid-air stutter cycling →
+   * pre-landing claw) with a speed-scaled 7°→14° sprint rake, thoracic
+   * counter-yaw, roll sway, an active anti-phase arm pump and a horizon-
+   * locked visor on the `eva-head` neck pivot. Each touchdown kicks a
+   * regolith boot-dust puff from the exact planting-sole coordinates and
+   * arms the −0.06 m landing crouch.
    * Visual only — physics stays in `LunarEvaSuit`. Stopped the pose snaps
    * back to neutral standing.
    */
@@ -1595,10 +1781,13 @@ export class EvaSuitAvatar {
     // Landing-crouch envelope (compress→release), advanced once per frame.
     const crouch = this.advanceBoundCrouch();
     const gait = state.gaitMode ?? 'walk';
-    // Stride torso lean/roll is bounding-only — every other branch below
-    // owns a level torso, so park it before dispatching on the gait band.
+    // Stride torso lean/roll/yaw are bounding-only — every other branch below
+    // owns a level torso, so park them (and the Spec 31 visor pitch) before
+    // dispatching on the gait band.
     upper.rotation.x = 0;
+    upper.rotation.y = 0;
     upper.rotation.z = 0;
+    if (this.head !== null) this.head.rotation.x = 0;
 
     // Spec 29 Phase 4: the rung rail owns the frame while the boots are
     // clamped — alternating arm/leg stroke clocked by climbProgressM, or a
@@ -1646,7 +1835,15 @@ export class EvaSuitAvatar {
         this.boundCrouchClock = BOUND_CROUCH_DURATION_S / 2;
         this.triggerBootDustPuff(this.bootSoleWorldPos(state, strideLeg));
       }
-      const pose = hurryStridePose(strideLeg, airborne);
+      // Spec 31 §2: airborne frames ride the live normalized flight phase and
+      // horizontal speed so the triple-jump cycling and hustle scale with the
+      // arc; grounded frames ignore both and return the brace pose.
+      const pose = hurryStridePose(
+        strideLeg,
+        airborne,
+        state.hurryAirPhase ?? 0,
+        Math.hypot(state.vx, state.vy),
+      );
       hipL.rotation.x = pose.hipLx;
       hipR.rotation.x = pose.hipRx;
       if (kneeL !== null) kneeL.rotation.x = pose.kneeLx;
@@ -1663,11 +1860,16 @@ export class EvaSuitAvatar {
       }
       if (elbowL !== null) elbowL.rotation.x = pose.elbowLx;
       if (elbowR !== null) elbowR.rotation.x = pose.elbowRx;
-      // Torso dynamics: 7° pitch into the thrust vector + 1.5° roll sway
-      // toward the stance hip; the upper body dips through the brace ramp
-      // (physics-reported compression) and the landing crouch envelope.
+      // Torso dynamics (Spec 30 §2.2.3 + Spec 31 §2.5): 7°→14° sprint rake
+      // with a spinal breathing pulse, ±4° thoracic counter-yaw against the
+      // pelvis, 1.5° roll sway toward the stance hip; the visor holds the
+      // horizon at −0.65 × pitch on the `eva-head` neck pivot. The upper body
+      // dips through the brace ramp (physics-reported compression) and the
+      // landing crouch envelope.
       upper.rotation.x = pose.torsoPitchRad;
+      upper.rotation.y = pose.torsoYawRad;
       upper.rotation.z = pose.torsoRollRad;
+      if (this.head !== null) this.head.rotation.x = pose.headPitchRad;
       const dip = crouch - (airborne ? 0 : (state.hurryBraceCompression ?? 0));
       torso.position.y = GEO.torso.y + dip;
       upper.position.y = dip;
