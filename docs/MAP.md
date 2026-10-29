@@ -27,6 +27,7 @@
 - `docs/architecture/28-lunar-frontier-ftue-eva-mechanics-and-controls.md`: FTUE arrival boot pipeline, retro-modern slimmer EVA suit avatar, low-g bounding kinematics, and gamepad stick rectification.
 - `docs/architecture/29-lunar-frontier-radio-tower-and-climbing.md`: 52m titanium lattice radio tower landmark, vertical ladder kinematics, observation deck at +48.0m, panoramic Citadel/maglev vista, and procedural climbing audio.
 - `docs/architecture/30-lunar-frontier-eva-locomotion-stormtrooper-suit-and-ui-cleanup.md`: Stormtrooper stylized composite armor hierarchy, asymmetric unilateral "Steelpush" bounding locomotion, contact-brace compression, alternating regolith footfall dust bursts, and dedicated browser-safe [U]/[H]/R3 UI toggle controls.
+- `docs/architecture/31-lunar-frontier-steelpush-locomotion-athletic-hustle-and-hydraulic-assist.md`: High-speed Steelpush locomotion, Olympic triple-jump airborne hitch-kick & stutter step, dynamic sprint rake & thoracic counter-yaw, hydraulic assist boots & procedural Web Audio.
 - `docs/architecture/15-subagent-context-pruning-and-turn-budgeting.md`: Subagent context pruning, N-3 turn-budget circuit breaker, AST extraction, and Beehive Neo4j symbol discovery.
 - `specs/`:
   - `specs/00-system-overview.md`: Project vision, minigame architecture, rendering stack.
@@ -52,6 +53,7 @@
   - `specs/28-lunar-frontier-ftue-eva-mechanics-and-controls.md`: First-time user experience (FTUE) boot pipeline, retro-modern slimmer EVA suit avatar, low-g bounding locomotion, and gamepad stick rectification.
   - `specs/29-lunar-frontier-radio-tower-and-climbing.md`: Frontier Radio Tower landmark, vertical ladder climbing kinematics, summit observation platform & panoramic vista.
   - `specs/30-lunar-frontier-eva-locomotion-stormtrooper-suit-and-ui-cleanup.md`: EVA locomotion overhaul, Stormtrooper stylized suit aesthetics, asymmetric Mistborn Steelpush bounding dynamics & dedicated UI toggle controls.
+  - `specs/31-lunar-frontier-steelpush-locomotion-athletic-hustle-and-hydraulic-assist.md`: High-speed Steelpush locomotion overhaul, Olympic triple-jump mid-air cycling & stutter step, dynamic sprint hustle & hydraulic assist boots.
 
 ## Lunar Frontier Multiplayer & Economy Subsystem (Spec 12)
 - `games/lunar-frontier/server/`: Fastify + `ws` server, SQLite schema, market pricing, 20Hz tick (`LunarServer.ts`, `Database.ts`).
