@@ -177,6 +177,13 @@ export const SUIT_HURRY_RESTITUTION = 0.90;
 export const SUIT_HURRY_BRACE_COMPRESSION_M = 0.08;
 /** Duration of the grounded brace-and-launch transition window (seconds). */
 export const SUIT_HURRY_BRACE_DURATION_S = 0.12;
+/**
+ * Spec 31 §2: analytical ballistic hangtime of one hurry bound under lunar
+ * gravity, τ = 2·v_launch / g = 2·1.55 / 1.62 ≈ 1.91358 s. This is the
+ * expected hangtime reported to the animation layer and the denominator the
+ * normalized flight phase u = clamp(t_air / τ, 0, 1) advances against.
+ */
+export const SUIT_HURRY_FLIGHT_TIME_S = (2 * SUIT_HURRY_LAUNCH_VZ) / LUNAR_GRAVITY;
 
 /**
  * Spec 30 §2.2.2: the stance/pushing leg of the alternating stride. Toggles
@@ -363,6 +370,20 @@ export interface SuitState {
    */
   hurryAirTime?: number;
   /**
+   * Spec 31 §2: normalized flight phase u ∈ [0, 1] of the current ballistic
+   * arc — clamp(hurryAirTime / SUIT_HURRY_FLIGHT_TIME_S, 0, 1) while airborne
+   * in `bound_flight`; 0 on grounded/touchdown frames. Drives the Olympic
+   * triple-jump stride cycle without exposing raw seconds to the rig.
+   */
+  hurryAirPhase?: number;
+  /**
+   * Spec 31 §2: expected hangtime (s) of the hurry bound — always
+   * {@link SUIT_HURRY_FLIGHT_TIME_S}, refreshed every frame so animation and
+   * audio layers can schedule against the stride clock without duplicating
+   * the physics constants.
+   */
+  hurryExpectedHangtime?: number;
+  /**
    * Spec 30 §2.2.2: knee/ankle compression (m) during the grounded brace
    * window, ramping to {@link SUIT_HURRY_BRACE_COMPRESSION_M} across
    * {@link SUIT_HURRY_BRACE_DURATION_S}; 0 outside the brace.
@@ -483,6 +504,8 @@ export class LunarEvaSuit {
       hurryStrideLeg: initial.hurryStrideLeg ?? 'left',
       hurryStepPhase: initial.hurryStepPhase ?? 'ground_brace',
       hurryAirTime: initial.hurryAirTime ?? 0,
+      hurryAirPhase: initial.hurryAirPhase ?? 0,
+      hurryExpectedHangtime: initial.hurryExpectedHangtime ?? SUIT_HURRY_FLIGHT_TIME_S,
       hurryBraceCompression: initial.hurryBraceCompression ?? 0,
       locomotionMode: initial.locomotionMode ?? 'WALK',
       climbProgressM: initial.climbProgressM ?? 0,
@@ -593,6 +616,9 @@ export class LunarEvaSuit {
     s.hangtime = 0;
     // Spec 30 §2.2.2: the latch parks the stride fields (boots braced).
     s.hurryAirTime = 0;
+    // Spec 31 §2: no ballistic arc exists on the rung rail — phase parked.
+    s.hurryAirPhase = 0;
+    s.hurryExpectedHangtime = SUIT_HURRY_FLIGHT_TIME_S;
     s.hurryBraceCompression = 0;
     s.hurryStepPhase = 'ground_brace';
     return true;
@@ -971,6 +997,18 @@ export class LunarEvaSuit {
       s.hurryAirTime = 0;
       s.hurryBraceCompression = 0;
     }
+    // -- Spec 31 §2: normalized flight phase & dynamic stride clock ---------
+    // u advances against the analytical hangtime τ = 2·v_launch / g so the
+    // animation layer can cycle the Olympic triple-jump arc without knowing
+    // any physics constant. Inside `bound_flight` this is exactly
+    // clamp(boundClock / τ, 0, 1) (boundClock owns hurryAirTime there);
+    // touchdown and every grounded frame pin u to 0, while the expected
+    // hangtime stays reported on all frames for the animation/audio clocks.
+    s.hurryExpectedHangtime = SUIT_HURRY_FLIGHT_TIME_S;
+    s.hurryAirPhase =
+      !s.isGrounded && this.boundPhase === 'bound_flight'
+        ? clamp(this.boundClock / SUIT_HURRY_FLIGHT_TIME_S, 0, 1)
+        : 0;
     // Spec 30 §2.2.2: the stride fields are always reported — grounded
     // frames are the stance/brace phase, airborne frames the flight arc.
     s.hurryStrideLeg = this.hurryLeg;
@@ -2835,7 +2873,10 @@ declare module 'node:util' {}
 
 // The two mount helpers are declared on LunarBuggy via interface merging so
 // they stay next to the state they touch without exporting the raw object.
-interface LunarBuggy {
+// Must be `export`ed: TS2395 requires all merged declarations of an exported
+// class to be exported too (a local interface silently splits the declaration
+// and strips setStateFromMount/setStateParked/rollRateProxy from the type).
+export interface LunarBuggy {
   /** @internal */
   setStateFromMount(vLong: number, vLat: number): void;
   /** @internal */
