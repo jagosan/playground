@@ -1256,6 +1256,12 @@ export class ClientApp {
   private audio: LunarAudioSystem | null = new LunarAudioSystem();
   /** Footfall odometer: last suit position sample (physics frame x/y). */
   private audioFootPrev: { x: number; y: number } | null = null;
+  /**
+   * Spec 31 Phase 4: previous frame's grounded flag — the bounding touchdown
+   * (hydraulic compression) and push-off launch (pneumatic crack) cues are
+   * edges, not odometer hits. Null = no baseline yet (spawn / mode change).
+   */
+  private audioFootPrevGrounded: boolean | null = null;
   /** Metres walked since the last `playFootstep()` thump. */
   private audioFootTravelled = 0;
   /** Wall-clock ms until which the mining-laser loop keeps burning. */
@@ -3613,26 +3619,58 @@ export class ClientApp {
   }
 
   /**
-   * Suit footfall cadence: accumulate grounded walking distance and thump
-   * once per stride (2.0 m base, stretched by speed for the low-g lope).
-   * Mirrors the quest odometer's teleport guard — a >25 m single-frame jump
-   * is a spawn correction, never a footstep.
+   * Suit footfall cadence. For non-bounding gaits: accumulate grounded
+   * walking distance and thump once per stride (2.0 m base, stretched by
+   * speed for the low-g lope). Spec 31 Phase 4: while `gaitMode ===
+   * 'bounding'` the distance odometer is SUPPRESSED entirely — the
+   * ballistic arc carries no contact, so mid-flight odometer footsteps
+   * would machine-gun — and cues fire on the true ground-contact edges
+   * instead: the touchdown edge into `ground_brace` rings
+   * `playHydraulicCompression()` + `playFootstep()`, and the push-off edge
+   * into `flight_arc` cracks `playPneumaticLaunch()` (the visual twin vapor
+   * plumes are triggered inside `EvaSuitAvatar` on the same edge). Mirrors
+   * the quest odometer's teleport guard — a >25 m single-frame jump is a
+   * spawn correction, never a footstep.
    */
   private pumpFootstepAudio(): void {
     const audio = this.audio;
     if (audio === null || this.disposed) return;
     if (this.mode !== 'suit') {
       this.audioFootPrev = null;
+      this.audioFootPrevGrounded = null;
       return;
     }
     const suit = this.requireSuit();
+    const state = suit.getState();
     const pos = suit.getPosition();
     const prev = this.audioFootPrev;
+    const prevGrounded = this.audioFootPrevGrounded;
     this.audioFootPrev = { x: pos.x, y: pos.y };
+    const grounded = state.isGrounded;
+    this.audioFootPrevGrounded = grounded;
     if (prev === null) return;
     const step = Math.hypot(pos.x - prev.x, pos.y - prev.y);
-    if (step <= 0.005 || step >= ClientApp.QUEST_TELEPORT_GUARD_M) return;
-    if (!suit.getState().isGrounded) return;
+    if (step >= ClientApp.QUEST_TELEPORT_GUARD_M) {
+      // Spawn correction, not locomotion — re-baseline without firing cues.
+      this.audioFootTravelled = 0;
+      return;
+    }
+    if (state.gaitMode === 'bounding') {
+      // Spec 31 Phase 4: edge-driven assist-boot cues only — the odometer
+      // stays parked for the whole stride, footsteps mean true contact.
+      if (prevGrounded === false && grounded) {
+        // Touchdown edge: hydraulics compress under the landing load.
+        audio.playHydraulicCompression();
+        audio.playFootstep();
+        this.audioFootTravelled = 0;
+      } else if (prevGrounded === true && !grounded) {
+        // Push-off launch edge: the pneumatic boots fire into the flight arc.
+        audio.playPneumaticLaunch();
+      }
+      return;
+    }
+    if (step <= 0.005) return;
+    if (!grounded) return;
     const stride =
       FOOTSTEP_STRIDE_BASE_M + FOOTSTEP_STRIDE_SPEED_GAIN * suit.getSpeed();
     this.audioFootTravelled += step;

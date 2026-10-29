@@ -235,6 +235,47 @@ export const LADDER_STEP_CADENCE_S = 0.35;
 export const SUMMIT_CHIME_LOW_HZ = 880;
 export const SUMMIT_CHIME_HIGH_HZ = 1320;
 
+// -- Spec 31 §2.3.2: hydraulic assist boot / pneumatic launch voices -----------
+
+/**
+ * Hydraulic touchdown compression (Spec 31 §2.3.2): heavy mechanical fluid
+ * valve hiss — band-passed noise swept 1200 Hz → 380 Hz (Q = 3.5) over
+ * 90 ms with a 5 ms attack / 85 ms decay peaking at 0.18, layered over a
+ * muffled 60 Hz → 30 Hz damper thump (40 ms, peak 0.15). Rides the sfx bus
+ * directly: boot-conducted acoustics survive the vacuum cut like footsteps.
+ */
+export const HYDRAULIC_SWEEP_HIGH_HZ = 1200;
+export const HYDRAULIC_SWEEP_LOW_HZ = 380;
+export const HYDRAULIC_SWEEP_Q = 3.5;
+const HYDRAULIC_SWEEP_S = 0.09;
+const HYDRAULIC_ATTACK_S = 0.005;
+const HYDRAULIC_DECAY_S = 0.085;
+const HYDRAULIC_PEAK = 0.18;
+export const HYDRAULIC_THUMP_HIGH_HZ = 60;
+export const HYDRAULIC_THUMP_LOW_HZ = 30;
+const HYDRAULIC_THUMP_S = 0.04;
+const HYDRAULIC_THUMP_PEAK = 0.15;
+
+/**
+ * Pneumatic push-off launch (Spec 31 §2.3.2): crisp high-pressure release
+ * crack — noise through a high-pass + band-pass swept 2400 Hz → 550 Hz over
+ * 110 ms (3 ms attack / 105 ms decay peaking at 0.22), layered over an
+ * explosive 110 Hz → 45 Hz kinetic pop sine (50 ms, peak 0.20). Rides the
+ * sfx bus directly (suit-conducted, survives the vacuum cut).
+ */
+export const PNEUMATIC_SWEEP_HIGH_HZ = 2400;
+export const PNEUMATIC_SWEEP_LOW_HZ = 550;
+const PNEUMATIC_SWEEP_Q = 2.2;
+const PNEUMATIC_HIGHPASS_HZ = 300;
+const PNEUMATIC_SWEEP_S = 0.11;
+const PNEUMATIC_ATTACK_S = 0.003;
+const PNEUMATIC_DECAY_S = 0.105;
+const PNEUMATIC_PEAK = 0.22;
+export const PNEUMATIC_POP_HIGH_HZ = 110;
+export const PNEUMATIC_POP_LOW_HZ = 45;
+const PNEUMATIC_POP_S = 0.05;
+const PNEUMATIC_POP_PEAK = 0.2;
+
 /** Noise buffer length baked once per context (seconds). */
 const NOISE_BUFFER_SECONDS = 2;
 
@@ -489,6 +530,11 @@ export class LunarAudioSystem {
   private ladderLatchCount = 0;
   private ladderStepCount = 0;
   private summitChimeCount = 0;
+  // -- Spec 31 Phase 4: Steelpush assist-boot cue bookkeeping (times + counts). -
+  private lastHydraulicCompressionAt = Number.NEGATIVE_INFINITY;
+  private lastPneumaticLaunchAt = Number.NEGATIVE_INFINITY;
+  private hydraulicCompressionCount = 0;
+  private pneumaticLaunchCount = 0;
   /** Last flyby record (null before the first pass). */
   private lastFlyby: MaglevFlybyRecord | null = null;
 
@@ -620,6 +666,10 @@ export class LunarAudioSystem {
     this.ladderLatchCount = 0;
     this.ladderStepCount = 0;
     this.summitChimeCount = 0;
+    this.lastHydraulicCompressionAt = Number.NEGATIVE_INFINITY;
+    this.lastPneumaticLaunchAt = Number.NEGATIVE_INFINITY;
+    this.hydraulicCompressionCount = 0;
+    this.pneumaticLaunchCount = 0;
     this.musicFilter = null;
     this.noiseBuffer = null;
   }
@@ -1431,6 +1481,160 @@ export class LunarAudioSystem {
       latchCount: this.ladderLatchCount,
       stepCount: this.ladderStepCount,
       chimeCount: this.summitChimeCount,
+    };
+  }
+
+  // -- Spec 31 §2.3.2: hydraulic assist boot procedural voices --------------------
+
+  /**
+   * Hydraulic touchdown compression (Spec 31 §2.3.2): fired when a bounding
+   * footfall enters `ground_brace` — the assist-boot cylinders absorbing the
+   * landing shock. Acoustic signature: band-passed noise swept 1200 Hz →
+   * 380 Hz (Q = 3.5) across 90 ms (5 ms attack, 85 ms decay, peak 0.18),
+   * layered over a muffled 60 Hz → 30 Hz damper thump (40 ms, peak 0.15).
+   * Rides the sfx bus directly — boot-conducted acoustics survive the
+   * vacuum cut like footsteps. Deterministic in the headless mock context
+   * (every node is created and scheduled exactly as in the browser, zero
+   * wall-clock audio); safe before `init()` / after `dispose()` (no-op).
+   */
+  playHydraulicCompression(): void {
+    if (!this.ready()) return;
+    const ctx = this.ctx!;
+    const t0 = ctx.currentTime + 0.005;
+    this.lastHydraulicCompressionAt = t0;
+    this.hydraulicCompressionCount++;
+
+    // Fluid-valve hiss: Q=3.5 band-pass sliding 1200 → 380 Hz over 90 ms.
+    const hiss = this.createNoiseSource();
+    if (hiss !== null) {
+      const band = ctx.createBiquadFilter();
+      band.type = 'bandpass';
+      band.Q.value = HYDRAULIC_SWEEP_Q;
+      band.frequency.setValueAtTime(HYDRAULIC_SWEEP_HIGH_HZ, t0);
+      band.frequency.exponentialRampToValueAtTime(HYDRAULIC_SWEEP_LOW_HZ, t0 + HYDRAULIC_SWEEP_S);
+      const hissGain = ctx.createGain();
+      hissGain.gain.setValueAtTime(0, t0);
+      hissGain.gain.linearRampToValueAtTime(HYDRAULIC_PEAK, t0 + HYDRAULIC_ATTACK_S);
+      hissGain.gain.exponentialRampToValueAtTime(SILENT, t0 + HYDRAULIC_ATTACK_S + HYDRAULIC_DECAY_S);
+      hiss.connect(band);
+      band.connect(hissGain);
+      hissGain.connect(this.sfxBus!);
+      hiss.start(t0);
+      hiss.stop(t0 + HYDRAULIC_SWEEP_S + 0.05);
+    }
+
+    // Damper thump: sine slamming 60 → 30 Hz across the 40 ms compression.
+    const thump = ctx.createOscillator();
+    thump.type = 'sine';
+    thump.frequency.setValueAtTime(HYDRAULIC_THUMP_HIGH_HZ, t0);
+    thump.frequency.exponentialRampToValueAtTime(HYDRAULIC_THUMP_LOW_HZ, t0 + HYDRAULIC_THUMP_S);
+    const thumpGain = ctx.createGain();
+    thumpGain.gain.setValueAtTime(0, t0);
+    thumpGain.gain.linearRampToValueAtTime(HYDRAULIC_THUMP_PEAK, t0 + HYDRAULIC_ATTACK_S);
+    thumpGain.gain.exponentialRampToValueAtTime(SILENT, t0 + HYDRAULIC_THUMP_S);
+    thump.connect(thumpGain);
+    thumpGain.connect(this.sfxBus!);
+    thump.start(t0);
+    thump.stop(t0 + HYDRAULIC_THUMP_S + 0.02);
+
+    void this.resumeIfSuspended();
+  }
+
+  /** Lifetime count of hydraulic compression cues fired since `init()`. */
+  getHydraulicCompressionCount(): number {
+    return this.hydraulicCompressionCount;
+  }
+
+  /** Context time of the last hydraulic compression (−∞ before the first). */
+  getLastHydraulicCompressionAt(): number {
+    return this.lastHydraulicCompressionAt;
+  }
+
+  /**
+   * Pneumatic push-off launch (Spec 31 §2.3.2): fired on the Steelpush
+   * launch edge entering `flight_arc` — the gas-piston boots firing. Acoustic
+   * signature: high-pressure vent crack of noise through a high-pass +
+   * band-pass swept 2400 Hz → 550 Hz across 110 ms (3 ms attack, 105 ms
+   * decay, peak 0.22), layered over an explosive 110 Hz → 45 Hz kinetic pop
+   * sine (50 ms, peak 0.20) that decays cleanly with no DC offset. Rides
+   * the sfx bus directly (suit-conducted, survives the vacuum cut). Fully
+   * deterministic headlessly via the mock nodes; safe before `init()` /
+   * after `dispose()` (silent no-op).
+   */
+  playPneumaticLaunch(): void {
+    if (!this.ready()) return;
+    const ctx = this.ctx!;
+    const t0 = ctx.currentTime + 0.005;
+    this.lastPneumaticLaunchAt = t0;
+    this.pneumaticLaunchCount++;
+
+    // High-pressure release crack: high-pass + band-pass sliding 2400 →
+    // 550 Hz across 110 ms (the vent shrieks down as the cylinder empties).
+    const vent = this.createNoiseSource();
+    if (vent !== null) {
+      const shelf = ctx.createBiquadFilter();
+      shelf.type = 'highpass';
+      shelf.frequency.value = PNEUMATIC_HIGHPASS_HZ;
+      const band = ctx.createBiquadFilter();
+      band.type = 'bandpass';
+      band.Q.value = PNEUMATIC_SWEEP_Q;
+      band.frequency.setValueAtTime(PNEUMATIC_SWEEP_HIGH_HZ, t0);
+      band.frequency.exponentialRampToValueAtTime(PNEUMATIC_SWEEP_LOW_HZ, t0 + PNEUMATIC_SWEEP_S);
+      const crackGain = ctx.createGain();
+      crackGain.gain.setValueAtTime(0, t0);
+      crackGain.gain.linearRampToValueAtTime(PNEUMATIC_PEAK, t0 + PNEUMATIC_ATTACK_S);
+      crackGain.gain.exponentialRampToValueAtTime(SILENT, t0 + PNEUMATIC_ATTACK_S + PNEUMATIC_DECAY_S);
+      vent.connect(shelf);
+      shelf.connect(band);
+      band.connect(crackGain);
+      crackGain.connect(this.sfxBus!);
+      vent.start(t0);
+      vent.stop(t0 + PNEUMATIC_SWEEP_S + 0.05);
+    }
+
+    // Kinetic impulse pop: sine dropping 110 → 45 Hz across 50 ms — the
+    // piston bottoming out. Exponential decay keeps the tail DC-free.
+    const pop = ctx.createOscillator();
+    pop.type = 'sine';
+    pop.frequency.setValueAtTime(PNEUMATIC_POP_HIGH_HZ, t0);
+    pop.frequency.exponentialRampToValueAtTime(PNEUMATIC_POP_LOW_HZ, t0 + PNEUMATIC_POP_S);
+    const popGain = ctx.createGain();
+    popGain.gain.setValueAtTime(0, t0);
+    popGain.gain.linearRampToValueAtTime(PNEUMATIC_POP_PEAK, t0 + PNEUMATIC_ATTACK_S);
+    popGain.gain.exponentialRampToValueAtTime(SILENT, t0 + PNEUMATIC_POP_S);
+    pop.connect(popGain);
+    popGain.connect(this.sfxBus!);
+    pop.start(t0);
+    pop.stop(t0 + PNEUMATIC_POP_S + 0.02);
+
+    void this.resumeIfSuspended();
+  }
+
+  /** Lifetime count of pneumatic launch cues fired since `init()`. */
+  getPneumaticLaunchCount(): number {
+    return this.pneumaticLaunchCount;
+  }
+
+  /** Context time of the last pneumatic launch (−∞ before the first). */
+  getLastPneumaticLaunchAt(): number {
+    return this.lastPneumaticLaunchAt;
+  }
+
+  /**
+   * Context times + lifetime counts of the two Spec 31 assist-boot cues —
+   * harness readback for the smoke gates (mirrors {@link getClimbingCueTimes}).
+   */
+  getSteelpushCueTimes(): {
+    compressionAt: number;
+    launchAt: number;
+    compressionCount: number;
+    launchCount: number;
+  } {
+    return {
+      compressionAt: this.lastHydraulicCompressionAt,
+      launchAt: this.lastPneumaticLaunchAt,
+      compressionCount: this.hydraulicCompressionCount,
+      launchCount: this.pneumaticLaunchCount,
     };
   }
 

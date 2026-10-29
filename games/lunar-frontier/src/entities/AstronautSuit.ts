@@ -508,6 +508,32 @@ export const BOOT_DUST_PARTICLE_COUNT = 24;
 /** Boot-dust puff gravity, metres per second squared (lunar datum). */
 const BOOT_DUST_GRAVITY_Y = -1.62;
 
+// -- Dual pneumatic exhaust vapor vents (Spec 31 §2.3.1 / Phase 4) -------------
+/**
+ * Spec 31 §2.3.1: on every Steelpush push-off launch, twin high-velocity
+ * vapor plumes vent from the aft heel exhaust ports of the pushing boot —
+ * white/cyan pressurised nitrogen directed 45° aft/downward against the
+ * heading, accompanying the regolith footfall dust puff. One ParticleSystem
+ * per nozzle (the twin plumes), NullEngine-safe via a fallback node.
+ */
+export const PNEUMATIC_VENT_NOZZLE_COUNT = 2;
+/** Particle budget per nozzle emitter. */
+export const PNEUMATIC_VENT_PARTICLE_COUNT = 36;
+/** Plume lifespan, seconds (spec 0.22 s). */
+export const PNEUMATIC_VENT_LIFETIME_S = 0.22;
+/** Muzzle velocity, m/s (spec ≈ 4.0 m/s along the 45° aft/down vector). */
+export const PNEUMATIC_VENT_SPEED_MPS = 4.0;
+/** Nozzle offset from the boot sole: ± lateral hip half-width (m). */
+export const PNEUMATIC_VENT_LATERAL_OFFSET_M = 0.06;
+/** Nozzle heel rise above the sole (m). */
+export const PNEUMATIC_VENT_HEEL_RISE_M = 0.05;
+/** Nozzle aft offset behind the sole along −heading (m). */
+export const PNEUMATIC_VENT_AFT_OFFSET_M = 0.12;
+/** Pressurised-gas plume tint — white/cyan Color4(0.85, 0.95, 1.0, 0.7). */
+export const PNEUMATIC_VENT_COLOR: readonly [number, number, number, number] = [
+  0.85, 0.95, 1.0, 0.7,
+];
+
 export interface EvaSuitAvatarOptions {
   /** Seed for the owned `LunarEvaSuit` (spawn position, reserves…). */
   initial?: Partial<SuitState>;
@@ -681,6 +707,18 @@ export class EvaSuitAvatar {
    * assert consecutive bounding footfalls alternate left/right through this.
    */
   private lastBootDustPuffPos: { x: number; y: number; z: number } | null = null;
+  /**
+   * Spec 31 §2.3.1 twin aft-heel pneumatic vapor emitters (one ParticleSystem
+   * per nozzle). Built lazily on the first vent over a real GL engine; on
+   * NullEngine the fallback transform node stands in so headless harnesses
+   * still observe the plume origin.
+   */
+  private pneumaticVentNozzles: ParticleSystem[] = [];
+  private pneumaticVentFallback?: TransformNode;
+  /** Cumulative vent triggers (twin plumes each) since init (smoke readback). */
+  private pneumaticVentCount = 0;
+  /** Physics-frame coordinates of the most recent vent (null before first). */
+  private lastPneumaticVentPos: { x: number; y: number; z: number } | null = null;
   /** Most recently stepped state — keeps getters honest across scene life. */
   private last: SuitState;
 
@@ -808,6 +846,14 @@ export class EvaSuitAvatar {
     if (this.bootDustFallback !== undefined) {
       EvaSuitAvatar.disposeQuietly(this.bootDustFallback);
       this.bootDustFallback = undefined;
+    }
+    for (const nozzle of this.pneumaticVentNozzles) {
+      EvaSuitAvatar.disposeQuietly(nozzle);
+    }
+    this.pneumaticVentNozzles = [];
+    if (this.pneumaticVentFallback !== undefined) {
+      EvaSuitAvatar.disposeQuietly(this.pneumaticVentFallback);
+      this.pneumaticVentFallback = undefined;
     }
     EvaSuitAvatar.disposeQuietly(this.root);
     this.root = null;
@@ -1057,6 +1103,119 @@ export class EvaSuitAvatar {
     return this.lastBootDustPuffPos === null
       ? null
       : { ...this.lastBootDustPuffPos };
+  }
+
+  /**
+   * Spec 31 §2.3.1: fire the twin aft-heel pneumatic exhaust vents — two
+   * high-velocity white/cyan vapor plumes (`Color4(0.85, 0.95, 1.0, 0.7)`
+   * fading to transparent) from the aft heel exhaust ports at the given
+   * physics-frame point (default: the suit centre), aimed 45° aft/downward
+   * along −heading at ≈ 4 m/s with a 0.22 s lifespan. Callers pass the
+   * PUSHING boot sole on a Steelpush launch edge (see {@link applyWalkCycle}).
+   *
+   * On real WebGL engines each nozzle is a lazily-built `ParticleSystem`
+   * whose emitter and direction vectors are re-aimed per trigger. Under
+   * NullEngine no GPU system is created — the trigger instead parks the
+   * fallback node at the plume origin and records count + position
+   * deterministically, so headless smoke harnesses exercise the full path.
+   * Returns the cumulative number of vent triggers (twin plumes each)
+   * since init.
+   */
+  triggerPneumaticVent(at?: { x: number; y: number; z: number }): number {
+    if (this.disposed) return this.pneumaticVentCount;
+    const scene = this.scene;
+    if (scene === null || scene.isDisposed) return this.pneumaticVentCount;
+    const p = at ?? { x: this.last.x, y: this.last.y, z: this.last.z };
+    this.lastPneumaticVentPos = { x: p.x, y: p.y, z: p.z };
+    const h = this.last.heading ?? 0;
+    const isNull = scene.getEngine().name === 'NullEngine';
+    if (isNull) {
+      if (this.pneumaticVentFallback === undefined) {
+        this.pneumaticVentFallback = new TransformNode('eva-pneumatic-vent-fallback', scene);
+      }
+      // Park the fallback node at the vent origin so headless consumers can
+      // read the plume coordinates off the scene too.
+      const fb = worldToBabylon(p);
+      this.pneumaticVentFallback.position.set(fb.x, fb.y + PNEUMATIC_VENT_HEEL_RISE_M, fb.z);
+      this.pneumaticVentCount += 1;
+      return this.pneumaticVentCount;
+    }
+    // 45° aft/down unit vector scaled to muzzle velocity. Physics aft is
+    // (−cos h, −sin h, 0) and down is −z; the (x, z↑, −y) map turns this
+    // into the Babylon vector (−cos h·k, −k, sin h·k) with k = v/√2.
+    const k = PNEUMATIC_VENT_SPEED_MPS * Math.SQRT1_2;
+    const dirX = -Math.cos(h) * k;
+    const dirY = -k;
+    const dirZ = Math.sin(h) * k;
+    // Fixed 15 % spread (deterministic — no Math.random in the vent path).
+    const jx = Math.abs(dirX) * 0.15 + 0.05;
+    const jy = Math.abs(dirY) * 0.15 + 0.05;
+    const jz = Math.abs(dirZ) * 0.15 + 0.05;
+    if (this.pneumaticVentNozzles.length === 0) {
+      for (let i = 0; i < PNEUMATIC_VENT_NOZZLE_COUNT; i++) {
+        const ps = new ParticleSystem(
+          `${this.prefix}-pneumatic-vent-${i}`,
+          PNEUMATIC_VENT_PARTICLE_COUNT,
+          scene,
+        );
+        ps.minLifeTime = PNEUMATIC_VENT_LIFETIME_S * 0.72;
+        ps.maxLifeTime = PNEUMATIC_VENT_LIFETIME_S * 1.18;
+        ps.minSize = 0.04;
+        ps.maxSize = 0.14;
+        ps.emitRate = 180;
+        ps.minEmitPower = 1;
+        ps.maxEmitPower = 1;
+        // Pressurised gas over 0.22 s: gravity is negligible — keep the
+        // plume on its ballistic 45° vector.
+        ps.gravity = new Vector3(0, 0, 0);
+        ps.color1 = new Color4(
+          PNEUMATIC_VENT_COLOR[0],
+          PNEUMATIC_VENT_COLOR[1],
+          PNEUMATIC_VENT_COLOR[2],
+          PNEUMATIC_VENT_COLOR[3],
+        );
+        ps.color2 = new Color4(PNEUMATIC_VENT_COLOR[0], PNEUMATIC_VENT_COLOR[1], PNEUMATIC_VENT_COLOR[2], 0.25);
+        ps.colorDead = new Color4(0, 0, 0, 0);
+        ps.blendMode = ParticleSystem.BLENDMODE_ADD;
+        this.pneumaticVentNozzles.push(ps);
+      }
+    }
+    // Lateral unit vector perpendicular to heading (same law as the boot
+    // soles): (−sin h, cos h); aft is (−cos h, −sin h) in the physics frame.
+    for (let i = 0; i < this.pneumaticVentNozzles.length; i++) {
+      const ps = this.pneumaticVentNozzles[i]!;
+      const side = i === 0 ? -1 : 1;
+      const nozzle = worldToBabylon({
+        x: p.x + side * PNEUMATIC_VENT_LATERAL_OFFSET_M * -Math.sin(h) - PNEUMATIC_VENT_AFT_OFFSET_M * Math.cos(h),
+        y: p.y + side * PNEUMATIC_VENT_LATERAL_OFFSET_M * Math.cos(h) - PNEUMATIC_VENT_AFT_OFFSET_M * Math.sin(h),
+        z: p.z + PNEUMATIC_VENT_HEEL_RISE_M,
+      });
+      (ps.emitter as Vector3).set(nozzle.x, nozzle.y, nozzle.z);
+      ps.direction1 = new Vector3(dirX - jx, dirY - jy, dirZ - jz);
+      ps.direction2 = new Vector3(dirX + jx, dirY + jy, dirZ + jz);
+      try {
+        ps.start();
+      } catch {
+        /* NullEngine / disposed scene — never propagate a GPU failure. */
+      }
+    }
+    this.pneumaticVentCount += 1;
+    return this.pneumaticVentCount;
+  }
+
+  /** Cumulative pneumatic vent triggers (twin plumes each) since init. */
+  getPneumaticVentCount(): number {
+    return this.pneumaticVentCount;
+  }
+
+  /**
+   * Spec 31 §2.3.1: physics-frame coordinates of the most recent pneumatic
+   * vent (the pushing boot heel), or null before the first trigger.
+   */
+  getLastPneumaticVentPos(): { x: number; y: number; z: number } | null {
+    return this.lastPneumaticVentPos === null
+      ? null
+      : { ...this.lastPneumaticVentPos };
   }
 
   // -- internals --------------------------------------------------------------
@@ -1827,6 +1986,13 @@ export class EvaSuitAvatar {
       const strideLeg = state.hurryStrideLeg ?? 'left';
       const airborne = !state.isGrounded;
       if (airborne) {
+        if (!this.boundingFlight) {
+          // Spec 31 §2.3.1 rising edge of flight — Steelpush push-off launch:
+          // fire the twin aft-heel vapor plumes from the PUSHING boot, i.e.
+          // the leg OPPOSITE the next touchdown (stride) leg, at its sole.
+          const pushLeg: HurryStrideLeg = strideLeg === 'left' ? 'right' : 'left';
+          this.triggerPneumaticVent(this.bootSoleWorldPos(state, pushLeg));
+        }
         this.boundingFlight = true;
       } else if (this.boundingFlight) {
         // Touchdown edge: kick regolith dust at the EXACT world coordinates
