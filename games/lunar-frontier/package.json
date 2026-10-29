@@ -18,6 +18,7 @@
     "smoke:mass-accelerator": "npx tsx scripts/smoke-mass-accelerator.ts",
     "smoke:radio-tower": "npx tsx scripts/smoke-radio-tower.ts",
     "smoke:eva-cleanup": "npx tsx scripts/smoke-eva-cleanup.ts",
+    "smoke:steelpush": "npx tsx scripts/smoke-steelpush-hustle.ts",
     "lunar:smoke:cleanup": "npx tsx scripts/smoke-general-cleanup.ts",
     "verify:surface": "npx tsx tests/verify-surface-rendering.ts",
     "typecheck:server": "tsc -p tsconfig.server.json"
