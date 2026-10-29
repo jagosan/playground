@@ -157,7 +157,23 @@ npm run smoke:mass-accelerator
   - Fire control overlay with 0.1° AZ/EL crosshair, dynamic pulsating lead reticle with $\pm 1.5^\circ$ green lock snapping (`#00e676`), hemispherical orbital sky-track radar, vertical capacitor muzzle gauge with optimal velocity bracket, and flashing amber/crimson USP threat alert widget.
   - Procedural Web Audio: 80–880 Hz dual-oscillator capacitor charge whine with 13 Hz AM jitter, 45 Hz sub-bass drop Lorentz blast with 2,400 Hz electrical snap and 320 Hz barrel resonance, Doppler canister hiss, two-tone ascending major capture chime (523 $\to$ 659 Hz), and 440/587 Hz square-LFO emergency klaxon.
 
-## 8. Production Build & Deployment
+## 8. EVA Locomotion Overhaul, Stormtrooper Suit & Dedicated HUD Controls (Spec 30)
+- **Stormtrooper Composite Armor (`AstronautSuit.ts`):** 56-mesh armored hierarchy featuring pectoral carapace, segmented abdominal cuirass, utility belt, codpiece, flared shoulder bells (pauldrons spanning $\ge 0.48\,\text{m}$), vambraces, thigh cuirasses, knee cops with strike plates, and heavy magnetic boots.
+- **Unilateral Alternating Steelpush Bounding (`TraversalPhysics.ts`):** Unilateral single-leg bounding leaps ($v_{z,\text{launch}} = 1.55\,\text{m/s}$, forward boost $\Delta v = 1.0\,\text{m/s}$, restitution $\eta = 0.90$), alternating stance legs (`hurryStrideLeg`).
+- **Dedicated Browser-Safe UI Controls (`ClientApp.ts`, `LunarHUD.ts`):** `[U]` / `[H]` keyboard shortcuts and gamepad double-tap `R3` / long-press `View` cycle HUD modes (`standard` $\to$ `minimal` $\to$ `hidden`), completely independent of `Escape` to avoid pointer lock release.
+
+## 9. High-Speed Steelpush Locomotion: Olympic Stutter Cycle & Hydraulic Assist Boots (Spec 31)
+- **Triple-Jump Mid-Air Stutter Cycle & Hitch-Kick (`AstronautSuit.ts`):** Dynamic, non-static airborne kinematics across normalized phase $u \in [0, 1]$:
+  - *Phase A (Takeoff Drive, $u \in [0, 0.28)$):* Hyperextension of pushing leg aft ($+0.62\,\text{rad}$), lead knee punching forward and upward ($-0.58\,\text{rad}$).
+  - *Phase B (Olympic Hitch-Kick Stutter, $u \in [0.28, 0.72)$):* Trailing leg whips forward in rapid tuck under pelvis (knee flexes to $1.15\,\text{rad}$); leading leg cycles downward into claw with $\sin(\pi t_B)$ velocity stutter.
+  - *Phase C (Pre-Landing Claw, $u \in [0.72, 1.0]$):* Landing leg claws down to regolith (knee in active pre-tensioned $[0.25, 0.50]\,\text{rad}$ band); recovery leg cocked high for instant rebound.
+- **Ambient Upper-Body Hustle:** Torso forward rake scales dynamically from $7^\circ$ ($0.12\,\text{rad}$) at $1.8\,\text{m/s}$ to $14^\circ$ ($0.24\,\text{rad}$) at $5.2\,\text{m/s}$ with $\pm 1.5^\circ$ spinal breathing heave; thoracic counter-yaw twists $\pm 4^\circ$ against pelvis; arms actively pump in opposition ($\Delta \theta \ge 0.55\,\text{rad}$); visor horizon lock counter-pitches the head ($-0.65 \times \theta_\text{torso}$).
+- **Hydraulic/Pneumatic Assist Boots FX & Web Audio (`LunarAudioSystem.ts`, `AstronautSuit.ts`, `ClientApp.ts`):**
+  - *Pneumatic Heel Vents:* Twin directional white-cyan vapor exhaust plumes shoot $45^\circ$ aft/downward on each push-off launch from the pushing boot heel spur.
+  - *Procedural Web Audio:* `playHydraulicCompression()` (1200 $\to$ 380 Hz fluid sweep + 60 Hz damper thump on touchdown) and `playPneumaticLaunch()` (2400 $\to$ 550 Hz high-pressure crack + 110 Hz kinetic punch on launch).
+  - Footstep audio synchronized to true regolith contacts with zero mid-air odometer footsteps.
+
+## 10. Production Build & Deployment
 ```bash
 cd games/lunar-frontier
 npm run build
