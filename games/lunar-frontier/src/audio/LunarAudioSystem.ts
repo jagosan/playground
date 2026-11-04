@@ -276,6 +276,26 @@ export const PNEUMATIC_POP_LOW_HZ = 45;
 const PNEUMATIC_POP_S = 0.05;
 const PNEUMATIC_POP_PEAK = 0.2;
 
+/**
+ * Cold-gas PLSS RCS jump-boost thrust (Spec 32 §2.3.3): sustained valve
+ * hiss — band-passed noise swept 1 900 Hz → 650 Hz (Q = 3.0) over 220 ms
+ * (8 ms attack / 205 ms decay peaking at 0.16), layered over a muffled
+ * 90 Hz → 55 Hz reservoir rumble (150 ms, peak 0.09). Rides the sfx bus
+ * directly (suit-conducted through the PLSS frame, survives the vacuum
+ * cut). ClientApp re-triggers on ~0.22 s ticks while `rcsBoostActive`.
+ */
+export const RCS_THRUST_SWEEP_HIGH_HZ = 1900;
+export const RCS_THRUST_SWEEP_LOW_HZ = 650;
+export const RCS_THRUST_SWEEP_Q = 3.0;
+const RCS_THRUST_SWEEP_S = 0.22;
+const RCS_THRUST_ATTACK_S = 0.008;
+const RCS_THRUST_DECAY_S = 0.205;
+const RCS_THRUST_PEAK = 0.16;
+const RCS_THRUST_RUMBLE_HIGH_HZ = 90;
+const RCS_THRUST_RUMBLE_LOW_HZ = 55;
+const RCS_THRUST_RUMBLE_S = 0.15;
+const RCS_THRUST_RUMBLE_PEAK = 0.09;
+
 /** Noise buffer length baked once per context (seconds). */
 const NOISE_BUFFER_SECONDS = 2;
 
@@ -535,6 +555,9 @@ export class LunarAudioSystem {
   private lastPneumaticLaunchAt = Number.NEGATIVE_INFINITY;
   private hydraulicCompressionCount = 0;
   private pneumaticLaunchCount = 0;
+  /** Spec 32 §2.3.3: PLSS RCS cold-gas boost bursts (count + last context time). */
+  private rcsThrustCount = 0;
+  private lastRcsThrustAt = Number.NEGATIVE_INFINITY;
   /** Last flyby record (null before the first pass). */
   private lastFlyby: MaglevFlybyRecord | null = null;
 
@@ -670,6 +693,8 @@ export class LunarAudioSystem {
     this.lastPneumaticLaunchAt = Number.NEGATIVE_INFINITY;
     this.hydraulicCompressionCount = 0;
     this.pneumaticLaunchCount = 0;
+    this.rcsThrustCount = 0;
+    this.lastRcsThrustAt = Number.NEGATIVE_INFINITY;
     this.musicFilter = null;
     this.noiseBuffer = null;
   }
@@ -1636,6 +1661,79 @@ export class LunarAudioSystem {
       compressionCount: this.hydraulicCompressionCount,
       launchCount: this.pneumaticLaunchCount,
     };
+  }
+
+  /**
+   * Cold-gas PLSS RCS jump-boost thrust (Spec 32 §2.3.3): fired by
+   * ClientApp while `SuitState.rcsBoostActive` is true (rising edge plus
+   * ~0.22 s re-arm ticks while the valve holds). Acoustic signature:
+   * high-pressure valve hiss — band-passed noise swept 1 900 Hz → 650 Hz
+   * (Q = 3.0) over 220 ms with an 8 ms attack and 205 ms exponential decay
+   * peaking at 0.16 — layered over a muffled 90 Hz → 55 Hz reservoir
+   * rumble (150 ms, peak 0.09). Rides the sfx bus directly (conducted
+   * through the PLSS frame, survives the vacuum cut). Deterministic under
+   * the headless mock nodes; safe before `init()` / after `dispose()`
+   * (silent no-op).
+   */
+  playRcsThrust(): void {
+    if (!this.ready()) return;
+    const ctx = this.ctx!;
+    const t0 = ctx.currentTime + 0.005;
+    this.lastRcsThrustAt = t0;
+    this.rcsThrustCount++;
+
+    // Valve hiss: band-pass sliding 1900 → 650 Hz as the reservoir blows
+    // down — the plume shrieks then softens across the burst window.
+    const hiss = this.createNoiseSource();
+    if (hiss !== null) {
+      const band = ctx.createBiquadFilter();
+      band.type = 'bandpass';
+      band.Q.value = RCS_THRUST_SWEEP_Q;
+      band.frequency.setValueAtTime(RCS_THRUST_SWEEP_HIGH_HZ, t0);
+      band.frequency.exponentialRampToValueAtTime(
+        RCS_THRUST_SWEEP_LOW_HZ,
+        t0 + RCS_THRUST_SWEEP_S,
+      );
+      const hissGain = ctx.createGain();
+      hissGain.gain.setValueAtTime(0, t0);
+      hissGain.gain.linearRampToValueAtTime(RCS_THRUST_PEAK, t0 + RCS_THRUST_ATTACK_S);
+      hissGain.gain.exponentialRampToValueAtTime(
+        SILENT,
+        t0 + RCS_THRUST_ATTACK_S + RCS_THRUST_DECAY_S,
+      );
+      hiss.connect(band);
+      band.connect(hissGain);
+      hissGain.connect(this.sfxBus!);
+      hiss.start(t0);
+      hiss.stop(t0 + RCS_THRUST_SWEEP_S + 0.05);
+    }
+
+    // Reservoir rumble: sine dropping 90 → 55 Hz across 150 ms — the
+    // tank body resonating as the high-pressure gas leaves. DC-free tail.
+    const rumble = ctx.createOscillator();
+    rumble.type = 'sine';
+    rumble.frequency.setValueAtTime(RCS_THRUST_RUMBLE_HIGH_HZ, t0);
+    rumble.frequency.exponentialRampToValueAtTime(RCS_THRUST_RUMBLE_LOW_HZ, t0 + RCS_THRUST_RUMBLE_S);
+    const rumbleGain = ctx.createGain();
+    rumbleGain.gain.setValueAtTime(0, t0);
+    rumbleGain.gain.linearRampToValueAtTime(RCS_THRUST_RUMBLE_PEAK, t0 + RCS_THRUST_ATTACK_S);
+    rumbleGain.gain.exponentialRampToValueAtTime(SILENT, t0 + RCS_THRUST_RUMBLE_S);
+    rumble.connect(rumbleGain);
+    rumbleGain.connect(this.sfxBus!);
+    rumble.start(t0);
+    rumble.stop(t0 + RCS_THRUST_RUMBLE_S + 0.02);
+
+    void this.resumeIfSuspended();
+  }
+
+  /** Lifetime count of cold-gas RCS thrust bursts fired since `init()`. */
+  getRcsThrustCount(): number {
+    return this.rcsThrustCount;
+  }
+
+  /** Context time of the last cold-gas RCS thrust burst (−∞ before the first). */
+  getLastRcsThrustAt(): number {
+    return this.lastRcsThrustAt;
   }
 
   // -- internals ---------------------------------------------------------------------

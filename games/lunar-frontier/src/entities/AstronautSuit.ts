@@ -686,6 +686,31 @@ export const PNEUMATIC_VENT_COLOR: readonly [number, number, number, number] = [
   0.85, 0.95, 1.0, 0.7,
 ];
 
+// -- PLSS backpack upper RCS exhaust ports (Spec 32 §2.3.3) -------------------
+/**
+ * Spec 32 §2.3.3: while the tactical cold-gas RCS jump boost fires
+ * (`SuitState.rcsBoostActive`), twin high-pressure vapor plumes vent from
+ * the PLSS backpack upper exhaust ports (on the twin cryo-tank axis, near
+ * the pack top), directed aft and tilted ≈30° upward against the heading.
+ * One ParticleSystem per nozzle, NullEngine-safe via a fallback node —
+ * same architecture as the Spec 31 heel vents.
+ */
+export const RCS_BACKPACK_NOZZLE_COUNT = 2;
+/** Particle budget per nozzle emitter. */
+export const RCS_BACKPACK_PARTICLE_COUNT = 30;
+/** Plume lifespan, seconds (matches the 0.22 s ClientApp re-arm cadence). */
+export const RCS_BACKPACK_LIFETIME_S = 0.22;
+/** Muzzle velocity, m/s. */
+export const RCS_BACKPACK_SPEED_MPS = 3.5;
+/** Port lateral offset along the tank axis, ± (m) — GEO `plss.tank.dx`. */
+export const RCS_BACKPACK_LATERAL_OFFSET_M = 0.12;
+/** Port aft offset behind the suit centre along −heading (m). */
+export const RCS_BACKPACK_AFT_OFFSET_M = 0.42;
+/** Port height above the suit-centre datum (m; pack top ≈ 1.30 m). */
+export const RCS_BACKPACK_PORT_RISE_M = 1.3;
+/** Plume tilt above horizontal aft, radians (≈ 30°). */
+export const RCS_BACKPACK_TILT_RAD = 0.5236;
+
 export interface EvaSuitAvatarOptions {
   /** Seed for the owned `LunarEvaSuit` (spawn position, reserves…). */
   initial?: Partial<SuitState>;
@@ -880,6 +905,17 @@ export class EvaSuitAvatar {
   private pneumaticVentCount = 0;
   /** Physics-frame coordinates of the most recent vent (null before first). */
   private lastPneumaticVentPos: { x: number; y: number; z: number } | null = null;
+  /**
+   * Spec 32 §2.3.3 twin PLSS backpack upper-port RCS vapor emitters — same
+   * lazy/NullEngine-fallback architecture as the heel vents; armed while
+   * `SuitState.rcsBoostActive` fires.
+   */
+  private rcsBackpackNozzles: ParticleSystem[] = [];
+  private rcsBackpackFallback?: TransformNode;
+  /** Cumulative backpack vent triggers (twin plumes each) since init. */
+  private rcsBackpackVentCount = 0;
+  /** Physics-frame coordinates of the most recent backpack vent. */
+  private lastRcsBackpackVentPos: { x: number; y: number; z: number } | null = null;
   /** Most recently stepped state — keeps getters honest across scene life. */
   private last: SuitState;
 
@@ -1377,6 +1413,118 @@ export class EvaSuitAvatar {
     return this.lastPneumaticVentPos === null
       ? null
       : { ...this.lastPneumaticVentPos };
+  }
+
+  /**
+   * Spec 32 §2.3.3: fire the twin high-pressure PLSS vapor plumes from the
+   * backpack upper exhaust ports (twin cryo-tank axis, pack top), aimed aft
+   * and tilted ≈30° upward against the heading at ≈ 3.5 m/s — the visual
+   * signature of the cold-gas RCS jump boost. ClientApp calls this on the
+   * `SuitState.rcsBoostActive` rising edge and on ~0.22 s re-arm ticks while
+   * the valve holds.
+   *
+   * On real WebGL engines each nozzle is a lazily-built `ParticleSystem`
+   * re-aimed per trigger; under NullEngine a fallback node parks at the
+   * port coordinates and count/position are recorded deterministically so
+   * headless smoke harnesses exercise the full path. Returns the cumulative
+   * number of backpack vent triggers (twin plumes each) since init.
+   */
+  triggerBackpackRcsVent(): number {
+    if (this.disposed) return this.rcsBackpackVentCount;
+    const scene = this.scene;
+    if (scene === null || scene.isDisposed) return this.rcsBackpackVentCount;
+    const p = { x: this.last.x, y: this.last.y, z: this.last.z };
+    const h = this.last.heading ?? 0;
+    const port = {
+      x: p.x - RCS_BACKPACK_AFT_OFFSET_M * Math.cos(h),
+      y: p.y - RCS_BACKPACK_AFT_OFFSET_M * Math.sin(h),
+      z: p.z + RCS_BACKPACK_PORT_RISE_M,
+    };
+    this.lastRcsBackpackVentPos = { ...p, ...port };
+    if (scene.getEngine().name === 'NullEngine') {
+      if (this.rcsBackpackFallback === undefined) {
+        this.rcsBackpackFallback = new TransformNode('eva-rcs-backpack-fallback', scene);
+      }
+      const fb = worldToBabylon(port);
+      this.rcsBackpackFallback.position.set(fb.x, fb.y, fb.z);
+      this.rcsBackpackVentCount += 1;
+      return this.rcsBackpackVentCount;
+    }
+    // Aft/up unit vector: physics aft is (−cos h, −sin h, 0), up is +z,
+    // tilted RCS_BACKPACK_TILT_RAD above horizontal; the (x, z↑, −y) map
+    // turns it into the Babylon vector (−cos h·k, +sin θ·v, sin h·k).
+    const v = RCS_BACKPACK_SPEED_MPS;
+    const k = Math.cos(RCS_BACKPACK_TILT_RAD) * v;
+    const dirX = -Math.cos(h) * k;
+    const dirY = Math.sin(RCS_BACKPACK_TILT_RAD) * v;
+    const dirZ = Math.sin(h) * k;
+    // Fixed 15 % spread (deterministic — no Math.random in the vent path).
+    const jx = Math.abs(dirX) * 0.15 + 0.05;
+    const jy = Math.abs(dirY) * 0.15 + 0.05;
+    const jz = Math.abs(dirZ) * 0.15 + 0.05;
+    if (this.rcsBackpackNozzles.length === 0) {
+      for (let i = 0; i < RCS_BACKPACK_NOZZLE_COUNT; i++) {
+        const ps = new ParticleSystem(
+          `${this.prefix}-rcs-backpack-${i}`,
+          RCS_BACKPACK_PARTICLE_COUNT,
+          scene,
+        );
+        ps.minLifeTime = RCS_BACKPACK_LIFETIME_S * 0.72;
+        ps.maxLifeTime = RCS_BACKPACK_LIFETIME_S * 1.18;
+        ps.minSize = 0.04;
+        ps.maxSize = 0.13;
+        ps.emitRate = 160;
+        ps.minEmitPower = 1;
+        ps.maxEmitPower = 1;
+        // Pressurised gas: gravity is negligible over the burst window.
+        ps.gravity = new Vector3(0, 0, 0);
+        ps.color1 = new Color4(
+          PNEUMATIC_VENT_COLOR[0],
+          PNEUMATIC_VENT_COLOR[1],
+          PNEUMATIC_VENT_COLOR[2],
+          PNEUMATIC_VENT_COLOR[3],
+        );
+        ps.color2 = new Color4(PNEUMATIC_VENT_COLOR[0], PNEUMATIC_VENT_COLOR[1], PNEUMATIC_VENT_COLOR[2], 0.25);
+        ps.colorDead = new Color4(0, 0, 0, 0);
+        ps.blendMode = ParticleSystem.BLENDMODE_ADD;
+        this.rcsBackpackNozzles.push(ps);
+      }
+    }
+    // Twin ports on the tank axis: lateral unit (−sin h, cos h), ± offsets.
+    for (let i = 0; i < this.rcsBackpackNozzles.length; i++) {
+      const ps = this.rcsBackpackNozzles[i]!;
+      const side = i === 0 ? -1 : 1;
+      const nozzle = worldToBabylon({
+        x: p.x + side * RCS_BACKPACK_LATERAL_OFFSET_M * -Math.sin(h) - RCS_BACKPACK_AFT_OFFSET_M * Math.cos(h),
+        y: p.y + side * RCS_BACKPACK_LATERAL_OFFSET_M * Math.cos(h) - RCS_BACKPACK_AFT_OFFSET_M * Math.sin(h),
+        z: p.z + RCS_BACKPACK_PORT_RISE_M,
+      });
+      (ps.emitter as Vector3).set(nozzle.x, nozzle.y, nozzle.z);
+      ps.direction1 = new Vector3(dirX - jx, dirY - jy, dirZ - jz);
+      ps.direction2 = new Vector3(dirX + jx, dirY + jy, dirZ + jz);
+      try {
+        ps.start();
+      } catch {
+        /* NullEngine / disposed scene — never propagate a GPU failure. */
+      }
+    }
+    this.rcsBackpackVentCount += 1;
+    return this.rcsBackpackVentCount;
+  }
+
+  /** Cumulative PLSS backpack RCS vent triggers (twin plumes each) since init. */
+  getBackpackRcsVentCount(): number {
+    return this.rcsBackpackVentCount;
+  }
+
+  /**
+   * Spec 32 §2.3.3: physics-frame coordinates of the most recent backpack
+   * RCS vent port (null before the first trigger).
+   */
+  getLastBackpackRcsVentPos(): { x: number; y: number; z: number } | null {
+    return this.lastRcsBackpackVentPos === null
+      ? null
+      : { ...this.lastRcsBackpackVentPos };
   }
 
   // -- internals --------------------------------------------------------------

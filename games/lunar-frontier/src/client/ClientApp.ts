@@ -693,6 +693,12 @@ export interface ClientInputFrame {
   sprint: boolean;
   /** Space held — hop (physics tracks its own rising edge). */
   jump: boolean;
+  /**
+   * Spec 32 §2.2: `[KeyC]`/`[ControlLeft]` or gamepad `[B]`/`[LB]` held —
+   * mid-air acrobatic roll (crouch/roll somersault). Consumed only while
+   * airborne; ignored on the ground (B keeps its trade role there).
+   */
+  roll?: boolean;
   /** 0..1 analog service brake (gamepad left trigger); 0 from the keyboard. */
   brake: number;
   /**
@@ -1264,6 +1270,12 @@ export class ClientApp {
   private audioFootPrevGrounded: boolean | null = null;
   /** Metres walked since the last `playFootstep()` thump. */
   private audioFootTravelled = 0;
+  /**
+   * Spec 32 §2.3.3: plume/hiss re-arm clock while `SuitState.rcsBoostActive`
+   * holds — the 0.22 s cold-gas burst cadence for the PLSS backpack vents.
+   */
+  private rcsBoostFxClock = 0;
+  private static readonly RCS_BOOST_FX_REARM_S = 0.22;
   /** Wall-clock ms until which the mining-laser loop keeps burning. */
   private miningAudioUntilMs = Number.NEGATIVE_INFINITY;
 
@@ -2405,6 +2417,8 @@ export class ClientApp {
       pitch: keyPitch,
       sprint: p.has('ShiftLeft') || p.has('ShiftRight'),
       jump: p.has('Space'),
+      // Spec 32 §2.2: mid-air crouch/roll latch ([C] or left Ctrl).
+      roll: p.has('KeyC') || p.has('ControlLeft'),
       brake: 0,
       reverse: false,
     };
@@ -2568,6 +2582,13 @@ export class ClientApp {
       (pad.buttons[GAMEPAD_BUTTONS.sprintLeft]?.pressed ?? false) ||
       (pad.buttons[GAMEPAD_BUTTONS.sprintLeftAlt]?.pressed ?? false);
     frame.jump = frame.jump || (pad.buttons[GAMEPAD_BUTTONS.jump]?.pressed ?? false);
+    // Spec 32 §2.2: aloft, B/LB double as the acrobatic-roll latch — on the
+    // ground the same buttons keep their trade/sprint roles, and the roll
+    // channel is only ever consumed while the suit is airborne.
+    frame.roll =
+      (frame.roll ?? false) ||
+      (pad.buttons[GAMEPAD_BUTTONS.trade]?.pressed ?? false) ||
+      (pad.buttons[GAMEPAD_BUTTONS.sprintLeft]?.pressed ?? false);
     return frame;
   }
 
@@ -3500,12 +3521,18 @@ export class ClientApp {
       const latched = suit.getState().ladderLatchActive === true;
       const speedScale = frame.sprint ? 1 : 0.55;
       const moveScale = latched ? 1 : speedScale;
+      // Spec 32 §2.2: the crouch/roll latch (KeyC / Ctrl / B / LB) is live
+      // only on free-airborne frames — grounded and ladder-latched frames
+      // deactivate the somersault envelope.
+      const acrobaticRoll =
+        frame.roll === true && !suit.getState().isGrounded && !latched;
       const input: SuitInput = {
         forward: clamp(frame.forward, -1, 1) * moveScale,
         strafe: clamp(frame.strafe, -1, 1) * moveScale,
         yaw: clamp(frame.yaw, -1, 1),
         pitch: clamp(frame.pitch, -1, 1),
         jump: frame.jump,
+        acrobaticRoll,
         sprint: latched ? frame.sprint : undefined,
         rcs: frame.jump && !latched && !suit.getState().isGrounded,
         rcsForward: 0,
@@ -3513,6 +3540,12 @@ export class ClientApp {
         rcsUp: frame.jump && !latched ? 0.5 : 0,
       };
       suit.update(dt, input);
+      // Spec 32 §2.2: mirror the latch onto the rig (self-clearing every
+      // frame — grounded or released rolls deactivate immediately).
+      suit.setAcrobaticRoll(acrobaticRoll);
+      // Spec 32 §2.3.3: while the PLSS cold-gas RCS jump boost fires, fire
+      // the twin backpack upper-port vapor plumes + thruster hiss.
+      this.pumpRcsBoostFx(dt, suit);
       // Spec 29 Phase 4: after the step, the gantry railing holds the
       // climber on the deck (hatch sector excepted). Latched frames skip.
       this.clampToDeckBoundary();
@@ -3677,6 +3710,30 @@ export class ClientApp {
     if (this.audioFootTravelled >= stride) {
       this.audioFootTravelled = 0;
       audio.playFootstep();
+    }
+  }
+
+  /**
+   * Spec 32 §2.3.3 — PLSS cold-gas RCS jump-boost FX pump, one call per
+   * frame on the EVA path. While `SuitState.rcsBoostActive` is high (the
+   * physics valve open after a mid-air jump press), fires the twin PLSS
+   * backpack upper-port vapor plumes (`triggerBackpackRcsVent()`) plus the
+   * procedural cold-gas thruster hiss (`playRcsThrust()`) — immediately on
+   * the boost ignition frame, then re-armed every
+   * {@link ClientApp.RCS_BOOST_FX_REARM_S} (0.22 s ≈ one plume lifespan)
+   * while the valve holds. The clock parks the moment the state lets go, so
+   * the next burst always starts flush with the ignition edge.
+   */
+  private pumpRcsBoostFx(dt: number, suit: EvaSuitAvatar): void {
+    if (suit.getState().rcsBoostActive) {
+      this.rcsBoostFxClock -= dt;
+      if (this.rcsBoostFxClock <= 0) {
+        this.rcsBoostFxClock = ClientApp.RCS_BOOST_FX_REARM_S;
+        suit.triggerBackpackRcsVent();
+        this.audio?.playRcsThrust();
+      }
+    } else {
+      this.rcsBoostFxClock = 0;
     }
   }
 

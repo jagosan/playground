@@ -215,6 +215,28 @@ export const SUIT_MAX_RCS_FUEL = 100;
 export const SUIT_O2_BASE = 0.05;
 export const SUIT_O2_EXERTION = 0.12;
 export const SUIT_O2_RCS = 0.04;
+
+// -- Spec 32 §2.3: PLSS compressed-air RCS jump boost -------------------------
+
+/**
+ * Spec 32 §2.3.2: upward vertical acceleration of the tactical cold-gas
+ * jump boost while the valve fires (m/s²) — exceeds lunar g (1.62), so a
+ * held mid-air jump press climbs AND cushions the arc.
+ */
+export const SUIT_RCS_BOOST_UP_ACCEL = 2.8;
+/** Spec 32 §2.3.2: forward boost along the heading while firing (m/s²). */
+export const SUIT_RCS_BOOST_FWD_ACCEL = 1.5;
+/**
+ * Spec 32 §2.3.3: the thrusters bleed straight from the high-pressure
+ * breathing-O₂ reservoir — 12.0 units/s ≈ 3–5 % of a full tank per second.
+ */
+export const SUIT_O2_RCS_BOOST = 12.0;
+/**
+ * Descent-arrest rate constant while the boost fires (1/s): an exponential
+ * chase of {@link SUIT_SOFT_LANDING_VY} so high-altitude drops cushion into
+ * a soft-landing rate instead of free-falling.
+ */
+export const SUIT_RCS_BOOST_ARREST_RATE = 12;
 /**
  * Dynamic metabolic respiration (TASK-PLAY-060, spec §3.7): gait-gated
  * multipliers on the baseline O₂ draw. Idle breathes at 1×, a brisk lunar
@@ -297,6 +319,13 @@ export interface SuitInput {
   /** Rising edge while grounded triggers a hop. */
   jump: boolean;
   /**
+   * Spec 32 §2.2: hold the crouch/roll key while airborne to tuck and
+   * somersault. Mirrored verbatim onto {@link SuitState.acrobaticRoll} so
+   * animation consumers can read the latch. Optional so pre-Spec-32 callers
+   * stay source-compatible.
+   */
+  acrobaticRoll?: boolean;
+  /**
    * Spec 28 §2.3: sprint latch (LB / Left Bumper). Ground contact with the
    * sprint held — or `forward` past 0.6 with ground speed over
    * {@link SUIT_BOUND_MIN_SPEED} — engages the lunar bounding loop. Optional
@@ -341,6 +370,19 @@ export interface SuitState {
   isGrounded: boolean;
   /** Last applied vertical launch impulse (diagnostics / animation). */
   jumpImpulse: number;
+  /**
+   * Spec 32 §2.3: true on every frame the PLSS cold-gas RCS jump boost is
+   * actively firing (airborne, jump held, breathing O₂ remaining). Drives the
+   * twin backpack vapor plumes and the procedural thruster hiss in
+   * `ClientApp`; false whenever the valve is shut.
+   */
+  rcsBoostActive: boolean;
+  /**
+   * Spec 32 §2.2: mid-air crouch/roll latch mirrored from
+   * {@link SuitInput.acrobaticRoll} — true while the astronaut is performing
+   * a somersault, so the rig and HUD consumers know it.
+   */
+  acrobaticRoll?: boolean;
   /**
    * Spec 28 §2.3: locomotion gait band for animation authoring — the suited
    * propector idles, strides on the regolith, or loops down the surface in
@@ -457,6 +499,12 @@ export class LunarEvaSuit {
   private state: SuitState;
   private jumpWasHeld = false;
   /**
+   * Spec 32 §2.3: latch armed by a jump *press made while airborne* (the
+   * ground hop holds its button through the arc without stealing the boost
+   * channel). Cleared on release, landing, or an empty O₂ reservoir.
+   */
+  private rcsBoostEngaged = false;
+  /**
    * Spec 28 §2.3 bounding state machine phase: `walk` (surface stride),
    * `bound_launch` (grounded frame queuing the next leap), `bound_flight`
    * (ballistic arc), `bound_land` (touchdown frame, momentum restitution).
@@ -499,6 +547,8 @@ export class LunarEvaSuit {
       pitch: initial.pitch ?? 0,
       isGrounded: initial.isGrounded ?? false,
       jumpImpulse: initial.jumpImpulse ?? 0,
+      rcsBoostActive: initial.rcsBoostActive ?? false,
+      acrobaticRoll: initial.acrobaticRoll ?? false,
       gaitMode: initial.gaitMode ?? 'idle',
       hangtime: initial.hangtime ?? 0,
       hurryStrideLeg: initial.hurryStrideLeg ?? 'left',
@@ -685,6 +735,11 @@ export class LunarEvaSuit {
     // Look/look-around survives the latch; strafe deliberately does not.
     s.heading = wrapAngle(s.heading + clamp(input.yaw, -1, 1) * SUIT_TURN_RATE * dt);
     s.pitch = approach(s.pitch, 0, 2, dt);
+    // Spec 32 §2.3/§2.2: the rails own the vertical channel — the RCS boost
+    // valve is shut and no somersault is possible while boot-clamped.
+    this.rcsBoostEngaged = false;
+    s.rcsBoostActive = false;
+    s.acrobaticRoll = false;
 
     // §3.2.2 vertical channel (neutral input → hard mechanical hold).
     const climbRate =
@@ -896,7 +951,10 @@ export class LunarEvaSuit {
     }
 
     // -- Hop (rising edge, grounded only) -------------------------------------
-    if (input.jump && !this.jumpWasHeld && s.isGrounded) {
+    // Spec 32 §2.3: the same rising edge is reused below — a press made
+    // while airborne arms the PLSS RCS boost instead of the ground hop.
+    const jumpRisingEdge = input.jump && !this.jumpWasHeld;
+    if (jumpRisingEdge && s.isGrounded) {
       s.vz = SUIT_JUMP_VELOCITY;
       s.jumpImpulse = SUIT_JUMP_VELOCITY;
       s.isGrounded = false;
@@ -946,6 +1004,34 @@ export class LunarEvaSuit {
       // touchdown lands on the opposite leg, then flips back for its turn.
       this.hurryLeg = this.hurryLeg === 'left' ? 'right' : 'left';
       this.boundPhase = 'bound_flight';
+    }
+
+    // -- PLSS cold-gas RCS jump boost (Spec 32 §2.3) --------------------------
+    // A fresh jump press struck while airborne ignites the tactical RCS:
+    // twin upper-port plumes drive the suit up (+2.8 m/s²) and forward along
+    // the heading (+1.5 m/s²), bleeding 12.0 units/s of breathing O₂ from
+    // the PLSS reservoir and arresting any descent steeper than the soft-
+    // landing rate. The press must be a rising edge made aloft — the ground
+    // hop holds its button through the arc without stealing this channel —
+    // and the valve cuts the instant the button lifts, boots touch down, or
+    // the reservoir runs dry.
+    if (jumpRisingEdge && !wasGrounded && s.oxygen > 0) {
+      this.rcsBoostEngaged = true;
+    }
+    if (this.rcsBoostEngaged && (s.isGrounded || !input.jump || s.oxygen <= 0)) {
+      this.rcsBoostEngaged = false;
+    }
+    s.rcsBoostActive = this.rcsBoostEngaged;
+    if (this.rcsBoostEngaged) {
+      s.vz += SUIT_RCS_BOOST_UP_ACCEL * step;
+      s.vx += SUIT_RCS_BOOST_FWD_ACCEL * Math.cos(s.heading) * step;
+      s.vy += SUIT_RCS_BOOST_FWD_ACCEL * Math.sin(s.heading) * step;
+      // Cushion high-altitude drops: chase the soft-landing descent rate
+      // while the valve is open instead of free-falling through it.
+      if (s.vz < SUIT_SOFT_LANDING_VY) {
+        s.vz = approach(s.vz, SUIT_SOFT_LANDING_VY, SUIT_RCS_BOOST_ARREST_RATE, step);
+      }
+      s.oxygen = clamp(s.oxygen - SUIT_O2_RCS_BOOST * step, 0, this.oxygenCap);
     }
 
     // -- Ballistics -----------------------------------------------------------
@@ -1013,6 +1099,9 @@ export class LunarEvaSuit {
     // frames are the stance/brace phase, airborne frames the flight arc.
     s.hurryStrideLeg = this.hurryLeg;
     s.hurryStepPhase = s.isGrounded ? 'ground_brace' : 'flight_arc';
+    // Spec 32 §2.2: mirror the mid-air crouch/roll latch onto the state so
+    // the rig / HUD consumers see the somersault without a second channel.
+    s.acrobaticRoll = input.acrobaticRoll === true;
     s.gaitMode = bounding
       ? 'bounding'
       : Math.hypot(s.vx, s.vy) > 0.08
