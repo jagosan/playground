@@ -113,10 +113,10 @@ console.log('\n[1] Climbing pose engages on locomotionMode === CLIMBING');
     shL <= CLIMB_SHOULDER_FLEX_RAD + CLIMB_REACH_AMPLITUDE_RAD + 1e-12 &&
     shR >= CLIMB_SHOULDER_FLEX_RAD - CLIMB_REACH_AMPLITUDE_RAD - 1e-12,
     `L=${shL.toFixed(3)} R=${shR.toFixed(3)}`);
-  check('elbows gripping rungs (~0.85 rad band)',
-    elL >= CLIMB_ELBOW_FLEX_RAD - CLIMB_REACH_ELBOW_RELIEF_RAD - 1e-12 &&
-    elR >= CLIMB_ELBOW_FLEX_RAD - CLIMB_REACH_ELBOW_RELIEF_RAD - 1e-12 &&
-    elL > 0.6 && elR > 0.6,
+  check('elbows gripping rungs (~ -0.85 rad forward-flex band, Spec 32 §2.1)',
+    elL <= CLIMB_ELBOW_FLEX_RAD - CLIMB_REACH_ELBOW_RELIEF_RAD + 1e-12 &&
+    elR <= CLIMB_ELBOW_FLEX_RAD - CLIMB_REACH_ELBOW_RELIEF_RAD + 1e-12 &&
+    elL < -0.6 && elR < -0.6,
     `L=${elL.toFixed(3)} R=${elR.toFixed(3)}`);
   // The live nodes must track the pure law for this exact state.
   const pose = climbGripPose(s.climbProgressM ?? 0, s.vz);
@@ -160,7 +160,11 @@ console.log('\n[2] Alternating arms/legs cycle (wavelength 0.70 m = 2 rungs)');
     poseA.hipRx < poseA.hipLx && poseA.hipRx < 0 && poseA.hipLx === 0,
     `hipR=${poseA.hipRx} hipL=${poseA.hipLx}`);
   check('phase A: reaching arm straightens (less elbow flex than the gripping one)',
-    poseA.elbowLx < poseA.elbowRx);
+    // Spec 32 §2.1: elbow flex is NEGATIVE, so "straighter" = magnitude
+    // closer to zero while staying forward-flexed (never aft/positive).
+    Math.abs(poseA.elbowLx) < Math.abs(poseA.elbowRx)
+    && poseA.elbowLx < 0 && poseA.elbowRx < 0,
+    `L=${poseA.elbowLx} R=${poseA.elbowRx}`);
   check('phase A: lifting knee flexes deeper than the planted one',
     poseA.kneeRx > poseA.kneeLx);
   // Half-wavelength later: every left/right relation flips.

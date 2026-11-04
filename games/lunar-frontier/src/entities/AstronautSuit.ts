@@ -91,8 +91,12 @@ export const TORSO_BOB_M = 0.025;
 export const ARM_SWING_SCALE = 0.75;
 /** Knee flexion (rad per rad of back-swing) applied during the swing phase. */
 export const KNEE_FLEX_WALK = 0.5;
-/** Resting elbow flex of a relaxed hanging arm (rad). */
-export const ELBOW_REST_RAD = 0.18;
+/**
+ * Resting elbow flex of a relaxed hanging arm (rad). Spec 32 §2.1: negative
+ * — in Babylon's left-handed frame a hanging arm along −Y needs θ < 0 for
+ * the forearm to swing FORWARD toward +Z (chest/visor), never aft.
+ */
+export const ELBOW_REST_RAD = -0.18;
 
 // -- Lunar bounding articulation (Spec 28 §2.3) -------------------------------
 /** Landing crouch compression before launch extension (m). */
@@ -119,7 +123,10 @@ export const BOUND_TROUGH_KNEE_RAD = 0.6;
  * FORWARD; positive `rotation.z` tilts the torso top toward the mesh-left
  * hip). The spec quotes hips in the anatomical convention (θ negative =
  * aft extension); the conversion is hip_mesh_x = −θ_anatomical, while knee
- * flexion keeps the spec sign directly.
+ * flexion keeps the spec sign directly. Elbow flexion follows the Spec 32
+ * §2.1 anatomical sign law DIRECTLY: negative `rotation.x` swings the
+ * forearm forward toward the chest/visor (θ < 0 ⇒ z′ > 0), positive values
+ * would hyperextend the arm aft behind the avatar and are never authored.
  */
 /** Pushing (stance) leg hip aft extension at launch, rad (spec θ_hip −0.55). */
 export const HURRY_PUSH_HIP_AFT_RAD = 0.55;
@@ -137,10 +144,11 @@ export const HURRY_TORSO_ROLL_RAD = 0.026;
 export const HURRY_ARM_STANCE_FWD_RAD = 0.45;
 /** Arm on the recovery side swings aft, rad (spec θ_shoulder +0.35). */
 export const HURRY_ARM_RECOVERY_AFT_RAD = 0.35;
-/** Elbow flex carried by the forward-driving sprint arm (rad). */
-export const HURRY_ARM_ELBOW_FWD_FLEX_RAD = 0.5;
-/** Elbow flex carried by the aft-swinging sprint arm (rad). */
-export const HURRY_ARM_ELBOW_AFT_FLEX_RAD = 0.25;
+/** Elbow flex carried by the forward-driving sprint arm (rad, Spec 32 §2.1:
+ *  negative = anterior drive flexion toward the visor). */
+export const HURRY_ARM_ELBOW_FWD_FLEX_RAD = -0.50;
+/** Elbow flex carried by the aft-swinging sprint arm (rad, relief flex, θ < 0). */
+export const HURRY_ARM_ELBOW_AFT_FLEX_RAD = -0.25;
 /** Brace phase: stance-hip load angle, slightly aft as the spring compresses (rad). */
 export const HURRY_BRACE_STANCE_HIP_RAD = 0.18;
 /** Brace phase: stance knee spring flexion (rad). */
@@ -170,10 +178,12 @@ export const HURRY_THORACIC_YAW_RAD = 0.07;
 export const HURRY_PUMP_STANCE_AMP_RAD = 0.55;
 /** Arm pump amplitude of the recovery-side arm riding +cos(πu), rad. */
 export const HURRY_PUMP_RECOVERY_AMP_RAD = 0.45;
-/** Extra elbow flex the pumping stance arm carries at full rear drive, rad. */
-export const HURRY_PUMP_ELBOW_STANCE_RAD = 0.5;
-/** Extra elbow flex the pumping recovery arm carries at full forward sweep, rad. */
-export const HURRY_PUMP_ELBOW_RECOVERY_RAD = 0.4;
+/** Extra elbow flex the pumping stance arm carries at full rear drive, rad
+ *  (Spec 32 §2.1 sign: negative adds forward flexion onto ELBOW_REST_RAD). */
+export const HURRY_PUMP_ELBOW_STANCE_RAD = -0.50;
+/** Extra elbow flex the pumping recovery arm carries at full forward sweep,
+ *  rad (negative = forward flex, Spec 32 §2.1). */
+export const HURRY_PUMP_ELBOW_RECOVERY_RAD = -0.40;
 /** Visor horizon-lock gain: head pitch = −0.65 × torso pitch (Blueprint 31 §2.5). */
 export const HEAD_HORIZON_STABILITY_RATIO = -0.65;
 
@@ -199,6 +209,13 @@ export interface HurryStridePose {
   torsoYawRad: number;
   /** Head/visor horizon-stabilization pitch (rad, `eva-head` node rotation.x; Spec 31 §2.5). */
   headPitchRad: number;
+  /**
+   * Extra avatar-root-mesh forward pitch (rad, Spec 32 §2.2). 0 outside an
+   * acrobatic roll; while a mid-air somersault runs it sweeps 0 → 2π across
+   * u ∈ [0.10, 0.90] so the avatar completes a full 360° forward flip and
+   * reads upright (2π ≡ 0) through the pre-landing claw and landing.
+   */
+  flipPitchRad: number;
   /** True on the ballistic `flight_arc` half, false on `ground_brace`. */
   airborne: boolean;
   /** The power side of this frame: pushing leg in flight, bracing leg braced. */
@@ -246,6 +263,7 @@ export function hurryStridePose(
   airborne: boolean,
   airPhase?: number,
   speed: number = SUIT_HURRY_TARGET_SPEED,
+  acrobatic: boolean = false,
 ): HurryStridePose {
   const strideLegIsLeft = strideLeg !== 'right';
   // In flight the stride leg is the LEADING leg, so the pushing side is the
@@ -276,6 +294,7 @@ export function hurryStridePose(
       // +rotation.z tips the torso top toward the mesh-left hip.
       torsoRollRad: powerIsLeft ? HURRY_TORSO_ROLL_RAD : -HURRY_TORSO_ROLL_RAD,
       headPitchRad: HEAD_HORIZON_STABILITY_RATIO * HURRY_TORSO_PITCH_FWD_RAD,
+      flipPitchRad: 0,
       airborne,
       powerIsLeft,
       strideLegIsLeft,
@@ -304,6 +323,7 @@ export function hurryStridePose(
       // +rotation.z tips the torso top toward the mesh-left hip.
       torsoRollRad: powerIsLeft ? HURRY_TORSO_ROLL_RAD : -HURRY_TORSO_ROLL_RAD,
       headPitchRad: HEAD_HORIZON_STABILITY_RATIO * HURRY_TORSO_PITCH_FWD_RAD,
+      flipPitchRad: 0,
       airborne,
       powerIsLeft,
       strideLegIsLeft,
@@ -365,23 +385,152 @@ export function hurryStridePose(
   const armRecovery = HURRY_PUMP_RECOVERY_AMP_RAD * cosU;
   const elbowStance = ELBOW_REST_RAD + HURRY_PUMP_ELBOW_STANCE_RAD * Math.max(0, -cosU);
   const elbowRecovery = ELBOW_REST_RAD + HURRY_PUMP_ELBOW_RECOVERY_RAD * Math.max(0, cosU);
+  // Spec 32 §2.2 acrobatic overlay: while a mid-air roll is active, every
+  // channel lerps onto the tuck envelope on w(u) — hips −1.25 / knees 1.85 /
+  // elbows −1.40 / torso 0.85 rad — curling in over the first tenth of the
+  // arc and unwinding back into the live Phase C claw channels over the last
+  // tenth, while flipPitchRad drives the 360° root-mesh somersault. With
+  // acrobatic = false w = 0 and every lerp below is the identity, keeping
+  // the Spec 31 cycle bit-identical.
+  const wAcro = acrobatic ? acrobaticTuckWeight(u) : 0;
+  const flipPitchRad = acrobatic ? acrobaticFlipPitchRad(u) : 0;
+  const hipLeadA = lerp(hipLead, ACRO_HIP_TUCK_RAD, wAcro);
+  const hipPushA = lerp(hipPush, ACRO_HIP_TUCK_RAD, wAcro);
+  const kneeLeadA = lerp(kneeLead, ACRO_KNEE_FOLD_RAD, wAcro);
+  const kneePushA = lerp(kneePush, ACRO_KNEE_FOLD_RAD, wAcro);
+  const armStanceA = lerp(armStance, ACRO_SHOULDER_TUCK_RAD, wAcro);
+  const armRecoveryA = lerp(armRecovery, ACRO_SHOULDER_TUCK_RAD, wAcro);
+  const elbowStanceA = lerp(elbowStance, ACRO_ELBOW_TUCK_RAD, wAcro);
+  const elbowRecoveryA = lerp(elbowRecovery, ACRO_ELBOW_TUCK_RAD, wAcro);
+  const torsoPitchA = lerp(torsoPitchRad, ACRO_TORSO_PITCH_RAD, wAcro);
   return {
-    hipLx: strideLegIsLeft ? hipLead : hipPush,
-    hipRx: strideLegIsLeft ? hipPush : hipLead,
-    kneeLx: strideLegIsLeft ? kneeLead : kneePush,
-    kneeRx: strideLegIsLeft ? kneePush : kneeLead,
-    shoulderLx: powerIsLeft ? armStance : armRecovery,
-    shoulderRx: powerIsLeft ? armRecovery : armStance,
-    elbowLx: powerIsLeft ? elbowStance : elbowRecovery,
-    elbowRx: powerIsLeft ? elbowRecovery : elbowStance,
-    torsoPitchRad,
+    hipLx: strideLegIsLeft ? hipLeadA : hipPushA,
+    hipRx: strideLegIsLeft ? hipPushA : hipLeadA,
+    kneeLx: strideLegIsLeft ? kneeLeadA : kneePushA,
+    kneeRx: strideLegIsLeft ? kneePushA : kneeLeadA,
+    shoulderLx: powerIsLeft ? armStanceA : armRecoveryA,
+    shoulderRx: powerIsLeft ? armRecoveryA : armStanceA,
+    elbowLx: powerIsLeft ? elbowStanceA : elbowRecoveryA,
+    elbowRx: powerIsLeft ? elbowRecoveryA : elbowStanceA,
+    torsoPitchRad: torsoPitchA,
     torsoYawRad,
     // +rotation.z tips the torso top toward the mesh-left hip.
     torsoRollRad,
-    headPitchRad: HEAD_HORIZON_STABILITY_RATIO * torsoPitchRad,
+    headPitchRad: HEAD_HORIZON_STABILITY_RATIO * torsoPitchA,
+    flipPitchRad,
     airborne,
     powerIsLeft,
     strideLegIsLeft,
+  };
+}
+
+// -- Mid-air acrobatic tuck & 360° flip (Spec 32 §2.2 / Phase 2) ---------------
+/*
+ * While the physics gait is bounding and the pilot holds the crouch/roll
+ * input aloft, the stride channels blend onto the tuck envelope below on
+ * w = acrobaticTuckWeight(u) and the avatar root pitches forward through a
+ * full somersault over u ∈ [ACRO_FLIP_START_U, ACRO_FLIP_END_U]. All limb
+ * angles follow the Spec 32 §2.1 sign law: NEGATIVE flexes a hanging limb
+ * forward (elbows wrap the tucked arms around the shins), knees keep the
+ * positive flexion convention of the stride law.
+ */
+/** Aggressive forward torso pitch of the acrobatic tuck, rad. */
+export const ACRO_TORSO_PITCH_RAD = 0.85;
+/** Bilateral hip flexion of the tuck — knees up against the chest, rad. */
+export const ACRO_HIP_TUCK_RAD = -1.25;
+/** Bilateral knee fold — shins tightly tucked, rad. */
+export const ACRO_KNEE_FOLD_RAD = 1.85;
+/** Bilateral elbow flex — arms wrapped around the shins, rad (θ < 0 forward). */
+export const ACRO_ELBOW_TUCK_RAD = -1.40;
+/** Bilateral shoulder drive carrying the tucked arms around the shins, rad. */
+export const ACRO_SHOULDER_TUCK_RAD = -1.30;
+/** Normalized flight phase where the 360° somersault pitch starts. */
+export const ACRO_FLIP_START_U = 0.10;
+/** Normalized flight phase where the somersault completes (Δθ = 2π ≡ upright). */
+export const ACRO_FLIP_END_U = 0.90;
+
+/** Cosine-eased 0→1 ramp on [0, 1] (clamped outside). */
+const smooth01 = (t: number): number => {
+  const c = t < 0 ? 0 : t > 1 ? 1 : t;
+  return 0.5 - 0.5 * Math.cos(Math.PI * c);
+};
+
+/**
+ * Spec 32 §2.2 tuck-envelope blend weight on the normalized flight phase u:
+ * ramps in smoothly over u ∈ [0, 0.10] (immediately after toe-off), holds a
+ * full tuck across the flip window [0.10, 0.90], and unwinds smoothly to 0
+ * over u ∈ [0.90, 1] so the limbs interpolate back into the Phase C
+ * pre-landing claw pose before touchdown.
+ */
+export function acrobaticTuckWeight(u: number): number {
+  if (!Number.isFinite(u) || u <= 0) return 0;
+  if (u < ACRO_FLIP_START_U) return smooth01(u / ACRO_FLIP_START_U);
+  if (u <= ACRO_FLIP_END_U) return 1;
+  if (u < 1) return 1 - smooth01((u - ACRO_FLIP_END_U) / (1 - ACRO_FLIP_END_U));
+  return 0;
+}
+
+/**
+ * Spec 32 §2.2 continuous forward somersault pitch of the avatar root mesh:
+ * Δθ_flip(u) = 2π · (u − 0.10) / 0.80 across the flip window — zero before
+ * launch, exactly 2π (upright again) from u ≥ 0.90 through landing.
+ */
+export function acrobaticFlipPitchRad(u: number): number {
+  if (!Number.isFinite(u) || u <= ACRO_FLIP_START_U) return 0;
+  if (u >= ACRO_FLIP_END_U) return Math.PI * 2;
+  return (Math.PI * 2 * (u - ACRO_FLIP_START_U)) / (ACRO_FLIP_END_U - ACRO_FLIP_START_U);
+}
+
+/**
+ * One frame of the Spec 32 §2.2 mid-air acrobatic tuck, expressed against
+ * NEUTRAL channel-zero values (see {@link acrobaticTuckPose}); the stride
+ * overlay inside {@link hurryStridePose} blends the same envelope on top of
+ * the live triple-jump channels instead.
+ */
+export interface AcrobaticTuckPose {
+  hipLx: number;
+  hipRx: number;
+  kneeLx: number;
+  kneeRx: number;
+  shoulderLx: number;
+  shoulderRx: number;
+  elbowLx: number;
+  elbowRx: number;
+  /** Forward torso pitch (upperBody.rotation.x), rad. */
+  torsoPitchRad: number;
+  /** Visor counter-pitch riding the horizon-lock ratio, rad. */
+  headPitchRad: number;
+  /** Extra avatar-root pitch (rad): 0 → 2π forward somersault over the flip window. */
+  flipPitchRad: number;
+  /** Tuck-envelope blend at this phase (0 = neutral, 1 = full tuck). */
+  tuckBlend: number;
+}
+
+/**
+ * Standalone acrobatic tuck-pose generator (Spec 32 §2.2): bilateral
+ * hip/knee tuck, arms wrapped around the shins (elbows −1.40 rad), 0.85 rad
+ * forward torso pitch and the continuous 360° root-mesh flip pitch, all
+ * ramped by {@link acrobaticTuckWeight} so the pose curls in at launch and
+ * uncurls into the pre-landing claw posture before touchdown. ClientApp /
+ * TraversalPhysics drive it with the live `hurryAirPhase` whenever the
+ * crouch/roll input is held over a bounding flight arc.
+ */
+export function acrobaticTuckPose(u: number): AcrobaticTuckPose {
+  const w = acrobaticTuckWeight(u);
+  const torsoPitchRad = ACRO_TORSO_PITCH_RAD * w;
+  return {
+    hipLx: ACRO_HIP_TUCK_RAD * w,
+    hipRx: ACRO_HIP_TUCK_RAD * w,
+    kneeLx: ACRO_KNEE_FOLD_RAD * w,
+    kneeRx: ACRO_KNEE_FOLD_RAD * w,
+    shoulderLx: ACRO_SHOULDER_TUCK_RAD * w,
+    shoulderRx: ACRO_SHOULDER_TUCK_RAD * w,
+    elbowLx: lerp(ELBOW_REST_RAD, ACRO_ELBOW_TUCK_RAD, w),
+    elbowRx: lerp(ELBOW_REST_RAD, ACRO_ELBOW_TUCK_RAD, w),
+    torsoPitchRad,
+    headPitchRad: HEAD_HORIZON_STABILITY_RATIO * torsoPitchRad,
+    flipPitchRad: acrobaticFlipPitchRad(u),
+    tuckBlend: w,
   };
 }
 
@@ -392,12 +541,15 @@ export function hurryStridePose(
  * face, the same sign convention the walk cycle uses in reverse).
  */
 export const CLIMB_SHOULDER_FLEX_RAD = -1.1;
-/** Base elbow flexion of a hand gripping a rung (rad). */
-export const CLIMB_ELBOW_FLEX_RAD = 0.85;
+/** Base elbow flexion of a hand gripping a rung (rad, Spec 32 §2.1: negative
+ *  = forearm flexed forward toward the ladder face / chest, never aft). */
+export const CLIMB_ELBOW_FLEX_RAD = -0.85;
 /** Shoulder reach amplitude of the alternating cycle (rad). */
 export const CLIMB_REACH_AMPLITUDE_RAD = 0.22;
-/** Elbow straightening the reaching arm carries at full reach (rad). */
-export const CLIMB_REACH_ELBOW_RELIEF_RAD = 0.2;
+/** Elbow straightening the reaching arm carries at full reach (rad; negative
+ *  so `flex − relief·reach` moves a negative flexion TOWARD zero — i.e.
+ *  relief means less forward flex, never aft hyperextension, Spec 32 §2.1). */
+export const CLIMB_REACH_ELBOW_RELIEF_RAD = -0.20;
 /** Hip lift on the stepping half-cycle (rad; − = forward/up toward rung). */
 export const CLIMB_STEP_HIP_RAD = 0.38;
 /** Knee flex held with both boots pressed on rungs (mechanical hold). */
@@ -677,6 +829,15 @@ export class EvaSuitAvatar {
    * frame and eases back out along the half-sine before the next launch.
    */
   private boundCrouchClock = 0;
+  /**
+   * Spec 32 §2.2: acrobatic roll latch set by ClientApp (hold the
+   * crouch/roll key aloft) — see {@link EvaSuitAvatar.setAcrobaticRoll}.
+   * Physics may instead mirror the request onto `SuitState.acrobaticRoll`;
+   * either path arms the tuck/flip, which only drives airborne frames.
+   */
+  private acrobaticRoll = false;
+  /** True while the tuck/flip envelope is driving the current pose frame. */
+  private acrobaticActive = false;
   private lamp: SpotLight | null = null;
   private materials: PBRMaterial[] = [];
 
@@ -1908,6 +2069,27 @@ export class EvaSuitAvatar {
   }
 
   /**
+   * Spec 32 §2.2 interface hook for ClientApp / TraversalPhysics: hold the
+   * crouch/roll input while airborne to tuck and somersault through a full
+   * 360° forward flip over the bounding arc's normalized phase
+   * u ∈ [0.10, 0.90]. The envelope only drives frames that are actually
+   * airborne in the bounding gait — on the ground the pose falls back to the
+   * brace/stride cycle, and physics may mirror the request straight onto
+   * `SuitState.acrobaticRoll` instead of calling this method.
+   */
+  setAcrobaticRoll(active: boolean): void {
+    this.acrobaticRoll = active;
+  }
+
+  /**
+   * True while the acrobatic tuck/flip envelope is driving the current
+   * frame (airborne with the roll requested, either latch path).
+   */
+  isAcrobaticRollActive(): boolean {
+    return this.acrobaticActive;
+  }
+
+  /**
    * Procedural walking articulation (TASK-PLAY-060; Spec 28 §2.2/§2.3):
    * counter-phase hip swing with knee flex on the recovery half-cycle, arms
    * swinging in natural opposition to the legs (elbows tracking the forward
@@ -1947,6 +2129,9 @@ export class EvaSuitAvatar {
     upper.rotation.y = 0;
     upper.rotation.z = 0;
     if (this.head !== null) this.head.rotation.x = 0;
+    // The acrobatic envelope is bounding-airborne-only; clear it before the
+    // gait dispatch and let the bounding branch re-arm it (Spec 32 §2.2).
+    this.acrobaticActive = false;
 
     // Spec 29 Phase 4: the rung rail owns the frame while the boots are
     // clamped — alternating arm/leg stroke clocked by climbProgressM, or a
@@ -2003,12 +2188,19 @@ export class EvaSuitAvatar {
       }
       // Spec 31 §2: airborne frames ride the live normalized flight phase and
       // horizontal speed so the triple-jump cycling and hustle scale with the
-      // arc; grounded frames ignore both and return the brace pose.
+      // arc; grounded frames ignore both and return the brace pose. Spec 32
+      // §2.2: an acrobatic roll held aloft (ClientApp latch or physics-
+      // mirrored `acrobaticRoll`) overlays the tuck envelope and the 360°
+      // somersault pitch on top of the same phase clock.
+      const acrobatic = airborne && (this.acrobaticRoll
+        || (state as SuitState & { acrobaticRoll?: boolean }).acrobaticRoll === true);
+      this.acrobaticActive = acrobatic;
       const pose = hurryStridePose(
         strideLeg,
         airborne,
         state.hurryAirPhase ?? 0,
         Math.hypot(state.vx, state.vy),
+        acrobatic,
       );
       hipL.rotation.x = pose.hipLx;
       hipR.rotation.x = pose.hipRx;
@@ -2036,6 +2228,15 @@ export class EvaSuitAvatar {
       upper.rotation.y = pose.torsoYawRad;
       upper.rotation.z = pose.torsoRollRad;
       if (this.head !== null) this.head.rotation.x = pose.headPitchRad;
+      // Spec 32 §2.2: the acrobatic somersault rides the avatar ROOT — add
+      // flipPitchRad on top of the look-pitch lean syncTransform just wrote
+      // (it rewrites root.rotation every frame, so the pose self-clears).
+      // 0 outside a roll; the full 2π at u ≥ 0.90 leaves the avatar upright
+      // for the Phase C claw and the landing brace.
+      const root = this.root;
+      if (root !== null) {
+        root.rotation.x = PITCH_LEAN_SCALE * (state.pitch ?? 0) + pose.flipPitchRad;
+      }
       const dip = crouch - (airborne ? 0 : (state.hurryBraceCompression ?? 0));
       torso.position.y = GEO.torso.y + dip;
       upper.position.y = dip;
@@ -2066,9 +2267,10 @@ export class EvaSuitAvatar {
         shoulderR.rotation.x = armSwing;
         shoulderR.rotation.z = 0;
       }
-      // Elbows add a touch of flex as their arm comes forward.
-      if (elbowL !== null) elbowL.rotation.x = ELBOW_REST_RAD + Math.max(0, armSwing) * 0.3;
-      if (elbowR !== null) elbowR.rotation.x = ELBOW_REST_RAD + Math.max(0, -armSwing) * 0.3;
+      // Elbows add a touch of forward flex as their arm comes forward
+      // (Spec 32 §2.1: negative increments deepen the forward bend).
+      if (elbowL !== null) elbowL.rotation.x = ELBOW_REST_RAD - Math.max(0, armSwing) * 0.3;
+      if (elbowR !== null) elbowR.rotation.x = ELBOW_REST_RAD - Math.max(0, -armSwing) * 0.3;
       // Torso + upper-body counter-bob at twice the leg frequency (heel-strike).
       const bob = Math.abs(Math.sin(this.walkCycleTime * 2)) * TORSO_BOB_M;
       torso.position.y = GEO.torso.y + bob + crouch;

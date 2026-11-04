@@ -419,11 +419,12 @@ function gate3Hustle(): void {
     }
     check('arms pump in anti-phase (stance × recovery shoulder sign opposition, ±0.55/±0.45)',
       antiPhase && HURRY_PUMP_RECOVERY_AMP_RAD === 0.45);
-    // Elbows flex dynamically with the pump: forward drive rides the rest
-    // angle, full rear drive adds the stance-elbow flex term (0.5 rad).
+    // Elbows flex dynamically with the pump (Spec 32 §2.1: flex is NEGATIVE,
+    // forward): forward drive rides the rest angle, full rear drive deepens
+    // the forward bend by the stance-elbow flex term (−0.50 rad).
     const elbowAt = (u: number): number => hurryStridePose('left', true, u, 5.2).elbowRx;
-    check(`stance elbow flexes from ${f3(elbowAt(0))} rad at the forward drive to ${f3(elbowAt(1))} rad at full rear swing (Δ ${f3(elbowAt(1) - elbowAt(0))} ≥ 0.30)`,
-      elbowAt(1) - elbowAt(0) >= 0.3);
+    check(`stance elbow deepens forward flex from ${f3(elbowAt(0))} rad at the forward drive to ${f3(elbowAt(1))} rad at full rear swing (Δ ${f3(elbowAt(1) - elbowAt(0))} ≤ -0.30)`,
+      elbowAt(1) - elbowAt(0) <= -0.3 && elbowAt(0) < 0 && elbowAt(1) < 0);
   }
 
   // Visor horizon stabilization: headPitch = −0.65 × torsoPitch.
