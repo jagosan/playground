@@ -11,7 +11,8 @@
  *
  * Panels (spec 13 §3, spec 14 §3.4/§3.5):
  *   • Compass        — top-centre bearing tape (0°–360° + cardinals) with
- *                      tracking pins for 🚗 rover, 🏛️ faction base, 💎 vein.
+ *                      tracking pins for 🚗 rover, 🏛️ faction base, 💎 vein,
+ *                      and the Spec 32 §2.6 gold ▼ POI nav chevron.
  *   • Tutorial       — top-right `MISSION ONBOARDING` checklist (5 steps).
  *   • Life support   — Oxygen % bar, EVA battery % bar, suit headlight lamp,
  *                      RCS fuel, altitude / ground-contact readouts.
@@ -563,6 +564,22 @@ export interface HudCompassTargets {
   buggy?: HudCompassBearing;
   base?: HudCompassBaseBearing;
   vein?: HudCompassVeinBearing;
+  /** Spec 32 §2.6 POI navigation target — persistent gold gold-chevron pin. */
+  nav?: HudCompassNavBearing;
+}
+
+/**
+ * Spec 32 §2.6 — the persistent POI navigation target rendered as a gold
+ * chevron `▼ [TARGET_NAME]` on the compass tape, with live distance in
+ * metres and a relative-bearing guidance arrow (`◀` / `▲` / `▶`).
+ */
+export interface HudCompassNavBearing extends HudCompassBearing {
+  /** Display name shown inside the gold chevron (e.g. `Citadel`). */
+  name: string;
+  /** Bearing minus heading, wrapped to (-180, 180]. */
+  relBearing?: number;
+  /** Guidance arrow prefixed to the readout: '◀' | '▲' | '▶'. */
+  arrow?: string;
 }
 
 // -- Spec 18: comms terminal & hint arrow payloads -------------------------
@@ -1553,6 +1570,9 @@ export class LunarHUD {
     this.setCompassPin('compass-pin-buggy', heading, targets.buggy);
     this.setCompassPin('compass-pin-base', heading, targets.base, targets.base?.name);
     this.setCompassPin('compass-pin-vein', heading, targets.vein, targets.vein?.kind);
+    // Spec 32 §2.6: gold POI nav chevron — hidden whenever targets.nav is
+    // null/undefined, persistent (never auto-expires) while armed.
+    this.setCompassPin('compass-pin-nav', heading, targets.nav ?? undefined, targets.nav?.name);
   }
 
   private setCompassPin(
@@ -1571,13 +1591,21 @@ export class LunarHUD {
     const clamped = clamp(delta, -HUD_COMPASS_WINDOW_DEG, HUD_COMPASS_WINDOW_DEG);
     const leftPct = ((clamped / HUD_COMPASS_WINDOW_DEG) * 0.5 + 0.5) * 100;
     pin.style['left'] = `${leftPct.toFixed(2)}%`;
-    const label = name !== undefined && name.length > 0 ? String(name).toUpperCase() : '';
+    const isNav = key === 'compass-pin-nav';
+    const label =
+      name !== undefined && name.length > 0
+        ? isNav
+          ? String(name)
+          : String(name).toUpperCase()
+        : '';
     const readout = this.compassPinReadouts.get(key);
     if (readout !== undefined) {
       const arrow = (target as HudCompassVeinBearing).arrow;
       const arrowPrefix = arrow !== undefined && arrow.length > 0 ? `${arrow} ` : '';
-      readout.textContent =
-        `${arrowPrefix}${label.length > 0 ? `${label} ` : ''}${Math.round(wrap360(target.bearing))}° · ${num(target.dist, 0)} m`;
+      readout.textContent = isNav
+        ? // Spec 32 §2.6 gold chevron: `◀ Citadel [2410m]` — live metres.
+          `${arrowPrefix}${label} [${Math.round(target.dist)}m]`
+        : `${arrowPrefix}${label.length > 0 ? `${label} ` : ''}${Math.round(wrap360(target.bearing))}° · ${num(target.dist, 0)} m`;
     }
     pin.setAttribute('data-arrow', (target as HudCompassVeinBearing).arrow ?? '');
     this.setClassEl(pin, 'is-hidden', false);
@@ -2177,6 +2205,24 @@ export class LunarHUD {
       this.compassPinReadouts.set(key, readoutEl);
       band.appendChild(pin);
     }
+
+    // Spec 32 §2.6 — persistent gold POI nav chevron `▼ [TARGET_NAME]`
+    // with live distance; armed/cleared via ClientApp.setNavTarget().
+    const navPin = this.make(
+      'div',
+      'lunar-hud-compass-pin-nav',
+      'compass-pin compass-pin-nav is-hidden',
+      'compass-pin-nav',
+    );
+    navPin.setAttribute('data-target', 'nav');
+    const navGlyph = this.make('span', undefined, 'compass-pin-icon');
+    navGlyph.textContent = '▼';
+    const navReadout = this.make('span', undefined, 'compass-pin-readout');
+    navReadout.textContent = '';
+    navPin.appendChild(navGlyph);
+    navPin.appendChild(navReadout);
+    this.compassPinReadouts.set('compass-pin-nav', navReadout);
+    band.appendChild(navPin);
   }
 
   /**

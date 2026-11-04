@@ -233,6 +233,31 @@
   font-weight: bold;
 }
 
+/* Spec 32 §2.6 — persistent gold POI nav chevron `▼ [TARGET_NAME] [2410m]` */
+.compass-pin.compass-pin-nav,
+.compass-pin[data-target="nav"] {
+  border-color: rgba(255, 215, 0, 0.78);
+  background:
+    radial-gradient(circle at 50% 40%, rgba(255, 215, 0, 0.16), transparent 70%),
+    var(--lf-glass-solid);
+  box-shadow:
+    0 0 12px rgba(255, 215, 0, 0.38),
+    0 0 3px rgba(255, 215, 0, 0.6),
+    inset 0 0 8px rgba(255, 215, 0, 0.12);
+}
+
+.compass-pin[data-target="nav"] .compass-pin-icon {
+  color: #ffd700;
+  text-shadow: 0 0 8px rgba(255, 215, 0, 0.85);
+  font-weight: bold;
+}
+
+.compass-pin[data-target="nav"] .compass-pin-readout {
+  color: #ffe566;
+  text-shadow: 0 0 6px rgba(255, 215, 0, 0.45);
+  font-weight: 600;
+}
+
 /* --- onboarding checklist (spec 14 §3.5) ------------------------------------------- */
 
 #lunar-hud-tutorial {

@@ -941,16 +941,110 @@ function wrap180(deg: number): number {
 
 /**
  * Compass bearing (degrees, 0 = North, clockwise) from one world-frame point
- * to another. World +y is North and physics heading θ runs counter-clockwise
- * from +x, so bearing = 90° − θ (planar delta only — the z component is
- * irrelevant to a bearing tape).
+ * to another (Spec 32 §2.4). The physics frame runs yaw clockwise from +x, so
+ * the azimuth transform is ADDITIVE: bearing = wrap360(90° + θ) — planar
+ * delta only, the z component is irrelevant to a bearing tape. Under this
+ * convention turning right (clockwise) strictly INCREASES the reading:
+ * W 270° → NW 315° → N 360°/0° → NE 45° → E 90°.
  */
 function compassBearingDeg(
   from: { x: number; y: number },
   to: { x: number; y: number },
 ): number {
   const theta = (Math.atan2(to.y - from.y, to.x - from.x) * 180) / Math.PI;
-  return wrap360(90 - theta);
+  return wrap360(90 + theta);
+}
+
+// -- Spec 32 §2.6: authoritative POI navigation directory ---------------------
+
+/** One entry of the POI nav directory (Spec 32 §2.6). */
+export interface NavPoi {
+  /** Stable machine id (`citadel`, `tower`, ...). */
+  id: string;
+  /** Full display name shown on the HUD nav pin. */
+  name: string;
+  /** Compact label used inside the gold compass chevron. */
+  shortName: string;
+  /** World-frame planar position (x, y). */
+  position: { x: number; y: number };
+  /** Lower-cased fuzzy-match keywords (console `setNavTarget` queries). */
+  keywords: readonly string[];
+}
+
+/**
+ * The authoritative points-of-interest directory (Spec 32 §2.6). Coordinates
+ * are fixed by the spec and win over any other landmark source in the game.
+ */
+export const NAV_POI_DIRECTORY: readonly NavPoi[] = [
+  {
+    id: 'citadel',
+    name: 'X-Corp Citadel Monolith',
+    shortName: 'Citadel',
+    position: { x: -1850, y: 2400 },
+    keywords: ['citadel', 'corp', 'x-corp', 'hq', 'headquarters', 'monolith', 'evil'],
+  },
+  {
+    id: 'tower',
+    name: 'Frontier Radio Tower',
+    shortName: 'Radio Tower',
+    position: { x: -1550, y: 2320 },
+    keywords: ['tower', 'radio', 'relay', 'relay 04', 'frontier'],
+  },
+  {
+    id: 'accelerator',
+    name: 'Mare Mass Accelerator',
+    shortName: 'Mass Accelerator',
+    position: { x: -320, y: -1450 },
+    keywords: [
+      'mass accelerator',
+      'accelerator',
+      'gauss',
+      'gauss needle',
+      'needle',
+      'mare',
+      'railgun',
+    ],
+  },
+  {
+    id: 'touchdown',
+    name: 'Touchdown Alpha',
+    shortName: 'Touchdown Alpha',
+    position: { x: 0, y: 0 },
+    keywords: ['touchdown', 'landing', 'lander', 'alpha', 'landing site', 'site'],
+  },
+  {
+    id: 'outpost',
+    name: 'Canyon Extraction Outpost',
+    shortName: 'Outpost',
+    position: { x: -920, y: 1150 },
+    keywords: ['outpost', 'canyon', 'extraction'],
+  },
+];
+
+/**
+ * Fuzzy-match a free-text query against {@link NAV_POI_DIRECTORY}. Scoring:
+ * exact id (3) > keyword phrase (2) > substring of display name (1); ties
+ * break toward the earliest directory entry. Returns `null` when nothing
+ * scores above zero.
+ */
+function matchNavPoi(query: string): NavPoi | null {
+  const q = query.trim().toLowerCase().replace(/\s+/g, ' ');
+  if (q.length === 0) return null;
+  let best: NavPoi | null = null;
+  let bestScore = 0;
+  for (const poi of NAV_POI_DIRECTORY) {
+    let score = 0;
+    if (poi.id === q) score = 3;
+    else if (poi.keywords.some((k) => k === q || k.includes(q) || q.includes(k))) score = 2;
+    else if (poi.name.toLowerCase().includes(q) || poi.shortName.toLowerCase().includes(q)) {
+      score = 1;
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      best = poi;
+    }
+  }
+  return bestScore > 0 ? best : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -1247,6 +1341,8 @@ export class ClientApp {
   /** Long-range nav target (TASK-PLAY-063c) — best vein within NAV_SCAN_RANGE_M. */
   private navVein: ResourceVein | null = null;
   private navVeinRangeM: number | null = null;
+  /** Spec 32 §2.6: selected POI nav target id (`NAV_POI_DIRECTORY`), null = none. */
+  private navTargetId: string | null = null;
 
   private started = false;
   private initialized = false;
@@ -1312,6 +1408,12 @@ export class ClientApp {
           : new NetworkClient();
     }
     this.hud = options.hud ?? null;
+    // Spec 32 §2.6: dev-console hook — `setNavTarget('citadel')` from the
+    // browser console selects the HUD gold nav pin target.
+    const win = (globalThis as unknown as { window?: Record<string, unknown> }).window;
+    if (win !== undefined) {
+      win['setNavTarget'] = (query: string | null): boolean => this.setNavTarget(query);
+    }
   }
 
   // -- lifecycle ----------------------------------------------------------------
@@ -2259,6 +2361,34 @@ export class ClientApp {
     return this.navVein !== null && this.navVeinRangeM !== null
       ? { vein: this.navVein, rangeM: this.navVeinRangeM }
       : null;
+  }
+
+  /**
+   * Spec 32 §2.6: select the persistent gold HUD nav pin target by fuzzy
+   * text query against {@link NAV_POI_DIRECTORY} (`'citadel'`, `'corp'`,
+   * `'hq'`, `'tower'`, `'radio'`, `'mass accelerator'`, `'gauss'`,
+   * `'needle'`, `'landing'`, `'touchdown'`, `'outpost'`, `'canyon'`, …).
+   * Passing `null`, an empty/whitespace string, or `'clear'` unsets the
+   * target. Returns `true` when the query resolved (target set or cleared),
+   * `false` when nothing matched — the previous target then stays armed.
+   */
+  setNavTarget(query: string | null | undefined): boolean {
+    const q = (query ?? '').trim().toLowerCase();
+    if (q.length === 0 || q === 'clear' || q === 'none' || q === 'unset') {
+      this.navTargetId = null;
+      return true;
+    }
+    const poi = matchNavPoi(q);
+    if (poi === null) return false;
+    this.navTargetId = poi.id;
+    return true;
+  }
+
+  /** The armed POI nav target, or `null` when none is selected. */
+  getNavTarget(): { id: string; name: string; position: { x: number; y: number } } | null {
+    const poi = NAV_POI_DIRECTORY.find((p) => p.id === this.navTargetId) ?? null;
+    if (poi === null) return null;
+    return { id: poi.id, name: poi.name, position: { ...poi.position } };
   }
 
   /** The frame the movement stream would send right now. */
@@ -5028,10 +5158,12 @@ export class ClientApp {
   }
 
   /**
-   * Feed the HUD compass tape: heading of the ridden entity (physics θ runs
-   * counter-clockwise from +x; compass bearing = 90° − θ) plus relative pins
-   * for the rover (on foot only), nearest faction base, and scanner-locked
-   * vein.
+   * Feed the HUD compass tape: heading of the ridden entity (Spec 32 §2.4:
+   * physics yaw runs clockwise, compass bearing = wrap360(90° + θ), so a
+   * right turn strictly increases the reading: W 270° → NW 315° → N 0° →
+   * NE 45° → E 90°) plus relative pins for the rover (on foot only),
+   * nearest faction base, scanner-locked vein, and the Spec 32 §2.6 POI
+   * navigation target (persistent gold chevron).
    */
   private refreshCompass(): void {
     const hud = this.hud;
@@ -5039,7 +5171,7 @@ export class ClientApp {
 
     const headingRad =
       this.mode === 'buggy' ? this.requireBuggy().getHeading() : this.requireSuit().getHeading();
-    const headingDeg = wrap360(90 - (headingRad * 180) / Math.PI);
+    const headingDeg = wrap360(90 + (headingRad * 180) / Math.PI);
 
     const p = this.activePosition();
     const targets: HudCompassTargets = {};
@@ -5071,6 +5203,23 @@ export class ClientApp {
         dist: nav.rangeM,
         relBearing,
         arrow,
+      };
+    }
+
+    // Spec 32 §2.6: persistent gold POI nav chevron with live distance.
+    const navPoi = NAV_POI_DIRECTORY.find((poi) => poi.id === this.navTargetId);
+    if (navPoi !== undefined) {
+      const navBearingDeg = compassBearingDeg(p, navPoi.position);
+      const navRel = wrap180(navBearingDeg - headingDeg);
+      let navArrow = '▲';
+      if (navRel < -15) navArrow = '◀';
+      else if (navRel > 15) navArrow = '▶';
+      targets.nav = {
+        name: navPoi.shortName,
+        bearing: navBearingDeg,
+        dist: Math.hypot(navPoi.position.x - p.x, navPoi.position.y - p.y),
+        relBearing: navRel,
+        arrow: navArrow,
       };
     }
 
