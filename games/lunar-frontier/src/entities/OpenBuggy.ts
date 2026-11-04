@@ -52,12 +52,16 @@ import { Mesh } from '@babylonjs/core/Meshes/mesh.js';
 
 import {
   BUGGY_BATTERY_KWH,
+  BUGGY_CHASSIS_MASS,
   BUGGY_MAX_CARGO,
+  BUGGY_SEAT_BELOW_DATUM,
+  BUGGY_SPRING_RATE,
   BUGGY_SPRING_TRAVEL,
   BUGGY_TRACK,
   BUGGY_WHEEL_RADIUS,
   IDLE_BUGGY_INPUT,
   LunarBuggy,
+  LUNAR_GRAVITY,
   type BuggyInput,
   type BuggyOptions,
   type BuggyState,
@@ -259,6 +263,22 @@ const AXIS_Y = new Vector3(0, 1, 0);
 /** Chassis datum rise above the wheel-centre plane at rest spawn ride (m).
  *  Mirrors the physics module's initial `bodyHeight = R + 0.229`. */
 const CHASSIS_DATUM_RISE = 0.229;
+
+/**
+ * Spec 32 §2.5: chassis-LOCAL wheel-centre height for a suspension
+ * compression fraction (0 = full droop, 1 = bump stop). Mirrors the physics
+ * corner law x0 = (2c − 1)·travel measured against the spring seat
+ * BUGGY_SEAT_BELOW_DATUM under the chassis datum. The root node rides at the
+ * chassis datum's true world elevation, so on the ground this places each
+ * wheel centre exactly on its own corner's terrain + R, and at compression
+ * 0 (airborne) the road wheels hang at MAXIMUM droop travel below the
+ * chassis body — decoupled from the terrain floor far below.
+ */
+function wheelLocalY(compression: number): number {
+  return (compression * 2 - 1) * BUGGY_SPRING_TRAVEL - BUGGY_SEAT_BELOW_DATUM;
+}
+/** Static build pose: neutral ride (compression ½) in the datum-riding root. */
+const WHEEL_NEUTRAL_LOCAL_Y = wheelLocalY(0.5);
 /** Tyre lay-down: cylinder axis local +y → axle axis local +x (left). */
 const LAY_DOWN = Quaternion.RotationAxis(new Vector3(0, 0, 1), -Math.PI / 2);
 /** Lamp attach points in the model frame: index 0 = left, 1 = right. */
@@ -1304,11 +1324,22 @@ export class OpenBuggy {
     const wheelDiameter = BUGGY_WHEEL_RADIUS * 2;
 
     // Nominal tie-rod chord (rest length) straight ahead at static ride:
-    // wheel plane sits CHASSIS_DATUM_RISE below the chassis datum.
+    // Spec 32 §2.5 the wheel plane hangs below the datum-riding root at the
+    // static-ride deflection of the corner law — x₀ = m·g/(4k) of spring
+    // compression under the empty chassis at lunar gravity — so the rods
+    // rest at their true chord while the rover rolls straight and level.
     {
       const a = new Vector3();
       const b = new Vector3();
-      this.tieRodRestLen = this.tieRodChord(0, 0, -CHASSIS_DATUM_RISE, a, b);
+      const staticRideDeflection =
+        (BUGGY_CHASSIS_MASS * LUNAR_GRAVITY) / (4 * BUGGY_SPRING_RATE);
+      this.tieRodRestLen = this.tieRodChord(
+        0,
+        0,
+        WHEEL_NEUTRAL_LOCAL_Y + staticRideDeflection,
+        a,
+        b,
+      );
     }
 
     for (let i = 0; i < WHEEL_SLOTS.length; i++) {
@@ -1316,7 +1347,9 @@ export class OpenBuggy {
       const isFront = i < 2;
       const cornerPivot = new TransformNode(`${p}-corner-pivot-${i}`, scene);
       cornerPivot.parent = this.root;
-      cornerPivot.position.set(slot.side * (BUGGY_TRACK / 2), BUGGY_WHEEL_RADIUS, slot.z);
+      // Spec 32 §2.5: the root now rides at the chassis datum elevation, so
+      // the wheel plane hangs BELOW it (static build pose = neutral ride).
+      cornerPivot.position.set(slot.side * (BUGGY_TRACK / 2), WHEEL_NEUTRAL_LOCAL_Y, slot.z);
       cornerPivots.push(cornerPivot);
 
       // Double wishbone A-arms: upper + lower V-struts, each merged from two
@@ -1437,7 +1470,7 @@ export class OpenBuggy {
         { diameter: wheelDiameter, height: 0.34, tessellation: 24 },
         scene,
       );
-      wheel.position.set(slot.side * (BUGGY_TRACK / 2), BUGGY_WHEEL_RADIUS, slot.z);
+      wheel.position.set(slot.side * (BUGGY_TRACK / 2), WHEEL_NEUTRAL_LOCAL_Y, slot.z);
       wheel.material = tire;
       wheel.parent = this.root;
       wheelsList.push(wheel);
@@ -1727,8 +1760,11 @@ export class OpenBuggy {
     if (root === null || this.scene === null || this.scene.isDisposed) return;
 
     // Physics frame (x, y lateral, z up) → Babylon (x, z up, -y) via the
-    // shared converter; state.z is the sampled ground under the chassis, so
-    // the node origin sits on the regolith and the body rides above it.
+    // shared converter. Spec 32 §2.5: state.z is the chassis datum's TRUE
+    // world elevation (ballistically integrated, terrain-barriered), so the
+    // node — and every chassis child riding on it — flies with the rover
+    // through lunar hangtime instead of staying tethered to the regolith
+    // under it.
     const b = worldToBabylon(state);
     root.position.set(b.x, b.y, b.z);
 
@@ -1745,28 +1781,28 @@ export class OpenBuggy {
     );
     root.computeWorldMatrix(true);
 
-    // Rigid chassis body translation (heave): all chassis children move
-    // together. Spec 16 §2.2 guard — the chassis may separate from the
-    // wheel-centre plane only by the suspension travel plus the static ride
-    // datum, so a transient physics excursion can never read as the body
-    // oscillating chaotically against its wheels.
+    // Rigid chassis body translation (heave). Spec 32 §2.5: the root node
+    // now rides at the chassis datum's true world elevation s.z, so the
+    // sprung mass IS the root frame — the chassis body sits exactly on the
+    // datum (the barriered z integration bounds it by construction, which
+    // supersedes the Spec-16 visual heave clamp against a z-pinned body).
     if (this.chassisBody !== null) {
-      let meanWheelY = 0;
+      // Spec 32 §2.5 — visual wheel-suspension decoupling: each corner road
+      // wheel (and its pivot) HANGS below the datum by its own suspension
+      // deflection via wheelLocalY(). On the ground that lands each wheel
+      // centre on its own corner's terrain + R (wheels track the surface,
+      // the chassis flies); when `state.airborne` the spring rings out to
+      // compression 0 and the road wheels suspend at MAXIMUM droop travel
+      // from the chassis body rather than being projected from the terrain
+      // floor below.
       for (let i = 0; i < this.wheels.length; i++) {
-        const springOffset = -(state.wheels[i].compression - 0.5) * BUGGY_SPRING_TRAVEL;
-        this.wheels[i].position.y = BUGGY_WHEEL_RADIUS + springOffset;
+        const droopY = wheelLocalY(state.wheels[i]?.compression ?? 0.5);
+        this.wheels[i].position.y = droopY;
         if (this.cornerPivots[i]) {
-          this.cornerPivots[i].position.y = BUGGY_WHEEL_RADIUS + springOffset;
+          this.cornerPivots[i].position.y = droopY;
         }
-        meanWheelY += springOffset;
       }
-      meanWheelY = BUGGY_WHEEL_RADIUS + meanWheelY / Math.max(this.wheels.length, 1);
-      const chassisNominal = meanWheelY + CHASSIS_DATUM_RISE;
-      this.chassisBody.position.y = clamp(
-        state.bodyHeight,
-        chassisNominal - BUGGY_SPRING_TRAVEL,
-        chassisNominal + BUGGY_SPRING_TRAVEL,
-      );
+      this.chassisBody.position.y = 0;
     }
 
     // -- Spec 17 §4.2: coilovers compress with per-wheel suspension --------
@@ -1823,16 +1859,17 @@ export class OpenBuggy {
   private applyTieRods(state: BuggyState): void {
     if (this.tieRods.length < 2) return;
     const steerAngle = state.steerAngle ?? 0;
-    const chassisY = this.chassisBody !== null ? this.chassisBody.position.y : BUGGY_WHEEL_RADIUS + CHASSIS_DATUM_RISE;
+    const chassisY = this.chassisBody !== null ? this.chassisBody.position.y : 0;
     const rackEnd = new Vector3();
     const attach = new Vector3();
     for (let i = 0; i < 2; i++) {
       const rod = this.tieRods[i];
-      // Wheel-plane height minus chassis-datum height, in chassis-local y:
-      // corner pivot sits at R + springOffset (root frame), datum at
-      // chassisY, so relative heave = R + springOffset − chassisY.
-      const springOffset = -(state.wheels[i].compression - 0.5) * BUGGY_SPRING_TRAVEL;
-      const relativeHeave = BUGGY_WHEEL_RADIUS + springOffset - chassisY;
+      // Wheel-plane height minus chassis-datum height in chassis-local y:
+      // Spec 32 §2.5 the corner pivot rides at wheelLocalY(compression) in
+      // the datum-riding root frame, the chassis body at chassisY, so the
+      // tie-rod attach sees relativeHeave = droop law − chassisY.
+      const relativeHeave =
+        wheelLocalY(state.wheels[i]?.compression ?? 0.5) - chassisY;
       const chord = this.tieRodChord(i, steerAngle, relativeHeave, rackEnd, attach);
 
       const dx = attach.x - rackEnd.x;

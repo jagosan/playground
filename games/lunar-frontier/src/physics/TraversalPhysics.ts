@@ -1178,6 +1178,26 @@ export const BUGGY_SPRING_RATE = 4_200;
 export const BUGGY_DAMPER = 1360;
 /** Suspension travel from static ride (m). */
 export const BUGGY_SPRING_TRAVEL = 0.2;
+/**
+ * Spring-seat plane below the chassis datum (m). Spec 32 §2.5 promotes this
+ * from the corner-law literal to an exported constant so the OpenBuggy
+ * visual wheel law shares one source of truth with the physics corner law.
+ */
+export const BUGGY_SEAT_BELOW_DATUM = 0.25;
+/**
+ * Spec 32 §2.5: bumper stand-off sampled AHEAD of the chassis datum for the
+ * steep-approach nose-clip barrier (m). Past the front axle (1.35 m) into
+ * the chassis overhang, so terrain the bumper is driving into is caught
+ * before the centre point ever arrives.
+ */
+export const BUGGY_NOSE_LOOKOUT_M = 1.6;
+/**
+ * Spec 32 §2.5: nose underside clearance below the chassis datum (m). The
+ * barrier fires only when terrain reaches above this plane at the lookout
+ * point — i.e. when the chassis underside would genuinely plough through
+ * regolith, never on sustained grades (margin ≥ 0.28 rad of pitch lag).
+ */
+export const BUGGY_NOSE_UNDERCARRIAGE_M = 0.12;
 /** Peak tyre force per unit normal load (regolith, simplified Pacejka peak). */
 export const BUGGY_MU_PEAK = REGOLITH_MU;
 /** Slip ratio at which peak traction occurs (simplified Pacejka shaping). */
@@ -1364,6 +1384,11 @@ export interface WheelState {
 export interface BuggyState {
   x: number;
   y: number;
+  /**
+   * TRUE world elevation of the chassis datum (m). Spec 32 §2.5: integrated
+   * ballistically from suspension net force + gravity and constrained by a
+   * rigid terrain barrier — no longer the sampled ground under the centre.
+   */
   z: number;
   heading: number;
   /** Body-frame longitudinal velocity (m/s, + forward). */
@@ -1456,16 +1481,22 @@ export class LunarBuggy {
     // (and the lunar smoke suite) bit-compatible.
     this.env = options.environment ?? ENV_LUNAR_FRONTIER;
     const cargo = clamp(initial.cargoMass ?? options.initialCargo ?? 0, 0, BUGGY_MAX_CARGO);
+    // Spec 32 §2.5: `z` is the chassis datum's TRUE world elevation (see
+    // substep for the ballistic barrier). A bodyHeight-only spawn sits that
+    // far above the terrain under the spawn point, so seed z consistently.
+    const spawnX = initial.x ?? 0;
+    const spawnY = initial.y ?? 0;
+    const bodyHeight0 = initial.bodyHeight ?? BUGGY_WHEEL_RADIUS + 0.229;
     this.state = {
-      x: initial.x ?? 0,
-      y: initial.y ?? 0,
-      z: initial.z ?? 0,
+      x: spawnX,
+      y: spawnY,
+      z: initial.z ?? this.ground(spawnX, spawnY) + bodyHeight0,
       heading: initial.heading ?? 0,
       vLong: initial.vLong ?? 0,
       vLat: initial.vLat ?? 0,
       vBody: initial.vBody ?? 0,
       yawRate: initial.yawRate ?? 0,
-      bodyHeight: initial.bodyHeight ?? BUGGY_WHEEL_RADIUS + 0.229,
+      bodyHeight: bodyHeight0,
       roll: initial.roll ?? 0,
       pitch: initial.pitch ?? 0,
       cargoMass: cargo,
@@ -1614,6 +1645,12 @@ export class LunarBuggy {
     const behind = this.ground(s.x - 2 * ch, s.y - 2 * sh);
     const right = this.ground(s.x - 2 * sh, s.y + 2 * ch);
     const here = this.ground(s.x, s.y);
+    // Spec 32 §2.5: s.z (true world elevation of the chassis datum,
+    // integrated ballistically against the terrain barrier at the foot of
+    // this substep) is the ONE authoritative vertical DOF. The suspension
+    // datum `bodyHeight` is slaved to it, so regolith that shifts under a
+    // stationary rover moves the FLOOR, never the chassis.
+    s.bodyHeight = s.z - here;
     const slopePitch = Math.atan2(ahead - behind, 4);
     const slopeRoll = Math.atan2(here - right, 2);
 
@@ -1852,7 +1889,7 @@ export class LunarBuggy {
       const zg = this.ground(s.x + fx * ch - fy * sh, s.y + fx * sh + fy * ch);
 
       // Chassis spring-seat height above the local ground datum.
-      const mountZ = s.bodyHeight - 0.25 + fx * cp * s.pitch - fy * cr * s.roll;
+      const mountZ = s.bodyHeight - BUGGY_SEAT_BELOW_DATUM + fx * cp * s.pitch - fy * cr * s.roll;
 
       // Suspension deflection x_i = z_contact + R_wheel - z_mount, positive =
       // compressed, measured against THIS corner's own ground so each wheel
@@ -2195,9 +2232,12 @@ export class LunarBuggy {
     if (this.state.rolled) s.yawRate *= Math.exp(-3 * dt);
 
     // -- Heave & attitude dynamics ----------------------------------------------
+    // Spec 32 §2.5: the net suspension-vs-weight force drives vBody, and the
+    // integration of that velocity into the chassis elevation happens at the
+    // foot of this substep (untethered ballistic heave + rigid terrain
+    // barrier), NOT against the local ground datum.
     const weight = m * env.gravity;
     s.vBody += ((n - weight) / m) * dt;
-    s.bodyHeight += s.vBody * dt;
 
     // Terrain attitude from the per-corner contact heights (spec 16 §2.2):
     // θ = atan((z_front − z_rear)/L), φ = atan((z_left − z_right)/W). The
@@ -2238,9 +2278,6 @@ export class LunarBuggy {
       this.state.rolled = true;
     }
 
-    // -- Airborne detection ---------------------------------------------------------
-    s.airborne = s.vBody > 0.05 || s.bodyHeight > BUGGY_WHEEL_RADIUS + 0.229 + BUGGY_SPRING_TRAVEL * 1.5;
-
     // -- Integration ----------------------------------------------------------------
     if (Math.abs(s.pitch) > 0.55 && !this.state.rolled && speedRef > 1) {
       this.state.rolled = true; // nose-in tip-over on a berm
@@ -2248,8 +2285,67 @@ export class LunarBuggy {
 
     s.x += (s.vLong * ch - s.vLat * sh) * dt;
     s.y += (s.vLong * sh + s.vLat * ch) * dt;
-    s.z = this.ground(s.x, s.y);
     s.heading = wrapAngle(s.heading + s.yawRate * dt);
+
+    // -- Spec 32 §2.5: true 3D rover ballistics (untethered vertical heave) ---------
+    // The chassis datum used to be re-pinned to ground(s.x, s.y) every
+    // substep. That zeroed vertical momentum at every crest — a berm or
+    // crater lip could never launch the buggy — and plunged the chassis nose
+    // through rising terrain before the centre arrived. s.z is now the
+    // datum's TRUE world elevation, integrated from the same net force that
+    // feeds vBody (s.vBody += ((n − weight)/m)·dt in the heave block above):
+    //
+    //     s.z += s.vBody · dt
+    //
+    // constrained only by the rigid regolith barrier below. Driving up and
+    // over a berm/lip at speed leaves vBody positive as floorZ drops away,
+    // so s.z exceeds floorZ and the rover catches true lunar hangtime —
+    // ballistic, vacuum, no drag, dead-stop touchdown.
+    s.z += s.vBody * dt;
+    const floorZ = this.ground(s.x, s.y);
+    if (s.z < floorZ) {
+      // Rigid terrain barrier, zero restitution: the datum cannot sink under
+      // the surface and downward velocity dies on contact (regolith absorbs,
+      // it does not rebound). Positive momentum through the contact is kept.
+      s.z = floorZ;
+      s.vBody = Math.max(0, s.vBody);
+    }
+
+    // Steep-approach nose-clip protection: the ground ahead of the datum
+    // rises faster than the first-order attitude controller can pitch the
+    // chassis, so barrier-check the bumper lookout point as well — the nose
+    // underside may never sit below the surface it is driving into. The
+    // correction feeds back into the same z/vBody heave state, which is what
+    // rides the rover up and over crater lips into hangtime. Sustained
+    // grades never trigger it (the linear-slope term cancels; it takes a
+    // genuine step/cliff or heavy pitch lag beyond ~0.28 rad).
+    const noseGround = this.ground(
+      s.x + BUGGY_NOSE_LOOKOUT_M * ch,
+      s.y + BUGGY_NOSE_LOOKOUT_M * sh,
+    );
+    const noseUnderZ =
+      s.z + BUGGY_NOSE_LOOKOUT_M * Math.sin(s.pitch) - BUGGY_NOSE_UNDERCARRIAGE_M;
+    if (noseUnderZ < noseGround) {
+      s.z += noseGround - noseUnderZ;
+      if (s.vBody < 0) s.vBody = 0;
+    }
+
+    // Suspension datum bookkeeping: chassis height above the CURRENT local
+    // floor (the corner spring law at the head of the next substep measures
+    // its deflections against this).
+    s.bodyHeight = s.z - floorZ;
+
+    // -- Airborne detection ---------------------------------------------------------
+    // Spec 32 §2.5 tri-part test: chassis clearance risen beyond the ride
+    // envelope, real climb rate relative to the floor sliding under it
+    // (vFloor cancels terrain-grade following so hills are not "flight"),
+    // or every spring rung out at full droop (wheels hanging free).
+    const vFloor = (floorZ - here) / dt;
+    const springsDrooped = s.wheels.every((w) => w.compression <= 1e-6);
+    s.airborne =
+      s.bodyHeight > BUGGY_WHEEL_RADIUS + 0.229 + BUGGY_SPRING_TRAVEL * 1.5 ||
+      s.vBody - vFloor > 0.05 ||
+      springsDrooped;
 
     // -- Energy bookkeeping ----------------------------------------------------------
     const motorPower = Math.max(0, driveForce * s.vLong);
