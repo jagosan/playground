@@ -449,11 +449,18 @@ export const HUD_PROMPT_KINDS = {
 export type HudPromptKind = keyof typeof HUD_PROMPT_KINDS;
 
 /**
- * Spec 19 §2.1.6: which device produced the last input. The prompt strip
- * re-glyphs itself — `[E]`/`[M]`/`[T]` on keyboard, `(X)`/`(RB)`/`(B)` on a
- * live gamepad — so a controller driver never chases keys they cannot press.
+ * Spec 19 §2.1.6 / Spec 33 §2.3: which device produced the last input. The
+ * prompt strip re-glyphs itself — `[E]`/`[M]`/`[T]` on keyboard,
+ * `(X)`/`(RB)`/`(B)` on a live gamepad, and the tactile `[👆] TAP …`
+ * badges on touch — so a driver never chases keys they cannot press.
  */
-export type HudInputSource = 'keyboard' | 'gamepad';
+export type HudInputSource = 'keyboard' | 'gamepad' | 'touch';
+
+/**
+ * Spec 33 §2.3: tactile glyph shown in the prompt key slot in touch mode
+ * instead of the `[E]` bracket or the `(X)` gamepad bubble.
+ */
+export const HUD_TOUCH_GLYPH = '\u{1F446}';
 
 /**
  * Canonical gamepad glyphs per prompt kind (Spec 19 §2.1.5 action sheet).
@@ -1451,17 +1458,29 @@ export class LunarHUD {
       }
       const kind = (prompt.kind ?? 'trade') as HudPromptKind;
       const label = prompt.label ?? HUD_PROMPT_KINDS[kind]?.label ?? 'Interact';
-      // Gamepad source swaps in the console glyph when the kind has one;
-      // kinds without a pad binding (claim) keep their keyboard bracket.
-      const padGlyph = this.inputSource === 'gamepad' ? HUD_GAMEPAD_GLYPHS[kind] : undefined;
+      // Spec 19 §2.1.6 / Spec 33 §2.3 — glyph choice by source: gamepad
+      // swaps in the console binding when the kind has one; touch replaces
+      // the key bracket with the tactile `[👆] TAP …` badge (there is no key
+      // to hunt for — the action lives under the thumb on the cluster).
+      // Keyboard and kinds without a pad binding (claim) keep brackets.
+      const touchMode = this.inputSource === 'touch';
+      const padGlyph =
+        !touchMode && this.inputSource === 'gamepad'
+          ? HUD_GAMEPAD_GLYPHS[kind]
+          : undefined;
       slot.textContent = '';
       const key = this.make('span', undefined, 'hud-key');
-      key.textContent = padGlyph !== undefined ? `(${padGlyph})` : `[${prompt.key}]`;
+      key.textContent = touchMode
+        ? `[${HUD_TOUCH_GLYPH}]`
+        : padGlyph !== undefined
+          ? `(${padGlyph})`
+          : `[${prompt.key}]`;
       const text = this.make('span', undefined, 'hud-prompt-label');
-      text.textContent = label;
+      text.textContent = touchMode ? `TAP ${label}` : label;
       slot.appendChild(key);
       slot.appendChild(text);
       slot.setAttribute('data-kind', prompt.kind ?? 'custom');
+      this.setClassEl(slot, 'is-touch', touchMode);
       this.setClassEl(slot, 'is-hidden', false);
     }
   }
@@ -1506,6 +1525,14 @@ export class LunarHUD {
     // Spec 30 §2.3.1 — [Esc] is modal dismissal ONLY (close dialog / map).
     // The UI-mode cycle moved to [U]/[H] (pad: 2× R3) so hiding the HUD can
     // never release the browser pointer lock.
+    // Spec 33 §2.3 — touch mode swaps to the thumb-deck legend: the action
+    // cluster and virtual sticks ARE the controls, no key sheet applies.
+    if (this.inputSource === 'touch') {
+      this.legendEl.textContent =
+        '\u{1F446} drag LEFT to steer · swipe RIGHT to look · TAP action buttons ' +
+        '(⤒ jump · ⟳ roll · smart ACTION) · 🗺 map · 👁 UI cycle';
+      return;
+    }
     this.legendEl.textContent =
       this.inputSource === 'gamepad'
         ? '(L-Stick) move · (A) hop / handbrake · (LB) sprint · (X) buggy · (Y) lamps · ' +

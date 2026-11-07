@@ -58,7 +58,6 @@ import {
   type Quest,
 } from './QuestEngine.ts';
 import { HintArrowSystem, type HintArrowTarget } from './HintArrowSystem.ts';
-import { TouchInputController, type TouchInputState } from './TouchInputController.ts';
 import { IntroDirector, type IntroPhase } from './IntroDirector.ts';
 import { FactionBases } from '../infrastructure/Factions.ts';
 // Spec 25 §2.4: derelict rival-team outposts (built inside WorldScene.init;
@@ -113,12 +112,19 @@ import NetworkClient, {
 import LunarHUD, {
   type HudCompassTargets,
   type HudExportGunnerTelemetry,
+  type HudInputSource,
   type HudPrompt,
   type HudRadarContact,
   type HudScannerReadout,
   type HudTradeRequest,
   type HUDMode,
 } from '../ui/LunarHUD.ts';
+import {
+  TouchInputController,
+  type ContextualAction,
+  type TouchActionId,
+  type TouchInputState,
+} from './TouchInputController.ts';
 import type { ResourceVein, ScrapSite } from '../world/LunarWorldGenerator.ts';
 import type { TopoMapPOI, TopoMapState } from '../ui/LunarHUD.ts';
 // Spec 25 §2.5: 100% procedural Web Audio engine (zero assets; the module
@@ -1233,11 +1239,14 @@ export class ClientApp {
   private readonly padRailStreaks = new WeakMap<object, number[]>();
 
   /**
-   * Spec 19 §2.1.6: which device last produced input. `sampleInput()` flips
-   * this to `'gamepad'` on any above-deadband pad activity and `'keyboard'`
-   * on any latched key; the HUD prompt glyphs follow it.
+   * Spec 19 §2.1.6 / Spec 33 §2.3: which device last produced input.
+   * `sampleInput()` flips this to `'gamepad'` on any above-deadband pad
+   * activity and `'keyboard'` on any latched key; the touch deck flips it
+   * to `'touch'` on any processed gesture. The HUD prompt glyphs follow it
+   * (`[E]` / `(X)` / `[👆] TAP …`), and the on-screen touch deck auto-hides
+   * (`.is-gamepad-hidden`, 300 ms fade) exactly while `'gamepad'` drives.
    */
-  private inputSource: 'keyboard' | 'gamepad' = 'keyboard';
+  private inputSource: HudInputSource = 'keyboard';
 
   /**
    * Spec 19 §2.1.3 / ADR-2 brake-to-reverse latched state (buggy only).
@@ -2458,10 +2467,11 @@ export class ClientApp {
   }
 
   /**
-   * Spec 19 §2.1.6: the device that produced the most recent input — drives
-   * the HUD's `[E]` vs `(X)` prompt glyph choice.
+   * Spec 19 §2.1.6 / Spec 33 §2.3: the device that produced the most recent
+   * input — drives the HUD's `[E]` vs `(X)` vs `[👆] TAP` prompt glyph
+   * choice and the touch-deck auto-hide arbiter.
    */
-  getInputSource(): 'keyboard' | 'gamepad' {
+  getInputSource(): HudInputSource {
     return this.inputSource;
   }
 
@@ -2624,6 +2634,12 @@ export class ClientApp {
       frame.forward = clamp(frame.forward + touch.forward, -1, 1);
       frame.strafe = clamp(frame.strafe + touch.strafe, -1, 1);
       if (touch.sprint) frame.sprint = true;
+      // Spec 33 §2.2.4 (Phase 3): the action cluster's hold channels ride
+      // the same frame. Jump follows the button press exactly, so a mid-air
+      // re-tap is a clean rising edge for the Spec 32 PLSS boost (pitfall
+      // #48), and roll feeds the acrobatic tuck valve unmodified.
+      if (touch.jump) frame.jump = true;
+      if (touch.roll) frame.roll = true;
     }
 
     // Poll the pad unconditionally so `pumpGamepadActions()` always has this
@@ -2839,13 +2855,26 @@ export class ClientApp {
     ) {
       this.touchInput.setViewport(win.innerWidth, win.innerHeight);
     }
+    // Spec 33 §2.3: any processed touch instantly re-claims the input
+    // source for `'touch'` and re-illuminates the deck (the gamepad
+    // auto-hide is a suggestion, the thumb always wins it back).
+    this.touchInput.onTouchActivity = (): void => {
+      if (this.disposed) return;
+      this.inputSource = 'touch';
+      this.touchInput?.setVisible(true);
+    };
     this.touchInput.attach();
+    this.touchInput.setVisible(this.inputSource !== 'gamepad');
   }
 
   /**
-   * Spec 33 Phase 2: the once-per-physics-frame touch poll. Stashes the
-   * movement/sprint state for `sampleInput()` and the look radians for
-   * {@link applyTouchLookDeltas}. Safe to call with no deck (clears stash).
+   * Spec 33 Phase 2 / Phase 3 §2.3: the once-per-physics-frame touch poll.
+   * Stashes the movement/sprint/hold state for `sampleInput()` and the look
+   * radians for {@link applyTouchLookDeltas}, drains the cluster's one-shot
+   * taps (smart ACTION / MAP / UI), and runs the tri-state arbiter: any
+   * active touch claims `'touch'`, and the on-screen deck fades out
+   * (`.is-gamepad-hidden`, 300 ms) exactly while a gamepad drives. Safe to
+   * call with no deck (clears stash).
    */
   private pumpTouchInput(): void {
     if (this.touchInput === null) {
@@ -2858,6 +2887,153 @@ export class ClientApp {
     this.lastTouchState = state;
     this.touchLookYawRad = state.yawDelta;
     this.touchLookPitchRad = state.pitchDelta;
+
+    // Tri-state arbiter (§2.3): a REAL finger down on the deck claims the
+    // glyph domain for touch. Passive afterglow (flick coast, thumb spring
+    // settling) deliberately does NOT re-claim — otherwise a coast from the
+    // last screen swipe would keep stealing the source back from a
+    // Bluetooth pad for a second after release. Fresh presses arrive via
+    // `hasFingerDown()` plus the synchronous `onTouchActivity` callback;
+    // gamepad / keyboard flips happen in `sampleInput()` / `runAction()`.
+    if (this.touchInput.hasFingerDown()) this.inputSource = 'touch';
+
+    // Phase 3: dispatch the discrete cluster taps. The smart ACTION button
+    // re-derives its verb from live proximity at execution time, mirroring
+    // the keyboard [E]/[X] priority chain, so a stale label can never fire
+    // a stale action. While the trade terminal owns the screen only the
+    // dismissal lane stays live (MAP closes it like [M]; parked buttons do
+    // nothing else — mirroring the gamepad convention).
+    const taps = this.touchInput.consumeActions();
+    if (taps.length > 0) {
+      this.inputSource = 'touch';
+      const tradeOpen = this.hud?.isTradeDialogOpen() ?? false;
+      for (const tap of taps) {
+        this.dispatchTouchAction(tap, tradeOpen);
+      }
+    }
+
+    // Auto-hide law: show the deck unless the gamepad is the live device.
+    this.touchInput.setVisible(this.inputSource !== 'gamepad');
+  }
+
+  /**
+   * Execute one discrete cluster tap (Spec 33 §2.2.4). Hold channels (jump
+   * / roll) never arrive here — they ride the `ClientInputFrame`.
+   */
+  private dispatchTouchAction(tap: TouchActionId, tradeOpen: boolean): void {
+    switch (tap) {
+      case 'action':
+        if (!tradeOpen) this.runContextualTouchAction();
+        break;
+      case 'map':
+        this.toggleMap();
+        break;
+      case 'ui':
+        // Spec 30 §2.3.2: same cycle lane as [U]/[H] and double-tap R3.
+        if (!tradeOpen) this.cycleHudMode();
+        break;
+      default:
+        // jump / roll: consumed through the analog frame.
+        break;
+    }
+  }
+
+  /**
+   * Spec 33 §2.2.4 item 3: the top interactive target right now, in the
+   * same priority order the keyboard [E]/[X] chain uses inside `runAction`
+   * (ladder → security terminal → siphon → salvage → board/stow → mine →
+   * trade), rendered as the smart button's label + icon. `null` parks the
+   * button. `refreshHud()` mirrors this onto the deck every HUD frame.
+   */
+  private contextualTouchAction(suit: EvaSuitAvatar): ContextualAction | null {
+    if (this.mode === 'buggy') {
+      if (this.getSiphonableCart() !== null) {
+        return { icon: '\u{1F4E6}', label: 'INTERCEPT', active: true };
+      }
+      return { icon: '\u{1F6B6}', label: 'DISMOUNT', active: true };
+    }
+    // Radio tower ladder (Spec 29): latch state outranks everything on foot.
+    if (suit.getState().ladderLatchActive === true) {
+      return { icon: '\u{1FA9C}', label: 'RELEASE', active: true };
+    }
+    const radioTower = this.world.getRadioTower();
+    if (radioTower !== null) {
+      if (radioTower.isNearLadderBase(suit.getPosition())) {
+        return { icon: '\u{1FA9C}', label: 'CLIMB', active: true };
+      }
+      if (radioTower.isNearTopHatch(suit.getPosition())) {
+        return { icon: '\u{1FA9C}', label: 'DESCEND', active: true };
+      }
+    }
+    if (this.mode === 'suit' && this.nearestVaultTerminal !== null) {
+      return { icon: '\u{1F5A5}️', label: 'INTERFACE', active: true };
+    }
+    if (this.getSalvageableScrap() !== null) {
+      return { icon: '♻️', label: 'SALVAGE', active: true };
+    }
+    if (this.suitBuggyDistance() <= MOUNT_RADIUS_M) {
+      return { icon: '\u{1F697}', label: 'BOARD', active: true };
+    }
+    const vein = this.getNearestVein();
+    if (vein !== null && vein.rangeM <= MINE_RANGE_M) {
+      return {
+        icon: '⛏',
+        label: `MINE ${vein.vein.kind.replace(/_/g, ' ').toUpperCase()}`,
+        active: true,
+      };
+    }
+    if (this.network !== null) {
+      return { icon: '\u{1F4CA}', label: 'TRADE', active: true };
+    }
+    return null;
+  }
+
+  /**
+   * Fire the smart ACTION tap (Spec 33 §2.2.4): executes
+   * {@link contextualTouchAction}'s chain against live proximity — the exact
+   * verb routing of the keyboard [E]/[X] keys, thumb-sized. Returns true
+   * when a world action actually fired.
+   */
+  private runContextualTouchAction(): boolean {
+    if (this.disposed) return false;
+    if (this.mode === 'buggy') {
+      const cart = this.getSiphonableCart();
+      if (cart !== null) {
+        this.siphonFreight(cart);
+        return true;
+      }
+      this.toggleMount();
+      return true;
+    }
+    // Ladder latch / latch / release (mirrors keyboard [E] + [C] cancel).
+    if (this.tryLadderInteraction()) return true;
+    if (this.mode === 'suit' && this.nearestVaultTerminal !== null) {
+      this.interfaceVaultTerminal(this.nearestVaultTerminal.vaultId);
+      return true;
+    }
+    const scrap = this.getSalvageableScrap();
+    if (scrap !== null) {
+      this.salvageScrap(scrap);
+      return true;
+    }
+    if (this.suitBuggyDistance() <= MOUNT_RADIUS_M) {
+      // Loaded backpack beside the rover: first tap stows, next boards
+      // (Spec 19 §2.3.3 two-tap convention).
+      const suit = this.requireSuit();
+      if (suit.getCargoMass() > 0 && this.stowCargoToBuggy() > 0) return true;
+      this.toggleMount();
+      return true;
+    }
+    const vein = this.getNearestVein();
+    if (vein !== null && vein.rangeM <= MINE_RANGE_M) {
+      this.mineNearestVein();
+      return true;
+    }
+    if (this.network !== null) {
+      this.toggleTradeTerminal();
+      return true;
+    }
+    return false;
   }
 
   /**
@@ -4427,6 +4603,11 @@ export class ClientApp {
       prompts.push({ key: 'T', kind: 'trade' });
     }
     hud.setPrompts(prompts);
+
+    // Spec 33 Phase 3 §2.2.4: mirror the top proximity target onto the
+    // mobile smart button (label + icon + active glow) with the same
+    // proximity data the prompt strip just consumed.
+    this.touchInput?.setContextualAction(this.contextualTouchAction(suit));
 
     // Bearing tape last — it reads the freshest scanner lock + entity poses.
     this.refreshCompass();

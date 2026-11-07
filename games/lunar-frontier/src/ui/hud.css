@@ -2516,3 +2516,192 @@
     margin-bottom: 0; /* origin math handles placement; hook kept for Phase 4 tuning */
   }
 }
+
+/* ==========================================================================
+   Spec 33 Phase 3 §2.2.4 — mobile action button cluster (right thumb zone).
+   `TouchInputController.ensureActionCluster()` mounts #lf-touch-actions into
+   <body>; the placement constants here mirror `defaultActionRects()` in the
+   controller 1:1 (margins 24 px, gap 12 px, JUMP/ROLL 64 px, smart ACTION
+   76 px, utility corners 52 px — all ≥ the 52 px × 52 px touch mandate).
+   The container is a pointer-transparent overlay: only the buttons eat taps,
+   and the controller claims them at window level before the look trackpad.
+   ========================================================================== */
+
+#lf-touch-actions {
+  position: fixed;
+  inset: 0;
+  z-index: 25;
+  pointer-events: none;
+  opacity: 1;
+  /* Tri-state auto-hide law (§2.3): exactly 300 ms fade both ways. */
+  transition: opacity 300ms ease;
+}
+
+/* Gamepad co-existence: while a Bluetooth pad drives, the whole deck fades
+   out and stops eating touches; any screen tap flips back to 'touch' and
+   re-illuminates it (the class is toggled via setVisible()). */
+#lf-touch-actions.is-gamepad-hidden {
+  opacity: 0;
+  pointer-events: none;
+}
+
+#lf-touch-actions.is-gamepad-hidden .lf-touch-action-btn {
+  pointer-events: none;
+}
+
+/* High-contrast glassmorphic round key: smoked disc, hairline cyan rule,
+   legible over sunlit regolith AND in the night terminator band. */
+.lf-touch-action-btn {
+  position: absolute;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  min-width: 52px;
+  min-height: 52px;
+  margin: 0;
+  padding: 0;
+  border: 2px solid rgba(86, 224, 255, 0.40);
+  border-radius: 50%;
+  color: #dff6ff;
+  background:
+    radial-gradient(circle at 40% 35%,
+      rgba(86, 224, 255, 0.16) 0%,
+      rgba(10, 16, 24, 0.45) 72%);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  box-shadow:
+    0 0 16px rgba(86, 224, 255, 0.18),
+    inset 0 0 12px rgba(86, 224, 255, 0.10);
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.85);
+  cursor: pointer;
+  pointer-events: auto;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-tap-highlight-color: transparent;
+  transition: transform 120ms ease, box-shadow 200ms ease,
+    border-color 200ms ease, opacity 200ms ease;
+}
+
+.lf-touch-action-btn:active {
+  transform: scale(0.92);
+  border-color: rgba(86, 224, 255, 0.85);
+}
+
+.lf-touch-action-icon {
+  font-size: 20px;
+  line-height: 1;
+}
+
+.lf-touch-action-label {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  line-height: 1.1;
+  max-width: 76px;
+  padding: 0 4px;
+  text-align: center;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* --- cluster placement (bottom-right, mirrors defaultActionRects) --------- */
+
+/* [JUMP / RCS BOOST]: above the smart key, under the right index thumb. */
+#btn-touch-jump {
+  width: 64px;
+  height: 64px;
+  right: 24px;
+  right: calc(24px + env(safe-area-inset-right));
+  bottom: 112px;
+  bottom: calc(24px + env(safe-area-inset-bottom) + 88px);
+}
+
+/* [CONTEXTUAL ACTION]: the big primary smart key at the thumb rest. */
+#btn-touch-action {
+  width: 76px;
+  height: 76px;
+  right: 24px;
+  right: calc(24px + env(safe-area-inset-right));
+  bottom: 24px;
+  bottom: calc(24px + env(safe-area-inset-bottom));
+}
+
+/* [ROLL / TUCK]: left of the smart key. */
+#btn-touch-roll {
+  width: 64px;
+  height: 64px;
+  right: 112px;
+  right: calc(24px + env(safe-area-inset-right) + 88px);
+  bottom: 24px;
+  bottom: calc(24px + env(safe-area-inset-bottom));
+}
+
+/* --- utility corners ------------------------------------------------------ */
+
+#btn-touch-map {
+  width: 52px;
+  height: 52px;
+  left: 24px;
+  left: calc(24px + env(safe-area-inset-left));
+  top: 88px;
+  top: calc(8px + env(safe-area-inset-top) + 80px);
+}
+
+#btn-touch-ui {
+  width: 52px;
+  height: 52px;
+  right: 24px;
+  right: calc(24px + env(safe-area-inset-right));
+  top: 88px;
+  top: calc(8px + env(safe-area-inset-top) + 80px);
+}
+
+/* Contextual glow: an interaction target sits inside the active radius —
+   amber halo with a cyan under-glow breathing pulse (spec §2.2.4 item 3). */
+#btn-touch-action.is-active {
+  border-color: rgba(255, 204, 85, 0.85);
+  color: #fff6e0;
+  background:
+    radial-gradient(circle at 40% 35%,
+      rgba(255, 204, 85, 0.28) 0%,
+      rgba(60, 40, 10, 0.50) 72%);
+  box-shadow:
+    0 0 22px rgba(255, 204, 85, 0.55),
+    0 0 48px rgba(86, 224, 255, 0.25),
+    inset 0 0 16px rgba(255, 204, 85, 0.30);
+  animation: lf-touch-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes lf-touch-pulse {
+  0%, 100% {
+    box-shadow:
+      0 0 18px rgba(255, 204, 85, 0.45),
+      0 0 40px rgba(86, 224, 255, 0.16),
+      inset 0 0 14px rgba(255, 204, 85, 0.24);
+  }
+  50% {
+    box-shadow:
+      0 0 30px rgba(255, 204, 85, 0.75),
+      0 0 64px rgba(86, 224, 255, 0.28),
+      inset 0 0 20px rgba(255, 204, 85, 0.40);
+  }
+}
+
+/* No interaction target in reach: parked, dimmed, still tappable (the
+   controller re-derives the verb at press time, never trusts the label). */
+#btn-touch-action.is-empty {
+  opacity: 0.5;
+}
+
+/* Touch-mode prompt badges: the strip re-glyphs [E] → [👆] with a TAP verb
+   (LunarHUD.setPrompts, Spec 33 §2.3); warm the key chip so it reads as a
+   finger action, not a keycap. */
+#lunar-hud .hud-prompt.is-touch .hud-key {
+  color: #ffcc55;
+  border-color: rgba(255, 204, 85, 0.55);
+  background: rgba(255, 204, 85, 0.10);
+}

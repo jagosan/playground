@@ -1,6 +1,6 @@
 /**
- * Lunar Frontier — mobile touch input deck (Spec 33 §2.2, Phase 2,
- * TASK-PLAY-080b).
+ * Lunar Frontier — mobile touch input deck (Spec 33 §2.2 / §2.3, Phase 3,
+ * TASK-PLAY-080c).
  *
  * `TouchInputController` decouples multi-touch gesture processing from the
  * render loop and feeds normalized frames into `ClientApp.sampleInput()`:
@@ -26,6 +26,24 @@
  *     — both `pointer-events: none` so gestures never fight the canvas, styled
  *     from `src/ui/hud.css`. The thumb trails the deflection with a damped
  *     spring return to origin on `touchend`.
+ *
+ *   • ACTION BUTTON CLUSTER (Spec 33 §2.2.4, Phase 3): a glassmorphic
+ *     bottom-right cluster with `[JUMP / RCS BOOST]` (`#btn-touch-jump`,
+ *     live hold latch feeding `jump` — physics edge-detects the hop and the
+ *     airborne PLSS boost), `[ROLL / TUCK]` (`#btn-touch-roll`), a dynamic
+ *     `[CONTEXTUAL ACTION]` smart button (`#btn-touch-action`, label/icon/
+ *     glow driven by {@link TouchInputController.setContextualAction}), and
+ *     `[MAP]` / `[UI]` utility toggles. Every button keeps a ≥ 52 px hit
+ *     target; touches landing on a button rect are CLAIMED by the cluster
+ *     and never leak into the free-look trackpad (Spec 33 §2.2.3 zone
+ *     exclusion). Discrete taps queue for the host via
+ *     {@link TouchInputController.consumeActions}.
+ *
+ *   • Gamepad co-existence (§2.3): {@link TouchInputController.setVisible}
+ *     fades the whole cluster out (`opacity: 0`, `pointer-events: none`,
+ *     300 ms) while a Bluetooth pad drives; any screen touch fires the
+ *     `onTouchActivity` callback so `ClientApp` flips the tri-state input
+ *     source back to `'touch'` and re-illuminates the deck.
  *
  * Headless-resilient by construction: no `window` / `document` reference is
  * ever taken un-guarded, listeners only attach when a real event target
@@ -85,6 +103,31 @@ export const STICK_SPRING_STIFFNESS = 260;
 export const STICK_SPRING_DAMPING = 20;
 
 // ---------------------------------------------------------------------------
+// Action button cluster (Spec 33 §2.2.4, Phase 3) — exported for the smoke
+// suite; `hud.css` keeps the visual sizes in lockstep with these values.
+// ---------------------------------------------------------------------------
+
+/** Every action button maintains at least this hit target on both axes. */
+export const ACTION_BUTTON_MIN_PX = 52;
+/** Extra slop (px) added around each hit rect when claiming a touch. */
+export const ACTION_HIT_SLOP_PX = 6;
+/** `[JUMP]` / `[ROLL]` button diameter (px). */
+export const JUMP_BUTTON_PX = 64;
+export const ROLL_BUTTON_PX = 64;
+/** `[CONTEXTUAL ACTION]` smart-button diameter (px). */
+export const CONTEXT_BUTTON_PX = 76;
+/** `[MAP]` / `[UI]` utility-button diameter (px). */
+export const UTILITY_BUTTON_PX = 52;
+/** Gap (px) between neighbouring cluster buttons. */
+export const ACTION_CLUSTER_GAP_PX = 12;
+/** Cluster margin (px) from the viewport edges (CSS adds safe-area inset). */
+export const ACTION_CLUSTER_MARGIN_PX = 24;
+/** Utility-button top anchor (px, viewport space) below the HUD card row. */
+export const UTILITY_BUTTON_TOP_PX = 88;
+/** Cap on the one-shot tap queue when the host never drains. */
+export const ACTION_TAP_QUEUE_CAP = 16;
+
+// ---------------------------------------------------------------------------
 // Structural event shapes (duck-typed: real TouchEvents AND headless fakes).
 // ---------------------------------------------------------------------------
 
@@ -104,6 +147,43 @@ export interface TouchEventLike {
   time?: number;
 }
 
+/** Identifiers for the Phase 3 action button cluster (Spec 33 §2.2.4). */
+export type TouchActionId = 'jump' | 'roll' | 'action' | 'map' | 'ui';
+
+/** Every action id, in cluster iteration order. */
+export const TOUCH_ACTION_IDS: readonly TouchActionId[] = [
+  'jump',
+  'roll',
+  'action',
+  'map',
+  'ui',
+];
+
+/**
+ * Dynamic state of the `[CONTEXTUAL ACTION]` smart button (Spec 33 §2.2.4
+ * item 3). `ClientApp` recomputes the top proximity target every HUD frame
+ * and mirrors it here: the button relabels itself (`⛏ MINE …`, `🚗 BOARD`,
+ * `🪜 CLIMB`, `📊 TRADE`…) and glows while `active` is true. `null` parks
+ * the button in its dimmed no-target state.
+ */
+export interface ContextualAction {
+  /** Text label, e.g. `MINE IRON ORE`. */
+  label: string;
+  /** Optional leading icon / emoji, e.g. `⛏`. */
+  icon?: string;
+  /** True while an interaction target sits inside the active radius. */
+  active: boolean;
+}
+
+/** Viewport-space rectangle occupied by one action button. */
+export interface ActionHitRect {
+  id: TouchActionId;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
 /** One normalized poll frame handed to `ClientApp`. */
 export interface TouchInputState {
   /** -1..1 forward demand from the left stick (screen-up is forward). */
@@ -118,6 +198,17 @@ export interface TouchInputState {
   pitchDelta: number;
   /** Any finger down, coast coasting, or spring still settling. */
   isActive: boolean;
+  /**
+   * Spec 33 §2.2.4: `[JUMP / RCS BOOST]` button held (raw live latch — the
+   * physics valve edge-detects the ground hop and the airborne PLSS boost,
+   * exactly like keyboard Space).
+   */
+  jump: boolean;
+  /**
+   * Spec 33 §2.2.4: `[ROLL / TUCK]` button held (raw live latch; consumed
+   * as the Spec 32 acrobatic somersault while airborne, crouch on ground).
+   */
+  roll: boolean;
 }
 
 export interface TouchInputControllerOptions {
@@ -129,6 +220,13 @@ export interface TouchInputControllerOptions {
   now?: () => number;
   /** Set false to never create the glassmorphic DOM visuals. */
   visuals?: boolean;
+  /**
+   * Spec 33 §2.3: fired on EVERY processed `touchstart` (stick, look pad and
+   * action buttons alike — including taps on a hidden cluster). `ClientApp`
+   * wires this to flip the tri-state input source to `'touch'` instantly and
+   * re-illuminate the deck. Exceptions from the callback are swallowed.
+   */
+  onTouchActivity?: () => void;
 }
 
 interface Spring2D {
@@ -136,6 +234,19 @@ interface Spring2D {
   y: number;
   vx: number;
   vy: number;
+}
+
+/**
+ * Minimal duck-typed DOM element for the action cluster: real browsers hand
+ * full `HTMLElement`s; headless harnesses inject stripped-down fakes, so
+ * every member beyond `style` / `className` is optional and called via `?.`.
+ */
+interface LooseDomEl {
+  style: { [k: string]: string };
+  className: string;
+  textContent?: string;
+  setAttribute?: (name: string, value: string) => void;
+  appendChild?: (child: unknown) => unknown;
 }
 
 interface FlickSample {
@@ -209,9 +320,37 @@ export class TouchInputController {
   private accYawRad = 0;
   private accPitchRad = 0;
 
+  // -- action button cluster (Spec 33 §2.2.4, Phase 3) -------------------------
+  /** Live hold state per action button (true while a finger covers it). */
+  private readonly actionHeld: Record<TouchActionId, boolean> = {
+    jump: false,
+    roll: false,
+    action: false,
+    map: false,
+    ui: false,
+  };
+  /** Fingers claimed by an action button — isolated from the look trackpad. */
+  private readonly buttonTouchIds = new Map<number, TouchActionId>();
+  /** One-shot discrete taps (action / map / ui) awaiting the host drain. */
+  private actionTapQueue: TouchActionId[] = [];
+  /** Contextual smart-button state painted by `setContextualAction()`. */
+  private contextualAction: ContextualAction | null = null;
+  /** Deck visibility (gamepad co-existence fades the cluster out, §2.3). */
+  private deckVisible = true;
+  /** Headless override for the action hit rects (smoke harness). */
+  private actionRectsOverride: ActionHitRect[] | null = null;
+
+  /** Spec 33 §2.3: tri-state flip hook (assigned by `ClientApp`). */
+  onTouchActivity: (() => void) | null;
+
   // -- DOM visuals --------------------------------------------------------------
   private baseEl: { style: { [k: string]: string }; className: string } | null = null;
   private nubEl: { style: { [k: string]: string }; className: string } | null = null;
+  /** `#lf-touch-actions` cluster container + contextual-button handles. */
+  private clusterEl: LooseDomEl | null = null;
+  private contextBtnEl: LooseDomEl | null = null;
+  private contextIconEl: LooseDomEl | null = null;
+  private contextLabelEl: LooseDomEl | null = null;
 
   // -- listener plumbing ---------------------------------------------------------
   private attached = false;
@@ -224,6 +363,7 @@ export class TouchInputController {
     this.viewportHeight = Math.max(1, options.viewportHeight ?? 800);
     this.now = options.now ?? defaultNow;
     this.visualsEnabled = options.visuals !== false;
+    this.onTouchActivity = options.onTouchActivity ?? null;
   }
 
   // -- lifecycle -----------------------------------------------------------------
@@ -260,7 +400,10 @@ export class TouchInputController {
     host.addEventListener('touchend', this.boundEnd, opts);
     host.addEventListener('touchcancel', this.boundEnd, opts);
     this.attached = true;
-    if (this.visualsEnabled) this.ensureVisuals();
+    if (this.visualsEnabled) {
+      this.ensureVisuals();
+      this.ensureActionCluster();
+    }
     return true;
   }
 
@@ -308,6 +451,10 @@ export class TouchInputController {
     this.accPitchRad = 0;
     this.lastFlickAtMs = Number.NEGATIVE_INFINITY;
     this.stickPrevNorm = 0;
+    // Phase 3: drop every cluster latch, claim and pending tap.
+    this.buttonTouchIds.clear();
+    this.actionTapQueue.length = 0;
+    for (const id of TOUCH_ACTION_IDS) this.actionHeld[id] = false;
   }
 
   /** Live viewport (browsers push this on resize / orientation change). */
@@ -322,9 +469,24 @@ export class TouchInputController {
   handleTouchStart(event: TouchEventLike): void {
     const t = event.time ?? this.now();
     let handled = false;
-    for (const touch of event.changedTouches.length > 0
+    const starts = event.changedTouches.length > 0
       ? event.changedTouches
-      : event.touches) {
+      : event.touches;
+    // Pass 1 (Spec 33 §2.2.4): action-button claims. A finger landing on a
+    // cluster button's hit rect belongs to the cluster — it must NEVER leak
+    // into the free-look trackpad underneath (the cluster sits inside the
+    // right look zone). Runs before the zone routing, on every device.
+    for (const touch of starts) {
+      if (this.buttonTouchIds.has(touch.identifier)) continue;
+      const hit = this.hitTestActionAt(touch.clientX, touch.clientY);
+      if (hit !== null) {
+        this.claimActionButton(hit, touch.identifier);
+        handled = true;
+      }
+    }
+    // Pass 2: movement / look zone routing for the remaining fingers.
+    for (const touch of starts) {
+      if (this.buttonTouchIds.has(touch.identifier)) continue;
       if (this.stickTouchId === null && this.isInStickZone(touch.clientX, touch.clientY)) {
         // Floating origin anchors exactly at the initial contact point.
         this.stickTouchId = touch.identifier;
@@ -348,7 +510,11 @@ export class TouchInputController {
         handled = true;
       }
     }
-    if (handled) event.preventDefault?.();
+    if (handled) {
+      event.preventDefault?.();
+      // Spec 33 §2.3: ANY processed touch claims the tri-state input source.
+      this.fireTouchActivity();
+    }
   }
 
   /** `touchmove` handler — routes each claimed finger to its deck. */
@@ -374,6 +540,10 @@ export class TouchInputController {
         this.lookLastT = t;
         this.pushLookSample(touch.clientX, touch.clientY, t);
         handled = true;
+      } else if (this.buttonTouchIds.has(touch.identifier)) {
+        // Cluster finger: swallow the move (hold stays latched until the
+        // lift) so a sliding thumb never paints the camera around.
+        handled = true;
       }
     }
     if (handled) event.preventDefault?.();
@@ -385,7 +555,14 @@ export class TouchInputController {
     let handled = false;
     const ended = event.changedTouches.length > 0 ? event.changedTouches : event.touches;
     for (const touch of ended) {
-      if (this.stickTouchId !== null && touch.identifier === this.stickTouchId) {
+      const claimed = this.buttonTouchIds.get(touch.identifier);
+      if (claimed !== undefined) {
+        // Cluster lift: drop the hold latch (the jump/roll edges physics
+        // edge-detects live in the poll state).
+        this.buttonTouchIds.delete(touch.identifier);
+        this.actionHeld[claimed] = false;
+        handled = true;
+      } else if (this.stickTouchId !== null && touch.identifier === this.stickTouchId) {
         this.releaseStick(t);
         this.hideStickVisuals();
         handled = true;
@@ -460,6 +637,8 @@ export class TouchInputController {
       yawDelta: this.accYawRad,
       pitchDelta: this.accPitchRad,
       isActive: this.isActive(),
+      jump: this.actionHeld.jump,
+      roll: this.actionHeld.roll,
     };
     this.accYawRad = 0;
     this.accPitchRad = 0;
@@ -475,6 +654,8 @@ export class TouchInputController {
       yawDelta: this.accYawRad,
       pitchDelta: this.accPitchRad,
       isActive: this.isActive(),
+      jump: this.actionHeld.jump,
+      roll: this.actionHeld.roll,
     };
   }
 
@@ -483,6 +664,8 @@ export class TouchInputController {
     return (
       this.stickTouchId !== null ||
       this.lookTouchId !== null ||
+      this.buttonTouchIds.size > 0 ||
+      this.anyActionHeld() ||
       this.hasCoast() ||
       Math.abs(this.spring.x) + Math.abs(this.spring.y) > 0.05 ||
       Math.abs(this.spring.vx) + Math.abs(this.spring.vy) > 0.05
@@ -510,6 +693,147 @@ export class TouchInputController {
       forward: this.stickForward,
       sprint: this.sprintLatched,
     };
+  }
+
+  /** True while a real finger owns a deck surface (stick, look, button). */
+  hasFingerDown(): boolean {
+    return (
+      this.stickTouchId !== null ||
+      this.lookTouchId !== null ||
+      this.buttonTouchIds.size > 0
+    );
+  }
+
+  // -- action button cluster API (Spec 33 §2.2.4 / §2.3, Phase 3) ----------------
+
+  /**
+   * Mirror the current interactive target onto the `[CONTEXTUAL ACTION]`
+   * smart button. `ClientApp` calls this from its HUD refresh with the top
+   * proximity action (`⛏ MINE …`, `🚗 BOARD` / `🚶 DISMOUNT`, `🪜 CLIMB`,
+   * `📊 TRADE`…); `null` parks the button in its dimmed no-target state.
+   * Taps are queued regardless of the label — the host re-derives the
+   * action at execution time, so a stale label can never fire a stale verb.
+   */
+  setContextualAction(action: ContextualAction | null): void {
+    this.contextualAction =
+      action === null
+        ? null
+        : { label: action.label, icon: action.icon, active: action.active === true };
+    this.syncContextButton();
+  }
+
+  /** The last label/icon/glow handed to {@link setContextualAction}. */
+  getContextualAction(): ContextualAction | null {
+    return this.contextualAction;
+  }
+
+  /**
+   * Show / hide the whole touch deck for tri-state co-existence
+   * (Spec 33 §2.3): hiding fades `#lf-touch-actions` out via the
+   * `.is-gamepad-hidden` class (300 ms CSS transition,
+   * `pointer-events: none`) and drops every pending hold / pending tap so
+   * the deck never re-illuminates mid-gesture. Idempotent.
+   */
+  setVisible(visible: boolean): void {
+    const next = visible === true;
+    if (this.deckVisible === next) return;
+    this.deckVisible = next;
+    if (!next) {
+      this.buttonTouchIds.clear();
+      this.actionTapQueue.length = 0;
+      for (const id of TOUCH_ACTION_IDS) this.actionHeld[id] = false;
+    }
+    if (this.clusterEl !== null) {
+      this.clusterEl.className = next
+        ? 'lf-touch-actions'
+        : 'lf-touch-actions is-gamepad-hidden';
+    }
+  }
+
+  /** Current deck visibility (hidden = gamepad drives, cluster faded). */
+  isVisible(): boolean {
+    return this.deckVisible;
+  }
+
+  /**
+   * Drain the one-shot discrete tap queue (`action` / `map` / `ui` presses,
+   * fired on touch-down for zero-latency response). The host dispatches
+   * each id exactly once — jump / roll ride the live `poll()` hold state
+   * instead and never appear here.
+   */
+  consumeActions(): TouchActionId[] {
+    if (this.actionTapQueue.length === 0) return [];
+    const drained = this.actionTapQueue;
+    this.actionTapQueue = [];
+    return drained;
+  }
+
+  /** True while the named action button is under a finger. */
+  isActionHeld(id: TouchActionId): boolean {
+    return this.actionHeld[id] === true;
+  }
+
+  /**
+   * Override the action hit rects (headless smoke harness injects explicit
+   * geometry; `null` restores the DOM/default resolution order of
+   * {@link getActionHitRects}).
+   */
+  registerActionHitRects(rects: readonly ActionHitRect[] | null): void {
+    this.actionRectsOverride = rects === null ? null : rects.map((r) => ({ ...r }));
+  }
+
+  /**
+   * Live hit rects, resolved in order: harness override → real DOM
+   * `getBoundingClientRect()` of the mounted buttons → the analytic layout
+   * mirrored from `hud.css` ({@link defaultActionRects}).
+   */
+  getActionHitRects(): ActionHitRect[] {
+    if (this.actionRectsOverride !== null) return this.actionRectsOverride;
+    const domRects = this.actionRectsFromDom();
+    return domRects.length > 0 ? domRects : this.defaultActionRects();
+  }
+
+  /**
+   * Which action button (if any) owns this viewport point. Rects grow by
+   * {@link ACTION_HIT_SLOP_PX} so the ≥ 52 px target reads forgiving under
+   * a thumb, per Spec 33 §2.2.4's high-contrast / high-precision mandate.
+   */
+  hitTestActionAt(x: number, y: number): TouchActionId | null {
+    const slop = ACTION_HIT_SLOP_PX;
+    for (const r of this.getActionHitRects()) {
+      if (
+        x >= r.x - slop &&
+        x <= r.x + r.width + slop &&
+        y >= r.y - slop &&
+        y <= r.y + r.height + slop
+      ) {
+        return r.id;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Analytic cluster layout mirrored 1:1 from `hud.css` (bottom-right
+   * JUMP / ACTION / ROL cluster + top-corner MAP / UI utility corners).
+   * Used headless, and as the browser fallback before the buttons mount.
+   */
+  defaultActionRects(): ActionHitRect[] {
+    const w = this.viewportWidth;
+    const h = this.viewportHeight;
+    const m = ACTION_CLUSTER_MARGIN_PX;
+    const g = ACTION_CLUSTER_GAP_PX;
+    const a = CONTEXT_BUTTON_PX;
+    const j = JUMP_BUTTON_PX;
+    const r = ROLL_BUTTON_PX;
+    const u = UTILITY_BUTTON_PX;
+    return [
+      { id: 'action', x: w - m - a, y: h - m - a, width: a, height: a },
+      { id: 'jump', x: w - m - j, y: h - m - a - g - j, width: j, height: j },
+      { id: 'roll', x: w - m - a - g - r, y: h - m - r, width: r, height: r },
+      { id: 'map', x: m, y: UTILITY_BUTTON_TOP_PX, width: u, height: u },
+      { id: 'ui', x: w - m - u, y: UTILITY_BUTTON_TOP_PX, width: u, height: u },
+    ];
   }
 
   // -- zone maths ---------------------------------------------------------------------
@@ -652,6 +976,76 @@ export class TouchInputController {
     return this.coastYawRadPerMs !== 0 || this.coastPitchRadPerMs !== 0;
   }
 
+  // -- action button cluster internals -----------------------------------------
+
+  /**
+   * Claim a finger for an action button (Spec 33 §2.2.4). While the deck is
+   * visible: hold channels (jump / roll) latch until the lift, discrete
+   * verbs (action / map / ui) enter the one-shot queue consumed by
+   * {@link consumeActions}. Taps landing on a HIDDEN cluster are swallowed
+   * as-is — they never fire an action, they only re-illuminate the deck via
+   * the activity callback (Spec 33 §2.3 "touching the screen instantly
+   * restores virtual controls").
+   */
+  private claimActionButton(id: TouchActionId, identifier: number): void {
+    this.buttonTouchIds.set(identifier, id);
+    if (this.deckVisible) {
+      this.actionHeld[id] = true;
+      if (id !== 'jump' && id !== 'roll') {
+        if (this.actionTapQueue.length < ACTION_TAP_QUEUE_CAP) {
+          this.actionTapQueue.push(id);
+        }
+      }
+    }
+  }
+
+  /** Fire the host tri-state flip hook; host exceptions never kill touch. */
+  private fireTouchActivity(): void {
+    const cb = this.onTouchActivity;
+    if (cb === null) return;
+    try {
+      cb();
+    } catch {
+      /* the host owns its failures */
+    }
+  }
+
+  /** True while any action button sits under a finger. */
+  private anyActionHeld(): boolean {
+    for (const id of TOUCH_ACTION_IDS) {
+      if (this.actionHeld[id] === true) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Resolve action hit rects from the mounted DOM buttons. Defensive: fake
+   * headless documents without `getElementById` / `getBoundingClientRect`,
+   * and zero-size (unstyled / unmounted) buttons yield nothing, so the
+   * caller falls back to {@link defaultActionRects}.
+   */
+  private actionRectsFromDom(): ActionHitRect[] {
+    const doc = (globalThis as {
+      document?: {
+        getElementById?: (id: string) =>
+          | { getBoundingClientRect?: () => { left: number; top: number; width: number; height: number } }
+          | null;
+      };
+    }).document;
+    if (doc === undefined || typeof doc.getElementById !== 'function') return [];
+    const out: ActionHitRect[] = [];
+    for (const id of TOUCH_ACTION_IDS) {
+      const el = doc.getElementById(`btn-touch-${id}`);
+      if (el === null || el === undefined || typeof el.getBoundingClientRect !== 'function') {
+        continue;
+      }
+      const r = el.getBoundingClientRect();
+      if (!(r.width > 0) || !(r.height > 0)) continue;
+      out.push({ id, x: r.left, y: r.top, width: r.width, height: r.height });
+    }
+    return out;
+  }
+
   // -- glassmorphic DOM visuals ---------------------------------------------------------
 
   /** Lazily create `.lf-touch-stick-base` / `.lf-touch-stick-nub`. No-op headless. */
@@ -713,6 +1107,97 @@ export class TouchInputController {
     this.nubEl.style.transform = `translate(calc(-50% + ${clampedX.toFixed(2)}px), calc(-50% + ${clampedY.toFixed(2)}px))`;
   }
 
+  /**
+   * Lazily build the Spec 33 §2.2.4 action cluster:
+   *
+   * ```text
+   *   #lf-touch-actions                 (fixed overlay, pointer-events: none)
+   *     #btn-touch-jump   ⤒ JUMP        (bottom-right, above the smart key)
+   *     #btn-touch-action ✋ ACTION      (dynamic label/icon/glow)
+   *     #btn-touch-roll   ⟳ ROLL        (left of the smart key)
+   *     #btn-touch-map    🗺 MAP         (top-left utility corner)
+   *     #btn-touch-ui     👁 UI          (top-right utility corner)
+   * ```
+   *
+   * Buttons are pure feedback surfaces — the controller claims touches at
+   * the window level (pass 1 of `handleTouchStart`), so no per-button DOM
+   * listeners exist and hidden buttons can never eat a gesture. No-op
+   * headless (fake documents without `createElement` are declined).
+   */
+  private ensureActionCluster(): void {
+    if (!this.visualsEnabled || this.clusterEl !== null) return;
+    const doc = (globalThis as { document?: Document }).document;
+    if (doc === undefined || doc === null || typeof doc.createElement !== 'function') {
+      return;
+    }
+    const container = doc.createElement('div');
+    container.id = 'lf-touch-actions';
+    container.className = this.deckVisible
+      ? 'lf-touch-actions'
+      : 'lf-touch-actions is-gamepad-hidden';
+    const makeButton = (
+      id: TouchActionId,
+      icon: string,
+      label: string,
+    ): { btn: LooseDomEl; iconEl: LooseDomEl; labelEl: LooseDomEl } => {
+      const btn = doc.createElement('button');
+      btn.id = `btn-touch-${id}`;
+      btn.className = `lf-touch-action-btn lf-touch-action-${id}`;
+      btn.setAttribute?.('type', 'button');
+      btn.setAttribute?.('aria-label', label);
+      const iconEl = doc.createElement('span');
+      iconEl.className = 'lf-touch-action-icon';
+      iconEl.textContent = icon;
+      const labelEl = doc.createElement('span');
+      labelEl.className = 'lf-touch-action-label';
+      labelEl.textContent = label;
+      btn.appendChild(iconEl);
+      btn.appendChild(labelEl);
+      container.appendChild(btn);
+      return {
+        btn: btn as unknown as LooseDomEl,
+        iconEl: iconEl as unknown as LooseDomEl,
+        labelEl: labelEl as unknown as LooseDomEl,
+      };
+    };
+    makeButton('jump', '⤒', 'JUMP');
+    const ctx = makeButton(
+      'action',
+      this.contextualAction?.icon ?? '✋',
+      this.contextualAction?.label ?? 'NO TARGET',
+    );
+    this.contextBtnEl = ctx.btn;
+    this.contextIconEl = ctx.iconEl;
+    this.contextLabelEl = ctx.labelEl;
+    makeButton('roll', '⟳', 'ROLL');
+    makeButton('map', '🗺', 'MAP');
+    makeButton('ui', '👁', 'UI');
+    doc.body.appendChild(container);
+    this.clusterEl = container as unknown as LooseDomEl;
+    this.syncContextButton();
+  }
+
+  /** Repaint the `[CONTEXTUAL ACTION]` label / icon / active glow. */
+  private syncContextButton(): void {
+    const btn = this.contextBtnEl;
+    if (btn === null) return;
+    const a = this.contextualAction;
+    if (a === null) {
+      btn.className = 'lf-touch-action-btn lf-touch-action-action is-empty';
+      btn.setAttribute?.('data-active', '0');
+      if (this.contextIconEl !== null) this.contextIconEl.textContent = '✋';
+      if (this.contextLabelEl !== null) this.contextLabelEl.textContent = 'NO TARGET';
+      return;
+    }
+    btn.className = a.active
+      ? 'lf-touch-action-btn lf-touch-action-action is-active'
+      : 'lf-touch-action-btn lf-touch-action-action';
+    btn.setAttribute?.('data-active', a.active ? '1' : '0');
+    btn.setAttribute?.('aria-label', a.label);
+    if (this.contextIconEl !== null) this.contextIconEl.textContent = a.icon ?? '✋';
+    if (this.contextLabelEl !== null) this.contextLabelEl.textContent = a.label;
+  }
+
   private removeVisuals(): void {
     const doc = (globalThis as { document?: Document }).document;
     for (const el of [this.baseEl, this.nubEl]) {
@@ -725,5 +1210,16 @@ export class TouchInputController {
     }
     this.baseEl = null;
     this.nubEl = null;
+    if (this.clusterEl !== null && doc !== undefined && doc !== null) {
+      try {
+        doc.body.removeChild(this.clusterEl as unknown as Node);
+      } catch {
+        /* already gone */
+      }
+    }
+    this.clusterEl = null;
+    this.contextBtnEl = null;
+    this.contextIconEl = null;
+    this.contextLabelEl = null;
   }
 }
