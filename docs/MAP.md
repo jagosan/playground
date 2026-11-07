@@ -30,6 +30,7 @@
 - `docs/architecture/31-lunar-frontier-steelpush-locomotion-athletic-hustle-and-hydraulic-assist.md`: High-speed Steelpush locomotion, Olympic triple-jump airborne hitch-kick & stutter step, dynamic sprint rake & thoracic counter-yaw, hydraulic assist boots & procedural Web Audio.
 - `docs/architecture/32-lunar-frontier-locomotion-acrobatics-and-wayfinding-overhaul.md`: Forward-flexing anatomical elbows, mid-air acrobatic tuck & flip cycle, PLSS compressed-air jump boost, clockwise compass tape rectification & POI nav system, and true 3D untethered rover ballistics.
 - `docs/architecture/33-lunar-frontier-mobile-touch-client-and-responsive-hud.md`: Mobile touch architecture, floating virtual dual-sticks, safe-area responsive HUD, PWA harness, high-DPI scaling & tactile haptics.
+- `docs/architecture/34-lunar-frontier-dual-sticks-view-toggle-and-pwa-installability.md`: Virtual dual-sticks, dedicated view touch toggle, default behind-camera & PWA installability harness.
 - `docs/architecture/15-subagent-context-pruning-and-turn-budgeting.md`: Subagent context pruning, N-3 turn-budget circuit breaker, AST extraction, and Beehive Neo4j symbol discovery.
 - `specs/`:
   - `specs/00-system-overview.md`: Project vision, minigame architecture, rendering stack.
@@ -58,6 +59,7 @@
   - `specs/31-lunar-frontier-steelpush-locomotion-athletic-hustle-and-hydraulic-assist.md`: High-speed Steelpush locomotion overhaul, Olympic triple-jump mid-air cycling & stutter step, dynamic sprint hustle & hydraulic assist boots.
   - `specs/32-lunar-frontier-locomotion-acrobatics-and-wayfinding-overhaul.md`: Locomotion acrobatics, forward elbow flexion, RCS jump boost & O2 draw, clockwise compass nav & 3D ballistic rover crater jumping.
   - `specs/33-lunar-frontier-mobile-touch-client-and-responsive-hud.md`: Mobile touch client, floating virtual dual-sticks, responsive safe-area HUD, PWA standalone shell & tactile haptics.
+  - `specs/34-lunar-frontier-dual-sticks-view-toggle-and-pwa-installability.md`: Virtual dual-sticks, dedicated view touch toggle, default behind-camera & PWA installability harness.
 
 ## Lunar Frontier Multiplayer & Economy Subsystem (Spec 12)
 - `games/lunar-frontier/server/`: Fastify + `ws` server, SQLite schema, market pricing, 20Hz tick (`LunarServer.ts`, `Database.ts`).
