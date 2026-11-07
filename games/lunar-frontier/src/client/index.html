@@ -11,8 +11,19 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <!-- Spec 33 Phase 1: lock pinch-zoom; viewport-fit=cover feeds safe-area insets. -->
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
+    />
     <meta name="color-scheme" content="dark" />
+    <!-- iOS standalone (Add to Home Screen) — Spec 33 §2.1.2 -->
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="LunarFrontier" />
+    <link rel="apple-touch-icon" href="./icons/apple-touch-icon.png" />
+    <!-- PWA Web App Manifest — Spec 33 §2.1.1 (copied from public/ by Vite) -->
+    <link rel="manifest" href="./manifest.webmanifest" />
     <title>Lunar Frontier — Second Lunar Rush</title>
     <style>
       :root {
@@ -104,6 +115,44 @@
     <script>
       window.LF_CONFIG = window.LF_CONFIG || {};
     </script>
+
+    <!--
+      Spec 33 §2.1.3 — Portrait Orientation Shield. Hidden by default (inline
+      style prevents a pre-CSS flash); hud.css media queries force it visible
+      only while the viewport is in portrait.
+    -->
+    <div id="orientation-guard" style="display: none" role="alertdialog" aria-live="assertive" aria-label="Rotate device to landscape">
+      <div class="og-frame">
+        <svg class="og-rotate-icon" viewBox="0 0 120 120" aria-hidden="true">
+          <!-- outer rotation arrow -->
+          <path
+            class="og-arrow"
+            d="M60 14 a46 46 0 1 1 -32.5 13.5"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="4"
+            stroke-linecap="round"
+          />
+          <polygon points="20,12 20,34 38,26" fill="currentColor" />
+          <!-- rotating phone glyph -->
+          <rect
+            class="og-phone"
+            x="47"
+            y="38"
+            width="26"
+            height="44"
+            rx="5"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="3.5"
+          />
+          <line x1="55" y1="75" x2="65" y2="75" stroke="currentColor" stroke-width="3" stroke-linecap="round" />
+        </svg>
+        <h1 class="og-title">LUNAR FRONTIER // ORBITAL TRANSIT LOCK</h1>
+        <p class="og-sub">Rotate device to landscape to engage surface telemetry and controls</p>
+      </div>
+    </div>
+
     <script type="module" src="./main.ts"></script>
   </body>
 </html>

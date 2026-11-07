@@ -23,7 +23,9 @@ export default defineConfig({
   // Nginx sub-folder, GitHub Pages project pages).
   base: './',
   root: CLIENT_ROOT,
-  publicDir: false,
+  // Spec 33 Phase 1: `public/` holds manifest.webmanifest + PWA icons; Vite
+  // copies it verbatim into dist so the static artifact stays CDN-droppable.
+  publicDir: resolve(PACKAGE_ROOT, 'public'),
   resolve: {
     // The workspace uses `allowImportingTsExtensions` (tsc -p tsconfig.client.json);
     // Vite resolves those specifiers natively.
