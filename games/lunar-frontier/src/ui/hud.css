@@ -3000,3 +3000,46 @@
     font-size: 11px;
   }
 }
+
+/* ==========================================================================
+   Spec 33 Phase 5 §2.6 — first-touch Web Audio unlock banner (#audio-unlock)
+   Lives inside the boot loader (#loading); revealed by
+   ClientApp.attachMobileAudioUnlock() on mobile UAs. Generous thumb-sized
+   hit target, pulsing cyan glass pill, hidden via the HTML `hidden` attr.
+   ========================================================================== */
+.audio-unlock-hint {
+  margin-top: 18px;
+  padding: 14px 26px;
+  min-height: 48px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 26px;
+  border: 1px solid rgba(86, 224, 230, 0.55);
+  background: rgba(8, 22, 30, 0.72);
+  color: #7ff3e6;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-align: center;
+  cursor: pointer;
+  touch-action: manipulation;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+  animation: lf-audio-unlock-pulse 1.6s ease-in-out infinite;
+}
+
+.audio-unlock-hint[hidden] {
+  display: none;
+}
+
+@keyframes lf-audio-unlock-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(86, 224, 230, 0.35);
+  }
+  50% {
+    box-shadow: 0 0 22px 4px rgba(86, 224, 230, 0.28);
+  }
+}

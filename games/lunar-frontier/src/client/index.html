@@ -109,6 +109,19 @@
       <h1>Lunar Frontier</h1>
       <div class="spinner" role="progressbar" aria-label="Booting"></div>
       <div class="sub">pressurising suit · pinging station exchange</div>
+      <!--
+        Spec 33 §2.6 — first-touch Web Audio unlock banner. Hidden by default;
+        ClientApp.attachMobileAudioUnlock() reveals it on mobile UAs, and the
+        first touchstart/pointerdown anywhere on the page calls
+        `audio.resume()` (the gesture mobile Safari/Chrome autoplay policy
+        demands) and hides it again.
+      -->
+      <div
+        id="audio-unlock"
+        class="audio-unlock-hint"
+        hidden
+        aria-label="Tap to engage suit life support and enter simulation"
+      >⏻ TAP TO ENGAGE SUIT LIFE SUPPORT &amp; ENTER SIMULATION</div>
     </div>
 
     <!-- Optional identity overrides: { username, faction, role, wsUrl, seed } -->

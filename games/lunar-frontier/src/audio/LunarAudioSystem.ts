@@ -2178,6 +2178,23 @@ export class LunarAudioSystem {
     }
   }
 
+  /**
+   * Spec 33 §2.6 — explicit unlock hook for the first user gesture (the boot
+   * screen's "TAP TO ENGAGE" banner calls this on mobile Safari/Chrome, where
+   * the context stays suspended until a real touch happens). Safe to call any
+   * time, from anywhere: pre-init, running, or headless (mock context) — it
+   * never rejects, so a gesture handler can fire-and-forget without an
+   * unhandled promise rejection.
+   */
+  resume(): Promise<void> {
+    return this.resumeIfSuspended();
+  }
+
+  /** True once the context reports `running` (audio actually audible). */
+  isAudioRunning(): boolean {
+    return this.ctx !== null && this.ctx.state === 'running';
+  }
+
   /** Resume a suspended context; silently ignores rejections (pre-gesture). */
   private async resumeIfSuspended(): Promise<void> {
     const ctx = this.ctx;

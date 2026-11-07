@@ -131,6 +131,16 @@ import type { TopoMapPOI, TopoMapState } from '../ui/LunarHUD.ts';
 // imports nothing and falls back to an internal mock context headless, so
 // NullEngine smoke suites never touch a real AudioContext).
 import { LunarAudioSystem, LADDER_STEP_CADENCE_S } from '../audio/LunarAudioSystem.ts';
+// Spec 33 Phase 5 §2.5/§2.6 — mobile performance presets (DPR clamp + FPS
+// gate) and the `navigator.vibrate` tactile haptics synthesizer.
+import {
+  applyHardwareScaling,
+  isMobileDevice,
+  writeMobileProfile,
+  type HardwareScalingOutcome,
+  type MobilePerformanceProfile,
+} from './MobileSettings.ts';
+import { TactileHaptics } from '../audio/TactileHaptics.ts';
 
 // ---------------------------------------------------------------------------
 // Tunables
@@ -684,6 +694,13 @@ export interface ClientAppOptions {
    * browsers only; an explicit `null` disables the mobile deck entirely.
    */
   touchInput?: TouchInputController | null;
+  /**
+   * Spec 33 Phase 5 §2.5 — force a mobile performance profile regardless of
+   * UA sniff (headless harnesses / desktop override). `undefined` resolves
+   * the persisted profile from `localStorage['LF_MOBILE_PROFILE']` and only
+   * applies scaling when the device UA is mobile.
+   */
+  mobileProfile?: MobilePerformanceProfile;
 }
 
 export interface ClientInputFrame {
@@ -1284,6 +1301,35 @@ export class ClientApp {
   /** Spec 33 Phase 2: unconsumed camera look radians from the touch trackpad. */
   private touchLookYawRad = 0;
   private touchLookPitchRad = 0;
+
+  /**
+   * Spec 33 Phase 5 §2.6 — tactile haptics engine (footfall / RCS / mining /
+   * collision pulses over `navigator.vibrate`). Safe no-op on iOS Safari and
+   * headless; the enable flag persists in `localStorage['LF_HAPTICS']`.
+   */
+  readonly haptics: TactileHaptics = new TactileHaptics();
+
+  /** Spec 33 Phase 5 §2.5: last applied mobile scaling (null on desktop). */
+  private mobileScaling: HardwareScalingOutcome | null = null;
+
+  /** Spec 33 Phase 5 §2.5: render-loop frame-gate interval (0 = uncapped). */
+  private mobileFrameGateMs = 0;
+
+  /** Frame-gate bookkeeping for the `run()` render loop. */
+  private lastGateTickMs: number | null = null;
+
+  /** Haptic edge trackers: RCS valve latch, buggy airborne, bump-stop hit. */
+  private hapticRcsLatched = false;
+  private hapticBuggyAirborne: boolean | null = null;
+  private hapticBuggyBottomedOut = false;
+
+  /** Spec 33 §2.6: once-only audio-unlock gesture handlers (for dispose). */
+  private audioUnlockHandlers: {
+    target: { removeEventListener: (type: string, fn: unknown) => void };
+    type: string;
+    fn: unknown;
+  }[] = [];
+
   private lastRumbleAt = Number.NEGATIVE_INFINITY;
 
   /**
@@ -1476,6 +1522,12 @@ export class ClientApp {
 
     this.world.init(canvasOrEngine as never);
 
+    // Spec 33 Phase 5 §2.5 — clamp mobile DPR before the first frame renders:
+    // Balanced pins DPR_effective ≤ 1.5, Battery Saver scales to 1.5 (~720p)
+    // with a 30 FPS loop gate, High Fidelity allows native DPR up to 2.0.
+    // Desktop / headless runs are untouched unless a profile is forced.
+    this.applyMobilePerformance();
+
     const ground: GroundElevationFn = (x, y) => this.groundAt(x, y);
     const scene = this.world.getScene();
     const spawn = this.resolveSpawn();
@@ -1653,6 +1705,10 @@ export class ClientApp {
     if (this.hud !== null) this.audio.setVolumes(this.hud.getAudioVolumes());
     this.audio.setAudioMode('vacuum');
     void this.audio.init().catch(() => undefined);
+    // Spec 33 Phase 5 §2.6 — first-touch Web Audio unlock (mobile Safari /
+    // Chrome refuse playback until a real gesture; the boot banner is the
+    // affordance, the tap calls `audio.resume()` exactly once).
+    this.attachMobileAudioUnlock();
 
     if (this.ownsNetwork && this.network !== null) {
       // Fire-and-forget: the `connected` handler performs the JOIN. A failed
@@ -1767,11 +1823,28 @@ export class ClientApp {
     this.world.render();
   }
 
-  /** Start the engine render loop feeding `update()`. Idempotent. */
+  /**
+   * Start the engine render loop feeding `update()`. Idempotent.
+   *
+   * Spec 33 Phase 5 §2.5: on Battery Saver the loop is gated to the profile's
+   * FPS target (30 FPS) — Babylon exposes no per-tier frame cap, so ticks
+   * faster than the target interval are skipped outright. `update()` derives
+   * its own clamped `dt` from the timestamp, so skipped ticks simply merge
+   * into the next frame's step with no simulation drift.
+   */
   run(): this {
     if (this.disposed || !this.initialized || this.started) return this;
     this.started = true;
-    this.world.getEngine().runRenderLoop(() => this.update(this.nowMs()));
+    const gateMs = this.mobileFrameGateMs;
+    this.lastGateTickMs = null;
+    this.world.getEngine().runRenderLoop(() => {
+      const now = this.nowMs();
+      if (gateMs > 0 && this.lastGateTickMs !== null && now - this.lastGateTickMs < gateMs) {
+        return;
+      }
+      this.lastGateTickMs = now;
+      this.update(now);
+    });
     this.log('client render loop running');
     return this;
   }
@@ -1808,6 +1881,99 @@ export class ClientApp {
     ) {
       this.touchInput.setViewport(win.innerWidth, win.innerHeight);
     }
+  }
+
+  // -- mobile performance & haptics (Spec 33 Phase 5 §2.5 / §2.6) -------------
+
+  /**
+   * Spec 33 Phase 5 §2.5 — resolve the active mobile performance profile
+   * (explicit argument > `mobileProfile` option > persisted
+   * `localStorage['LF_MOBILE_PROFILE']`) and push the resulting Babylon
+   * `hardwareScalingLevel` onto the live engine, arming the render-loop FPS
+   * gate with the profile target. Returns null (engine untouched) on
+   * desktop/headless runs with no forced profile.
+   */
+  applyMobilePerformance(profile?: MobilePerformanceProfile): HardwareScalingOutcome | null {
+    if (this.disposed) return null;
+    const forced = profile ?? this.options.mobileProfile ?? null;
+    if (forced === null && !isMobileDevice()) return null;
+    const outcome = applyHardwareScaling(this.world.getEngine(), forced);
+    this.mobileScaling = outcome;
+    this.mobileFrameGateMs = outcome.frameGateMs;
+    this.log(
+      `mobile perf: ${outcome.profile} · DPR ${outcome.rawDpr} → ${outcome.effectiveDpr} · ` +
+        `scaling ${outcome.scalingLevel.toFixed(3)} · ` +
+        `fps gate ${outcome.frameGateMs > 0 ? `${Math.round(1000 / outcome.frameGateMs)} Hz` : 'off'}`,
+    );
+    return outcome;
+  }
+
+  /**
+   * Spec 33 Phase 5 §2.5 — Settings-sheet entry point: persist the chosen
+   * profile to `localStorage['LF_MOBILE_PROFILE']` and re-scale the live
+   * engine immediately (no reload required).
+   */
+  setMobilePerformanceProfile(profile: MobilePerformanceProfile): HardwareScalingOutcome | null {
+    writeMobileProfile(profile);
+    if (!this.initialized || this.disposed) return null;
+    return this.applyMobilePerformance(profile);
+  }
+
+  /** Last applied mobile scaling outcome (null before init / on desktop). */
+  getMobileScaling(): HardwareScalingOutcome | null {
+    return this.mobileScaling;
+  }
+
+  /**
+   * Spec 33 Phase 5 §2.6 — first-touch Web Audio unlock. On mobile devices
+   * reveals the `#audio-unlock` boot banner ("TAP TO ENGAGE…") and arms
+   * once-only `touchstart` / `pointerdown` listeners that call
+   * `audio.resume()` — the gesture the mobile autoplay policy demands — and
+   * hide the banner. Fire-and-forget safe: `resume()` never rejects, so no
+   * unhandled promise rejections on pre-gesture Safari.
+   *
+   * Returns true when unlock listeners were armed (mobile browsers only).
+   */
+  attachMobileAudioUnlock(): boolean {
+    if (this.disposed) return false;
+    const doc = (globalThis as { document?: Document }).document;
+    if (doc === undefined || doc === null || typeof doc.addEventListener !== 'function') {
+      return false;
+    }
+    const banner =
+      typeof doc.getElementById === 'function' ? doc.getElementById('audio-unlock') : null;
+    const mobile = isMobileDevice() || this.options.mobileProfile !== undefined;
+    if (!mobile) {
+      // Desktop: the banner is never relevant — keep it hidden and bail.
+      if (banner !== null) banner.setAttribute('hidden', '');
+      return false;
+    }
+    if (banner !== null) banner.removeAttribute('hidden');
+    const unlock = (): void => {
+      if (banner !== null) banner.setAttribute('hidden', '');
+      void this.audio?.resume();
+    };
+    const handlers: {
+      target: { removeEventListener: (type: string, fn: unknown) => void };
+      type: string;
+      fn: unknown;
+    }[] = [];
+    for (const type of ['touchstart', 'pointerdown'] as const) {
+      try {
+        doc.addEventListener(type, unlock, { once: true, passive: true });
+        handlers.push({
+          target: doc as unknown as {
+            removeEventListener: (type: string, fn: unknown) => void;
+          },
+          type,
+          fn: unlock,
+        });
+      } catch {
+        /* hostile document — lazy resume on play calls still applies */
+      }
+    }
+    this.audioUnlockHandlers = handlers;
+    return handlers.length > 0;
   }
 
   // -- proving grounds track mode (Spec 17 Phase 4) --------------------------------
@@ -2016,6 +2182,16 @@ export class ClientApp {
     this.stop();
     this.detachDomInput();
     this.detachGamepadHotplug();
+    // Spec 33 §2.6: release the once-only audio-unlock gesture listeners
+    // (already gone if they fired; guard mock DOMs lacking the remover).
+    for (const handler of this.audioUnlockHandlers) {
+      try {
+        handler.target.removeEventListener?.(handler.type, handler.fn);
+      } catch {
+        /* listener already detached by the environment */
+      }
+    }
+    this.audioUnlockHandlers = [];
     // Spec 33 Phase 2: tear the touch deck down (listeners + glass visuals).
     this.touchInput?.dispose();
     this.touchInput = null;
@@ -3840,6 +4016,9 @@ export class ClientApp {
       this.audio?.setMiningAudioActive(true, intensity);
       this.miningAudioUntilMs = now + MINING_AUDIO_TAIL_MS;
       this.audio?.playOreCollectChime();
+      // Spec 33 Phase 5 §2.6: 25 ms mining-laser buzz — the haptics engine
+      // self-throttles to one pulse per 150 ms while drilling continues.
+      this.haptics.miningPulse();
     }
 
     const carrierLabel = onFoot ? 'backpack' : 'flatbed';
@@ -4097,13 +4276,35 @@ export class ClientApp {
 
     if (this.mode === 'buggy') {
       const buggy = this.requireBuggy();
+      const buggyState = buggy.getState();
       audio.updateDrivingAudio(
         buggy.getSpeed(),
         Math.abs(this.filteredThrottle),
-        !buggy.getState().airborne,
+        !buggyState.airborne,
       );
+      // Spec 33 Phase 5 §2.6 — rover ground shock haptics: a heavy 60 ms
+      // thump on the airborne → grounded touchdown edge and on the frame
+      // the suspension crosses the bump stop (bottoming out). Both pulses
+      // share the haptics engine's impact throttle, so hammering a washboard
+      // cannot buzz-saw the thumb.
+      if (this.hapticBuggyAirborne === true && !buggyState.airborne) {
+        this.haptics.collisionImpact();
+      }
+      // Mean wheel compression straight off the physics frame (0 drooped ..
+      // 1 bump stop) — `BuggyState` carries the wheels, telemetry is derived.
+      let meanCompression = 0;
+      for (const wheel of buggyState.wheels) meanCompression += wheel.compression;
+      meanCompression /= buggyState.wheels.length;
+      const bottomedOut = !buggyState.airborne && meanCompression >= 0.995;
+      if (bottomedOut && !this.hapticBuggyBottomedOut) {
+        this.haptics.collisionImpact();
+      }
+      this.hapticBuggyBottomedOut = bottomedOut;
+      this.hapticBuggyAirborne = buggyState.airborne;
     } else {
       audio.updateDrivingAudio(0, 0, false);
+      this.hapticBuggyAirborne = null;
+      this.hapticBuggyBottomedOut = false;
     }
 
     // Spec 26 §3.5.2: linear induction guideway hum — carrier tracks the
@@ -4172,6 +4373,8 @@ export class ClientApp {
         // Touchdown edge: hydraulics compress under the landing load.
         audio.playHydraulicCompression();
         audio.playFootstep();
+        // Spec 33 §2.6: 12 ms boot-impact micro-tap on the same edge.
+        this.haptics.footfall();
         this.audioFootTravelled = 0;
       } else if (prevGrounded === true && !grounded) {
         // Push-off launch edge: the pneumatic boots fire into the flight arc.
@@ -4187,6 +4390,8 @@ export class ClientApp {
     if (this.audioFootTravelled >= stride) {
       this.audioFootTravelled = 0;
       audio.playFootstep();
+      // Spec 33 §2.6: haptic micro-tap rides every footfall audio cue.
+      this.haptics.footfall();
     }
   }
 
@@ -4202,7 +4407,11 @@ export class ClientApp {
    * the next burst always starts flush with the ignition edge.
    */
   private pumpRcsBoostFx(dt: number, suit: EvaSuitAvatar): void {
-    if (suit.getState().rcsBoostActive) {
+    const rcsActive = suit.getState().rcsBoostActive;
+    if (rcsActive) {
+      // Spec 33 Phase 5 §2.6: crisp [15, 30, 20] double-tap on the ignition
+      // rising edge only — holding the valve re-arms plumes, never thumbs.
+      if (!this.hapticRcsLatched) this.haptics.rcsBoost();
       this.rcsBoostFxClock -= dt;
       if (this.rcsBoostFxClock <= 0) {
         this.rcsBoostFxClock = ClientApp.RCS_BOOST_FX_REARM_S;
@@ -4212,6 +4421,7 @@ export class ClientApp {
     } else {
       this.rcsBoostFxClock = 0;
     }
+    this.hapticRcsLatched = rcsActive;
   }
 
   /**
