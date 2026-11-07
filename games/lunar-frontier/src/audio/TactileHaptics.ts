@@ -5,6 +5,7 @@
  * players physical feedback the desktop client simply does not need:
  *
  *   • `footfall()`        — 12 ms micro-pulse on stance-boot impact.
+ *   • `uiTap()`           — 15 ms crisp tick on a utility-button tap (Spec 34).
  *   • `rcsBoost()`        — crisp double-tap [15, 30, 20] on PLSS ignition.
  *   • `miningPulse()`     — 25 ms buzz, self-throttled to one pulse per
  *                           150 ms while a mining beam stays latched.
@@ -34,6 +35,12 @@ export const MINING_PULSE_INTERVAL_MS = 150;
 
 /** Rover ground collision / bottoming-out shock thump (ms). */
 export const COLLISION_IMPACT_MS = 60;
+
+/**
+ * Spec 34 §2.2: crisp confirmation tick for discrete utility-button taps
+ * (`[🎥 VIEW]` camera cycle, etc.) — shorter than a footfall, no throttle.
+ */
+export const UI_TAP_PULSE_MS = 15;
 
 /** Minimum spacing between heavy impacts so hammering bumps cannot buzz-saw. */
 export const COLLISION_IMPACT_INTERVAL_MS = 250;
@@ -126,6 +133,11 @@ export class TactileHaptics {
   /** Suit footfall contact: single 12 ms micro-tap on boot impact. */
   footfall(): boolean {
     return this.pulse(FOOTFALL_PULSE_MS);
+  }
+
+  /** Spec 34 §2.2: crisp 15 ms utility-tap tick (e.g. `[🎥 VIEW]` cycle). */
+  uiTap(): boolean {
+    return this.pulse(UI_TAP_PULSE_MS);
   }
 
   /** RCS boost activation: crisp [15, 30, 20] cold-gas double tap. */

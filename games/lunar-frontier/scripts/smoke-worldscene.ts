@@ -307,11 +307,14 @@ section('3. camera rig modes, FOV & smoothing');
 
 const rig = world.getCameraRig();
 check('rig attached to scene', rig !== null);
-check('initial mode is eva_first_person', rig.getMode() === 'eva_first_person');
+check('initial mode is eva_third_person (Spec 34 §2.2 default)', rig.getMode() === 'eva_third_person');
 check(
-  'active camera is the rig first-person camera',
-  scene.activeCamera?.name === 'rig_eva_fp',
+  'active camera is the rig third-person camera',
+  scene.activeCamera?.name === 'rig_eva_tp',
 );
+// Spec 34 flipped the default to the behind-camera; pin first person
+// explicitly for the FP eye-point / heading coverage below.
+rig.setMode('eva_first_person');
 const fpFov = rig.getFovDegrees();
 check(`first-person FOV in 55–65° band (${fpFov.toFixed(1)}°)`, fpFov >= 55 && fpFov <= 65);
 
@@ -863,7 +866,7 @@ const soloEngine = new NullEngine({ renderWidth: 320, renderHeight: 240 });
 const soloWorld = new WorldScene({ seed: 'solo' });
 soloWorld.init(soloEngine);
 const soloRig = new CameraRig(soloWorld.getScene());
-check('standalone rig defaults to FP', soloRig.getMode() === 'eva_first_person');
+check('standalone rig defaults to behind (Spec 34)', soloRig.getMode() === 'eva_third_person');
 soloRig.update({ x: 1, y: 2, z: 3 }, 0.5, 1 / 60);
 check('standalone rig updates', Number.isFinite(soloRig.getPhysicsPosition().x));
 soloRig.dispose();

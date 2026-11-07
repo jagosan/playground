@@ -52,6 +52,7 @@ import {
   TOUCH_LOOK_PITCH_RAD_PER_PX,
   TOUCH_LOOK_YAW_RAD_PER_PX,
   TOUCH_ACTION_IDS,
+  touchButtonDomId,
   TouchInputController,
   UTILITY_BUTTON_PX,
   type ActionHitRect,
@@ -65,6 +66,7 @@ import {
   MINING_PULSE_INTERVAL_MS,
   MINING_PULSE_MS,
   RCS_BOOST_PATTERN,
+  UI_TAP_PULSE_MS,
   TactileHaptics,
 } from '../src/audio/TactileHaptics.ts';
 import NetworkClient from '../src/network/NetworkClient.ts';
@@ -1077,9 +1079,11 @@ async function main(): Promise<void> {
   section('E1. boot + DOM-mounted touch deck (Spec 33 §4.1)');
   check('ClientApp boots with the injected touch deck', app.isInitialized());
   check('deck visible at boot (touch not yet displaced)', deck.isVisible() === true);
-  check('cluster + all five buttons mounted on the DOM',
+  check('cluster + every button mounted on the DOM (Spec 34: #btn-touch-cam included)',
     env.registry.has('lf-touch-actions') &&
-      TOUCH_ACTION_IDS.every((id) => env.registry.has(`btn-touch-${id}`)));
+      TOUCH_ACTION_IDS.every((id) => env.registry.has(touchButtonDomId(id))));
+  check('Spec 34 default boots behind the suit (eva_third_person)',
+    app.world.getCameraRig().getMode() === 'eva_third_person');
   check('mobile audio-unlock stays hidden on non-mobile hosts (desktop no-op)',
     env.registry.get('audio-unlock')?.getAttribute('hidden') === '' &&
       app.attachMobileAudioUnlock() === false);
@@ -1314,6 +1318,27 @@ async function main(): Promise<void> {
       (hud.getHUDMode?.() ?? null) !== modeBefore);
     deck.handleTouchEnd(tev(51, uc.x, uc.y, clockMs + 8));
     step(1);
+    deck.consumeActions();
+
+    // Spec 34 §2.2: dedicated [🎥 VIEW] utility button — tap cycles the
+    // camera perspective with a crisp 15 ms haptic confirmation tick.
+    const camRect = rectOf(rects, 'camera');
+    check('[🎥 VIEW] mounted at #btn-touch-cam with ≥ 44 px hit target',
+      env.registry.get('btn-touch-cam') !== undefined &&
+        camRect.width >= 44 && camRect.height >= 44);
+    const camModeBefore = app.world.getCameraRig().getMode();
+    vib.log.length = 0;
+    const vc = centerOf(camRect);
+    deck.handleTouchStart(tev(54, vc.x, vc.y, clockMs + 8));
+    step(1);
+    deck.handleTouchEnd(tev(54, vc.x, vc.y, clockMs + 8));
+    step(1);
+    const camModeAfter = app.world.getCameraRig().getMode();
+    check('VIEW tap cycles the camera perspective',
+      camModeAfter !== camModeBefore,
+      `${camModeBefore} → ${camModeAfter}`);
+    check('VIEW tap fires the crisp 15 ms haptic tick',
+      vib.log.some((p) => p === UI_TAP_PULSE_MS), JSON.stringify(vib.log));
     deck.consumeActions();
 
     // Make touch the live device again and park at the rover for a prompt.

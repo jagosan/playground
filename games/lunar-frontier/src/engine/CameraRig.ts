@@ -160,7 +160,7 @@ export interface CameraModeConfig {
 export interface CameraRigOptions {
   /** Override the per-mode table wholesale or partially. */
   modes?: Partial<Record<CameraMode, Partial<CameraModeConfig>>>;
-  /** Starting mode (default `eva_first_person`). */
+  /** Starting mode (default `eva_third_person`, Spec 34 §2.2). */
   initialMode?: CameraMode;
   /** Near clip. */
   minZ?: number;
@@ -409,7 +409,7 @@ export class CameraRig {
     this.follow.cameraAcceleration = 0.08;
     this.follow.maxCameraSpeed = 40;
 
-    this.mode = options.initialMode ?? 'eva_first_person';
+    this.mode = options.initialMode ?? 'eva_third_person';
     this.activateMode(this.mode);
   }
 

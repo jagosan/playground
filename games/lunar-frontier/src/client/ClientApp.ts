@@ -1196,7 +1196,7 @@ export class ClientApp {
 
   private mode: TravelMode = 'suit';
   /** EVA camera mode to restore when dismounting the buggy. */
-  private lastEvaCamera: CameraMode = 'eva_first_person';
+  private lastEvaCamera: CameraMode = 'eva_third_person';
 
   private readonly pressed = new Set<string>();
 
@@ -3107,6 +3107,14 @@ export class ClientApp {
       case 'ui':
         // Spec 30 §2.3.2: same cycle lane as [U]/[H] and double-tap R3.
         if (!tradeOpen) this.cycleHudMode();
+        break;
+      case 'camera':
+        // Spec 34 §2.2.2: `[🎥 VIEW]` — first / third / chase cycle with a
+        // crisp 15 ms haptic tick confirming the perspective swap.
+        if (!tradeOpen) {
+          this.cycleCamera();
+          this.haptics.uiTap();
+        }
         break;
       default:
         // jump / roll: consumed through the analog frame.

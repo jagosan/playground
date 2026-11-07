@@ -166,7 +166,7 @@ export interface WorldSceneOptions {
   starDomeRadius?: number;
   /** Number of stars (default 900). */
   starCount?: number;
-  /** Initial camera mode for the rig (default `eva_first_person`). */
+  /** Initial camera mode for the rig (default `eva_third_person`, Spec 34 §2.2). */
   cameraMode?: CameraMode;
   /** Extra metres above ground the camera spawns at (default 1.7). */
   spawnClearance?: number;
@@ -870,7 +870,7 @@ export class WorldScene {
     this.buildRivalBases();
 
     this.rig = new CameraRig(this.scene, {
-      initialMode: this.options.cameraMode ?? 'eva_first_person',
+      initialMode: this.options.cameraMode ?? 'eva_third_person',
       groundHeightAt: (x, y) => this.getGroundHeightAt(x, y),
       // Spec 16 §2.3 / ADR-016-3: the shadow box chases whatever the rig is
       // filming (suit on foot, rover in chase mode) every frame.

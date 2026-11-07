@@ -2698,6 +2698,18 @@
   top: calc(8px + env(safe-area-inset-top) + 80px);
 }
 
+/* Spec 34 §2.2.2 `[🎥 VIEW]`: utility row, left of [UI]; mirrors the
+   `defaultActionRects()` camera entry (52 px disc, 12 px gap, 24 px margin)
+   — same glassmorphic treatment as MAP / UI, ≥ 44 px × 44 px hit mandate. */
+#btn-touch-cam {
+  width: 52px;
+  height: 52px;
+  right: 88px;
+  right: calc(24px + env(safe-area-inset-right) + 64px);
+  top: 88px;
+  top: calc(8px + env(safe-area-inset-top) + 80px);
+}
+
 /* Contextual glow: an interaction target sits inside the active radius —
    amber halo with a cyan under-glow breathing pulse (spec §2.2.4 item 3). */
 #btn-touch-action.is-active {

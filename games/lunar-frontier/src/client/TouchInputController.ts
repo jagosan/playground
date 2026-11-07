@@ -147,8 +147,17 @@ export interface TouchEventLike {
   time?: number;
 }
 
-/** Identifiers for the Phase 3 action button cluster (Spec 33 §2.2.4). */
-export type TouchActionId = 'jump' | 'roll' | 'action' | 'map' | 'ui';
+/** Identifiers for the Phase 3 action button cluster (Spec 33 §2.2.4).
+ *  `'camera'` (Spec 34 §2.2) is the discrete `[🎥 VIEW]` utility tap. */
+export type TouchActionId = 'jump' | 'roll' | 'action' | 'map' | 'ui' | 'camera';
+
+/**
+ * DOM element id an action button mounts under. The Spec 34 `'camera'` verb
+ * mounts as `#btn-touch-cam` (§2.2.2); every other verb uses its own name.
+ */
+export function touchButtonDomId(id: TouchActionId): string {
+  return id === 'camera' ? 'btn-touch-cam' : `btn-touch-${id}`;
+}
 
 /** Every action id, in cluster iteration order. */
 export const TOUCH_ACTION_IDS: readonly TouchActionId[] = [
@@ -157,6 +166,7 @@ export const TOUCH_ACTION_IDS: readonly TouchActionId[] = [
   'action',
   'map',
   'ui',
+  'camera',
 ];
 
 /**
@@ -328,6 +338,7 @@ export class TouchInputController {
     action: false,
     map: false,
     ui: false,
+    camera: false,
   };
   /** Fingers claimed by an action button — isolated from the look trackpad. */
   private readonly buttonTouchIds = new Map<number, TouchActionId>();
@@ -833,6 +844,8 @@ export class TouchInputController {
       { id: 'roll', x: w - m - a - g - r, y: h - m - r, width: r, height: r },
       { id: 'map', x: m, y: UTILITY_BUTTON_TOP_PX, width: u, height: u },
       { id: 'ui', x: w - m - u, y: UTILITY_BUTTON_TOP_PX, width: u, height: u },
+      // Spec 34 §2.2.2: `[🎥 VIEW]` sits left of `[UI]` in the utility row.
+      { id: 'camera', x: w - m - u - g - u, y: UTILITY_BUTTON_TOP_PX, width: u, height: u },
     ];
   }
 
@@ -1035,7 +1048,7 @@ export class TouchInputController {
     if (doc === undefined || typeof doc.getElementById !== 'function') return [];
     const out: ActionHitRect[] = [];
     for (const id of TOUCH_ACTION_IDS) {
-      const el = doc.getElementById(`btn-touch-${id}`);
+      const el = doc.getElementById(touchButtonDomId(id));
       if (el === null || el === undefined || typeof el.getBoundingClientRect !== 'function') {
         continue;
       }
@@ -1117,6 +1130,7 @@ export class TouchInputController {
    *     #btn-touch-roll   ⟳ ROLL        (left of the smart key)
    *     #btn-touch-map    🗺 MAP         (top-left utility corner)
    *     #btn-touch-ui     👁 UI          (top-right utility corner)
+   *     #btn-touch-cam    🎥 VIEW        (utility row, left of UI, Spec 34)
    * ```
    *
    * Buttons are pure feedback surfaces — the controller claims touches at
@@ -1141,7 +1155,7 @@ export class TouchInputController {
       label: string,
     ): { btn: LooseDomEl; iconEl: LooseDomEl; labelEl: LooseDomEl } => {
       const btn = doc.createElement('button');
-      btn.id = `btn-touch-${id}`;
+      btn.id = touchButtonDomId(id);
       btn.className = `lf-touch-action-btn lf-touch-action-${id}`;
       btn.setAttribute?.('type', 'button');
       btn.setAttribute?.('aria-label', label);
@@ -1172,6 +1186,7 @@ export class TouchInputController {
     makeButton('roll', '⟳', 'ROLL');
     makeButton('map', '🗺', 'MAP');
     makeButton('ui', '👁', 'UI');
+    makeButton('camera', '🎥', 'VIEW');
     doc.body.appendChild(container);
     this.clusterEl = container as unknown as LooseDomEl;
     this.syncContextButton();
