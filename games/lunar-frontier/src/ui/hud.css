@@ -2432,3 +2432,87 @@
   }
 }
 
+
+/* ==========================================================================
+   Spec 33 §2.2 Phase 2 — floating virtual dual-stick deck (mobile touch).
+
+   `TouchInputController` spawns these two elements at the dynamic stick
+   origin inside the bottom-left anchor quadrant. Both are pure feedback:
+   `pointer-events: none` keeps every gesture on the canvas, and the deck
+   rides at z-index 25 — above the telemetry HUD (20) but below the modal
+   sheets (40/60) and the portrait orientation guard (9999), so a trade
+   terminal or map always covers it. Geometry mirrors the JS constants:
+   108 px ring (R_max 54) and a 44 px thumb (≥ 44 px touch-target law even
+   though the deck itself never receives taps).
+   ========================================================================== */
+
+.lf-touch-stick-base,
+.lf-touch-stick-nub {
+  position: fixed;
+  z-index: 25;
+  border-radius: 50%;
+  pointer-events: none;
+  user-select: none;
+  will-change: transform;
+  transition: opacity 120ms ease-out;
+}
+
+/* Glassmorphic outer boundary ring: smoked-glass disc, hairline cyan rule,
+   faint inner bloom so the rim reads as a physical bezel on bright regolith. */
+.lf-touch-stick-base {
+  width: 108px;
+  height: 108px;
+  border: 2px solid rgba(86, 224, 255, 0.35);
+  background:
+    radial-gradient(circle at 50% 45%, rgba(86, 224, 255, 0.10), rgba(10, 16, 24, 0.30) 72%);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  box-shadow:
+    0 0 18px rgba(86, 224, 255, 0.16),
+    inset 0 0 14px rgba(86, 224, 255, 0.10);
+}
+
+/* Glowing cyan thumb nub: tracks the deflection with the damped-spring
+   return (transform set by the controller), bright enough to find with
+   peripheral vision while sprint-bounding across the terminator line. */
+.lf-touch-stick-nub {
+  width: 44px;
+  height: 44px;
+  background:
+    radial-gradient(circle at 38% 35%,
+      rgba(214, 246, 255, 0.95) 0%,
+      var(--lf-cyan, #56e0ff) 55%,
+      rgba(0, 138, 190, 0.92) 100%);
+  box-shadow:
+    0 0 14px rgba(86, 224, 255, 0.85),
+    0 0 42px rgba(86, 224, 255, 0.35),
+    inset 0 -3px 6px rgba(0, 40, 60, 0.45);
+}
+
+/* Hidden state (headless harnesses toggle the class directly; browsers get
+   it from the controller on release-settled / deck-disabled frames). */
+.lf-touch-stick-base.is-hidden,
+.lf-touch-stick-nub.is-hidden {
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 160ms ease-out, visibility 0s linear 160ms;
+}
+
+/* Sprint latch cue: rim flares amber-cyan while the sprint channel is hot
+   (controller adds `.is-sprint` to the base alongside the deflection). */
+.lf-touch-stick-base.is-sprint {
+  border-color: rgba(255, 204, 85, 0.75);
+  box-shadow:
+    0 0 26px rgba(255, 204, 85, 0.35),
+    inset 0 0 18px rgba(86, 224, 255, 0.22);
+}
+
+/* Safe-area law (pitfall #52): the dynamic origin already lives inside the
+   35 vh / 42 vw quadrant, but clamp the deck away from rounded corners and
+   the iOS home-indicator strip when the thumb hugs the physical edge. */
+@supports (inset: env(safe-area-inset-bottom)) {
+  .lf-touch-stick-base,
+  .lf-touch-stick-nub {
+    margin-bottom: 0; /* origin math handles placement; hook kept for Phase 4 tuning */
+  }
+}

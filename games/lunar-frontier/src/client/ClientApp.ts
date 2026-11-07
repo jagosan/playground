@@ -58,6 +58,7 @@ import {
   type Quest,
 } from './QuestEngine.ts';
 import { HintArrowSystem, type HintArrowTarget } from './HintArrowSystem.ts';
+import { TouchInputController, type TouchInputState } from './TouchInputController.ts';
 import { IntroDirector, type IntroPhase } from './IntroDirector.ts';
 import { FactionBases } from '../infrastructure/Factions.ts';
 // Spec 25 §2.4: derelict rival-team outposts (built inside WorldScene.init;
@@ -670,6 +671,13 @@ export interface ClientAppOptions {
    * smoke harnesses on their manual director attachment and timelines.
    */
   autoAttachIntroDirector?: boolean;
+  /**
+   * Spec 33 Phase 2 §2.2 — injected {@link TouchInputController} (headless
+   * smoke harness hands its own instance and drives synthetic multi-touch
+   * events). `undefined` lets `init()` auto-build one on touch-capable
+   * browsers only; an explicit `null` disables the mobile deck entirely.
+   */
+  touchInput?: TouchInputController | null;
 }
 
 export interface ClientInputFrame {
@@ -921,6 +929,17 @@ const VALID_INTRO_PHASES: ReadonlySet<string> = new Set([
 
 function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
+}
+
+/** Wrap an angle into (−π, +π] (Spec 33 Phase 2 touch-look heading update). */
+function wrapSignedAngle(a: number): number {
+  let x = a + Math.PI;
+  if (x >= 0) {
+    x %= Math.PI * 2;
+  } else {
+    x = Math.PI * 2 - ((-x) % (Math.PI * 2));
+  }
+  return x - Math.PI;
 }
 
 function finite(value: unknown): number | null {
@@ -1238,6 +1257,24 @@ export class ClientApp {
 
   /** Frame-driven haptic clock (ms) + last `playEffect` timestamp (rate limit). */
   private rumbleClockMs = 0;
+
+  /**
+   * Spec 33 Phase 2 §2.2 — mobile touch deck (floating left virtual stick +
+   * free-look right trackpad). Null when disabled or on non-touch devices.
+   */
+  private touchInput: TouchInputController | null = null;
+
+  /**
+   * Spec 33 Phase 2: this frame's touch poll, taken ONCE per physics frame
+   * in `stepEntities()` (`poll()` consumes the look accumulators, so
+   * `sampleInput()` — which harnesses may call any number of times per frame
+   * — reads this stash instead of polling again).
+   */
+  private lastTouchState: TouchInputState | null = null;
+
+  /** Spec 33 Phase 2: unconsumed camera look radians from the touch trackpad. */
+  private touchLookYawRad = 0;
+  private touchLookPitchRad = 0;
   private lastRumbleAt = Number.NEGATIVE_INFINITY;
 
   /**
@@ -1595,6 +1632,9 @@ export class ClientApp {
     this.wireNetwork();
     this.attachDomInput();
     this.attachGamepadHotplug();
+    // Spec 33 Phase 2 §2.2: mount the mobile touch deck (injected harness
+    // instance, or auto-built on touch-capable browsers).
+    this.initTouchDeck();
 
     // Spec 25 §2.5: procedural audio boot. Autoplay-policy-safe (the context
     // stays suspended until the first pointer/key gesture in browsers) and
@@ -1635,6 +1675,11 @@ export class ClientApp {
     if (this.lastFrameAt === null) this.lastFrameAt = timestamp;
     const dt = clamp((timestamp - this.lastFrameAt) / 1000, 0, 0.25);
     this.lastFrameAt = timestamp;
+
+    // Spec 33 Phase 2: advance the touch deck's damped-spring thumb and the
+    // exponential flick coast BEFORE the physics step, so the deltas emitted
+    // by coast land in this frame's `stepEntities()` poll.
+    this.touchInput?.update(dt * 1000);
 
     // Gamepad hotkey edges run before the physics step so an X-press mounts
     // this frame rather than the next (stepEntities → sampleInput refreshes
@@ -1741,6 +1786,18 @@ export class ClientApp {
       this.world.getEngine().resize();
     } catch {
       /* headless engines have nothing to resize */
+    }
+    // Spec 33 Phase 2: keep the touch deck's zone maths glued to the live
+    // viewport (rotation / URL-bar collapse change innerWidth/Height).
+    const win = (globalThis as {
+      window?: { innerWidth?: number; innerHeight?: number };
+    }).window;
+    if (
+      this.touchInput !== null &&
+      typeof win?.innerWidth === 'number' &&
+      typeof win.innerHeight === 'number'
+    ) {
+      this.touchInput.setViewport(win.innerWidth, win.innerHeight);
     }
   }
 
@@ -1950,6 +2007,10 @@ export class ClientApp {
     this.stop();
     this.detachDomInput();
     this.detachGamepadHotplug();
+    // Spec 33 Phase 2: tear the touch deck down (listeners + glass visuals).
+    this.touchInput?.dispose();
+    this.touchInput = null;
+    this.lastTouchState = null;
 
     for (const remote of this.remotes.values()) remote.entity.dispose();
     this.remotes.clear();
@@ -2553,6 +2614,18 @@ export class ClientApp {
       reverse: false,
     };
 
+    // Spec 33 Phase 2 §2.2: merge the touch deck's analog movement demand on
+    // top of the keyboard base (the gamepad stages downstream read
+    // `frame.forward/strafe/sprint`, so a touch gesture flows through the
+    // same shaping). `lastTouchState` is the once-per-frame stash taken by
+    // `pumpTouchInput()` — sampleInput() itself never consumes.
+    const touch = this.lastTouchState;
+    if (touch !== null && touch.isActive) {
+      frame.forward = clamp(frame.forward + touch.forward, -1, 1);
+      frame.strafe = clamp(frame.strafe + touch.strafe, -1, 1);
+      if (touch.sprint) frame.sprint = true;
+    }
+
     // Poll the pad unconditionally so `pumpGamepadActions()` always has this
     // frame's button snapshot; while the trade terminal is parked the analog
     // axes sleep with the page keys (B still closes via the edge pump).
@@ -2720,6 +2793,90 @@ export class ClientApp {
       (pad.buttons[GAMEPAD_BUTTONS.trade]?.pressed ?? false) ||
       (pad.buttons[GAMEPAD_BUTTONS.sprintLeft]?.pressed ?? false);
     return frame;
+  }
+
+  // -- spec 33 mobile touch deck ---------------------------------------------------
+
+  /**
+   * Spec 33 Phase 2 §2.2 — mount the mobile touch deck. An injected
+   * {@link ClientAppOptions.touchInput} instance wins (headless harness);
+   * `null` disables the deck entirely; `undefined` auto-builds one ONLY on a
+   * touch-capable browser (`ontouchstart` / `maxTouchPoints`), so desktop and
+   * NullEngine runs never allocate or attach it. The viewport is seeded from
+   * `window.innerWidth/Height` (refreshed by {@link resize}).
+   */
+  private initTouchDeck(): void {
+    const injected = this.options.touchInput;
+    if (injected === null) return;
+    if (injected !== undefined) {
+      this.touchInput = injected;
+    } else {
+      const win = (globalThis as {
+        window?: {
+          addEventListener?: unknown;
+          innerWidth?: number;
+          innerHeight?: number;
+          ontouchstart?: unknown;
+        };
+      }).window;
+      if (win === undefined || typeof win.addEventListener !== 'function') return;
+      const nav = (globalThis as { navigator?: { maxTouchPoints?: number } }).navigator;
+      const touchCapable =
+        win.ontouchstart !== undefined || (nav?.maxTouchPoints ?? 0) > 0;
+      if (!touchCapable) return;
+      this.touchInput = new TouchInputController({
+        viewportWidth: win.innerWidth ?? 1280,
+        viewportHeight: win.innerHeight ?? 800,
+      });
+    }
+    const win = (globalThis as {
+      window?: { innerWidth?: number; innerHeight?: number };
+    }).window;
+    if (
+      this.options.touchInput !== undefined &&
+      typeof win?.innerWidth === 'number' &&
+      typeof win.innerHeight === 'number'
+    ) {
+      this.touchInput.setViewport(win.innerWidth, win.innerHeight);
+    }
+    this.touchInput.attach();
+  }
+
+  /**
+   * Spec 33 Phase 2: the once-per-physics-frame touch poll. Stashes the
+   * movement/sprint state for `sampleInput()` and the look radians for
+   * {@link applyTouchLookDeltas}. Safe to call with no deck (clears stash).
+   */
+  private pumpTouchInput(): void {
+    if (this.touchInput === null) {
+      this.lastTouchState = null;
+      this.touchLookYawRad = 0;
+      this.touchLookPitchRad = 0;
+      return;
+    }
+    const state = this.touchInput.poll();
+    this.lastTouchState = state;
+    this.touchLookYawRad = state.yawDelta;
+    this.touchLookPitchRad = state.pitchDelta;
+  }
+
+  /**
+   * Spec 33 Phase 2 §2.2.3: rotate the ridden EVA suit by the accumulated
+   * free-look trackpad radians (yaw → heading, pitch → look attitude with the
+   * TraversalPhysics ±1.2 rad clamp). Consumes the pending radians; a no-op
+   * on a quiet frame.
+   */
+  private applyTouchLookDeltas(suit: EvaSuitAvatar): void {
+    const yawRad = this.touchLookYawRad;
+    const pitchRad = this.touchLookPitchRad;
+    this.touchLookYawRad = 0;
+    this.touchLookPitchRad = 0;
+    if (yawRad === 0 && pitchRad === 0) return;
+    const s = suit.getState();
+    const patch: { heading?: number; pitch?: number } = {};
+    if (yawRad !== 0) patch.heading = wrapSignedAngle(s.heading + yawRad);
+    if (pitchRad !== 0) patch.pitch = clamp(s.pitch + pitchRad, -1.2, 1.2);
+    suit.setState(patch);
   }
 
   /**
@@ -3606,6 +3763,10 @@ export class ClientApp {
   // -- render internals -----------------------------------------------------------------
 
   private stepEntities(dt: number): void {
+    // Spec 33 Phase 2: take this frame's single touch poll BEFORE sampling —
+    // `poll()` consumes the look accumulators, and `sampleInput()` reads the
+    // stashed movement state (keeping it idempotent for the harnesses).
+    this.pumpTouchInput();
     const frame = this.sampleInput();
     // Spec 17 Phase 2 anti-jerk filter: one exponential approach per frame on
     // the shaped trigger demands (rate-limited slew, never a step). Advanced
@@ -3637,6 +3798,11 @@ export class ClientApp {
         parkBrake: handbrake,
       };
       buggy.update(dt, input);
+      // Spec 33 Phase 2: free-look deltas are consumed-but-dropped while
+      // driving — the chase camera is locked to chassis heading, and Spec 25
+      // §2.2.3 forbids bleeding camera yaw into the steering rack.
+      this.touchLookYawRad = 0;
+      this.touchLookPitchRad = 0;
       if (buggy.getState().rolled) buggy.getPhysics().right();
       this.pumpHaptics(dt, buggy);
     } else {
@@ -3670,6 +3836,11 @@ export class ClientApp {
         rcsUp: frame.jump && !latched ? 0.5 : 0,
       };
       suit.update(dt, input);
+      // Spec 33 Phase 2 §2.2.3: apply this frame's free-look trackpad deltas
+      // (drag + flick coast) to the suit's heading / look pitch after the
+      // physics step, mirroring the ±1.2 rad attitude clamp TraversalPhysics
+      // uses for RCS pointing.
+      this.applyTouchLookDeltas(suit);
       // Spec 32 §2.2: mirror the latch onto the rig (self-clearing every
       // frame — grounded or released rolls deactivate immediately).
       suit.setAcrobaticRoll(acrobaticRoll);
