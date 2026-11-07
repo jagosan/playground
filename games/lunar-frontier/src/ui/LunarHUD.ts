@@ -103,6 +103,37 @@ export function isHudMode(value: unknown): value is HUDMode {
   return value === 'standard' || value === 'minimal' || value === 'hidden';
 }
 
+/* --------------------------------------------------------------------------
+ * Spec 33 §2.4 Phase 4 — responsive mobile breakpoint.
+ *
+ * Below this viewport width the compass tape collapses to 50 vw, life
+ * support aggregates into the O₂ / Power / Speed pill, and the trade /
+ * map modals switch to touch-scroll sheets with ≥ 44 px tap targets.
+ * `hud.css` mirrors {@link HUD_MOBILE_MEDIA_QUERY} verbatim in its
+ * `@media` blocks; this class is the JS-visible state hook (harness
+ * assertions, prompt re-glyphing, future phases) that `setMobileCompact`
+ * toggles on `#lunar-hud` and `#lunar-hud-trade`.
+ * ----------------------------------------------------------------------- */
+
+/** Viewport width (px) at/under which the compact mobile HUD layout applies. */
+export const HUD_MOBILE_BREAKPOINT_PX = 960;
+
+/** Media query string mirrored 1:1 by the Phase 4 blocks in `hud.css`. */
+export const HUD_MOBILE_MEDIA_QUERY = `(max-width: ${HUD_MOBILE_BREAKPOINT_PX}px)`;
+
+/** Class added to the HUD roots while the compact layout is active. */
+export const HUD_MOBILE_COMPACT_CLASS = 'hud-mobile-compact';
+
+/** Duck-typed `window.matchMedia()` result (headless Node has neither). */
+interface MediaQueryListish {
+  matches: boolean;
+  addEventListener?(type: string, listener: (event: { matches: boolean }) => void): void;
+  removeEventListener?(type: string, listener: (event: { matches: boolean }) => void): void;
+  /** Legacy Safari/Safari-13 change binding. */
+  addListener?(listener: (event: { matches: boolean }) => void): void;
+  removeListener?(listener: (event: { matches: boolean }) => void): void;
+}
+
 /** Safe localStorage read — undefined on absent / throwing / bad value. */
 function readStoredHudMode(): HUDMode | undefined {
   try {
@@ -954,6 +985,16 @@ export class LunarHUD {
    * the prompt strip (and the key-sheet legend) when it flips.
    */
   private inputSource: HudInputSource = 'keyboard';
+  /**
+   * Spec 33 §2.4 Phase 4 — compact mobile layout state. Driven by the
+   * `HUD_MOBILE_MEDIA_QUERY` listener when `window.matchMedia` exists
+   * (browsers) and by {@link setMobileCompact} directly (headless
+   * harnesses); toggles {@link HUD_MOBILE_COMPACT_CLASS} on both roots.
+   */
+  private mobileCompact = false;
+  /** Live matchMedia binding (null in headless Node / after dispose). */
+  private mobileMediaQuery: MediaQueryListish | null = null;
+  private mobileMediaHandler: ((event: { matches: boolean }) => void) | null = null;
   /** Last prompts handed to `setPrompts` (re-rendered on source flip). */
   private lastPrompts: readonly HudPrompt[] = [];
   /** The key-sheet whisper under the prompts (source-dependent text). */
@@ -1054,6 +1095,10 @@ export class LunarHUD {
     this.buildMapOverlay();
     this.buildTradeTerminal(options.commodities ?? HUD_DEFAULT_COMMODITIES);
 
+    // Spec 33 §2.4 Phase 4: bind the ≤960px responsive breakpoint (no-op in
+    // headless Node, where there is no `window.matchMedia`).
+    this.attachMobileBreakpoint();
+
     // Escape closes the terminal even if ClientApp's own listener is absent.
     if (typeof doc.addEventListener === 'function') {
       doc.addEventListener('keydown', (event) => {
@@ -1090,6 +1135,7 @@ export class LunarHUD {
       clearTimeout(this.landmarkTimer);
       this.landmarkTimer = null;
     }
+    this.detachMobileBreakpoint();
     this.clearCommsTimers();
     this.lastIntroTelemetry = null;
     this.lastHeistTelemetry = null;
@@ -1506,6 +1552,79 @@ export class LunarHUD {
   /** Currently-active input source for the prompt glyphs. */
   getInputSource(): HudInputSource {
     return this.inputSource;
+  }
+
+  /**
+   * Spec 33 §2.4 Phase 4 — drive the compact mobile layout. Toggles
+   * `HUD_MOBILE_COMPACT_CLASS` on `#lunar-hud` and `#lunar-hud-trade`
+   * (the `hud.css` ≤960px `@media` blocks carry the actual styling; this
+   * class is the observable state hook for harnesses and JS affordances).
+   * Idempotent for repeats of the same value.
+   */
+  setMobileCompact(active: boolean): void {
+    if (this.disposed) return;
+    if (this.mobileCompact === active) return;
+    this.mobileCompact = active;
+    const roots = [this.root, this.tradeRoot];
+    for (const el of roots) {
+      if (active) el.classList.add(HUD_MOBILE_COMPACT_CLASS);
+      else el.classList.remove(HUD_MOBILE_COMPACT_CLASS);
+    }
+  }
+
+  /** Whether the compact mobile HUD layout is currently flagged. */
+  isMobileCompact(): boolean {
+    return this.mobileCompact;
+  }
+
+  /**
+   * Bind `HUD_MOBILE_MEDIA_QUERY` to `setMobileCompact` via
+   * `window.matchMedia` (modern listeners first, legacy `addListener`
+   * fallback for older Safari). Silently inert headless: no `window`
+   * or no `matchMedia` leaves the flag at its default (false).
+   */
+  private attachMobileBreakpoint(): void {
+    const win = (globalThis as {
+      window?: { matchMedia?: (query: string) => MediaQueryListish };
+    }).window;
+    if (win === undefined || typeof win.matchMedia !== 'function') return;
+    let mql: MediaQueryListish;
+    try {
+      mql = win.matchMedia(HUD_MOBILE_MEDIA_QUERY);
+    } catch {
+      return;
+    }
+    this.mobileMediaQuery = mql;
+    const handler = (event: { matches: boolean }): void => {
+      this.setMobileCompact(event !== null && typeof event === 'object' ? event.matches : mql.matches);
+    };
+    this.mobileMediaHandler = handler;
+    if (typeof mql.addEventListener === 'function') {
+      mql.addEventListener('change', handler);
+    } else if (typeof mql.addListener === 'function') {
+      mql.addListener(handler);
+    }
+    // Paint the initial state so a phone refresh never flashes the desktop HUD.
+    this.setMobileCompact(mql.matches);
+  }
+
+  /** Detach the matchMedia binding (called from `dispose`). Idempotent. */
+  private detachMobileBreakpoint(): void {
+    const mql = this.mobileMediaQuery;
+    const handler = this.mobileMediaHandler;
+    if (mql !== null && handler !== null) {
+      try {
+        if (typeof mql.removeEventListener === 'function') {
+          mql.removeEventListener('change', handler);
+        } else if (typeof mql.removeListener === 'function') {
+          mql.removeListener(handler);
+        }
+      } catch {
+        /* headless mock or already-detached media list — teardown is best-effort */
+      }
+    }
+    this.mobileMediaQuery = null;
+    this.mobileMediaHandler = null;
   }
 
   /**

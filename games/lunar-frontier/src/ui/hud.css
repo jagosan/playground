@@ -24,6 +24,22 @@
   --lf-bad: #ff5d5c;
   --lf-radius: 14px;
   --lf-mono: ui-monospace, "SFMono-Regular", "JetBrains Mono", Menlo, Consolas, monospace;
+
+  /* --- Spec 33 §2.4 Phase 4 — safe-area inset tokens ---------------------
+     Raw env() values (0px wherever there is no hardware cutout) compose
+     into every fixed HUD anchor below, so desktop layouts never shift and
+     Dynamic Island / notch / camera hole-punch / iOS home-indicator
+     hardware pushes telemetry inward instead of over it (pitfall #52). */
+  --lf-safe-top: env(safe-area-inset-top, 0px);
+  --lf-safe-right: env(safe-area-inset-right, 0px);
+  --lf-safe-bottom: env(safe-area-inset-bottom, 0px);
+  --lf-safe-left: env(safe-area-inset-left, 0px);
+  /* Edge-chrome floor clamps (blueprint 33 §2.3): the outermost overlay
+     padding never reads thinner than 8/12 px, notch or no notch. */
+  --safe-top: max(8px, var(--lf-safe-top));
+  --safe-right: max(12px, var(--lf-safe-right));
+  --safe-bottom: max(8px, var(--lf-safe-bottom));
+  --safe-left: max(12px, var(--lf-safe-left));
 }
 
 /* --- overlay root --------------------------------------------------------- */
@@ -39,6 +55,11 @@
   letter-spacing: 0.02em;
   text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9);
   user-select: none;
+  /* Spec 33 §2.4.1: root-edge floor padding so no in-flow HUD content can
+     ever hug a physical screen edge (absolutely-positioned cards compose
+     env() into their own top/left/right/bottom anchors instead). */
+  padding: var(--safe-top) var(--safe-right) var(--safe-bottom) var(--safe-left);
+  box-sizing: border-box;
 }
 
 #lunar-hud.is-hidden {
@@ -60,11 +81,15 @@
   box-shadow: 0 10px 40px rgba(0, 0, 0, 0.45);
 }
 
-/* --- placement ------------------------------------------------------------ */
+/* --- placement ------------------------------------------------------------
+   Spec 33 §2.4.1: every edge anchor composes its resting offset with the
+   raw env(safe-area-inset-*) token so notched hardware displaces the card
+   instead of occluding it. `left: auto` + right-edge math is mirrored in
+   the ≤960px mobile block below. */
 
 #lunar-hud-status {
-  top: 16px;
-  left: 16px;
+  top: calc(16px + var(--lf-safe-top));
+  left: calc(16px + var(--lf-safe-left));
   display: flex;
   gap: 18px;
   align-items: baseline;
@@ -72,25 +97,25 @@
 }
 
 #lunar-hud-life {
-  top: 72px;
-  left: 16px;
+  top: calc(72px + var(--lf-safe-top));
+  left: calc(16px + var(--lf-safe-left));
   width: 232px;
 }
 
 #lunar-hud-buggy {
-  bottom: 96px;
-  right: 16px;
+  bottom: calc(96px + var(--lf-safe-bottom));
+  right: calc(16px + var(--lf-safe-right));
   width: 264px;
 }
 
 #lunar-hud-scanner {
-  bottom: 96px;
-  left: 16px;
+  bottom: calc(96px + var(--lf-safe-bottom));
+  left: calc(16px + var(--lf-safe-left));
   width: 268px;
 }
 
 #lunar-hud-prompts {
-  bottom: 22px;
+  bottom: calc(22px + var(--lf-safe-bottom));
   left: 50%;
   transform: translateX(-50%);
   display: flex;
@@ -108,7 +133,7 @@
 /* --- compass band (spec 14 §3.4) -------------------------------------------------- */
 
 #lunar-hud-compass {
-  top: 16px;
+  top: calc(16px + var(--lf-safe-top));
   left: 50%;
   transform: translateX(-50%);
   width: min(440px, 62vw);
@@ -261,8 +286,8 @@
 /* --- onboarding checklist (spec 14 §3.5) ------------------------------------------- */
 
 #lunar-hud-tutorial {
-  top: 72px;
-  right: 16px;
+  top: calc(72px + var(--lf-safe-top));
+  right: calc(16px + var(--lf-safe-right));
   width: 268px;
 }
 
@@ -446,7 +471,8 @@
 
 #lunar-hud-toast {
   position: absolute;
-  top: 84px;
+  /* Safe-area law: clear the notch/Dynamic Island band before centering. */
+  top: calc(84px + var(--lf-safe-top));
   left: 50%;
   transform: translateX(-50%);
   max-width: min(720px, 86vw);
@@ -661,8 +687,11 @@
   transform: translate(-50%, -50%);
   z-index: 40;
   width: min(680px, 92vw);
-  max-height: 84vh;
+  max-height: min(84vh, calc(100vh - var(--lf-safe-top) - var(--lf-safe-bottom)));
   overflow-y: auto;
+  /* Spec 33 §2.4.2: momentum touch-scrolling on iOS Safari / Android Chrome. */
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
   pointer-events: auto;
   color: var(--lf-text);
   font-family: var(--lf-mono);
@@ -672,7 +701,8 @@
   -webkit-backdrop-filter: blur(22px) saturate(140%);
   border: 1px solid var(--lf-rule);
   border-radius: 18px;
-  padding: 18px 20px 22px;
+  /* Bottom padding grows with the iOS home-indicator strip. */
+  padding: 18px 20px calc(22px + var(--lf-safe-bottom));
   box-shadow: 0 30px 90px rgba(0, 0, 0, 0.65);
 }
 
@@ -867,8 +897,8 @@
 /* --- proving grounds lap timing (Spec 17 Phase 4) -------------------------- */
 
 #lunar-hud-lap {
-  top: 288px;
-  right: 16px;
+  top: calc(288px + var(--lf-safe-top));
+  right: calc(16px + var(--lf-safe-right));
   width: 232px;
 }
 
@@ -910,7 +940,7 @@
 
 #lunar-hud-comms {
   top: 34%;
-  left: 16px;
+  left: calc(16px + var(--lf-safe-left));
   width: 320px;
   overflow: hidden;
   background: linear-gradient(
@@ -1186,6 +1216,14 @@
   display: flex;
   align-items: center;
   justify-content: center;
+  /* Spec 33 §2.4.2: keep the console frame inside the viewport on small
+     screens; scroll (with touch momentum) when it cannot fit. */
+  padding: calc(16px + var(--lf-safe-top)) calc(16px + var(--lf-safe-right))
+    calc(16px + var(--lf-safe-bottom)) calc(16px + var(--lf-safe-left));
+  box-sizing: border-box;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
   background: radial-gradient(ellipse at 50% 42%, rgba(6, 26, 34, 0.78), rgba(3, 8, 12, 0.93));
   backdrop-filter: blur(10px) saturate(140%);
   -webkit-backdrop-filter: blur(10px) saturate(140%);
@@ -1341,8 +1379,8 @@
 /* --- audio mixer (Spec 25 §2.5) ------------------------------------------------- */
 
 #lunar-hud-audio {
-  top: 386px;
-  left: 16px;
+  top: calc(386px + var(--lf-safe-top));
+  left: calc(16px + var(--lf-safe-left));
   width: 232px;
   /* The one telemetry card that takes pointer input (faders + mute). */
   pointer-events: auto;
@@ -1442,7 +1480,7 @@
    ========================================================================== */
 
 #lunar-hud-heist {
-  top: 96px;
+  top: calc(96px + var(--lf-safe-top));
   left: 50%;
   transform: translateX(-50%);
   width: 340px;
@@ -1757,8 +1795,8 @@
    ========================================================================== */
 
 #lunar-hud-gunner {
-  top: 96px;
-  right: 18px;
+  top: calc(96px + var(--lf-safe-top));
+  right: calc(18px + var(--lf-safe-right));
   width: 320px;
   display: flex;
   flex-direction: column;
@@ -2129,7 +2167,7 @@
    ========================================================================== */
 
 #lunar-hud-climb {
-  right: 16px;
+  right: calc(16px + var(--lf-safe-right));
   top: 50%;
   transform: translateY(-50%);
   width: 208px;
@@ -2198,7 +2236,7 @@
 /* --- comms landmark banner ------------------------------------------------ */
 
 #lunar-hud-landmark {
-  top: 118px;
+  top: calc(118px + var(--lf-safe-top));
   left: 50%;
   transform: translateX(-50%);
   display: flex;
@@ -2285,8 +2323,8 @@
 /* --- mode-switch toast (Spec 30 §2.3.3: upper-right, 1.5 s auto-fade) -------- */
 #lunar-hud-mode-toast {
   position: fixed;
-  top: 20px;
-  right: 20px;
+  top: calc(20px + var(--lf-safe-top));
+  right: calc(20px + var(--lf-safe-right));
   z-index: 40;
   max-width: min(420px, 60vw);
   padding: 9px 20px;
@@ -2507,15 +2545,15 @@
     inset 0 0 18px rgba(86, 224, 255, 0.22);
 }
 
-/* Safe-area law (pitfall #52): the dynamic origin already lives inside the
-   35 vh / 42 vw quadrant, but clamp the deck away from rounded corners and
-   the iOS home-indicator strip when the thumb hugs the physical edge. */
-@supports (inset: env(safe-area-inset-bottom)) {
-  .lf-touch-stick-base,
-  .lf-touch-stick-nub {
-    margin-bottom: 0; /* origin math handles placement; hook kept for Phase 4 tuning */
-  }
-}
+/* Safe-area law (pitfall #52), RESOLVED in Phase 4: the stick deck is
+   transform/coordinate-placed by the controller at the live contact point
+   inside the 35 vh / 42 vw anchor quadrant, so CSS edge clamps cannot see
+   its position — and need not: the deck is purely decorative feedback
+   (`pointer-events: none`), while every tappable control that must clear
+   the home-indicator strip (the action cluster below) composes
+   env(safe-area-inset-*) directly into its right/bottom anchors. The
+   controller additionally keeps floating stick origins ≥ the inset band
+   via its zone bounds, so the thumb never rests on the iOS swipe bar. */
 
 /* ==========================================================================
    Spec 33 Phase 3 §2.2.4 — mobile action button cluster (right thumb zone).
@@ -2704,4 +2742,261 @@
   color: #ffcc55;
   border-color: rgba(255, 204, 85, 0.55);
   background: rgba(255, 204, 85, 0.10);
+}
+
+/* ==========================================================================
+   Spec 33 §2.4 Phase 4 — responsive mobile layout (≤ 960 px).
+
+   `LunarHUD` mirrors this breakpoint with `HUD_MOBILE_MEDIA_QUERY` and
+   toggles `.hud-mobile-compact` on `#lunar-hud` / `#lunar-hud-trade`
+   (state hook for harnesses and JS-driven affordances; the media query
+   itself carries the styling). Landscape phones (e.g. 844 × 390) get the
+   tightest pass: 50 vw compass tape, an aggregated O₂ / Power / Speed
+   telemetry pill in the top-right safe corner, wrap-friendly toasts, and
+   modal sheets sized 92 vw × 88 vh with ≥ 48 px trade rows and ≥ 44 px
+   stepper / buy / sell hit targets (iOS HIG + Material tap-target law).
+
+   Placement in the cascade is deliberate: this block comes AFTER the
+   legacy handheld `@media (max-width: 900px)` rules, so its overrides
+   (POI pin readouts, compass width) win at every phone width.
+   ========================================================================== */
+
+@media (max-width: 960px) {
+  #lunar-hud {
+    font-size: 12px;
+  }
+
+  /* --- compact compass tape: 50 vw, condensed degrees, pins first -------- */
+  #lunar-hud-compass {
+    width: 50vw;
+    padding: 6px 10px 12px;
+  }
+  .compass-readout {
+    font-size: 14px;
+    letter-spacing: 0.08em;
+  }
+  .compass-tape {
+    height: 24px;
+  }
+  .compass-tick-label {
+    font-size: 9px;
+    letter-spacing: 0.06em;
+  }
+  /* Collapse extraneous degree typography: only cardinals keep labels,
+     intercardinals stay as tick marks so the tape still reads at a glance. */
+  .compass-tick:not([data-deg="0"]):not([data-deg="90"]):not([data-deg="180"]):not([data-deg="270"]) .compass-tick-label {
+    display: none;
+  }
+  #lunar-hud-compass-caret {
+    top: 24px;
+  }
+  /* Active waypoint pins / POI chevrons are the primary navigation
+     affordance on phones — keep their readouts (overriding the legacy
+     900 px hide) but trim them so three pins can share a 50 vw tape. */
+  .compass-pin {
+    bottom: -20px;
+    gap: 4px;
+    padding: 2px 7px;
+    font-size: 10px;
+  }
+  .compass-pin-readout {
+    display: inline;
+    max-width: 16vw;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  /* --- life support → unified O₂ / Power / Speed pill (top-right) -------- */
+  #lunar-hud-life {
+    top: calc(8px + var(--lf-safe-top));
+    right: calc(8px + var(--lf-safe-right));
+    left: auto;
+    width: auto;
+    max-width: 46vw;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 2px 16px;
+    padding: 6px 16px;
+    border-radius: 999px;
+  }
+  /* Chrome + secondary readouts fold away; O₂, SUIT BAT, RCS, EVA SPD and
+     their micro-gauges stay live inside the pill. */
+  #lunar-hud-life .hud-heading,
+  #lunar-hud-life .hud-lamp,
+  #lunar-hud-life #lunar-hud-suit-cargo,
+  #lunar-hud-life #lunar-hud-altitude,
+  #lunar-hud-life #lunar-hud-contact {
+    display: none;
+  }
+  #lunar-hud-life #lunar-hud-suit-cargo + .hud-bar {
+    display: none;
+  }
+  #lunar-hud-life .hud-field {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 6px;
+    margin: 0;
+  }
+  #lunar-hud-life .hud-field-label {
+    font-size: 9px;
+    letter-spacing: 0.12em;
+  }
+  #lunar-hud-life .hud-field-value {
+    font-size: 12px;
+  }
+  /* Micro-gauges: short hairline rails that fit the pill height snugly. */
+  #lunar-hud-life .hud-bar {
+    width: 54px;
+    height: 4px;
+    margin: 0;
+  }
+  #lunar-hud-life .hud-alarm {
+    margin: 0;
+    font-size: 10px;
+  }
+
+  /* Status strip: slim so the compass keeps the top-centre lane clean. */
+  #lunar-hud-status {
+    padding: 6px 10px;
+    gap: 12px;
+    font-size: 11px;
+  }
+
+  /* --- toasts & prompts: scaled type, wrap, cluster clearance ------------ */
+  #lunar-hud-toast {
+    top: calc(64px + var(--lf-safe-top));
+    max-width: 92vw;
+    padding: 8px 18px;
+    font-size: 12px;
+    white-space: normal;
+  }
+  #lunar-hud-mode-toast {
+    max-width: 70vw;
+    font-size: 12px;
+  }
+  /* Prompt strip caps at 56 vw — centred, it clears both the floating
+     stick quadrant (≤ 42 vw left) and the right-thumb action cluster. */
+  #lunar-hud-prompts {
+    max-width: min(56vw, 520px);
+    font-size: 11px;
+  }
+  .hud-prompt {
+    padding: 3px 10px;
+  }
+  .hud-key {
+    font-size: 10px;
+  }
+  .hud-legend {
+    font-size: 9px;
+  }
+
+  /* --- touch-friendly modal sheets --------------------------------------- */
+  #lunar-hud-trade {
+    width: 92vw;
+    max-height: 88vh;
+    padding: 16px 14px calc(16px + var(--lf-safe-bottom));
+  }
+  /* Commodity rows ≥ 48 px tall (iOS HIG / Material tap-target law). */
+  .trade-row {
+    min-height: 48px;
+    padding: 8px 10px;
+  }
+  .trade-close {
+    min-width: 44px;
+    min-height: 44px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 16px;
+    touch-action: manipulation;
+  }
+  .trade-input {
+    min-height: 44px;
+    font-size: 15px; /* ≥ 16 px would zoom-trigger; 15 + wide box stays quiet */
+  }
+  #lunar-hud-trade-amount {
+    width: 96px;
+  }
+  /* Stepper + buy/sell buttons: 44 × 44 px minimum hit targets. */
+  .trade-button {
+    min-width: 44px;
+    min-height: 44px;
+    padding: 10px 18px;
+    font-size: 13px;
+    touch-action: manipulation;
+  }
+  .trade-form {
+    gap: 12px;
+  }
+
+  /* Topographic map console: constrained, scrollable, thumb-sized buttons. */
+  .hud-map-frame {
+    max-width: 92vw;
+    max-height: 88vh;
+    padding: 12px 12px 8px;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  #lunar-map-canvas {
+    width: min(512px, 58vmin);
+    height: min(512px, 58vmin);
+  }
+  .hud-map-close {
+    min-width: 64px;
+    min-height: 44px;
+    touch-action: manipulation;
+  }
+  .lunar-hud-map-button {
+    min-height: 44px;
+    touch-action: manipulation;
+  }
+
+  /* Audio mixer settings card: pulled into the left thumb column so it
+     never hangs off the bottom of a 390 px-tall landscape viewport. */
+  #lunar-hud-audio {
+    top: calc(72px + var(--lf-safe-top));
+    width: 210px;
+  }
+  .audio-mute-button {
+    min-width: 44px;
+    min-height: 44px;
+    touch-action: manipulation;
+  }
+}
+
+/* Landscape-specific refinements: with the vertical budget crushed to
+   ~380–430 px, lift the prompt strip clear of both thumb zones and keep
+   the telemetry pill a single tight row. */
+@media (max-width: 960px) and (orientation: landscape) {
+  #lunar-hud-life {
+    flex-wrap: nowrap;
+    gap: 2px 14px;
+    padding: 4px 14px;
+  }
+  #lunar-hud-life .hud-bar {
+    width: 44px;
+  }
+  #lunar-hud-prompts {
+    bottom: calc(24vh + var(--lf-safe-bottom));
+  }
+  #lunar-hud-toast {
+    top: calc(52px + var(--lf-safe-top));
+  }
+  /* Secondary left-column cards fold under the tighter layout; the scanner
+     and buggy dash stay, lifted above the floating stick quadrant. */
+  #lunar-hud-scanner {
+    bottom: calc(35vh + var(--lf-safe-bottom));
+    width: min(268px, 34vw);
+  }
+  #lunar-hud-buggy {
+    right: calc(120px + var(--lf-safe-right));
+    bottom: calc(4px + var(--lf-safe-bottom));
+    width: min(264px, 32vw);
+  }
+  #lunar-hud-tutorial {
+    width: min(268px, 30vw);
+    font-size: 11px;
+  }
 }
