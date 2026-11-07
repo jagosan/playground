@@ -2545,6 +2545,71 @@
     inset 0 0 18px rgba(86, 224, 255, 0.22);
 }
 
+/* ==========================================================================
+   Spec 34 §2.1 Phase 2 — floating dynamic RIGHT look stick (twin-stick).
+
+   `TouchInputController` spawns `.lf-touch-look-base` / `.lf-touch-look-nub`
+   at the dynamic look anchor (x̄_look, ȳ_look) inside the right look zone
+   (X ≥ 45 vw, Y ≥ 20 vh). Geometry mirrors the left stick 1:1 — 108 px ring
+   (R_max 54 px), 44 px thumb, `pointer-events: none` pure feedback, z-index
+   25 — with an amber accent on the rim/nub glow so the twin sticks read as
+   distinct hands at a glance (cyan = move, amber = look). The damped-spring
+   return (k = 260, c = 20) transform is driven by the controller; hidden
+   state rides the same `.is-hidden` class law as the left stick.
+   ========================================================================== */
+
+.lf-touch-look-base,
+.lf-touch-look-nub {
+  position: fixed;
+  z-index: 25;
+  border-radius: 50%;
+  pointer-events: none;
+  user-select: none;
+  will-change: transform;
+  transition: opacity 120ms ease-out;
+}
+
+/* Glassmorphic look ring: smoked-glass disc, hairline amber rule over the
+   cyan inner bloom — same bezel language as the movement stick. */
+.lf-touch-look-base {
+  width: 108px;
+  height: 108px;
+  border: 2px solid rgba(255, 204, 85, 0.38);
+  background:
+    radial-gradient(circle at 50% 45%, rgba(255, 204, 85, 0.09), rgba(10, 16, 24, 0.30) 72%);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  box-shadow:
+    0 0 18px rgba(255, 204, 85, 0.15),
+    inset 0 0 14px rgba(86, 224, 255, 0.10);
+}
+
+/* Glowing amber-cyan look nub: tracks the deflection with the damped-spring
+   return (transform set by the controller) and snaps to a stop the instant
+   the thumb lifts — the glow itself never lags the camera. */
+.lf-touch-look-nub {
+  width: 44px;
+  height: 44px;
+  background:
+    radial-gradient(circle at 38% 35%,
+      rgba(255, 244, 224, 0.95) 0%,
+      #ffcc55 55%,
+      rgba(178, 118, 20, 0.92) 100%);
+  box-shadow:
+    0 0 14px rgba(255, 204, 85, 0.85),
+    0 0 42px rgba(255, 204, 85, 0.32),
+    inset 0 -3px 6px rgba(60, 34, 0, 0.45);
+}
+
+/* Hidden state (headless harnesses toggle the class directly; browsers get
+   it from the controller on release-settled / deck-disabled frames). */
+.lf-touch-look-base.is-hidden,
+.lf-touch-look-nub.is-hidden {
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 160ms ease-out, visibility 0s linear 160ms;
+}
+
 /* Safe-area law (pitfall #52), RESOLVED in Phase 4: the stick deck is
    transform/coordinate-placed by the controller at the live contact point
    inside the 35 vh / 42 vw anchor quadrant, so CSS edge clamps cannot see

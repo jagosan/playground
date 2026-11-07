@@ -10,8 +10,10 @@
  *      orientation-guard CSS, audio-unlock banner markup (static analysis).
  *   B. Touch input kinematics — floating stick origin, 8 px deadzone, 54 px
  *      rim clamp, normalized [−1,1] output, 300 ms / double-flick sprint
- *      latches, differential yaw/pitch look scaling, exponential flick coast
- *      (τ = 120 ms), damped-spring thumb return, button isolation.
+ *      latches, the Spec 34 §2.1 floating right look stick (continuous
+ *      angular velocity ω = û·r_norm·Ω_max, deadzone, rim clamp, instant
+ *      zero on release — NO flick coast), damped-spring thumb return,
+ *      button isolation.
  *   C. MobileSettings — DPR clamp maths per profile, hardware scaling pins,
  *      frame gates, UA sniff, profile/haptics localStorage persistence.
  *   D. TactileHaptics — footfall / RCS / mining / collision pulse patterns,
@@ -27,9 +29,9 @@
  *      audio-unlock banner + once-only gesture → audio.resume() wiring.
  *
  * Synthetic touch events carry an EXPLICIT `time` clock (the wall clock
- * barely advances between back-to-back injections, which would explode the
- * flick-velocity estimator), and every injection is followed by at least one
- * `app.update(t)` before sampling.
+ * barely advances between back-to-back injections, so gesture timing gates
+ * must run on the scripted clock), and every injection is followed by at
+ * least one `app.update(t)` before sampling.
  */
 import assert from 'node:assert';
 import { existsSync, readFileSync } from 'node:fs';
@@ -48,9 +50,12 @@ import {
   ACTION_BUTTON_MIN_PX,
   CONTEXT_BUTTON_PX,
   JUMP_BUTTON_PX,
+  LOOK_PITCH_MAX_RAD_PER_S,
+  LOOK_STICK_DEAD_RADIUS_PX,
+  LOOK_STICK_MAX_RADIUS_PX,
+  LOOK_YAW_MAX_RAD_PER_S,
+  LOOK_ZONE_MIN_Y_RATIO,
   ROLL_BUTTON_PX,
-  TOUCH_LOOK_PITCH_RAD_PER_PX,
-  TOUCH_LOOK_YAW_RAD_PER_PX,
   TOUCH_ACTION_IDS,
   touchButtonDomId,
   TouchInputController,
@@ -322,7 +327,9 @@ section('B1. zone routing + floating dynamic origin');
   const c = makeController();
   check('bottom-left quadrant claims the movement stick', c.isInStickZone(300, 500));
   check('stick quadrant EXCLUDES the right look half', !c.isInStickZone(700, 300));
-  check('right half claims the free-look trackpad', c.isInLookZone(700, 300));
+  check('right half claims the floating look stick', c.isInLookZone(700, 300));
+  check(`look zone EXCLUDES the top strip above ${LOOK_ZONE_MIN_Y_RATIO * 100} vh`,
+    !c.isInLookZone(700, 100) && c.isInLookZone(700, 800 * LOOK_ZONE_MIN_Y_RATIO));
   // x=550 sits in the dead band between 42 vw (537.6) and 45 vw (576).
   check('dead band between quadrants claims neither deck',
     !c.isInStickZone(550, 400) && !c.isInLookZone(550, 400));
@@ -396,71 +403,121 @@ section('B3. sprint latches (300 ms hold + outward double-flick)');
   check('lift clears sprint + stick', d.peek().sprint === false && d.getStickGeometry().active === false);
 }
 
-section('B4. free-look trackpad — differential yaw/pitch scaling');
+section('B4. right look stick — continuous angular-velocity law (Spec 34 §2.1)');
 {
   const c = makeController();
   c.handleTouchStart(tev(1, 700, 300, 1));
-  c.handleTouchMove(tev(1, 800, 350, 17)); // right 100 px, DOWN 50 px
-  const s = c.peek();
-  check(`rightward drag scales by ${TOUCH_LOOK_YAW_RAD_PER_PX} rad/px`, near(s.yawDelta, 100 * TOUCH_LOOK_YAW_RAD_PER_PX, 1e-12));
-  check(`downward drag INVERTS pitch (${TOUCH_LOOK_PITCH_RAD_PER_PX} rad/px)`,
-    near(s.pitchDelta, -50 * TOUCH_LOOK_PITCH_RAD_PER_PX, 1e-12));
+  const g0 = c.getLookGeometry();
+  check('look anchor floats EXACTLY to first contact',
+    g0.active === true && g0.originX === 700 && g0.originY === 300);
+  check('fresh grab is dead still', g0.omegaYaw === 0 && g0.omegaPitch === 0);
+
+  // Deadzone: deflection inside 8 px emits exactly nothing.
+  c.handleTouchMove(tev(1, 703, 304, 5)); // r = 5.0 px < 8 px deadzone
+  let g = c.getLookGeometry();
+  check(`deadzone: ω exactly zero inside ${LOOK_STICK_DEAD_RADIUS_PX} px`,
+    g.omegaYaw === 0 && g.omegaPitch === 0 && g.radiusNorm === 0);
+  c.update(16);
+  let s = c.poll();
+  check('deadzone emits ZERO radians per frame', s.yawDelta === 0 && s.pitchDelta === 0);
+
+  // Full right deflection: ω_yaw = +Ω_max, ω_pitch = 0; Δθ = ω·Δt.
+  c.handleTouchMove(tev(1, 754, 300, 21)); // r = 54 px rim, due right
+  g = c.getLookGeometry();
+  check(`full right deflection (r = R_max ${LOOK_STICK_MAX_RADIUS_PX} px): ω_yaw = ${LOOK_YAW_MAX_RAD_PER_S} rad/s, ω_pitch = 0`,
+    near(g.omegaYaw, LOOK_YAW_MAX_RAD_PER_S, 1e-12) && near(g.omegaPitch, 0, 1e-12));
+  check('rim clamp: raw radius 120 px still normalizes to 1.0', (() => {
+    c.handleTouchMove(tev(1, 820, 300, 23));
+    const gg = c.getLookGeometry();
+    return gg.radiusPx === 120 && near(gg.radiusNorm, 1, 1e-12) &&
+      near(gg.omegaYaw, LOOK_YAW_MAX_RAD_PER_S, 1e-12);
+  })());
+  c.handleTouchMove(tev(1, 754, 300, 25)); // back on the rim
+  c.update(16);
+  s = c.poll();
+  check('frame integrates Δθ_yaw = ω·Δt (2.4 rad/s × 16 ms)',
+    near(s.yawDelta, LOOK_YAW_MAX_RAD_PER_S * 0.016, 1e-12));
+  c.update(16);
+  s = c.poll();
+  check('held deflection emits CONTINUOUS constant velocity every frame',
+    near(s.yawDelta, LOOK_YAW_MAX_RAD_PER_S * 0.016, 1e-12));
+
+  // Proportional scaling + pitch inversion: 31 px UP → r_norm 0.5,
+  // ω_pitch = +0.9 rad/s (dragging UP looks UP).
+  c.handleTouchMove(tev(1, 700, 269, 37));
+  g = c.getLookGeometry();
+  check('half deflection scales ω proportionally (r_norm 0.5 → 0.9 rad/s pitch up)',
+    near(g.radiusNorm, 0.5, 1e-12) && near(g.omegaYaw, 0, 1e-12) &&
+      near(g.omegaPitch, 0.5 * LOOK_PITCH_MAX_RAD_PER_S, 1e-12),
+    `norm=${g.radiusNorm} ωy=${g.omegaYaw} ωp=${g.omegaPitch}`);
+  c.update(16);
+  s = c.poll();
+  check('upward deflection integrates POSITIVE pitch delta', s.pitchDelta > 0);
+
+  // peek/poll semantics on the integrated accumulator.
+  c.handleTouchMove(tev(1, 754, 300, 53)); // full right again
+  c.update(16);
   const peeked = c.peek();
-  check('peek() is non-consuming', near(peeked.yawDelta, s.yawDelta, 1e-12));
+  check('peek() is non-consuming',
+    near(peeked.yawDelta, LOOK_YAW_MAX_RAD_PER_S * 0.016, 1e-12) &&
+      near(c.peek().yawDelta, peeked.yawDelta, 1e-12));
   const consumed = c.poll();
-  check('poll() hands out the accumulated radians', near(consumed.yawDelta, s.yawDelta, 1e-12));
+  check('poll() hands out the accumulated radians',
+    near(consumed.yawDelta, peeked.yawDelta, 1e-12));
   const next = c.poll();
   check('poll() zeroes the accumulator', next.yawDelta === 0 && next.pitchDelta === 0);
-  c.handleTouchEnd(tev(1, 800, 350, 25));
+  c.handleTouchEnd(tev(1, 754, 300, 69));
 }
 
-section('B5. release-flick inertial coast (exponential decay, τ = 120 ms)');
+section('B5. release stop — angular velocity zeroes instantly, NO coast (Spec 34 §2.1)');
 {
   const c = makeController();
   c.handleTouchStart(tev(1, 700, 300, 1));
-  c.handleTouchMove(tev(1, 760, 300, 17)); // 3.75 px/ms → way over the 0.4 flick gate
-  c.poll(); // drain the drag delta; only coast should remain
-  c.handleTouchEnd(tev(1, 760, 300, 17));
-  check('fast flick release keeps the deck alive on coast alone',
-    c.isActive() === true && c.hasFingerDown() === false);
-
+  c.handleTouchMove(tev(1, 760, 300, 17)); // full right deflection spinning
   c.update(16);
-  const d1 = c.poll().yawDelta;
+  const spinning = c.poll().yawDelta;
+  c.handleTouchEnd(tev(1, 760, 300, 18));
+  const g = c.getLookGeometry();
+  check('ω drops to EXACTLY zero on touchend (both axes)',
+    spinning > 0 && g.omegaYaw === 0 && g.omegaPitch === 0);
   c.update(16);
-  const d2 = c.poll().yawDelta;
-  const expectedRatio = Math.exp(-16 / 120);
-  check('coast emits positive yaw each frame and decays exponentially (ratio ≈ e^−16/120)',
-    d1 > 0 && d2 > 0 && Math.abs(d2 / d1 - expectedRatio) < 0.05,
-    `d1=${d1} d2=${d2} ratio=${d2 / d1} expected≈${expectedRatio}`);
+  let s = c.poll();
+  check('frame right after release emits ZERO radians (no flick coast)',
+    s.yawDelta === 0 && s.pitchDelta === 0);
 
-  let frames = 0;
-  while (frames < 200 && c.isActive()) {
+  // Pump a full second after the lift: not one micro-radian of drift.
+  let drift = 0;
+  for (let frames = 0; frames < 60; frames++) {
     c.update(16);
-    c.poll();
-    frames++;
+    const d = c.poll();
+    drift += Math.abs(d.yawDelta) + Math.abs(d.pitchDelta);
   }
-  check(`coast dies out to exactly zero (${frames} frames)`, c.isActive() === false && c.poll().yawDelta === 0);
+  check('60 post-release frames drift NOTHING', drift === 0);
+  check('deck deactivates once the look nub spring settles', c.isActive() === false);
 
-  // Slow drag never arms the coast.
+  // Neutral (deadzone) release goes inactive immediately — no spring seed.
   const d = makeController();
   d.handleTouchStart(tev(2, 700, 300, 1));
-  d.handleTouchMove(tev(2, 705, 300, 51)); // 100 px/s < 0.4 px/ms gate
-  d.handleTouchEnd(tev(2, 705, 300, 51));
-  d.poll();
-  d.update(16);
-  check('sub-threshold drag release coasts NOTHING', d.poll().yawDelta === 0 && d.isActive() === false);
+  d.handleTouchEnd(tev(2, 700, 300, 9));
+  check('neutral look release deactivates instantly with zero delta',
+    d.isActive() === false && d.poll().yawDelta === 0);
 
-  // A fresh grab kills an in-flight coast mid-flight.
+  // A second finger can re-grab the look stick while the first nub settles.
   const e = makeController();
   e.handleTouchStart(tev(3, 700, 300, 1));
   e.handleTouchMove(tev(3, 760, 300, 17));
+  e.update(16);
   e.poll();
-  e.handleTouchEnd(tev(3, 760, 300, 17));
+  e.handleTouchEnd(tev(3, 760, 300, 33));
+  e.handleTouchStart(tev(4, 900, 500, 49)); // fresh anchor mid-settle
+  const g2 = e.getLookGeometry();
+  check('fresh look re-grab re-anchors at the NEW contact point',
+    g2.active === true && g2.originX === 900 && g2.originY === 500);
+  e.handleTouchMove(tev(4, 954, 500, 65));
   e.update(16);
-  const mid = e.poll().yawDelta;
-  e.handleTouchStart(tev(4, 700, 300, 40));
-  e.update(16);
-  check('new look grab cancels the running coast', mid > 0 && e.poll().yawDelta === 0);
+  check('re-grabbed stick spins again from zero (no inherited state)',
+    near(e.poll().yawDelta, LOOK_YAW_MAX_RAD_PER_S * 0.016, 1e-12));
+  e.handleTouchEnd(tev(4, 954, 500, 81));
 }
 
 section('B6. damped-spring thumb return on release');

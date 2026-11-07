@@ -1286,7 +1286,8 @@ export class ClientApp {
 
   /**
    * Spec 33 Phase 2 §2.2 — mobile touch deck (floating left virtual stick +
-   * free-look right trackpad). Null when disabled or on non-touch devices.
+   * floating dynamic right look stick). Null when disabled or on non-touch
+   * devices.
    */
   private touchInput: TouchInputController | null = null;
 
@@ -1298,7 +1299,7 @@ export class ClientApp {
    */
   private lastTouchState: TouchInputState | null = null;
 
-  /** Spec 33 Phase 2: unconsumed camera look radians from the touch trackpad. */
+  /** Spec 33 Phase 2: unconsumed camera look radians from the touch deck. */
   private touchLookYawRad = 0;
   private touchLookPitchRad = 0;
 
@@ -1741,9 +1742,10 @@ export class ClientApp {
     const dt = clamp((timestamp - this.lastFrameAt) / 1000, 0, 0.25);
     this.lastFrameAt = timestamp;
 
-    // Spec 33 Phase 2: advance the touch deck's damped-spring thumb and the
-    // exponential flick coast BEFORE the physics step, so the deltas emitted
-    // by coast land in this frame's `stepEntities()` poll.
+    // Spec 33 Phase 2 / Spec 34 Phase 2: advance the touch deck's damped-
+    // spring thumbs and integrate the right look stick's continuous angular
+    // velocity (ω·Δt) BEFORE the physics step, so the deltas emitted land in
+    // this frame's `stepEntities()` poll.
     this.touchInput?.update(dt * 1000);
 
     // Gamepad hotkey edges run before the physics step so an X-press mounts
@@ -3065,8 +3067,8 @@ export class ClientApp {
     this.touchLookPitchRad = state.pitchDelta;
 
     // Tri-state arbiter (§2.3): a REAL finger down on the deck claims the
-    // glyph domain for touch. Passive afterglow (flick coast, thumb spring
-    // settling) deliberately does NOT re-claim — otherwise a coast from the
+    // glyph domain for touch. Passive afterglow (thumb spring settling)
+    // deliberately does NOT re-claim — otherwise settling from
     // last screen swipe would keep stealing the source back from a
     // Bluetooth pad for a second after release. Fresh presses arrive via
     // `hasFingerDown()` plus the synchronous `onTouchActivity` callback;
@@ -3221,10 +3223,12 @@ export class ClientApp {
   }
 
   /**
-   * Spec 33 Phase 2 §2.2.3: rotate the ridden EVA suit by the accumulated
-   * free-look trackpad radians (yaw → heading, pitch → look attitude with the
-   * TraversalPhysics ±1.2 rad clamp). Consumes the pending radians; a no-op
-   * on a quiet frame.
+   * Spec 33 Phase 2 §2.2.3 / Spec 34 §2.1: rotate the ridden EVA suit by
+   * the radians integrated this frame from the floating right look stick's
+   * continuous angular velocity (yaw → heading, pitch → look attitude with
+   * the TraversalPhysics ±1.2 rad clamp). Consumes the pending radians; a
+   * no-op on a quiet frame — and, since the stick's ω drops to exactly zero
+   * on finger release, never a drift after the lift.
    */
   private applyTouchLookDeltas(suit: EvaSuitAvatar): void {
     const yawRad = this.touchLookYawRad;
@@ -4199,10 +4203,10 @@ export class ClientApp {
         rcsUp: frame.jump && !latched ? 0.5 : 0,
       };
       suit.update(dt, input);
-      // Spec 33 Phase 2 §2.2.3: apply this frame's free-look trackpad deltas
-      // (drag + flick coast) to the suit's heading / look pitch after the
-      // physics step, mirroring the ±1.2 rad attitude clamp TraversalPhysics
-      // uses for RCS pointing.
+      // Spec 33 Phase 2 §2.2.3 / Spec 34 §2.1: apply this frame's look-stick
+      // deltas (ω·Δt integrated by the deck pump) to the suit's heading /
+      // look pitch after the physics step, mirroring the ±1.2 rad attitude
+      // clamp TraversalPhysics uses for RCS pointing.
       this.applyTouchLookDeltas(suit);
       // Spec 32 §2.2: mirror the latch onto the rig (self-clearing every
       // frame — grounded or released rolls deactivate immediately).

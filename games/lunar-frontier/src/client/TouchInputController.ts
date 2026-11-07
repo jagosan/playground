@@ -15,11 +15,17 @@
  *     outward double-flick, and releases when the thumb returns to centre or
  *     lifts.
  *
- *   • FREE-LOOK RIGHT trackpad. Active zone is the right half of the viewport
- *     (X ≥ 45 % of width). Differential drag translates into camera yaw /
- *     pitch deltas (0.0035 / 0.0028 rad per pixel, pitch inverted), and a
- *     release flick faster than {@link FLICK_MIN_SPEED_PX_PER_MS} coasts with
- *     exponential decay (τ ≈ 120 ms) for cinematic camera glide.
+ *   • Floating dynamic RIGHT LOOK STICK (Spec 34 §2.1, twin-stick
+ *     architecture). Active zone is the right half of the viewport
+ *     (X ≥ 45 % of width, Y ≥ 20 % of height), excluding action-button hit
+ *     rects. The origin (x̄_look, ȳ_look) anchors to the initial
+ *     `touchstart` inside the zone; deflection is dead-zoned at
+ *     {@link LOOK_STICK_DEAD_RADIUS_PX} and clamped at
+ *     {@link LOOK_STICK_MAX_RADIUS_PX}, producing CONTINUOUS angular
+ *     velocities ω_yaw = û_x·r_norm·2.4 rad/s and
+ *     ω_pitch = −û_y·r_norm·1.8 rad/s which the per-frame pump integrates
+ *     into yaw/pitch deltas (Δθ = ω·Δt). On `touchend` the angular
+ *     velocities drop to EXACTLY zero — no residual flick coast or drift.
  *
  *   • Glassmorphic DOM feedback: a translucent outer ring
  *     (`.lf-touch-stick-base`) and a glowing cyan thumb (`.lf-touch-stick-nub`)
@@ -63,18 +69,24 @@
 export const STICK_ZONE_MAX_X_RATIO = 0.42;
 /** Left stick anchor zone: Y ≥ this fraction of viewport height. */
 export const STICK_ZONE_MIN_Y_RATIO = 0.35;
-/** Right free-look trackpad zone: X ≥ this fraction of viewport width. */
+/** Right free-look look-stick zone: X ≥ this fraction of viewport width. */
 export const LOOK_ZONE_MIN_X_RATIO = 0.45;
+/** Spec 34 §2.1: right look-stick zone: Y ≥ this fraction of viewport height. */
+export const LOOK_ZONE_MIN_Y_RATIO = 0.2;
 
 /** Stick deflection inside this radius (px) reads exactly (0, 0). */
 export const STICK_DEAD_RADIUS_PX = 8;
 /** Stick deflection beyond this radius (px) clamps to the rim. */
 export const STICK_MAX_RADIUS_PX = 54;
 
-/** Yaw sensitivity of the free-look trackpad (rad per horizontal px). */
-export const TOUCH_LOOK_YAW_RAD_PER_PX = 0.0035;
-/** Pitch sensitivity of the free-look trackpad (rad per vertical px, inverted). */
-export const TOUCH_LOOK_PITCH_RAD_PER_PX = 0.0028;
+/** Right look-stick inner deadzone radius (px) — spec 34 §2.1 mirrors the left. */
+export const LOOK_STICK_DEAD_RADIUS_PX = 8;
+/** Right look-stick max deflection clamp radius (px) — spec 34 §2.1. */
+export const LOOK_STICK_MAX_RADIUS_PX = 54;
+/** Full-deflection yaw angular velocity Ω_max,yaw (rad/s, spec 34 §2.1). */
+export const LOOK_YAW_MAX_RAD_PER_S = 2.4;
+/** Full-deflection pitch angular velocity Ω_max,pitch (rad/s, spec 34 §2.1). */
+export const LOOK_PITCH_MAX_RAD_PER_S = 1.8;
 
 /** r_norm at/above which the sprint timer / outward-flick counter arms. */
 export const SPRINT_NORM_THRESHOLD = 0.9;
@@ -90,13 +102,6 @@ export const SPRINT_DOUBLE_FLICK_WINDOW_MS = 400;
 export const SPRINT_FLICK_NORM_JUMP = 0.5;
 /** r_norm below which a latched sprint releases (thumb back to centre). */
 export const SPRINT_RELEASE_NORM = 0.3;
-
-/** Release flick speed (px/ms, vector magnitude) required for camera coast. */
-export const FLICK_MIN_SPEED_PX_PER_MS = 0.4;
-/** Inertial flick decay time constant (ms). */
-export const FLICK_DECAY_TAU_MS = 120;
-/** Flick velocity is estimated over this trailing window (ms). */
-export const FLICK_SAMPLE_WINDOW_MS = 120;
 
 /** Damped-spring visual return: stiffness (1/s²) and damping (1/s). */
 export const STICK_SPRING_STIFFNESS = 260;
@@ -206,7 +211,7 @@ export interface TouchInputState {
   yawDelta: number;
   /** Camera pitch delta (rad) accumulated since the previous poll. */
   pitchDelta: number;
-  /** Any finger down, coast coasting, or spring still settling. */
+  /** Any finger down, or a thumb spring still settling home. */
   isActive: boolean;
   /**
    * Spec 33 §2.2.4: `[JUMP / RCS BOOST]` button held (raw live latch — the
@@ -259,12 +264,6 @@ interface LooseDomEl {
   appendChild?: (child: unknown) => unknown;
 }
 
-interface FlickSample {
-  x: number;
-  y: number;
-  t: number;
-}
-
 // ---------------------------------------------------------------------------
 
 function clamp(v: number, lo: number, hi: number): number {
@@ -314,17 +313,23 @@ export class TouchInputController {
   /** Damped-spring visual state (thumb offset relative to origin). */
   private readonly spring: Spring2D = { x: 0, y: 0, vx: 0, vy: 0 };
 
-  // -- right look trackpad -----------------------------------------------------
-  /** Touch identifier driving the trackpad, or null when released. */
+  // -- right look stick (Spec 34 §2.1 twin-stick) --------------------------------
+  /** Touch identifier driving the look stick, or null when released. */
   private lookTouchId: number | null = null;
-  private lookLastX = 0;
-  private lookLastY = 0;
-  private lookLastT = 0;
-  /** Trailing position/time samples for release-flick velocity estimation. */
-  private readonly lookSamples: FlickSample[] = [];
-  /** Coast velocity (rad per ms) after a fast flick release, both axes. */
-  private coastYawRadPerMs = 0;
-  private coastPitchRadPerMs = 0;
+  /** Floating origin (x̄_look, ȳ_look) captured on the look stick's `touchstart`. */
+  private lookOriginX = 0;
+  private lookOriginY = 0;
+  /** Current look-thumb coordinates (viewport px). */
+  private lookX = 0;
+  private lookY = 0;
+  /** Live deflection geometry recomputed on every move. */
+  private lookRawRadius = 0;
+  private lookNorm = 0;
+  /** Continuous angular velocities (rad/s) from the Spec 34 §2.1 law. */
+  private lookOmegaYawRadPerS = 0;
+  private lookOmegaPitchRadPerS = 0;
+  /** Damped-spring visual state (look-thumb offset relative to origin). */
+  private readonly lookSpring: Spring2D = { x: 0, y: 0, vx: 0, vy: 0 };
 
   // -- accumulated look deltas (consumed by poll()) ---------------------------
   private accYawRad = 0;
@@ -357,6 +362,9 @@ export class TouchInputController {
   // -- DOM visuals --------------------------------------------------------------
   private baseEl: { style: { [k: string]: string }; className: string } | null = null;
   private nubEl: { style: { [k: string]: string }; className: string } | null = null;
+  /** Spec 34 §2.1 right look-stick ring / nub (`.lf-touch-look-*`). */
+  private lookBaseEl: { style: { [k: string]: string }; className: string } | null = null;
+  private lookNubEl: { style: { [k: string]: string }; className: string } | null = null;
   /** `#lf-touch-actions` cluster container + contextual-button handles. */
   private clusterEl: LooseDomEl | null = null;
   private contextBtnEl: LooseDomEl | null = null;
@@ -453,11 +461,15 @@ export class TouchInputController {
   /** Zero every gesture/latch/coast/accumulator state (visuals hidden). */
   reset(): void {
     this.releaseStick(this.now());
-    this.releaseLook(this.now(), false);
+    this.releaseLook();
     this.spring.x = 0;
     this.spring.y = 0;
     this.spring.vx = 0;
     this.spring.vy = 0;
+    this.lookSpring.x = 0;
+    this.lookSpring.y = 0;
+    this.lookSpring.vx = 0;
+    this.lookSpring.vy = 0;
     this.accYawRad = 0;
     this.accPitchRad = 0;
     this.lastFlickAtMs = Number.NEGATIVE_INFINITY;
@@ -509,15 +521,17 @@ export class TouchInputController {
         this.showStickVisuals(touch.clientX, touch.clientY);
         handled = true;
       } else if (this.lookTouchId === null && this.isInLookZone(touch.clientX, touch.clientY)) {
+        // Spec 34 §2.1: floating dynamic RIGHT look stick — the anchor
+        // (x̄_look, ȳ_look) snaps exactly to the initial contact point and
+        // the angular-velocity law reads deflection RELATIVE to that anchor.
         this.lookTouchId = touch.identifier;
-        this.lookLastX = touch.clientX;
-        this.lookLastY = touch.clientY;
-        this.lookLastT = t;
-        this.lookSamples.length = 0;
-        this.lookSamples.push({ x: touch.clientX, y: touch.clientY, t });
-        // A fresh look grab kills any in-flight camera coast.
-        this.coastYawRadPerMs = 0;
-        this.coastPitchRadPerMs = 0;
+        this.lookOriginX = touch.clientX;
+        this.lookOriginY = touch.clientY;
+        this.lookX = touch.clientX;
+        this.lookY = touch.clientY;
+        // Fresh grab starts dead still: no inherited velocity.
+        this.updateLookVelocity();
+        this.showLookVisuals(touch.clientX, touch.clientY);
         handled = true;
       }
     }
@@ -540,16 +554,12 @@ export class TouchInputController {
         this.updateStickDeflection(t);
         handled = true;
       } else if (this.lookTouchId !== null && touch.identifier === this.lookTouchId) {
-        const dx = touch.clientX - this.lookLastX;
-        const dy = touch.clientY - this.lookLastY;
-        // Differential drag → yaw/pitch deltas (Spec 33 §2.2.3). Pitch is
-        // inverted: dragging DOWN looks DOWN (screen y grows downward).
-        this.accYawRad += dx * TOUCH_LOOK_YAW_RAD_PER_PX;
-        this.accPitchRad += -dy * TOUCH_LOOK_PITCH_RAD_PER_PX;
-        this.lookLastX = touch.clientX;
-        this.lookLastY = touch.clientY;
-        this.lookLastT = t;
-        this.pushLookSample(touch.clientX, touch.clientY, t);
+        // Spec 34 §2.1: the look stick is POSITIONAL — thumb coordinates
+        // update, the continuous angular-velocity law recomputes, and the
+        // per-frame update() integrates ω into this frame's deltas.
+        this.lookX = touch.clientX;
+        this.lookY = touch.clientY;
+        this.updateLookVelocity();
         handled = true;
       } else if (this.buttonTouchIds.has(touch.identifier)) {
         // Cluster finger: swallow the move (hold stays latched until the
@@ -578,7 +588,8 @@ export class TouchInputController {
         this.hideStickVisuals();
         handled = true;
       } else if (this.lookTouchId !== null && touch.identifier === this.lookTouchId) {
-        this.releaseLook(t, true);
+        this.releaseLook();
+        this.hideLookVisuals();
         handled = true;
       }
     }
@@ -593,9 +604,11 @@ export class TouchInputController {
   // -- per-frame pump --------------------------------------------------------------
 
   /**
-   * Advance the damped-spring thumb return and the exponential flick coast.
-   * Call once per rendered frame (ClientApp feeds `dt * 1000`). Idempotent
-   * across zero-dt calls; dt clamped to [0, 100] ms for tab-switch safety.
+   * Advance the two damped-spring thumb returns and integrate the Spec 34
+   * §2.1 continuous angular velocity into this frame's look deltas
+   * (Δθ = ω·Δt). Call once per rendered frame (ClientApp feeds `dt * 1000`).
+   * Idempotent across zero-dt calls; dt clamped to [0, 100] ms for
+   * tab-switch safety.
    */
   update(dtMs: number): void {
     const dt = clamp(dtMs, 0, 100);
@@ -614,22 +627,30 @@ export class TouchInputController {
       this.spring.y += this.spring.vy * dtS;
     }
 
-    // Exponential flick coast (Spec 33 §2.2.3): velocity decays with
-    // τ = 120 ms; every frame emits its share into the accumulator poll()
-    // consumes, so the camera glides to a smooth stop.
-    if (dtS > 0 && this.hasCoast()) {
-      this.accYawRad += this.coastYawRadPerMs * dt;
-      this.accPitchRad += this.coastPitchRadPerMs * dt;
-      const decay = Math.exp(-dt / FLICK_DECAY_TAU_MS);
-      this.coastYawRadPerMs *= decay;
-      this.coastPitchRadPerMs *= decay;
-      if (Math.hypot(this.coastYawRadPerMs, this.coastPitchRadPerMs) < 1e-6) {
-        this.coastYawRadPerMs = 0;
-        this.coastPitchRadPerMs = 0;
-      }
+    // Spec 34 §2.1 continuous look law: while the right stick is deflected
+    // the camera rotates at a CONSTANT angular velocity; every frame emits
+    // its share ω·Δt into the accumulator poll() consumes. ω is exactly
+    // zero inside the deadzone and drops to zero the instant the finger
+    // lifts — no residual coast or drift.
+    if (dtS > 0 && (this.lookOmegaYawRadPerS !== 0 || this.lookOmegaPitchRadPerS !== 0)) {
+      this.accYawRad += this.lookOmegaYawRadPerS * dtS;
+      this.accPitchRad += this.lookOmegaPitchRadPerS * dtS;
+    }
+
+    // Look-thumb damped spring (mirrors the left stick, k = 260, c = 20).
+    const lookTargetX = this.lookTouchId !== null ? this.lookX - this.lookOriginX : 0;
+    const lookTargetY = this.lookTouchId !== null ? this.lookY - this.lookOriginY : 0;
+    if (dtS > 0) {
+      this.lookSpring.vx += (-STICK_SPRING_STIFFNESS * (this.lookSpring.x - lookTargetX) -
+        STICK_SPRING_DAMPING * this.lookSpring.vx) * dtS;
+      this.lookSpring.vy += (-STICK_SPRING_STIFFNESS * (this.lookSpring.y - lookTargetY) -
+        STICK_SPRING_DAMPING * this.lookSpring.vy) * dtS;
+      this.lookSpring.x += this.lookSpring.vx * dtS;
+      this.lookSpring.y += this.lookSpring.vy * dtS;
     }
 
     this.syncVisuals();
+    this.syncLookVisuals();
   }
 
   // -- output -----------------------------------------------------------------------
@@ -637,8 +658,8 @@ export class TouchInputController {
   /**
    * Consume this frame's normalized state (Spec 33 §2.2): movement + sprint
    * come from the live stick pose; `yawDelta` / `pitchDelta` are the look
-   * radians accumulated since the PREVIOUS poll (including flick coast) and
-   * are zeroed by this call.
+   * radians accumulated since the PREVIOUS poll (Spec 34 §2.1 ω·Δt
+   * integration) and are zeroed by this call.
    */
   poll(): TouchInputState {
     const state: TouchInputState = {
@@ -670,16 +691,17 @@ export class TouchInputController {
     };
   }
 
-  /** True while any finger owns a deck, coast runs, or the spring settles. */
+  /** True while any finger owns a deck surface or a spring still settles. */
   isActive(): boolean {
     return (
       this.stickTouchId !== null ||
       this.lookTouchId !== null ||
       this.buttonTouchIds.size > 0 ||
       this.anyActionHeld() ||
-      this.hasCoast() ||
       Math.abs(this.spring.x) + Math.abs(this.spring.y) > 0.05 ||
-      Math.abs(this.spring.vx) + Math.abs(this.spring.vy) > 0.05
+      Math.abs(this.spring.vx) + Math.abs(this.spring.vy) > 0.05 ||
+      Math.abs(this.lookSpring.x) + Math.abs(this.lookSpring.y) > 0.05 ||
+      Math.abs(this.lookSpring.vx) + Math.abs(this.lookSpring.vy) > 0.05
     );
   }
 
@@ -703,6 +725,31 @@ export class TouchInputController {
       strafe: this.stickStrafe,
       forward: this.stickForward,
       sprint: this.sprintLatched,
+    };
+  }
+
+  /**
+   * Raw right look-stick geometry (diagnostics / Spec 34 §2.1 smoke gates).
+   * `omegaYaw` / `omegaPitch` are the LIVE continuous angular velocities
+   * (rad/s) the per-frame pump integrates into the poll deltas.
+   */
+  getLookGeometry(): {
+    active: boolean;
+    originX: number;
+    originY: number;
+    radiusPx: number;
+    radiusNorm: number;
+    omegaYaw: number;
+    omegaPitch: number;
+  } {
+    return {
+      active: this.lookTouchId !== null,
+      originX: this.lookOriginX,
+      originY: this.lookOriginY,
+      radiusPx: this.lookRawRadius,
+      radiusNorm: this.lookNorm,
+      omegaYaw: this.lookOmegaYawRadPerS,
+      omegaPitch: this.lookOmegaPitchRadPerS,
     };
   }
 
@@ -859,9 +906,12 @@ export class TouchInputController {
     );
   }
 
-  /** Right-half free-look test (X ≥ 45 vw). */
+  /** Right-half look-stick test (X ≥ 45 vw, Y ≥ 20 vh — Spec 34 §2.1). */
   isInLookZone(x: number, y: number): boolean {
-    return x >= this.viewportWidth * LOOK_ZONE_MIN_X_RATIO;
+    return (
+      x >= this.viewportWidth * LOOK_ZONE_MIN_X_RATIO &&
+      y >= this.viewportHeight * LOOK_ZONE_MIN_Y_RATIO
+    );
   }
 
   // -- internals ------------------------------------------------------------------------
@@ -933,60 +983,65 @@ export class TouchInputController {
   }
 
   /**
-   * Look release: estimate flick velocity over the trailing
-   * {@link FLICK_SAMPLE_WINDOW_MS} window; above the threshold, arm the
-   * exponential coast.
+   * Recompute the Spec 34 §2.1 continuous angular-velocity law from the
+   * current look-thumb deflection relative to the floating anchor:
+   *
+   *   r ≤ R_dead               → ω_yaw = ω_pitch = 0 (deadzone)
+   *   r_norm = clamp((min(r, R_max) − R_dead) / (R_max − R_dead), 0, 1)
+   *   ω_yaw   =  û_x · r_norm · 2.4 rad/s
+   *   ω_pitch = −û_y · r_norm · 1.8 rad/s   (screen y grows downward, so
+   *                                            dragging UP looks UP)
    */
-  private releaseLook(nowMs: number, armCoast: boolean): void {
-    if (this.lookTouchId === null) {
-      this.coastYawRadPerMs = 0;
-      this.coastPitchRadPerMs = 0;
+  private updateLookVelocity(): void {
+    const dx = this.lookX - this.lookOriginX;
+    const dy = this.lookY - this.lookOriginY;
+    const r = Math.hypot(dx, dy);
+    this.lookRawRadius = r;
+    if (r <= LOOK_STICK_DEAD_RADIUS_PX) {
+      this.lookNorm = 0;
+      this.lookOmegaYawRadPerS = 0;
+      this.lookOmegaPitchRadPerS = 0;
       return;
     }
+    const ux = dx / r;
+    const uy = dy / r;
+    this.lookNorm = clamp(
+      (Math.min(r, LOOK_STICK_MAX_RADIUS_PX) - LOOK_STICK_DEAD_RADIUS_PX) /
+        (LOOK_STICK_MAX_RADIUS_PX - LOOK_STICK_DEAD_RADIUS_PX),
+      0,
+      1,
+    );
+    this.lookOmegaYawRadPerS = ux * this.lookNorm * LOOK_YAW_MAX_RAD_PER_S;
+    this.lookOmegaPitchRadPerS = -uy * this.lookNorm * LOOK_PITCH_MAX_RAD_PER_S;
+  }
+
+  /**
+   * Look release (Spec 34 §2.1): angular velocities drop to EXACTLY zero
+   * the instant the finger lifts — no residual flick coast or drift. The
+   * visual spring picks up exactly where the thumb lifted and damps home.
+   */
+  private releaseLook(): void {
+    this.lookOmegaYawRadPerS = 0;
+    this.lookOmegaPitchRadPerS = 0;
+    if (this.lookTouchId === null) return;
+    // Visual continuity: seed the spring from the live deflection (update()
+    // may not have run since the last move) and let it settle to centre.
+    this.lookSpring.x = clamp(
+      this.lookX - this.lookOriginX,
+      -LOOK_STICK_MAX_RADIUS_PX,
+      LOOK_STICK_MAX_RADIUS_PX,
+    );
+    this.lookSpring.y = clamp(
+      this.lookY - this.lookOriginY,
+      -LOOK_STICK_MAX_RADIUS_PX,
+      LOOK_STICK_MAX_RADIUS_PX,
+    );
+    this.lookSpring.vx = 0;
+    this.lookSpring.vy = 0;
     this.lookTouchId = null;
-    if (armCoast) {
-      const v = this.estimateFlickVelocity(nowMs);
-      if (Math.hypot(v.vx, v.vy) > FLICK_MIN_SPEED_PX_PER_MS) {
-        // px/ms → rad/ms through the per-axis sensitivities.
-        this.coastYawRadPerMs = v.vx * TOUCH_LOOK_YAW_RAD_PER_PX;
-        this.coastPitchRadPerMs = -v.vy * TOUCH_LOOK_PITCH_RAD_PER_PX;
-      } else {
-        this.coastYawRadPerMs = 0;
-        this.coastPitchRadPerMs = 0;
-      }
-    }
-    this.lookSamples.length = 0;
-  }
-
-  /** Trailing-window velocity (px/ms) from the look sample ring buffer. */
-  private estimateFlickVelocity(nowMs: number): { vx: number; vy: number } {
-    const samples = this.lookSamples;
-    if (samples.length < 2) return { vx: 0, vy: 0 };
-    const newest = samples[samples.length - 1];
-    // Oldest sample still inside the estimation window.
-    let oldest = samples[0];
-    for (let i = samples.length - 1; i >= 0; i--) {
-      if (newest.t - samples[i].t <= FLICK_SAMPLE_WINDOW_MS) oldest = samples[i];
-      else break;
-    }
-    const dt = newest.t - oldest.t;
-    if (dt <= 0) return { vx: 0, vy: 0 };
-    return { vx: (newest.x - oldest.x) / dt, vy: (newest.y - oldest.y) / dt };
-  }
-
-  private pushLookSample(x: number, y: number, t: number): void {
-    this.lookSamples.push({ x, y, t });
-    // Bounded window: drop anything older than the estimation window + slack.
-    while (
-      this.lookSamples.length > 2 &&
-      t - this.lookSamples[0].t > FLICK_SAMPLE_WINDOW_MS * 2
-    ) {
-      this.lookSamples.shift();
-    }
-  }
-
-  private hasCoast(): boolean {
-    return this.coastYawRadPerMs !== 0 || this.coastPitchRadPerMs !== 0;
+    this.lookX = this.lookOriginX;
+    this.lookY = this.lookOriginY;
+    this.updateLookVelocity();
   }
 
   // -- action button cluster internals -----------------------------------------
@@ -1061,7 +1116,11 @@ export class TouchInputController {
 
   // -- glassmorphic DOM visuals ---------------------------------------------------------
 
-  /** Lazily create `.lf-touch-stick-base` / `.lf-touch-stick-nub`. No-op headless. */
+  /**
+   * Lazily create `.lf-touch-stick-base` / `.lf-touch-stick-nub` and the
+   * Spec 34 §2.1 right look-stick pair `.lf-touch-look-base` /
+   * `.lf-touch-look-nub`. No-op headless.
+   */
   private ensureVisuals(): void {
     if (!this.visualsEnabled || this.baseEl !== null) return;
     const doc = (globalThis as { document?: Document }).document;
@@ -1070,10 +1129,18 @@ export class TouchInputController {
     base.className = 'lf-touch-stick-base is-hidden';
     const nub = doc.createElement('div');
     nub.className = 'lf-touch-stick-nub is-hidden';
+    const lookBase = doc.createElement('div');
+    lookBase.className = 'lf-touch-look-base is-hidden';
+    const lookNub = doc.createElement('div');
+    lookNub.className = 'lf-touch-look-nub is-hidden';
     doc.body.appendChild(base);
     doc.body.appendChild(nub);
+    doc.body.appendChild(lookBase);
+    doc.body.appendChild(lookNub);
     this.baseEl = base as unknown as { style: { [k: string]: string }; className: string };
     this.nubEl = nub as unknown as { style: { [k: string]: string }; className: string };
+    this.lookBaseEl = lookBase as unknown as { style: { [k: string]: string }; className: string };
+    this.lookNubEl = lookNub as unknown as { style: { [k: string]: string }; className: string };
   }
 
   private showStickVisuals(originX: number, originY: number): void {
@@ -1118,6 +1185,52 @@ export class TouchInputController {
       STICK_MAX_RADIUS_PX,
     );
     this.nubEl.style.transform = `translate(calc(-50% + ${clampedX.toFixed(2)}px), calc(-50% + ${clampedY.toFixed(2)}px))`;
+  }
+
+  /** Anchor the look-stick ring/nub at the floating origin on grab. */
+  private showLookVisuals(originX: number, originY: number): void {
+    this.ensureLookHandles();
+    if (this.lookBaseEl === null || this.lookNubEl === null) return;
+    const r = LOOK_STICK_MAX_RADIUS_PX;
+    this.lookBaseEl.style.left = `${originX - r}px`;
+    this.lookBaseEl.style.top = `${originY - r}px`;
+    this.lookNubEl.style.left = `${originX}px`;
+    this.lookNubEl.style.top = `${originY}px`;
+    this.lookBaseEl.className = 'lf-touch-look-base';
+    this.lookNubEl.className = 'lf-touch-look-nub';
+  }
+
+  private hideLookVisuals(): void {
+    if (this.lookBaseEl !== null) this.lookBaseEl.className = 'lf-touch-look-base is-hidden';
+    // The nub stays visible while the spring settles, then hides in
+    // syncLookVisuals() once it converges back on the origin.
+  }
+
+  private syncLookVisuals(): void {
+    if (this.lookNubEl === null) return;
+    if (this.lookTouchId === null && !this.isActive()) {
+      this.lookNubEl.className = 'lf-touch-look-nub is-hidden';
+    }
+    const clampedX = clamp(
+      this.lookSpring.x,
+      -LOOK_STICK_MAX_RADIUS_PX,
+      LOOK_STICK_MAX_RADIUS_PX,
+    );
+    const clampedY = clamp(
+      this.lookSpring.y,
+      -LOOK_STICK_MAX_RADIUS_PX,
+      LOOK_STICK_MAX_RADIUS_PX,
+    );
+    this.lookNubEl.style.transform = `translate(calc(-50% + ${clampedX.toFixed(2)}px), calc(-50% + ${clampedY.toFixed(2)}px))`;
+  }
+
+  /**
+   * Late-bind the look visuals when a synthetic grab arrives before
+   * `attach()` (headless harnesses with `visuals: true` on a fake DOM).
+   */
+  private ensureLookHandles(): void {
+    if (this.lookBaseEl !== null || !this.visualsEnabled) return;
+    this.ensureVisuals();
   }
 
   /**
@@ -1215,7 +1328,7 @@ export class TouchInputController {
 
   private removeVisuals(): void {
     const doc = (globalThis as { document?: Document }).document;
-    for (const el of [this.baseEl, this.nubEl]) {
+    for (const el of [this.baseEl, this.nubEl, this.lookBaseEl, this.lookNubEl]) {
       if (el === null || doc === undefined || doc === null) continue;
       try {
         doc.body.removeChild(el as unknown as Node);
@@ -1225,6 +1338,8 @@ export class TouchInputController {
     }
     this.baseEl = null;
     this.nubEl = null;
+    this.lookBaseEl = null;
+    this.lookNubEl = null;
     if (this.clusterEl !== null && doc !== undefined && doc !== null) {
       try {
         doc.body.removeChild(this.clusterEl as unknown as Node);

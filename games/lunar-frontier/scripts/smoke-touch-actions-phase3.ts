@@ -191,17 +191,22 @@ section('1c. touch isolation (buttons never leak into the look trackpad)');
   c.handleTouchEnd(tev(1, ac.x - 140, ac.y - 90));
 
   // A second finger on the open look field STILL steers the camera while a
-  // button finger is held (multi-touch co-ownership).
+  // button finger is held (multi-touch co-ownership). Spec 34 §2.1: the
+  // open field is now the floating RIGHT look stick — its ω is integrated
+  // per frame, so pump once before reading the delta.
   c.handleTouchStart(tev(2, ac.x, ac.y));
   c.handleTouchStart(tev(3, 700, 300));
   c.handleTouchMove(tev(3, 760, 300));
+  c.update(16);
   const multi = c.peek();
-  check('open-field look finger works alongside a held button', multi.yawDelta > 0);
+  check('open-field look stick works alongside a held button', multi.yawDelta > 0);
+  c.poll(); // drain the accumulator — peek() above was non-consuming
   c.handleTouchEnd(tev(2, ac.x, ac.y));
   c.handleTouchEnd(tev(3, 760, 300));
+  c.update(16);
   check(
-    'open-field release flick coasts (isActive) with no finger down (pad co-existence law)',
-    c.isActive() === true && c.hasFingerDown() === false,
+    'open-field release zeroes ω instantly (no coast; Spec 34 §2.1)',
+    c.hasFingerDown() === false && c.poll().yawDelta === 0,
   );
   c.consumeActions();
 
