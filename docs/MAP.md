@@ -29,6 +29,7 @@
 - `docs/architecture/30-lunar-frontier-eva-locomotion-stormtrooper-suit-and-ui-cleanup.md`: Stormtrooper stylized composite armor hierarchy, asymmetric unilateral "Steelpush" bounding locomotion, contact-brace compression, alternating regolith footfall dust bursts, and dedicated browser-safe [U]/[H]/R3 UI toggle controls.
 - `docs/architecture/31-lunar-frontier-steelpush-locomotion-athletic-hustle-and-hydraulic-assist.md`: High-speed Steelpush locomotion, Olympic triple-jump airborne hitch-kick & stutter step, dynamic sprint rake & thoracic counter-yaw, hydraulic assist boots & procedural Web Audio.
 - `docs/architecture/32-lunar-frontier-locomotion-acrobatics-and-wayfinding-overhaul.md`: Forward-flexing anatomical elbows, mid-air acrobatic tuck & flip cycle, PLSS compressed-air jump boost, clockwise compass tape rectification & POI nav system, and true 3D untethered rover ballistics.
+- `docs/architecture/33-lunar-frontier-mobile-touch-client-and-responsive-hud.md`: Mobile touch architecture, floating virtual dual-sticks, safe-area responsive HUD, PWA harness, high-DPI scaling & tactile haptics.
 - `docs/architecture/15-subagent-context-pruning-and-turn-budgeting.md`: Subagent context pruning, N-3 turn-budget circuit breaker, AST extraction, and Beehive Neo4j symbol discovery.
 - `specs/`:
   - `specs/00-system-overview.md`: Project vision, minigame architecture, rendering stack.
@@ -56,6 +57,7 @@
   - `specs/30-lunar-frontier-eva-locomotion-stormtrooper-suit-and-ui-cleanup.md`: EVA locomotion overhaul, Stormtrooper stylized suit aesthetics, asymmetric Mistborn Steelpush bounding dynamics & dedicated UI toggle controls.
   - `specs/31-lunar-frontier-steelpush-locomotion-athletic-hustle-and-hydraulic-assist.md`: High-speed Steelpush locomotion overhaul, Olympic triple-jump mid-air cycling & stutter step, dynamic sprint hustle & hydraulic assist boots.
   - `specs/32-lunar-frontier-locomotion-acrobatics-and-wayfinding-overhaul.md`: Locomotion acrobatics, forward elbow flexion, RCS jump boost & O2 draw, clockwise compass nav & 3D ballistic rover crater jumping.
+  - `specs/33-lunar-frontier-mobile-touch-client-and-responsive-hud.md`: Mobile touch client, floating virtual dual-sticks, responsive safe-area HUD, PWA standalone shell & tactile haptics.
 
 ## Lunar Frontier Multiplayer & Economy Subsystem (Spec 12)
 - `games/lunar-frontier/server/`: Fastify + `ws` server, SQLite schema, market pricing, 20Hz tick (`LunarServer.ts`, `Database.ts`).
@@ -67,7 +69,8 @@
 - `games/lunar-frontier/src/quests/`: High-speed train heist director, export minigame director, USP intercept threat engine (`TrainHeistDirector.ts`, `ExportMinigameDirector.ts`).
 - `games/lunar-frontier/src/network/`: WebSocket client, state delta interpolator, player manager (`NetworkClient.ts`).
 - `games/lunar-frontier/src/ui/`: Glassmorphic telemetry HUD, life support meters, commodity trade modal, hint arrow & comms terminal (`LunarHUD.ts`, `hud.css`).
-- `games/lunar-frontier/src/client/`: Interactive Babylon.js client game loop, quest engine, hint navigation, and Vite web entry (`ClientApp.ts`, `QuestEngine.ts`, `HintArrowSystem.ts`, `main.ts`).
+- `games/lunar-frontier/src/client/`: Interactive Babylon.js client game loop, quest engine, hint navigation, touch input controller, mobile settings, and Vite web entry (`ClientApp.ts`, `TouchInputController.ts`, `MobileSettings.ts`, `QuestEngine.ts`, `HintArrowSystem.ts`, `main.ts`).
+- `games/lunar-frontier/src/audio/`: Procedural Web Audio life support, motor whine, mining laser hum, climbing acoustics & tactile haptic synthesis (`LunarAudioSystem.ts`, `TactileHaptics.ts`).
 - `docs/runbooks/lunar-frontier-operations.md`: Operational runbook, controller layouts, test commands, and production build deployment.
 
 ## Blender Asset Pipeline (Spec 05)
