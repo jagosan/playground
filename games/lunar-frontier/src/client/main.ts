@@ -115,3 +115,36 @@ if (hot !== undefined && typeof hot.dispose === 'function') {
 
 const app = boot();
 (globalThis as { __lunarFrontierApp?: ClientApp }).__lunarFrontierApp = app ?? undefined;
+
+/**
+ * Spec 34 §2.3: PWA Service Worker registration.
+ *
+ * Guarded so headless/smoke environments without a real `navigator` (or with
+ * SW disabled, e.g. private-mode browsers) no-op silently. Registration itself
+ * is fire-and-forget: a failed SW never blocks the game boot.
+ */
+function registerServiceWorker(): void {
+  const nav = (globalThis as { navigator?: Navigator }).navigator;
+  if (nav == null || !('serviceWorker' in nav)) {
+    return;
+  }
+  const register = (): void => {
+    nav.serviceWorker
+      .register('./sw.js')
+      .then(() => {
+        // eslint-disable-next-line no-console
+        console.log('[pwa] Service Worker registered');
+      })
+      .catch((err: unknown) => {
+        // eslint-disable-next-line no-console
+        console.warn('[pwa] Service Worker registration failed:', err);
+      });
+  };
+  if (document.readyState === 'complete') {
+    register();
+  } else {
+    globalThis.addEventListener?.('load', register, { once: true });
+  }
+}
+
+registerServiceWorker();
