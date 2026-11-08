@@ -15,6 +15,7 @@
     "noEmit": true
   },
   "include": [
+    "src/base/SubterraneanExcavator.ts",
     "src/client/ClientApp.ts",
     "src/client/main.ts",
     "src/client/MobileSettings.ts",
