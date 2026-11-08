@@ -56,6 +56,7 @@ import {
   createTutorialQuest,
   createOperationGildedSerpentQuest,
   GILDED_SERPENT_QUEST_ID,
+  SECURE_HAUL_TO_TRADING_POST_OBJECTIVE_ID,
   DEFAULT_REACH_RADIUS_M,
   type CommsDialogue,
   type QuestCompletedPayload,
@@ -83,9 +84,12 @@ import type { OreCartEntity } from '../infrastructure/RailSystem.ts';
 import {
   TrainHeistDirector,
   HEIST_MOON_CARGO,
+  SECURE_HAUL_OBJECTIVE_KEY,
+  BUGGY_AUTOSTOP_STOP_SPEED_MPS,
   heistLootCargoKg,
   type CargoAimTelemetry,
   type HeistTelemetry,
+  type ReboardCatchResult,
 } from '../quests/TrainHeistDirector.ts';
 import {
   ExportMinigameDirector,
@@ -1160,6 +1164,17 @@ export class ClientApp {
    * together with the train (director FAILED).
    */
   private heistContrabandSecured = false;
+  /**
+   * Spec 36 Phase 4: rising-edge latch for the catwalk jump — the leap
+   * fires on the frame [SPACE] / gamepad A goes held (the suit hop physics
+   * consumes the hold itself; the arbiter never re-arms mid-press).
+   */
+  private heistJumpHeldPrev = false;
+  /**
+   * Spec 36 Phase 4: true once the pursuit-drone siren has been announced
+   * this run (edge-triggered toast; cleared on reset / stand-down).
+   */
+  private heistPursuitAnnounced = false;
   /**
    * Spec 27 §3.4 Phase 4: "The Gauss Needle" export minigame director.
    * Built on demand by {@link enableExportMinigameDirector} (Phase 1 coilgun
@@ -4275,8 +4290,27 @@ export class ClientApp {
       // Spec 29 Phase 4: after the step, the gantry railing holds the
       // climber on the deck (hatch sector excepted). Latched frames skip.
       this.clampToDeckBoundary();
+      // Spec 36 Phase 4: the catwalk jump — a rising [SPACE] / (A) edge
+      // while riding the vault car fires the moving re-boarding leap
+      // (heading toward the tracking buggy) or the Leap of Faith bailout.
+      this.stepHeistJumpEdge(frame.jump);
       // Parked buggy still settles on its suspension while abandoned.
-      this.buggy?.update(dt, { ...IDLE_BUGGY_INPUT, parkBrake: true });
+      // Spec 36 Phase 4: after a missed re-boarding the abandoned rover
+      // coasts smoothly down to a stop on the service road instead of
+      // parking on the spot.
+      const heistAutoStop = this.trainHeistDirector?.isBuggyAutoStopActive() === true;
+      if (heistAutoStop) {
+        this.buggy?.update(dt, { throttle: 0, brake: 0.35, regen: 1, steer: 0, parkBrake: false });
+        if (
+          this.buggy !== null &&
+          this.buggy.getSpeed() <= BUGGY_AUTOSTOP_STOP_SPEED_MPS
+        ) {
+          this.buggy.update(0.001, { ...IDLE_BUGGY_INPUT, parkBrake: true });
+          this.trainHeistDirector?.completeBuggyAutoStop();
+        }
+      } else {
+        this.buggy?.update(dt, { ...IDLE_BUGGY_INPUT, parkBrake: true });
+      }
       this.rumbleClockMs += dt * 1000;
     }
   }
@@ -4905,6 +4939,16 @@ export class ClientApp {
         } else if (heistCargoDirector.nearestCargoPickup() !== null) {
           prompts.push({ key: 'E', label: 'Unclamp & Pick Up Cargo', order: 2 });
         }
+        // Spec 36 Phase 4: the movie beat — leap back onto the moving
+        // cockpit, or bail clear while the depot clock burns.
+        if (heistCargoDirector.canReboardBuggy()) {
+          prompts.push({ key: 'SPACE', label: 'Leap to Buggy — Re-Board', order: 2 });
+        } else if (
+          heistCargoDirector.getPhase() === 'DEPOT_COUNTDOWN' &&
+          !heistCargoDirector.isReboardLeapActive()
+        ) {
+          prompts.push({ key: 'SPACE', label: 'Bail Out Now', order: 2 });
+        }
       }
       // Spec 21 §2.4: security terminal beside a vault bulkhead.
       if (this.nearestVaultTerminal !== null) {
@@ -5105,12 +5149,33 @@ export class ClientApp {
       roverVel = director.getBailoutExitVelocity();
     }
     const telemetry = director.update(dt, roverPos, roverVel);
+    // Spec 36 Phase 4: while the moving re-boarding leap is airborne, the
+    // catch arbiter owns the frame — feed it the live suit pose (R_board
+    // seat capture vs. regolith rollout).
+    if (director.isReboardLeapActive()) {
+      this.resolveHeistReboardCatch(director);
+    }
     // Spec 26 §3.5 Phase 5: paint the heist HUD overlay and keep the
     // intrusion klaxon in lockstep with the depot clock. STATE-driven and
     // idempotent per frame (the alarm setter de-dupes), so the LOOT_SECURED
     // → DEPOT_COUNTDOWN handoff collapsing inside one tick can never miss.
     this.hud?.updateHeistTelemetry(telemetry);
     this.audio?.setCitadelAlarmActive(telemetry.phase === 'DEPOT_COUNTDOWN');
+    // Spec 36 Phase 4: corporate pursuit drone threat once 3+ volatile
+    // canisters are siphoned — the emergency klaxon rides the alert state
+    // (idempotent per frame), the inbound toast is edge-triggered and
+    // re-arms when the drones stand down (escape complete / run reset).
+    const pursuitDronesInbound = director.isPursuitDroneAlertActive();
+    this.audio?.setUspKlaxonAlert(pursuitDronesInbound);
+    if (pursuitDronesInbound && !this.heistPursuitAnnounced) {
+      this.heistPursuitAnnounced = true;
+      this.hudFeedback(
+        'CORPORATE PURSUIT DRONES INBOUND — volatile haul tagged, warning siren',
+        'error',
+      );
+    } else if (!pursuitDronesInbound && this.heistPursuitAnnounced) {
+      this.heistPursuitAnnounced = false;
+    }
     this.syncHeistWithQuest(director, telemetry);
   }
 
@@ -5145,6 +5210,9 @@ export class ClientApp {
       // Reset (QA or failed-run retry): the next crack hands loot off again.
       this.heistLootHandedOff = false;
       this.heistContrabandSecured = false;
+      // Spec 36 Phase 4: the leap latch and drone-siren toast re-arm too.
+      this.heistJumpHeldPrev = false;
+      this.heistPursuitAnnounced = false;
     }
 
     const engine = this.questEngine;
@@ -5168,6 +5236,16 @@ export class ClientApp {
       (telemetry.phase === 'BAILOUT_SUCCESS' || telemetry.phase === 'ESCAPE_COMPLETE')
     ) {
       engine.recordHeistBailout();
+    }
+    // Spec 36 Phase 4: re-boarded or safely dismounted — the objective
+    // transitions to SECURE_HAUL_TO_TRADING_POST (the opt-in
+    // `heist_secure_haul` objective; a canonical Spec 26 quest carries no
+    // such objective and the hook answers false, state untouched).
+    if (
+      !ClientApp.questObjectiveCompleted(quest, SECURE_HAUL_TO_TRADING_POST_OBJECTIVE_ID) &&
+      (telemetry.phase === 'BAILOUT_SUCCESS' || telemetry.phase === 'ESCAPE_COMPLETE')
+    ) {
+      engine.recordHeistHaulSecured();
     }
     // Stage 6 (`heist_deliver`) closes via {@link deliverHeistContraband};
     // its `reach_target` half rides the per-frame recordPosition sensor.
@@ -5232,6 +5310,9 @@ export class ClientApp {
     const rustbelt = this.factionBases?.getBase('RUSTBELT') ?? null;
     this.heistLootHandedOff = false;
     this.heistContrabandSecured = false;
+    // Spec 36 Phase 4: fresh operation — leap latch and siren toast re-arm.
+    this.heistJumpHeldPrev = false;
+    this.heistPursuitAnnounced = false;
     return engine.startQuest(
       createOperationGildedSerpentQuest(
         rustbelt !== null
@@ -5241,8 +5322,9 @@ export class ClientApp {
                 y: rustbelt.position.y,
                 z: rustbelt.position.z,
               },
+              secureHaulObjective: true,
             }
-          : {},
+          : { secureHaulObjective: true },
       ),
     );
   }
@@ -5340,6 +5422,129 @@ export class ClientApp {
   getHeistCargoAim(): CargoAimTelemetry | null {
     if (this.disposed) return null;
     return this.trainHeistDirector?.getCargoThrowAim() ?? null;
+  }
+
+  // -- Spec 36 Phase 4: moving re-boarding leap & escape countdown ----------------
+
+  /**
+   * Catwalk jump edge pump (Spec 36 §3 Phase 4): on the rising [SPACE] /
+   * gamepad (A) frame while the avatar rides the vault car, a heading that
+   * points at the tracking buggy's seat fires the moving re-boarding leap
+   * (v_launch = v_train + v_jump·n̂_buggy, handed to the suit over its own
+   * lunar hop); any other jump during the depot countdown is the classic
+   * Leap of Faith bailout. The catch itself is resolved per frame by
+   * {@link resolveHeistReboardCatch} from the heist pump.
+   */
+  private stepHeistJumpEdge(jumpHeld: boolean): void {
+    const director = this.trainHeistDirector;
+    const held = jumpHeld === true;
+    const rising = held && !this.heistJumpHeldPrev;
+    this.heistJumpHeldPrev = held;
+    if (!rising || this.disposed || director === null) return;
+    if (!director.isPlayerOnBoard()) return;
+    const suit = this.suit;
+    if (suit === null) return;
+    // "Toward the buggy": the avatar's facing must close the bearing to
+    // the driver-seat datum rather than open it (dot of heading · d̂ > 0).
+    const seat = director.getBuggySeatDatum();
+    const p = suit.getPosition();
+    const dx = seat.x - p.x;
+    const dy = seat.y - p.y;
+    const dl = Math.hypot(dx, dy);
+    const heading = suit.getState().heading;
+    const dot = dl > 1e-6 ? (Math.cos(heading) * dx + Math.sin(heading) * dy) / dl : 1;
+    if (dot > 0 && director.canReboardBuggy()) {
+      const launch = director.executeReboardingJump();
+      if (launch !== null) {
+        // Hand the avatar the §2.3 launch velocity — the vacuum arc owns
+        // the gap from here; the arbiter books catch vs. rollout.
+        suit.setState({
+          vx: launch.launchVelocity.x,
+          vy: launch.launchVelocity.y,
+          vz: launch.launchVelocity.z,
+        });
+        this.audio?.playPneumaticLaunch();
+        this.hudFeedback('RE-BOARD — dive for the buggy cockpit', 'info');
+      }
+      return;
+    }
+    if (director.getPhase() === 'DEPOT_COUNTDOWN' && this.requestHeistBailout()) {
+      this.audio?.playPneumaticLaunch();
+      this.hudFeedback('Leap of Faith — clear the shield line!', 'info');
+    }
+  }
+
+  /**
+   * Per-frame re-boarding catch arbiter drive (Spec 36 §2.3): feeds the
+   * avatar's live world pose into the director's R_board = 2.2 m seat-catch
+   * test. On the capture frame the avatar is snapped to the driver seat,
+   * the buggy takes the player (manual steering restored, autopilot tether
+   * released by the director); on the miss frame the suit physics owns the
+   * regolith rollout and the abandoned rover coasts to a stop on the
+   * service road (deck pump). Ticked from {@link stepTrainHeistDirector}.
+   */
+  private resolveHeistReboardCatch(director: TrainHeistDirector): void {
+    const suit = this.suit;
+    if (suit === null) return;
+    const s = suit.getState();
+    const result: ReboardCatchResult | null = director.resolveReboardingCatch(
+      { x: s.x, y: s.y, z: s.z },
+      { x: s.vx, y: s.vy, z: s.vz },
+    );
+    if (result === null) return;
+    if (result.caught) {
+      this.landReboardCatch();
+      return;
+    }
+    if (director.getReboardOutcome() === 'MISSED') {
+      // One-shot miss bookkeeping; the rollout itself is the suit's
+      // lunar-gravity landing (no further steering — the leap is over).
+      this.hudFeedback('Missed the cockpit — rolled out in the regolith', 'error');
+      this.audio?.playHydraulicCompression();
+      return;
+    }
+    // Still arcing: steer the avatar along the closing line toward the
+    // moving seat datum (Spec 36 §2.3 capture premise — vacuum guidance).
+    const guide = director.getReboardGuidanceVelocity({ x: s.x, y: s.y, z: s.z });
+    if (guide !== null) {
+      suit.setState({ vx: guide.x, vy: guide.y, vz: guide.z });
+    }
+  }
+
+  /**
+   * Seat capture landing (Spec 36 §2.3 steps 1–4): cancel the relative
+   * kinetic impulse (velocity zeroed into the chassis frame), snap the
+   * avatar to the driver seat, hand the player state to driving the buggy
+   * with full manual steering — the director released the autopilot tether
+   * on the capture frame, so the rack answers the wheel instantly.
+   */
+  private landReboardCatch(): void {
+    const buggy = this.buggy;
+    const suit = this.suit;
+    if (buggy === null || suit === null) return;
+    // Snap smoothly to the driver seat transform.
+    const b = buggy.getPosition();
+    suit.setState({ x: b.x, y: b.y, z: b.z, vx: 0, vy: 0, vz: 0 });
+    if (this.mode !== 'buggy') {
+      // The catch arbiter already ruled on reach — mount without the
+      // static proximity gate, then mirror the toggleMount boarding chain.
+      buggy.mount();
+      this.mode = 'buggy';
+      const haul = suit.getCargoMass();
+      if (haul > 0) {
+        const stowed = buggy.addCargo(haul);
+        if (stowed > 0) suit.setCargoMass(haul - stowed);
+      }
+      this.lastEvaCamera = this.world.getCameraRig().getMode();
+      this.questEngine?.recordBuggyBoarded();
+      this.syncQuestDashboardTelemetry();
+      this.buggyBeacon?.setEnabled(false);
+      for (const mesh of suit.getMeshes()) mesh.setEnabled(false);
+      this.hud?.setBuggyPanelVisible(true);
+      this.world.getCameraRig().setMode('vehicle_chase');
+    }
+    this.audio?.playMagneticCaptureChime();
+    this.hudFeedback('RE-BOARDED — full manual control, run the haul', 'success');
   }
 
   /**
@@ -5623,7 +5828,13 @@ export class ClientApp {
     const ratio =
       state.isActive && accel !== null ? accel.getCapacitorChargeRatio() : 0;
     audio.setCapacitorSpoolWhine(ratio);
-    audio.setUspKlaxonAlert(state.uspAlertActive);
+    // Spec 36 Phase 4: the heist pursuit-drone siren shares this klaxon
+    // voice — OR it in so the two pumps (export USP clock, heist pursuit
+    // alert) can never flicker the shared voice by racing to write false.
+    audio.setUspKlaxonAlert(
+      state.uspAlertActive === true ||
+        this.trainHeistDirector?.isPursuitDroneAlertActive() === true,
+    );
     if (state.canisterInFlight && !this.exportFireCueWas) {
       audio.playLorentzDischargeBlast();
       audio.playCanisterVacuumWhistle();

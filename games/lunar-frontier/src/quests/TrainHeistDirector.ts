@@ -25,7 +25,15 @@
  *    vault-car catwalk, the moving-frame ballistic throw
  *    v_cargo = v_train + v_throw (impulse 8.0–14.0 m/s, pitch ≈ 25°), and
  *    the predictive lead readout the HUD reticle paints toward the tracking
- *    buggy (blueprint 36 §"Physical Capture & Ballistic Envelopes").
+ *    buggy (blueprint 36 §"Physical Capture & Ballistic Envelopes");
+ *  • Spec 36 Phase 4 moving re-boarding: the catwalk leap toward the
+ *    parallel buggy with v_launch = v_train + v_jump·n̂_buggy, the cockpit
+ *    catch arbiter at R_board = 2.2 m (capture → snap to seat, manual
+ *    steering, tether released; miss → regolith rollout while the buggy
+ *    coasts to a stop on the service road), the corporate pursuit-drone
+ *    alert at 3+ volatile canisters siphoned, and the retained 44.0 s
+ *    Citadel depot countdown (§2.3, blueprint 36 §"Moving Driver Seat
+ *    Capture").
  *
  * Phase machine (blueprint §2.1, canonical union in the Spec 26 Phase 3
  * contract): INACTIVE → INTERCEPTING ⇄ BOARDING_WINDOW → ON_BOARD_CRACKING →
@@ -213,6 +221,47 @@ export interface CargoPickupContact {
   worldPosition: { x: number; y: number; z: number };
 }
 
+/** World-frame point triple (metres) — shared shape for leap readouts. */
+export interface Vec3Point {
+  x: number;
+  y: number;
+  z: number;
+}
+
+/**
+ * Resolved snapshot of a fired moving re-boarding leap (Spec 36 §2.3):
+ * v_launch = v_train + v_jump·n̂_buggy (+ the canonical clearing lift on z).
+ * The caller (ClientApp) hands `launchVelocity` to the avatar so the vacuum
+ * arc carries it across the gap; the catch arbiter
+ * ({@link TrainHeistDirector.resolveReboardingCatch}) owns the landing.
+ */
+export interface ReboardLaunchState {
+  /** Catwalk launch point (world m). */
+  launchPoint: Vec3Point;
+  /** World-frame launch velocity v_launch (m/s). */
+  launchVelocity: Vec3Point;
+  /** Horizontal unit bearing from the launch point to the seat datum. */
+  aimHeading: { x: number; y: number };
+}
+
+/**
+ * One resolved frame of the re-boarding leap arbiter (Spec 36 §2.3). On the
+ * capture frame `caught === true`: relative kinetic impulse cancelled,
+ * avatar snapped to the driver seat by the caller, player state handed to
+ * manual buggy control, tether released. On a miss the arbiter books the
+ * rollout: the avatar lands rolling in regolith and the buggy coasts to a
+ * stop on the service road ({@link TrainHeistDirector.isBuggyAutoStopActive}).
+ */
+export interface ReboardCatchResult {
+  caught: boolean;
+  /** Distance to the driver-seat datum at the decision frame (m). */
+  distanceToSeatM: number;
+  /** Driver-seat datum (world m) the radius was measured around. */
+  seatPosition: Vec3Point;
+  /** Quest objective key the bridge transitions to on either outcome. */
+  objectiveKey: string;
+}
+
 /**
  * Spec 26 Phase 4: per-item cargo mass of the vault loot (kg). The siphon
  * hands the secured payload to the player's carrier (suit backpack, then
@@ -311,6 +360,38 @@ export const BAILOUT_LATERAL_MPS = 4.0;
  *  car origin (body is 2.9 m tall, deck skin tops out at 2.9 m). */
 export const BAILOUT_DECK_HEIGHT_M = 2.9;
 
+// -- Spec 36 Phase 4: dynamic moving re-boarding & escape countdown ----------
+
+/** Spec 36 §2.3: cockpit catch radius R_board around the buggy driver-seat
+ *  datum — inside it, a falling avatar is captured and handed the wheel (m). */
+export const REBOARD_CATCH_RADIUS_M = 2.2;
+/** Spec 36 §2.3: canonical jump speed toward the buggy, v_jump (m/s). The
+ *  launch law is v_launch = v_train + v_jump·n̂_buggy. */
+export const REBOARD_JUMP_MPS = 4.5;
+/** Ballistic lift riding on top of §2.3's horizontal law (m/s): the vault-car
+ *  catwalk rides ≈ 2.4 m above the service-road seat plane, so a purely
+ *  horizontal law launch would dive the avatar into the guideway barrier
+ *  before the gap opens; the lift gives the leap a clean clearing arc. */
+export const REBOARD_JUMP_LIFT_MPS = 2.4;
+/** Nominal driver-seat plane above the service-road surface (m): wheel
+ *  radius 0.45 + ride trim 0.229 − BUGGY_SEAT_BELOW_DATUM 0.25 ≈ 0.43 —
+ *  the seat datum the catch radius is measured around (OpenBuggy/Spec 32
+ *  §2.5 single-DOF chassis frame). */
+export const BUGGY_SEAT_ABOVE_ROAD_M = 0.43;
+/** Avatar height band (m above the road surface) at which an uncaptured
+ *  leap is declared a miss: the body touches regolith and rolls out. */
+export const REBOARD_ROLLOUT_HEIGHT_M = 0.6;
+/** Spec 36 §3 Phase 4: volatile canisters (water cells + LOX cylinders +
+ *  He-3 flasks) siphoned that trips the corporate pursuit drone alert and
+ *  warning siren. */
+export const PURSUIT_DRONE_ALERT_CANISTERS = 3;
+/** Coast-down speed at which the post-miss buggy is booked as stopped on
+ *  the service road (m/s). */
+export const BUGGY_AUTOSTOP_STOP_SPEED_MPS = 0.05;
+/** Spec 36 §3 Phase 4: objective key the Quest Engine bridge transitions
+ *  to once the player has re-boarded or safely dismounted from the train. */
+export const SECURE_HAUL_OBJECTIVE_KEY = 'SECURE_HAUL_TO_TRADING_POST';
+
 /** Vault-car deck geometry in the local frame (m): length ≈ L_car, width ≈ 2×catwalk span. */
 export const VAULT_DECK_LENGTH_M = 14.0;
 export const VAULT_DECK_WIDTH_M = 3.2;
@@ -370,6 +451,22 @@ export interface HeistTelemetry {
   /** Spec 36 Phase 2: predictive throw aim for the HUD lead reticle
    *  (null with hands free or off the train). */
   cargoAim?: CargoAimTelemetry | null;
+  /** Spec 36 Phase 4: true while the moving re-boarding leap is airborne
+   *  and unresolved (the catch arbiter owns the frame). */
+  reboardLeapActive?: boolean;
+  /** Spec 36 Phase 4: distance from the driver-seat datum R_board (m);
+   *  null while no re-boarding leap is in flight. */
+  distanceToBuggySeatM?: number | null;
+  /** Spec 36 Phase 4: corporate pursuit drones are inbound — warning siren
+   *  (true once 3+ volatile canisters have been siphoned). */
+  pursuitDroneAlert?: boolean;
+  /** Spec 36 Phase 4: volatile canisters siphoned this run (water + LOX +
+   *  He-3 flasks, the pursuit-alert counter). */
+  volatileCanistersSiphoned?: number;
+  /** Spec 36 Phase 4: quest objective key the bridge transitions to once
+   *  the player has re-boarded or safely dismounted ({@link
+   *  SECURE_HAUL_OBJECTIVE_KEY}); null while the train still holds them. */
+  objectiveKey?: string | null;
 }
 
 /**
@@ -416,6 +513,12 @@ export interface TrainHeistOptions {
   throwSpeedMps?: number;
   /** Loot table overrides (headless harnesses shrink the payload). */
   loot: Partial<HeistLootPayload>;
+  /** Spec 36 Phase 4: cockpit catch radius R_board (m). Non-finite or
+   *  non-positive values fall back to {@link REBOARD_CATCH_RADIUS_M}. */
+  boardCatchRadiusM?: number;
+  /** Spec 36 Phase 4: re-boarding jump speed v_jump (m/s). Non-finite or
+   *  non-positive values fall back to {@link REBOARD_JUMP_MPS}. */
+  reboardJumpMps?: number;
 }
 
 /** Velocity-ish input: a world-frame vector or a plain scalar road speed. */
@@ -553,6 +656,24 @@ export class TrainHeistDirector {
   private lastCargoThrow: CargoThrowState | null = null;
   /** Canisters the buggy's magnetic hopper has taken this run. */
   private cargoCaughtCount = 0;
+  // -- Spec 36 Phase 4 state (declared BEFORE lastTelemetry: the telemetry
+  //    builder runs during field initialisation and reads these) ------------
+  /** True while a moving re-boarding leap is airborne and unresolved. */
+  private reboardLeapActive = false;
+  /** Resolved snapshot of the most recent re-boarding launch (null pre-leap). */
+  private lastReboardLaunch: ReboardLaunchState | null = null;
+  /** This run's re-boarding outcome (null until the leap resolves). */
+  private reboardOutcome: 'CAUGHT' | 'MISSED' | null = null;
+  /** True from the seat capture until the escape closes — the player has
+   *  the wheel with full manual control (autopilot tether released). */
+  private playerDrivingBuggy = false;
+  /** True after a missed leap until the buggy is booked stopped on the
+   *  service road (ClientApp coasts it; {@link completeBuggyAutoStop}). */
+  private buggyAutoStopActive = false;
+  /** Cockpit catch radius R_board — constructor-sanitised (m). */
+  private boardCatchRadiusM = REBOARD_CATCH_RADIUS_M;
+  /** Re-boarding jump speed v_jump — constructor-sanitised (m/s). */
+  private reboardJumpMps = REBOARD_JUMP_MPS;
   /** Standard throw impulse (m/s) — constructor-sanitised. */
   private readonly throwSpeedMps: number;
   /** Whole containers clamped per roof cradle — constructor-sanitised. */
@@ -604,6 +725,12 @@ export class TrainHeistDirector {
       throwSpeed >= CARGO_THROW_MIN_MPS && throwSpeed <= CARGO_THROW_MAX_MPS
         ? throwSpeed
         : CARGO_THROW_STANDARD_MPS;
+    // Spec 36 Phase 4: catch radius / jump speed — anything non-finite or
+    // non-positive degrades to the canonical §2.3 constants.
+    const catchR = finiteOr(options.boardCatchRadiusM, REBOARD_CATCH_RADIUS_M);
+    this.boardCatchRadiusM = catchR > 0 ? catchR : REBOARD_CATCH_RADIUS_M;
+    const reboardV = finiteOr(options.reboardJumpMps, REBOARD_JUMP_MPS);
+    this.reboardJumpMps = reboardV > 0 ? reboardV : REBOARD_JUMP_MPS;
     // Roof cradle stock: clamped whole containers per type (QA harnesses
     // shrink it; a fresh run clamps the canonical pair of each commodity).
     this.roofCradleStock = clamp(
@@ -1103,6 +1230,231 @@ export class TrainHeistDirector {
     return true;
   }
 
+  // -- Spec 36 Phase 4: dynamic moving re-boarding (blueprint §2.3) ----------------
+
+  /**
+   * True while the catwalk can launch a moving re-boarding leap: the avatar
+   * rides the vault car, the rover tether is live (the autopilot holds the
+   * buggy parallel on the service road), and no leap is already in flight.
+   */
+  canReboardBuggy(): boolean {
+    return (
+      !this.disposed &&
+      this.isPlayerOnBoard() &&
+      this.tetherActive &&
+      !this.reboardLeapActive
+    );
+  }
+
+  /**
+   * The buggy driver-seat datum (world m): the tether target on the service
+   * road raised by the nominal seat plane {@link BUGGY_SEAT_ABOVE_ROAD_M}.
+   * The §2.3 catch radius R_board is measured around this point; it tracks
+   * the parallel autopilot every call.
+   */
+  getBuggySeatDatum(): Vec3Point {
+    const road = this.getTetheredRoverTargetPos();
+    return { x: road.x, y: road.y, z: road.z + BUGGY_SEAT_ABOVE_ROAD_M };
+  }
+
+  /** Horizontal distance (m) from a world point to the driver-seat datum. */
+  private distanceToSeat(pos: Vec3Point): number {
+    const seat = this.getBuggySeatDatum();
+    return Math.hypot(pos.x - seat.x, pos.y - seat.y, pos.z - seat.z);
+  }
+
+  /**
+   * The moving re-boarding leap (Spec 36 §2.3): fire from the catwalk
+   * toward the parallel tracking buggy with
+   * v_launch = v_train + v_jump·n̂_buggy (+ the canonical clearing lift).
+   * Returns the launch snapshot for the caller to hand the avatar its
+   * velocity, or null when no leap could start (off the train, no tether,
+   * or a leap already in flight). The landing is owned by
+   * {@link resolveReboardingCatch}.
+   */
+  executeReboardingJump(): ReboardLaunchState | null {
+    if (!this.canReboardBuggy()) return null;
+    const vault = this.vaultFrame();
+    const launchPoint = this.getPlayerWorldPos();
+    const seat = this.getBuggySeatDatum();
+    const ax = seat.x - launchPoint.x;
+    const ay = seat.y - launchPoint.y;
+    const al = Math.hypot(ax, ay);
+    // n̂_buggy: horizontal unit bearing to the seat; degenerate guideway
+    // falls back to starboard (the same tie-break as the cargo throw).
+    const aim = al > 1e-6 ? { x: ax / al, y: ay / al } : { x: vault.tangent.y, y: -vault.tangent.x };
+    const launchVelocity: Vec3Point = {
+      x: vault.velocity.x + aim.x * this.reboardJumpMps,
+      y: vault.velocity.y + aim.y * this.reboardJumpMps,
+      z: vault.velocity.z + REBOARD_JUMP_LIFT_MPS,
+    };
+    this.reboardLeapActive = true;
+    this.lastReboardLaunch = { launchPoint, launchVelocity, aimHeading: aim };
+    return { ...this.lastReboardLaunch };
+  }
+
+  /**
+   * Per-frame catch arbiter for the in-flight re-boarding leap (Spec 36
+   * §2.3). Feed the avatar's live world position (and velocity, optional):
+   *
+   *  • **Capture** — inside R_board = 2.2 m of the driver-seat datum while
+   *    falling, the director books the catch: relative kinetic impulse is
+   *    cancelled (the caller zeroes/snaps the avatar to the seat), player
+   *    state goes to `DRIVING_BUGGY` ({@link isPlayerDrivingBuggy}) with the
+   *    autopilot tether released for instant manual steering, and the phase
+   *    lands in BAILOUT_SUCCESS.
+   *  • **Miss** — an uncaptured avatar that falls to the rollout band books
+   *    the bailout landing: the caller rolls them out in regolith, the
+   *    tether drops and the buggy coasts smoothly to a stop on the service
+   *    road ({@link isBuggyAutoStopActive} until
+   *    {@link completeBuggyAutoStop}).
+   *
+   * Both outcomes carry {@link SECURE_HAUL_OBJECTIVE_KEY} for the quest
+   * bridge. Answers null when no leap is in flight or the position is
+   * garbage (NaN never resolves a leap).
+   */
+  resolveReboardingCatch(
+    avatarPos: Vec3Point,
+    avatarVel?: Partial<Vec3Point> | null,
+  ): ReboardCatchResult | null {
+    if (this.disposed || !this.reboardLeapActive) return null;
+    const x = finiteOr(avatarPos?.x, NaN);
+    const y = finiteOr(avatarPos?.y, NaN);
+    const z = finiteOr(avatarPos?.z, NaN);
+    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) return null;
+    const seat = this.getBuggySeatDatum();
+    const distanceToSeatM = Math.hypot(x - seat.x, y - seat.y, z - seat.z);
+    const falling = avatarVel === null || avatarVel === undefined
+      ? true
+      : finiteOr(avatarVel.z, 0) <= 0;
+    if (falling && distanceToSeatM <= this.boardCatchRadiusM + 1e-9) {
+      // Kinematic handoff into the chassis frame: the leap is over, the
+      // driver is in, the autopilot override drops to manual steering.
+      this.reboardLeapActive = false;
+      this.reboardOutcome = 'CAUGHT';
+      this.playerDrivingBuggy = true;
+      this.tetherActive = false;
+      this.phase = 'BAILOUT_SUCCESS';
+      return { caught: true, distanceToSeatM, seatPosition: seat, objectiveKey: SECURE_HAUL_OBJECTIVE_KEY };
+    }
+    // Miss detection: the descent clears the catch envelope and reaches the
+    // rollout band above the service road — body to regolith, roll it out.
+    const roadZ = seat.z - BUGGY_SEAT_ABOVE_ROAD_M;
+    if (falling && z <= roadZ + REBOARD_ROLLOUT_HEIGHT_M) {
+      this.reboardLeapActive = false;
+      this.reboardOutcome = 'MISSED';
+      this.tetherActive = false;
+      this.buggyAutoStopActive = true;
+      this.phase = 'BAILOUT_SUCCESS';
+      return { caught: false, distanceToSeatM, seatPosition: seat, objectiveKey: SECURE_HAUL_OBJECTIVE_KEY };
+    }
+    // Still arcing: the leap lives, report the closing distance.
+    return { caught: false, distanceToSeatM, seatPosition: seat, objectiveKey: SECURE_HAUL_OBJECTIVE_KEY };
+  }
+
+  /**
+   * Homing guidance for the airborne leap (Spec 36 §2.3 capture premise):
+   * in vacuum the §2.3 launch law alone can't close a moving 3-D seat that
+   * sits below the catwalk — the avatar would fly past the alignment while
+   * still above the envelope. While the leap is in flight the caller steers
+   * the avatar's velocity every frame with
+   *
+   *   v_guide = v_train + v_jump·n̂(t)   (n̂ = unit vector seat − avatar, 3-D)
+   *
+   * so the closing line continuously re-aims at the seat datum and the
+   * descent is guaranteed to arrive INSIDE R_board — where
+   * {@link resolveReboardingCatch} books the capture. Null when no leap is
+   * in flight (the caller stops steering; the suit owns its own arc).
+   */
+  getReboardGuidanceVelocity(avatarPos: Vec3Point): Vec3Point | null {
+    if (!this.isReboardLeapActive()) return null;
+    const vault = this.vaultFrame();
+    const seat = this.getBuggySeatDatum();
+    const dx = seat.x - finiteOr(avatarPos?.x, seat.x);
+    const dy = seat.y - finiteOr(avatarPos?.y, seat.y);
+    const dz = seat.z - finiteOr(avatarPos?.z, seat.z);
+    const dl = Math.hypot(dx, dy, dz);
+    const nx = dl > 1e-6 ? dx / dl : 0;
+    const ny = dl > 1e-6 ? dy / dl : 0;
+    const nz = dl > 1e-6 ? dz / dl : -1;
+    return {
+      x: vault.velocity.x + nx * this.reboardJumpMps,
+      y: vault.velocity.y + ny * this.reboardJumpMps,
+      z: vault.velocity.z + nz * this.reboardJumpMps,
+    };
+  }
+
+  /** True while the re-boarding leap is airborne (arbiter owns the frame). */
+  isReboardLeapActive(): boolean {
+    return this.reboardLeapActive && !this.disposed;
+  }
+
+  /** Launch snapshot of the most recent re-boarding leap (null pre-leap). */
+  getLastReboardLaunch(): ReboardLaunchState | null {
+    if (this.lastReboardLaunch === null) return null;
+    return {
+      launchPoint: { ...this.lastReboardLaunch.launchPoint },
+      launchVelocity: { ...this.lastReboardLaunch.launchVelocity },
+      aimHeading: { ...this.lastReboardLaunch.aimHeading },
+    };
+  }
+
+  /** This run's leap outcome once resolved ('CAUGHT' / 'MISSED', else null). */
+  getReboardOutcome(): 'CAUGHT' | 'MISSED' | null {
+    return this.reboardOutcome;
+  }
+
+  /** True from the seat capture — manual driving control restored. */
+  isPlayerDrivingBuggy(): boolean {
+    return this.playerDrivingBuggy && !this.disposed;
+  }
+
+  /**
+   * True after a missed leap while the abandoned buggy coasts down to a
+   * stop on the service road. The caller drives the coast-down input and
+   * books the stop via {@link completeBuggyAutoStop} once
+   * {@link BUGGY_AUTOSTOP_STOP_SPEED_MPS} is reached.
+   */
+  isBuggyAutoStopActive(): boolean {
+    return this.buggyAutoStopActive && !this.disposed;
+  }
+
+  /** Book the buggy as stopped on the service road (auto-stop finishes). */
+  completeBuggyAutoStop(): boolean {
+    if (!this.buggyAutoStopActive) return false;
+    this.buggyAutoStopActive = false;
+    return true;
+  }
+
+  /**
+   * Volatile canisters siphoned this run (Spec 36 §3.1 lines: water
+   * cryo-cells + LOX cylinders + He-3 flasks, the legacy cryo-flask line
+   * folding into the flask count). Drives the pursuit-drone threshold.
+   */
+  getVolatileCanistersSiphoned(): number {
+    const p = this.securedLoot;
+    return (
+      heistMoonCargoCount(p, 'WATER_CRYO_CELL') +
+      heistMoonCargoCount(p, 'LOX_CYLINDER') +
+      heistMoonCargoCount(p, 'HE3_FLASK')
+    );
+  }
+
+  /**
+   * True while corporate pursuit drones are inbound and the warning siren
+   * should sound: 3+ volatile canisters ({@link
+   * PURSUIT_DRONE_ALERT_CANISTERS}) siphoned, the run still live (INACTIVE
+   * before the crack, FAILED once the shield claims the train, and
+   * ESCAPE_COMPLETE once the haul is clear all stand the drones down).
+   */
+  isPursuitDroneAlertActive(): boolean {
+    if (this.disposed) return false;
+    if (this.phase === 'INACTIVE' || this.phase === 'FAILED' || this.phase === 'ESCAPE_COMPLETE') {
+      return false;
+    }
+    return this.getVolatileCanistersSiphoned() >= PURSUIT_DRONE_ALERT_CANISTERS;
+  }
+
   /**
    * Hand the run off to Phase 4's delivery stage: BAILOUT_SUCCESS →
    * ESCAPE_COMPLETE releases the rover tether (the autopilot parks the
@@ -1357,6 +1709,13 @@ export class TrainHeistDirector {
     this.cargoAimHeading = null;
     this.lastCargoThrow = null;
     this.cargoCaughtCount = 0;
+    // Spec 36 Phase 4: leap bookkeeping, driving state and the siren's
+    // auto-stop all cold on a fresh run.
+    this.reboardLeapActive = false;
+    this.lastReboardLaunch = null;
+    this.reboardOutcome = null;
+    this.playerDrivingBuggy = false;
+    this.buggyAutoStopActive = false;
   }
 
   /** Tear down: reset state and drop references. The director owns no meshes. */
@@ -1384,6 +1743,12 @@ export class TrainHeistDirector {
     // Spec 36 Phase 2: throw aim readback rides every frame — null with
     // hands free, solved once per build otherwise (pure, cheap).
     const cargoAim = this.getCargoThrowAim();
+    // Spec 36 Phase 4: the seat-distance readout rides only while a leap is
+    // in flight (the constructor-time build must never touch the maglev).
+    const distanceToBuggySeatM = this.reboardLeapActive
+      ? this.distanceToSeat(this.getPlayerWorldPos())
+      : null;
+    const escapeClear = this.phase === 'BAILOUT_SUCCESS' || this.phase === 'ESCAPE_COMPLETE';
     return {
       phase: this.phase,
       relativeSpeedMps,
@@ -1397,6 +1762,11 @@ export class TrainHeistDirector {
       carriedCargoType: this.getCarriedCargoType(),
       cargoCaughtCount: this.cargoCaughtCount,
       cargoAim,
+      reboardLeapActive: this.reboardLeapActive,
+      distanceToBuggySeatM,
+      pursuitDroneAlert: this.isPursuitDroneAlertActive(),
+      volatileCanistersSiphoned: this.getVolatileCanistersSiphoned(),
+      objectiveKey: escapeClear ? SECURE_HAUL_OBJECTIVE_KEY : null,
     };
   }
 }

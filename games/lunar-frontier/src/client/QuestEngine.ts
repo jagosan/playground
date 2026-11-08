@@ -53,6 +53,9 @@ export type ObjectiveType =
   | 'heist_crack_vault'
   | 'heist_bailout'
   | 'heist_deliver'
+  // Spec 36 §3 Phase 4 — post-leap objective: secure the haul to the
+  // Frontier Trading Post (fires once re-boarded or safely dismounted).
+  | 'heist_secure_haul'
   // Spec 27 §3.4 — Gauss Needle export/laundering objective family.
   | 'export_launch'
   | 'export_launder';
@@ -303,6 +306,9 @@ const OBJECTIVE_TYPES: readonly string[] = [
   'heist_crack_vault',
   'heist_bailout',
   'heist_deliver',
+  // Spec 36 §3 Phase 4 — required here or saves carrying the post-leap
+  // SECURE_HAUL_TO_TRADING_POST objective fail the shape validator.
+  'heist_secure_haul',
   // Spec 27 §3.4 export family — REQUIRED here or mid-export saves fail the
   // shape validator and `restoreProgress()` wrongly rejects them.
   'export_launch',
@@ -555,6 +561,17 @@ export class QuestEngine {
   /** One successful Leap of Faith off the train before the depot shield. */
   recordHeistBailout(): boolean {
     return this.accumulate('heist_bailout', () => true, 1);
+  }
+
+  /**
+   * Spec 36 §3 Phase 4: the haul is secure for the run — the player has
+   * re-boarded the moving buggy or dismounted safely on the regolith.
+   * Completes the active stage's `heist_secure_haul` objective
+   * (SECURE_HAUL_TO_TRADING_POST); a canonical Spec 26 quest carries no
+   * such objective and the hook answers false without touching state.
+   */
+  recordHeistHaulSecured(): boolean {
+    return this.accumulate('heist_secure_haul', () => true, 1);
   }
 
   /** The haul changed hands at the RustBelt fence (contraband delivered). */
@@ -1041,6 +1058,16 @@ export const MOUNT_APPROACH_RADIUS_M = 4;
 /** Canonical quest id for the Spec 26 heist narrative. */
 export const GILDED_SERPENT_QUEST_ID = 'operation-gilded-serpent';
 
+/**
+ * Spec 36 §3 Phase 4: objective id of the post-leap goal — the string the
+ * Quest Engine bridge (`ClientApp.syncHeistWithQuest`) transitions to once
+ * the player has re-boarded the moving buggy or safely dismounted from the
+ * train. Mirrors `SECURE_HAUL_OBJECTIVE_KEY` in `TrainHeistDirector` by
+ * value: QuestEngine keeps zero runtime imports, so the two constants are
+ * deliberately independent literals.
+ */
+export const SECURE_HAUL_TO_TRADING_POST_OBJECTIVE_ID = 'SECURE_HAUL_TO_TRADING_POST';
+
 /** Stage 1 marker: the canyon ridge overlook above the service corridor. */
 export const CANYON_OVERLOOK_POSITION: WorldPosition = { x: 850, y: 620, z: 0 };
 /** Stage 1 arrival radius (Spec 26 §3.4: proximity 25 m). */
@@ -1075,6 +1102,14 @@ export interface GildedSerpentQuestOptions {
   overlookProximityM?: number;
   /** Stage-6 RustBelt Dockworks fence seat (default anchor constant). */
   dockworksPosition?: WorldPosition;
+  /**
+   * Spec 36 §3 Phase 4: stage 5 additionally carries the
+   * `SECURE_HAUL_TO_TRADING_POST` objective (type `heist_secure_haul`),
+   * completed by `recordHeistHaulSecured()` the frame the player re-boards
+   * the moving buggy or lands the bailout safely. Default false keeps the
+   * canonical Spec 26 §3.4 six-stage shape byte-for-byte.
+   */
+  secureHaulObjective?: boolean;
 }
 
 /** Zero-Six comms literal — the fixer owns every stage of the operation. */
@@ -1205,6 +1240,19 @@ export function createOperationGildedSerpentQuest(
             'heist_bailout',
             1,
           ),
+          // Spec 36 Phase 4 (opt-in variant): the movie beat is the leap
+          // BACK into the moving cockpit — either outcome (re-boarded or a
+          // safe regolith rollout) secures the haul for the run.
+          ...(options.secureHaulObjective === true
+            ? [
+                objective(
+                  SECURE_HAUL_TO_TRADING_POST_OBJECTIVE_ID,
+                  'Leap to the moving buggy [SPACE toward it] or bail clear, then run the haul to the Frontier Trading Post.',
+                  'heist_secure_haul',
+                  1,
+                ),
+              ]
+            : []),
         ],
       },
       {
