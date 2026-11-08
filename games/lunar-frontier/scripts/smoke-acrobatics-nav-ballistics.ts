@@ -11,10 +11,12 @@
  *           pose laws swept across 1000 phases; every elbow channel strictly
  *           negative (θ < 0 ⇔ z′ > 0 toward visor/chest), zero backward
  *           hyperextension anywhere.
- *   GATE 2  Mid-air acrobatic tuck & flip — tuck envelope (torso 0.85 rad,
- *           hips −1.25, knees 1.85, elbows −1.40), continuous 360° somersault
- *           Δθ = 2π·(u−0.10)/0.80 across u ∈ [0.1, 0.9], exact unwinding at
- *           u ≥ 0.9, plus the TraversalPhysics `acrobaticRoll` wiring.
+ *   GATE 2  Mid-air fluid leg tuck (Spec 35 rectification) — tuck envelope
+ *           (torso 0.22 rad, hips −1.20, knees 1.80, elbows −1.35), strict
+ *           zero root flip (flipPitchRad ≡ 0 — the Spec 32 360° somersault
+ *           is removed), quintic W_tuck(u) fold/glide/unfold shape, plus the
+ *           TraversalPhysics `acrobaticRoll` wiring. Full Spec 35 acceptance
+ *           lives in smoke-spec35-airborne-tuck.ts.
  *   GATE 3  PLSS cold-gas jump boost — airborne rising-edge re-tap applies
  *           az = +2.8 m/s² and afwd = +1.5 m/s² (differenced against a
  *           control run to the last bit), O₂ drawn at exactly
@@ -44,15 +46,14 @@ import {
   HURRY_PUMP_ELBOW_RECOVERY_RAD,
   CLIMB_ELBOW_FLEX_RAD,
   CLIMB_REACH_ELBOW_RELIEF_RAD,
-  ACRO_TORSO_PITCH_RAD,
-  ACRO_HIP_TUCK_RAD,
-  ACRO_KNEE_FOLD_RAD,
-  ACRO_ELBOW_TUCK_RAD,
-  ACRO_FLIP_START_U,
-  ACRO_FLIP_END_U,
+  TUCK_TORSO_PITCH_RAD,
+  TUCK_HIP_FLEXION_RAD,
+  TUCK_KNEE_FLEXION_RAD,
+  TUCK_ELBOW_FLEXION_RAD,
+  TUCK_RAMP_IN_START_U,
+  TUCK_RAMP_OUT_END_U,
   acrobaticTuckPose,
-  acrobaticTuckWeight,
-  acrobaticFlipPitchRad,
+  acrobaticTuckEnvelope,
   climbGripPose,
   hurryStridePose,
 } from '../src/entities/AstronautSuit.ts';
@@ -256,75 +257,77 @@ section('GATE 1b — 1000-phase sweep: rest / stride / sprint / pump / climb elb
     maxElbow < 0);
   check(`forearm z′ = −h·sin θ > 0 for every sample (min z′ = ${minForwardZ.toFixed(4)} m)`,
     minForwardZ > 0);
-  check(`sweep range inside anatomical envelope [−1.40, −0.18] ⊇ [${minElbow.toFixed(2)}, ${maxElbow.toFixed(2)}]`,
-    minElbow >= ACRO_ELBOW_TUCK_RAD - 1e-12 && maxElbow <= ELBOW_REST_RAD + 1e-12);
+  check(`sweep range inside anatomical envelope [−1.35, −0.18] ⊇ [${minElbow.toFixed(2)}, ${maxElbow.toFixed(2)}]`,
+    minElbow >= TUCK_ELBOW_FLEXION_RAD - 1e-12 && maxElbow <= ELBOW_REST_RAD + 1e-12);
 }
 
 // ===========================================================================
-// GATE 2 — Mid-air acrobatic tuck & 360° flip (Spec 32 §2.2 / §4)
+// GATE 2 — Mid-air fluid leg tuck (Spec 35 §2 rectification of Spec 32 §2.2)
 // ===========================================================================
-section('GATE 2a — acrobaticTuckPose envelope at full tuck');
+section('GATE 2a — acrobaticTuckPose envelope at full tuck (Spec 35 constants)');
 {
   const mid = acrobaticTuckPose(0.5);
   check('full tuck blend w = 1 mid-window', mid.tuckBlend === 1);
-  check(`torso pitch ≈ 0.85 rad (${mid.torsoPitchRad})`, near(mid.torsoPitchRad, 0.85, 1e-12));
-  check(`bilateral hips ≈ -1.25 rad (${mid.hipLx}/${mid.hipRx})`,
-    near(mid.hipLx, -1.25, 1e-12) && near(mid.hipRx, -1.25, 1e-12));
-  check(`bilateral knees ≈ 1.85 rad (${mid.kneeLx}/${mid.kneeRx})`,
-    near(mid.kneeLx, 1.85, 1e-12) && near(mid.kneeRx, 1.85, 1e-12));
-  check(`bilateral elbows ≈ -1.40 rad (${mid.elbowLx}/${mid.elbowRx})`,
-    near(mid.elbowLx, -1.4, 1e-12) && near(mid.elbowRx, -1.4, 1e-12));
+  check(`torso pitch ≈ 0.22 rad (${mid.torsoPitchRad})`, near(mid.torsoPitchRad, 0.22, 1e-12));
+  check(`bilateral hips ≈ -1.20 rad (${mid.hipLx}/${mid.hipRx})`,
+    near(mid.hipLx, -1.2, 1e-12) && near(mid.hipRx, -1.2, 1e-12));
+  check(`bilateral knees ≈ 1.80 rad (${mid.kneeLx}/${mid.kneeRx})`,
+    near(mid.kneeLx, 1.8, 1e-12) && near(mid.kneeRx, 1.8, 1e-12));
+  check(`bilateral elbows ≈ -1.35 rad (${mid.elbowLx}/${mid.elbowRx})`,
+    near(mid.elbowLx, -1.35, 1e-12) && near(mid.elbowRx, -1.35, 1e-12));
   check('bilateral hip/knee tuck magnitude > 1.2 rad (gate §4)',
-    Math.abs(mid.hipLx) > 1.2 && mid.kneeLx > 1.2);
-  check('constants: ACRO_TORSO 0.85 / HIP -1.25 / KNEE 1.85 / ELBOW -1.40',
-    ACRO_TORSO_PITCH_RAD === 0.85 && ACRO_HIP_TUCK_RAD === -1.25 &&
-      ACRO_KNEE_FOLD_RAD === 1.85 && ACRO_ELBOW_TUCK_RAD === -1.4);
+    Math.abs(mid.hipLx) >= 1.2 && mid.kneeLx >= 1.2);
+  check('constants: TUCK_TORSO 0.22 / HIP -1.20 / KNEE 1.80 / ELBOW -1.35',
+    TUCK_TORSO_PITCH_RAD === 0.22 && TUCK_HIP_FLEXION_RAD === -1.2 &&
+      TUCK_KNEE_FLEXION_RAD === 1.8 && TUCK_ELBOW_FLEXION_RAD === -1.35);
 
   // Overlay inside the live triple-jump stride law.
   const ov = hurryStridePose('left', true, 0.5, 5.2, true);
   check('stride-law acrobatic overlay lands on the tuck envelope at u = 0.5',
-    near(ov.elbowLx, -1.4, 1e-12) && near(ov.hipLx, -1.25, 1e-12) &&
-      near(ov.kneeLx, 1.85, 1e-12));
+    near(ov.elbowLx, -1.35, 1e-12) && near(ov.hipLx, -1.2, 1e-12) &&
+      near(ov.kneeLx, 1.8, 1e-12));
 }
 
-section('GATE 2b — continuous 360° somersault with exact unwind at landing');
+section('GATE 2b — strict-zero root flip + quintic W_tuck fold/glide/unfold (Spec 35 §2.1/§2.2)');
 {
-  check('flip window is u ∈ [0.10, 0.90]',
-    ACRO_FLIP_START_U === 0.1 && ACRO_FLIP_END_U === 0.9);
-  check('no rotation before launch (flip(0) = flip(0.1) = 0)',
-    acrobaticFlipPitchRad(0) === 0 && acrobaticFlipPitchRad(0.1) === 0);
-  check('exactly π at mid-flip u = 0.5', near(acrobaticFlipPitchRad(0.5), PI, 1e-12),
-    `${acrobaticFlipPitchRad(0.5)}`);
-
-  // Strict monotone sweep across the window; total rotation is one revolution.
-  let prev = acrobaticFlipPitchRad(ACRO_FLIP_START_U);
-  let monotone = true;
-  for (let i = 1; i <= 1000; i++) {
-    const u = ACRO_FLIP_START_U + ((ACRO_FLIP_END_U - ACRO_FLIP_START_U) * i) / 1000;
-    const v = acrobaticFlipPitchRad(u);
-    if (!(v > prev)) monotone = false;
-    prev = v;
+  // Spec 35 rectification: the 360° root somersault is eliminated — the pose
+  // root flip channel is STRICT ZERO under all conditions.
+  let flipBad = 0;
+  for (let i = 0; i <= 1000; i++) {
+    const u = i / 1000;
+    if (acrobaticTuckPose(u).flipPitchRad !== 0) flipBad++;
+    if (hurryStridePose('left', true, u, 5.2, true).flipPitchRad !== 0) flipBad++;
+    if (hurryStridePose('right', true, u, 5.2, false).flipPitchRad !== 0) flipBad++;
   }
-  check('flip pitch strictly increases across 1000 window samples', monotone);
-  check(`total rotation across window is exactly 2π (${prev.toFixed(12)} rad)`,
-    near(prev, 2 * PI, 1e-12));
-  check('upright again from u ≥ 0.90 through landing (flip = 2π ≡ 0 mod 2π)',
-    near(acrobaticFlipPitchRad(0.9), 2 * PI, 1e-12) &&
-      near(acrobaticFlipPitchRad(0.95), 2 * PI, 1e-12) &&
-      near(acrobaticFlipPitchRad(1), 2 * PI, 1e-12) &&
-      near(acrobaticFlipPitchRad(1) % (2 * PI), 0, 1e-12));
+  check('flipPitchRad === 0 across 3000 pose samples — no somersault channel (bad=' + flipBad + ')',
+    flipBad === 0);
 
-  // Tuck unwinds to the Phase C pre-landing claw posture by touchdown.
-  check('tuck blend holds 1 across the window, unwinds to 0 by u = 1',
-    acrobaticTuckWeight(0.15) === 1 && acrobaticTuckWeight(0.9) === 1 &&
-      acrobaticTuckWeight(0.95) > 0 && acrobaticTuckWeight(0.95) < 1 &&
-      acrobaticTuckWeight(1) === 0);
+  // Quintic W_tuck(u): silent before fold-in, full glide through mid-arc,
+  // cleared for the landing handoff from u ≥ 0.90.
+  check(`fold-in window starts at u = ${TUCK_RAMP_IN_START_U} and unfold clears by u = ${TUCK_RAMP_OUT_END_U}`,
+    TUCK_RAMP_IN_START_U === 0.15 && TUCK_RAMP_OUT_END_U === 0.9);
+  check('no tuck before fold-in (W(0) = W(0.15) = 0)',
+    acrobaticTuckEnvelope(0) === 0 && acrobaticTuckEnvelope(0.15) === 0);
+  check('aerodynamic glide holds W = 1 across u ∈ [0.30, 0.70]',
+    acrobaticTuckEnvelope(0.3) === 1 && acrobaticTuckEnvelope(0.5) === 1 &&
+      acrobaticTuckEnvelope(0.7) === 1);
+  check('smooth unfold mid-ramp (W(0.8) = 0.5 quintic midpoint)',
+    near(acrobaticTuckEnvelope(0.8), 0.5, 1e-12));
+  check('cleared for landing handoff (W(0.9) = W(0.95) = W(1) = 0)',
+    acrobaticTuckEnvelope(0.9) === 0 && acrobaticTuckEnvelope(0.95) === 0 &&
+      acrobaticTuckEnvelope(1) === 0);
+  // Boundary continuity at the seams (lag ≪ ε/slope per skill #40; seams sit
+  // at zero-slope points of the quintic smoothstep).
+  let seamOk = true;
+  for (const seam of [0.15, 0.3, 0.7, 0.9]) {
+    const w0 = acrobaticTuckEnvelope(seam);
+    if (!near(acrobaticTuckEnvelope(seam + 1e-9), w0, 1e-6)) seamOk = false;
+    if (!near(acrobaticTuckEnvelope(seam - 1e-9), w0, 1e-6)) seamOk = false;
+  }
+  check('W_tuck continuous at all four seams (lag 1e-9)', seamOk);
   const land = acrobaticTuckPose(1);
   check('landing frame returns elbows to the neutral forward hang',
     near(land.elbowLx, ELBOW_REST_RAD, 1e-12) && near(land.torsoPitchRad, 0, 1e-12));
-  // Boundary continuity at u = 0.9 (lag ≪ ε/slope per skill #40).
-  check('flip curve continuous at u = 0.90 boundary (lag 1e-12)',
-    near(acrobaticFlipPitchRad(0.9), acrobaticFlipPitchRad(0.9 - 1e-12), 1e-6));
 }
 
 section('GATE 2c — TraversalPhysics acrobaticRoll wiring over real bounding arcs');
@@ -341,7 +344,7 @@ section('GATE 2c — TraversalPhysics acrobaticRoll wiring over real bounding ar
       airborneFrames++;
       if (s.acrobaticRoll === true) rollMirrored++;
       const u = s.hurryAirPhase ?? 0;
-      if (u >= ACRO_FLIP_START_U && u <= ACRO_FLIP_END_U) inFlipWindow++;
+      if (u >= TUCK_RAMP_IN_START_U && u <= TUCK_RAMP_OUT_END_U) inFlipWindow++;
       if (u < 0 || u > 1.0000001) phaseBad++;
     }
   }
@@ -349,7 +352,7 @@ section('GATE 2c — TraversalPhysics acrobaticRoll wiring over real bounding ar
     `airborne frames=${airborneFrames}`);
   check('acrobaticRoll input mirrored on every airborne frame',
     rollMirrored === airborneFrames, `${rollMirrored}/${airborneFrames}`);
-  check('live flight phase crosses the flip window [0.10, 0.90]', inFlipWindow > 100,
+  check('live flight phase crosses the tuck window [0.15, 0.90]', inFlipWindow > 100,
     `window frames=${inFlipWindow}`);
   check('hurryAirPhase stays inside [0, 1]', phaseBad === 0);
 }
