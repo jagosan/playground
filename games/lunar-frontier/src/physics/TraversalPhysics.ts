@@ -34,6 +34,10 @@
  */
 
 import type { RailRoute, Vec3 } from '../world/LunarWorldGenerator';
+// Spec 37 Phase 3: the garage-resolved upgrade stats drive the buggy's
+// powertrain / suspension / nitro / RCS laws. Type-only import keeps this
+// module free of any garage runtime dependency (client-bundle safe).
+import type { BuggyStats } from '../garage/BuggyUpgradeSystem';
 
 // ---------------------------------------------------------------------------
 // Shared constants & small maths
@@ -1377,6 +1381,31 @@ export const BUGGY_MAX_STEER = 0.78;
 /** Roll-over stability index at zero cargo: a_lat / g. */
 export const BUGGY_EMPTY_ROLLOVER_INDEX = BUGGY_TRACK / (2 * 0.75);
 
+// -- Spec 37 Phase 3: dynamic upgrade binding laws ---------------------------
+/**
+ * Stock Tier-1 wheel torque (N·m) — the {@link BuggyUpgradeSystem} powertrain
+ * baseline the {@link LunarBuggy} tractive-cap scaling ratio is normalised
+ * against (1400 → 2400 → 3800 N·m across Tiers 1-3, Spec 37 §2.2).
+ */
+export const BUGGY_STOCK_WHEEL_TORQUE_NM = 1400;
+/**
+ * Longitudinal acceleration (m/s²) the Tier-4 nitro overdrive pushes the
+ * chassis with while discharging (Spec 37 §2.2): chosen so the reaction
+ * (≈5.9 kN at kerb weight) stays inside the Tier-3 grouser cap and the
+ * sprint rides through to the 45 m/s ceiling.
+ */
+export const BUGGY_NITRO_ACCEL = 6.5;
+/** Fraction of total suspension travel where the progressive bump-stop bites. */
+export const BUGGY_BUMPSTOP_FRACTION = 0.8;
+/** Secondary bump-stop spring rate multiplier over the primary coil. */
+export const BUGGY_BUMPSTOP_SPRING_SCALE = 3.0;
+/** Secondary bump-stop damper multiplier (energy dissipation, Spec 37 §2.3). */
+export const BUGGY_BUMPSTOP_DAMPER_SCALE = 1.8;
+/** Cold-gas plume emitter window after an RCS jump firing (s). */
+export const BUGGY_RCS_PLUME_S = 0.45;
+/** Stock free-fall height absorbed before chassis bottom-out (m, Spec 37 §2.3). */
+export const BUGGY_STOCK_ABSORB_DROP_M = 6;
+
 /** Corner local coordinates: x forward, y left (right-hand yaw +). */
 const WHEEL_LOCAL: ReadonlyArray<{ x: number; y: number }> = [
   { x: 1.35, y: 0.85 }, // 0: front-right (y negative below via sign)
@@ -1401,6 +1430,18 @@ export interface BuggyInput {
   steer: number;
   /** Hold the parking brake while parked. */
   parkBrake: boolean;
+  /**
+   * Spec 37 §2.2 Tier-4 nitro overdrive (Superconducting Overdrive
+   * Capacitor): hold to discharge the capacitor into a sprint.
+   * Ignored entirely while the vehicle carries no Tier-4 powertrain.
+   */
+  boost?: boolean;
+  /**
+   * Spec 37 §2.4 Tier-4 chassis RCS jump thrusters: press (rising edge)
+   * while driving on the ground to fire the vertical cold-gas impulse.
+   * Ignored while the vehicle carries no Tier-4 suspension.
+   */
+  jump?: boolean;
 }
 
 export const IDLE_BUGGY_INPUT: Readonly<BuggyInput> = {
@@ -1457,6 +1498,18 @@ export interface BuggyState {
   driveMode?: 'FORWARD' | 'STOPPED' | 'REVERSE';
   /** Mean front road-wheel steering angle (rad). */
   steerAngle?: number;
+  /** Spec 37 §2.2: nitro capacitor charge, 0..1 (undefined = no capacitor). */
+  nitroCharge?: number;
+  /** Spec 37 §2.2: true while the nitro sprint is discharging. */
+  nitroActive?: boolean;
+  /** Spec 37 §2.2: seconds until the capacitor is fully recharged. */
+  nitroCooldownS?: number;
+  /** Spec 37 §2.4: true inside the cold-gas plume window after an RCS jump. */
+  rcsPlumeActive?: boolean;
+  /** Spec 37 §2.4: cumulative RCS jump firings this session. */
+  rcsJumpCount?: number;
+  /** Spec 37 §2.3: true on the touchdown frame a landing bottomed the chassis. */
+  hardLanding?: boolean;
 }
 
 export interface BuggyOptions {
@@ -1516,6 +1569,125 @@ export class LunarBuggy {
   private pitchRate = 0;
   private rollRate = 0;
 
+  // -- Spec 37 Phase 3: dynamic upgrade state --------------------------------
+  /**
+   * Garage-resolved stats currently bound into the physics laws (null =
+   * factory stock, every law below falls back to its legacy constant so a
+   * never-upgraded rover stays bit-identical to pre-Spec-37 callers).
+   */
+  private upgradeStats: BuggyStats | null = null;
+  /** Active top-speed governor (m/s); legacy default keeps BUGGY_SPEED_LIMIT. */
+  private speedLimitMps = BUGGY_SPEED_LIMIT;
+  /** Per-wheel drivetrain force ceiling (N); scales with wheelTorqueNm. */
+  private wheelForceCapN = BUGGY_WHEEL_FORCE;
+  /** Half-travel per corner (m) — stats.suspensionTravelM is the total. */
+  private springHalfTravelM = BUGGY_SPRING_TRAVEL;
+  /** Progressive secondary bump-stop active (Tier-2+ nitrogen dampers). */
+  private progressiveBumpStop = false;
+  /** Largest free-fall absorbed without bottoming the chassis (m). */
+  private maxAbsorbDropM = BUGGY_STOCK_ABSORB_DROP_M;
+  /** Nitro capacitor charge, 0..1 (Tier-4 powertrain only). */
+  private nitroCharge = 0;
+  /** True while the nitro sprint discharges. */
+  private nitroActive = false;
+  /** Seconds until the capacitor is full again (0 while charging-ready). */
+  private nitroCooldownS = 0;
+  /** Rising-edge detector for input.boost. */
+  private boostWasHeld = false;
+  /** Rising-edge detector for input.jump (RCS pods, Spec 37 §2.4). */
+  private jumpWasHeldBuggy = false;
+  /** Cold-gas plume emitter countdown (s) — drives particle FX + telemetry. */
+  private rcsPlumeClock = 0;
+  /** Cumulative RCS jump firings. */
+  private rcsJumpCount = 0;
+  /** Cumulative chassis bottom-out events. */
+  private bottomOutEvents = 0;
+  /** Vertical impact speed captured on the last touchdown (m/s, + = hard). */
+  private lastLandingImpactMs = 0;
+  /** True only on the substep a landing bottomed the chassis. */
+  private hardLandingFrame = false;
+  /**
+   * Free-fall memory (s): held at 0.3 while `state.airborne`, decays on the
+   * ground. The airborne flag rides the chassis-datum height and drops out a
+   * short window before the rigid barrier actually fires (the datum reaches
+   * floorZ only after the wheels have already swamped the travel), so the
+   * touchdown capture consults this memory as well as the flag itself.
+   */
+  private landingMemoryS = 0;
+
+  /**
+   * Spec 37 Phase 3: bind a garage build into the drive, suspension, nitro
+   * and RCS laws of {@link step}. Call again whenever the equipped tiers
+   * change; the laws re-read these fields every substep. Passing the stock
+   * Tier-1 build reproduces the catalog baselines exactly (18 m/s top speed,
+   * 1400 N·m, 0.35 m travel); a rover this method was never called on keeps
+   * the legacy pre-Spec-37 constants.
+   */
+  public setUpgradeStats(stats: BuggyStats): BuggyStats {
+    const firstNitro = this.upgradeStats === null || this.upgradeStats.nitro === null;
+    this.upgradeStats = stats;
+    this.speedLimitMps = stats.topSpeedMs;
+    this.wheelForceCapN =
+      BUGGY_WHEEL_FORCE * (stats.wheelTorqueNm / BUGGY_STOCK_WHEEL_TORQUE_NM);
+    this.springHalfTravelM = stats.suspensionTravelM / 2;
+    this.progressiveBumpStop =
+      stats.suspensionTravelM > 0.35 + 1e-9; /* Tier-2+ nitrogen reservoirs */
+    this.maxAbsorbDropM = stats.maxAbsorbDropM;
+    if (stats.nitro === null) {
+      this.nitroActive = false;
+      this.nitroCharge = 0;
+      this.nitroCooldownS = 0;
+    } else if (firstNitro || this.nitroCharge === 0) {
+      // Fitting the capacitor (or recovering from a previous build) arms it.
+      this.nitroCharge = 1;
+      this.nitroCooldownS = 0;
+    }
+    return stats;
+  }
+
+  /** The bound upgrade build (null while factory-legacy). */
+  public getUpgradeStats(): BuggyStats | null {
+    return this.upgradeStats;
+  }
+
+  /** Active top-speed governor (m/s), nitro ceiling included while sprinting. */
+  public get topSpeedGovernor(): number {
+    const nitro = this.upgradeStats?.nitro;
+    if (this.nitroActive && nitro) {
+      return Math.max(this.speedLimitMps, nitro.sprintSpeedMs);
+    }
+    return this.speedLimitMps;
+  }
+
+  /** Nitro capacitor telemetry snapshot (charge 0..1, cooldown seconds). */
+  public getNitroState(): { charge: number; active: boolean; cooldownS: number } {
+    return {
+      charge: this.nitroCharge,
+      active: this.nitroActive,
+      cooldownS: this.nitroCooldownS,
+    };
+  }
+
+  /** True inside the cold-gas plume window after an RCS jump firing. */
+  public get rcsPlumeActive(): boolean {
+    return this.rcsPlumeClock > 0;
+  }
+
+  /** Cumulative RCS jump firings / chassis bottom-outs / last landing shock. */
+  public get rcsJumps(): number {
+    return this.rcsJumpCount;
+  }
+  public get bottomOuts(): number {
+    return this.bottomOutEvents;
+  }
+  public get landingImpactMs(): number {
+    return this.lastLandingImpactMs;
+  }
+  /** True when a fall of `dropM` is inside this build's absorption envelope. */
+  public absorbsDrop(dropM: number): boolean {
+    return dropM <= this.maxAbsorbDropM + 1e-9;
+  }
+
   constructor(options: BuggyOptions = {}, initial: Partial<BuggyState> = {}) {
     this.chassisMass = options.chassisMass ?? BUGGY_CHASSIS_MASS;
     this.ground = options.groundElevation ?? FLAT_GROUND;
@@ -1557,6 +1729,12 @@ export class LunarBuggy {
       ...this.state,
       driveMode: this.driveMode,
       steerAngle: this.steerAngle,
+      nitroCharge: this.upgradeStats?.nitro ? this.nitroCharge : undefined,
+      nitroActive: this.upgradeStats?.nitro ? this.nitroActive : undefined,
+      nitroCooldownS: this.upgradeStats?.nitro ? this.nitroCooldownS : undefined,
+      rcsPlumeActive: this.rcsPlumeClock > 0,
+      rcsJumpCount: this.rcsJumpCount,
+      hardLanding: this.hardLandingFrame,
       wheels: this.state.wheels.map((w) => ({ ...w })) as [WheelState, WheelState, WheelState, WheelState],
     };
   }
@@ -1660,6 +1838,46 @@ export class LunarBuggy {
     const inertia = m * (1.35 * 1.35 + 0.85 * 0.85) * 0.9;
     const rollInertia = m * 0.55;
 
+    this.hardLandingFrame = false;
+
+    // -- Spec 37 §2.2: Tier-4 nitro overdrive capacitor state machine ---------
+    // Rising-edge arm (a held pedal through the cooldown must not steal the
+    // next charge), constant-power discharge while held (durationS of a full
+    // capacitor), then a rechargeS recharge back to full. The governor
+    // (`topSpeedGovernor`) lifts to nitro.sprintSpeedMs for the sprint.
+    const nitro = this.upgradeStats?.nitro ?? null;
+    const boostHeld = input.boost === true;
+    if (nitro) {
+      if (
+        boostHeld &&
+        !this.boostWasHeld &&
+        !this.nitroActive &&
+        this.nitroCharge > 0 &&
+        this.nitroCooldownS <= 0 &&
+        !this.state.rolled
+      ) {
+        this.nitroActive = true;
+      }
+      if (!boostHeld) this.nitroActive = false;
+      if (this.nitroActive) {
+        this.nitroCharge = Math.max(0, this.nitroCharge - dt / nitro.durationS);
+        if (this.nitroCharge <= 1e-9) {
+          this.nitroActive = false;
+          this.nitroCharge = 0;
+          this.nitroCooldownS = nitro.rechargeS;
+        }
+      } else if (this.nitroCooldownS > 0) {
+        this.nitroCooldownS = Math.max(0, this.nitroCooldownS - dt);
+      } else if (this.nitroCharge < 1) {
+        this.nitroCharge = Math.min(1, this.nitroCharge + dt / nitro.rechargeS);
+      }
+    } else {
+      this.nitroActive = false;
+    }
+    this.boostWasHeld = boostHeld;
+    const nitroSprintForce =
+      this.nitroActive && nitro ? m * BUGGY_NITRO_ACCEL : 0;
+
     const ch = Math.cos(s.heading);
     const sh = Math.sin(s.heading);
 
@@ -1748,7 +1966,11 @@ export class LunarBuggy {
     }
 
     if (this.state.rolled) targetTorqueDemand = 0;
-    if (s.vLong > BUGGY_SPEED_LIMIT && targetTorqueDemand > 0) targetTorqueDemand = 0;
+    // Spec 37 Phase 3: the top-speed governor follows the bound upgrade
+    // build (18 → 26 → 35 m/s, lifting to the 45 m/s nitro ceiling while the
+    // capacitor discharges). A never-upgraded rover keeps BUGGY_SPEED_LIMIT.
+    const speedCapMps = this.topSpeedGovernor;
+    if (s.vLong > speedCapMps && targetTorqueDemand > 0) targetTorqueDemand = 0;
     if (s.vLong < -BUGGY_REVERSE_SPEED_LIMIT && targetTorqueDemand < 0) targetTorqueDemand = 0;
     // Brake-priority override (spec 16 §2.6): pedal pressure scales drive torque
     // out so the 14 kN friction brake does the stopping instead of fighting the
@@ -1767,10 +1989,19 @@ export class LunarBuggy {
     this.motorTorque = approach(this.motorTorque, targetTorqueDemand, BUGGY_THROTTLE_RISE, dt);
     if (Math.abs(this.motorTorque) < 1e-4) this.motorTorque = 0;
 
-    const powerCap = (BUGGY_MOTOR_POWER * 4) / Math.max(Math.abs(s.vLong), 1.0);
-    const maxTractive = Math.min(BUGGY_WHEEL_FORCE * 4, powerCap);
+    // Spec 37 Phase 3: both the drivetrain force ceiling and the continuous
+    // power cap scale with the bound wheel torque (1400 → 3800 N·m), so a
+    // quad-motor build both launches harder AND holds its higher ceiling
+    // against plume drag. Ratio is exactly 1 for the stock build.
+    const drivePowerScale = this.wheelForceCapN / BUGGY_WHEEL_FORCE;
+    const powerCap =
+      (BUGGY_MOTOR_POWER * 4 * drivePowerScale) / Math.max(Math.abs(s.vLong), 1.0);
+    const maxTractive = Math.min(this.wheelForceCapN * 4, powerCap);
     let driveForce = this.motorTorque * maxTractive;
     if (this.state.batteryKwh <= 0) driveForce = 0;
+    // Spec 37 §2.2: the overdrive capacitor pushes forward through its own
+    // superconducting bus — independent of the traction pack's charge.
+    if (nitroSprintForce > 0) driveForce += nitroSprintForce;
 
     // Hard speed governor (spec 15 §3.2 limiter, hard-enforced for the Spec-16
     // powertrain): beyond a limiter cut drive instantly (a mere zeroed target
@@ -1785,9 +2016,9 @@ export class LunarBuggy {
       }
       limiterForce = Math.min(
         (-s.vLong - BUGGY_REVERSE_SPEED_LIMIT) * 4_000,
-        BUGGY_WHEEL_FORCE * 4,
+        this.wheelForceCapN * 4,
       );
-    } else if (s.vLong > BUGGY_SPEED_LIMIT && driveForce > 0) {
+    } else if (s.vLong > speedCapMps && driveForce > 0) {
       driveForce = 0;
       this.motorTorque = 0;
     }
@@ -1936,11 +2167,14 @@ export class LunarBuggy {
 
       // Suspension deflection x_i = z_contact + R_wheel - z_mount, positive =
       // compressed, measured against THIS corner's own ground so each wheel
-      // follows terrain independently of the chassis datum.
+      // follows terrain independently of the chassis datum. Spec 37 Phase 3:
+      // the travel envelope follows the bound build (0.35 m stock → 0.55 m
+      // Tier-2 nitrogen reservoirs); stock keeps BUGGY_SPRING_TRAVEL exactly.
+      const halfTravel = this.springHalfTravelM;
       const x0 = zg - here + BUGGY_WHEEL_RADIUS - mountZ;
-      const travel = BUGGY_SPRING_TRAVEL * 2; // droop..bump total
-      const compression = clamp((x0 + BUGGY_SPRING_TRAVEL) / travel, 0, 1);
-      const x = clamp(x0, -BUGGY_SPRING_TRAVEL, BUGGY_SPRING_TRAVEL);
+      const travel = halfTravel * 2; // droop..bump total
+      const compression = clamp((x0 + halfTravel) / travel, 0, 1);
+      const x = clamp(x0, -halfTravel, halfTravel);
 
       // True corner vertical velocity: heave plus the pitch/roll rates
       // realised last substep (small-angle). The pre-Spec-16 code evaluated
@@ -1952,7 +2186,21 @@ export class LunarBuggy {
       // (spec 16 §2.2): F_z = max(0, k·x - c·vz), c = 1360 = 2·ζ·√(k·m/4).
       // k/c are the gravity-scaled values (Spec 17 §5 Step C above).
       let fz = springK * x - damperC * vzCorner;
-      fz = clamp(fz, 0, springK * BUGGY_SPRING_TRAVEL * 2.5);
+      fz = clamp(fz, 0, springK * halfTravel * 2.5);
+
+      // Spec 37 §2.3: progressive secondary bump-stop (Tier-2+ nitrogen
+      // reservoir dampers). Past 80 % of the enlarged travel a second
+      // nitrogen column takes over — extra spring rate ∝ bite plus extra
+      // dissipation on the packing stroke only — so a 15 m crater-lip landing
+      // dumps its energy inside the envelope instead of hitting the hard
+      // stop. Dormant on the stock leaf/coil build.
+      if (this.progressiveBumpStop && compression > BUGGY_BUMPSTOP_FRACTION) {
+        const bite =
+          (compression - BUGGY_BUMPSTOP_FRACTION) / (1 - BUGGY_BUMPSTOP_FRACTION);
+        fz += springK * halfTravel * BUGGY_BUMPSTOP_SPRING_SCALE * bite;
+        fz -= damperC * BUGGY_BUMPSTOP_DAMPER_SCALE * bite * Math.min(vzCorner, 0);
+        fz = clamp(fz, 0, springK * halfTravel * 2.5 * (1 + BUGGY_BUMPSTOP_SPRING_SCALE));
+      }
 
       if (fx > 0) frontZ += zg;
       else rearZ += zg;
@@ -2026,7 +2274,7 @@ export class LunarBuggy {
       // groused wheel proportionally more braking/pull before shear, which is
       // what makes the §7.1 < 18 m panic-stop gate physically reachable.
       const grouserCap = Math.max(
-        BUGGY_WHEEL_FORCE * clamp(loadFrac, 0, 1) * (env.surfaceFrictionMu / REGOLITH_MU),
+        this.wheelForceCapN * clamp(loadFrac, 0, 1) * (env.surfaceFrictionMu / REGOLITH_MU),
         mu * loadN,
       );
 
@@ -2330,6 +2578,25 @@ export class LunarBuggy {
     s.y += (s.vLong * sh + s.vLat * ch) * dt;
     s.heading = wrapAngle(s.heading + s.yawRate * dt);
 
+    // -- Spec 37 §2.4: Tier-4 chassis RCS jump thrusters -----------------------
+    // Rising-edge press of Jump while driving on the ground fires the four
+    // downward cold-gas pods: the reactive impulse sets vBody → +vzMs
+    // (8.0 m/s) straight into the ballistic heave integrator below, enough
+    // hangtime to clear rail track and ravines. The press is consumed by the
+    // leap (pitfall: a held button must not pump the pods through the arc);
+    // the plume clock both marks the cold-gas particle window for the FX
+    // layer and debounces re-fires.
+    const jumpHeldBuggy = input.jump === true;
+    const jumpRisingEdge = jumpHeldBuggy && !this.jumpWasHeldBuggy;
+    this.jumpWasHeldBuggy = jumpHeldBuggy;
+    const rcs = this.upgradeStats?.rcsJump ?? null;
+    if (rcs && jumpRisingEdge && !s.airborne && !this.state.rolled) {
+      s.vBody = Math.max(s.vBody, rcs.vzMs);
+      this.rcsPlumeClock = BUGGY_RCS_PLUME_S;
+      this.rcsJumpCount += 1;
+    }
+    this.rcsPlumeClock = Math.max(0, this.rcsPlumeClock - dt);
+
     // -- Spec 32 §2.5: true 3D rover ballistics (untethered vertical heave) ---------
     // The chassis datum used to be re-pinned to ground(s.x, s.y) every
     // substep. That zeroed vertical momentum at every crest — a berm or
@@ -2347,6 +2614,25 @@ export class LunarBuggy {
     s.z += s.vBody * dt;
     const floorZ = this.ground(s.x, s.y);
     if (s.z < floorZ) {
+      // Spec 37 §2.3 bottom-out bookkeeping: on the airborne→grounded
+      // touchdown edge capture the vertical shock and judge it against the
+      // build's absorption envelope (6 m stock, 15 m with the Tier-2
+      // nitrogen reservoirs). Beyond it the chassis bottoms and takes the
+      // hit; inside it the springs + progressive stop eat the energy clean.
+      if ((s.airborne || this.landingMemoryS > 0) && s.vBody < -1e-6) {
+        this.lastLandingImpactMs = -s.vBody;
+        // Envelope judged with a 5 % grace band: the discrete rigid barrier
+        // integrates its impact velocity slightly above the continuous
+        // √(2·g·h) it represents, so a drop of exactly maxAbsorbDropM would
+        // otherwise race the boundary frame-to-frame.
+        const vBottomOut =
+          Math.sqrt(2 * env.gravity * this.maxAbsorbDropM) * 1.05;
+        if (-s.vBody > vBottomOut) {
+          this.bottomOutEvents += 1;
+          this.hardLandingFrame = true;
+        }
+        this.landingMemoryS = 0;
+      }
       // Rigid terrain barrier, zero restitution: the datum cannot sink under
       // the surface and downward velocity dies on contact (regolith absorbs,
       // it does not rebound). Positive momentum through the contact is kept.
@@ -2369,6 +2655,20 @@ export class LunarBuggy {
     const noseUnderZ =
       s.z + BUGGY_NOSE_LOOKOUT_M * Math.sin(s.pitch) - BUGGY_NOSE_UNDERCARRIAGE_M;
     if (noseUnderZ < noseGround) {
+      // Landing-shock capture at the bumper plane: a crater-lip landing is
+      // usually arrested here (the datum floats at the nose clearance
+      // height), never sinking to floorZ, so the same touchdown-edge capture
+      // as the main barrier applies.
+      if ((s.airborne || this.landingMemoryS > 0) && s.vBody < -1e-6) {
+        this.lastLandingImpactMs = Math.max(this.lastLandingImpactMs, -s.vBody);
+        const vBottomOutNose =
+          Math.sqrt(2 * env.gravity * this.maxAbsorbDropM) * 1.05;
+        if (-s.vBody > vBottomOutNose) {
+          this.bottomOutEvents += 1;
+          this.hardLandingFrame = true;
+        }
+        this.landingMemoryS = 0;
+      }
       s.z += noseGround - noseUnderZ;
       if (s.vBody < 0) s.vBody = 0;
     }
@@ -2386,9 +2686,12 @@ export class LunarBuggy {
     const vFloor = (floorZ - here) / dt;
     const springsDrooped = s.wheels.every((w) => w.compression <= 1e-6);
     s.airborne =
-      s.bodyHeight > BUGGY_WHEEL_RADIUS + 0.229 + BUGGY_SPRING_TRAVEL * 1.5 ||
+      s.bodyHeight > BUGGY_WHEEL_RADIUS + 0.229 + this.springHalfTravelM * 1.5 ||
       s.vBody - vFloor > 0.05 ||
       springsDrooped;
+    this.landingMemoryS = s.airborne
+      ? 0.3
+      : Math.max(0, this.landingMemoryS - dt);
 
     // -- Energy bookkeeping ----------------------------------------------------------
     const motorPower = Math.max(0, driveForce * s.vLong);
