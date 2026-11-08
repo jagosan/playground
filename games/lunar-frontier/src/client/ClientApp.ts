@@ -58,6 +58,9 @@ import {
   GILDED_SERPENT_QUEST_ID,
   SECURE_HAUL_TO_TRADING_POST_OBJECTIVE_ID,
   DEFAULT_REACH_RADIUS_M,
+  FRONTIER_TRADING_POST_POSITION,
+  TRADING_POST_DELIVERY_RADIUS_M,
+  TRADING_POST_FUNDS_PROMPT,
   type CommsDialogue,
   type QuestCompletedPayload,
   type QuestStorage,
@@ -87,6 +90,7 @@ import {
   SECURE_HAUL_OBJECTIVE_KEY,
   BUGGY_AUTOSTOP_STOP_SPEED_MPS,
   heistLootCargoKg,
+  heistMoonCargoValueCredits,
   type CargoAimTelemetry,
   type HeistTelemetry,
   type ReboardCatchResult,
@@ -1032,6 +1036,29 @@ export interface NavPoi {
 }
 
 /**
+ * One settled Frontier Trading Post delivery (Spec 36 §3 Phase 5): the
+ * canister counts taken off the buggy's magnetic hopper, the canonical
+ * fence payout credited to the player, and the physical mass the post
+ * banked into the liquidity pools (`WATER_ICE` / `HELIUM3`; LOX cylinders
+ * are value-only intake — see `MarketEngine.FENCED_VOLATILE_MAPPINGS`).
+ */
+export interface TradingPostSettlement {
+  waterCryoCells: number;
+  loxCylinders: number;
+  he3Flasks: number;
+  /** Total canisters transferred (water + LOX + He-3). */
+  canisterCount: number;
+  /** True when legacy Spec 26 vault contraband fenced in the same visit. */
+  legacyLootFenced: boolean;
+  /** Credits credited to the player (volatiles + legacy loot). */
+  creditsCredited: number;
+  /** kg deposited per commodity symbol (WATER_ICE / HELIUM3). */
+  depositedKg: Record<string, number>;
+  /** Liquidity-mirror reserves immediately after the deposits. */
+  reservesAfter: Record<string, number>;
+}
+
+/**
  * The authoritative points-of-interest directory (Spec 32 §2.6). Coordinates
  * are fixed by the spec and win over any other landmark source in the game.
  */
@@ -1078,6 +1105,24 @@ export const NAV_POI_DIRECTORY: readonly NavPoi[] = [
     shortName: 'Outpost',
     position: { x: -920, y: 1150 },
     keywords: ['outpost', 'canyon', 'extraction'],
+  },
+  {
+    // Spec 36 §3 Phase 5: the fence desk — haul destination for the
+    // SECURE_HAUL_TO_TRADING_POST objective.
+    id: 'trading-post',
+    name: 'Frontier Trading Post',
+    shortName: 'Trading Post',
+    position: { x: 220, y: -180 },
+    keywords: [
+      'trading',
+      'trading post',
+      'post',
+      'trade',
+      'fence',
+      'market',
+      'exchange',
+      'garage',
+    ],
   },
 ];
 
@@ -1175,6 +1220,25 @@ export class ClientApp {
    * this run (edge-triggered toast; cleared on reset / stand-down).
    */
   private heistPursuitAnnounced = false;
+  /**
+   * Spec 36 §3 Phase 5: hysteresis arm for the Frontier Trading Post
+   * arrival banner — set once clear of the re-arm ring (2× the delivery
+   * envelope), consumed on first entry, re-armed when the heist run resets.
+   */
+  private tradingPostArrivalArmed = true;
+  /**
+   * Spec 36 §3 Phase 5: client-side mirror of the station liquidity pools.
+   * `MarketEngine` links the sqlite3-backed persistence layer and cannot be
+   * pulled into the browser bundle, so this mirror keeps the same baseline
+   * reserves as `MarketEngine.BASELINE_RESERVES` (WATER_ICE 5,000 kg /
+   * HELIUM3 1,000 kg) in client literals and absorbs fenced volatiles with
+   * the same arithmetic as `MarketEngine.depositFencedCargo`; an
+   * authoritative market snapshot overwrites it on the next server sync.
+   */
+  private localLiquidityReserves: Record<string, number> = {
+    WATER_ICE: 5_000,
+    HELIUM3: 1_000,
+  };
   /**
    * Spec 27 §3.4 Phase 4: "The Gauss Needle" export minigame director.
    * Built on demand by {@link enableExportMinigameDirector} (Phase 1 coilgun
@@ -1811,6 +1875,10 @@ export class ClientApp {
     // state (velocity-match envelope, vault timer, depot countdown). No-op
     // until enableTrainHeistDirector() has been called.
     this.stepTrainHeistDirector(dt);
+    // Spec 36 §3 Phase 5: trading-post pump — arrival banner and the
+    // automatic cargo transfer / credit settlement inside the 15 m delivery
+    // envelope at (220, −180). Cheap planar distance; no-op everywhere else.
+    this.stepTradingPostDelivery();
     // Spec 27 §3.4 Phase 4: export console pump — mount detection near the
     // caldera seat, gunner aim slew, in-flight canister tracking, and the
     // payout/confiscation bridge. No-op until a director exists.
@@ -5213,6 +5281,8 @@ export class ClientApp {
       // Spec 36 Phase 4: the leap latch and drone-siren toast re-arm too.
       this.heistJumpHeldPrev = false;
       this.heistPursuitAnnounced = false;
+      // Spec 36 Phase 5: fresh run — the trading-post arrival banner re-arms.
+      this.tradingPostArrivalArmed = true;
     }
 
     const engine = this.questEngine;
@@ -5580,6 +5650,199 @@ export class ClientApp {
     const delivered = engine.recordHeistContrabandDelivered();
     if (delivered) this.hudFeedback('Contraband fenced to the RustBelt fixer — the sector is yours', 'success');
     return delivered;
+  }
+
+  // -- Spec 36 Phase 5: trading post delivery & economy fencing ------------------
+
+  /**
+   * One settled Frontier Trading Post delivery (Spec 36 §3 Phase 5): the
+   * canister counts taken off the flatbed, the credit payout, and the
+   * liquidity-pool deposits the post banked in exchange.
+   */
+  settleCargoAtTradingPost(): TradingPostSettlement | null {
+    if (this.disposed) return null;
+
+    // 1. Inventory the hopper (inbound + latched canisters both transfer —
+    //    the post's intake claw does not care which frame latched them).
+    const buggy = this.buggy;
+    const items = buggy?.getHopperCargoItems() ?? [];
+    let waterCryoCells = 0;
+    let loxCylinders = 0;
+    let he3Flasks = 0;
+    for (const item of items) {
+      if (item.type === 'WATER_CRYO_CELL') waterCryoCells += 1;
+      else if (item.type === 'LOX_CYLINDER') loxCylinders += 1;
+      else if (item.type === 'HE3_FLASK') he3Flasks += 1;
+    }
+    const canisterCount = waterCryoCells + loxCylinders + he3Flasks;
+
+    // 2. Price the haul. Moon volatiles at the canonical fence table
+    //    (water 1,200 / LOX 950 / He-3 4,500 via heistMoonCargoValueCredits);
+    //    any legacy Spec 26 contraband still riding the run is fenced in the
+    //    same visit — its payload prices through the same fold semantics
+    //    (legacy he3CryoFlasks via the He-3 line; slates/coils carry no
+    //    canonical credit value yet and read 0, per the Phase 1 contract).
+    const volatileCredits = heistMoonCargoValueCredits({
+      waterCryoCells,
+      loxCylinders,
+      he3Flasks,
+    });
+    const legacyPayload =
+      this.heistContrabandSecured ? this.trainHeistDirector?.getLootPayload() ?? null : null;
+    const legacyLootCredits =
+      legacyPayload !== null ? heistMoonCargoValueCredits(legacyPayload) : 0;
+    const totalCredits = volatileCredits + legacyLootCredits;
+    if (canisterCount === 0 && legacyPayload === null) return null;
+
+    // 3. Credit the player — same law as the export-minigame payout:
+    //    online the identity balance drives the HUD readout (the server
+    //    settles the ledger); offline reports the number and the server
+    //    reconciles on the next market sync.
+    const identity = this.network?.credits;
+    if (identity !== undefined) this.hud?.setCredits(identity + totalCredits);
+
+    // 4. Transfer the cargo: the flatbed empties (meshes disposed, caught
+    //    mass back off the physics loader) and the legacy ride closes out
+    //    the director's escape exactly like the RustBelt handoff.
+    if (canisterCount > 0) buggy?.clearHopperCargo();
+    if (legacyPayload !== null) {
+      this.heistContrabandSecured = false;
+      this.trainHeistDirector?.finishEscape();
+    }
+
+    // 5. Quest bridge: SECURE_HAUL_TO_TRADING_POST and DELIVER_CONTRABAND
+    //    close through the existing heist hooks (idempotent per objective;
+    //    answer false when no Gilded Serpent quest is live, state untouched).
+    this.questEngine?.recordHeistHaulSecured();
+    this.questEngine?.recordHeistContrabandDelivered();
+
+    // 6. Liquidity: the post banks the physical mass into the pool mirror —
+    //    water cryo-cells melt into WATER_ICE (10 kg/vessel) and He-3 flasks
+    //    into HELIUM3 (4 kg/vessel); LOX cylinders are value-only intake
+    //    (the six-line station board lists no OXYGEN commodity — see
+    //    MarketEngine.FENCED_VOLATILE_MAPPINGS for the canonical mapping).
+    const deposits: Record<string, number> = {};
+    const pushDeposit = (symbol: string, kg: number): void => {
+      if (kg > 0) deposits[symbol] = (deposits[symbol] ?? 0) + kg;
+    };
+    pushDeposit('WATER_ICE', waterCryoCells * HEIST_MOON_CARGO.WATER_CRYO_CELL.unitMassKg);
+    pushDeposit('HELIUM3', he3Flasks * HEIST_MOON_CARGO.HE3_FLASK.unitMassKg);
+    for (const [symbol, kg] of Object.entries(deposits)) {
+      this.localLiquidityReserves[symbol] = (this.localLiquidityReserves[symbol] ?? 0) + kg;
+    }
+
+    // 7. Terminal feedback: break-down toast, then the canonical prompt.
+    this.audio?.playCommsChirp('incoming');
+    if (canisterCount > 0) this.audio?.playMagneticCaptureChime();
+    this.hudFeedback(
+      `+${Math.round(totalCredits)} CR — ${canisterCount} canister${
+        canisterCount === 1 ? '' : 's'
+      } fenced at the Frontier Trading Post${
+        legacyPayload !== null ? ' (+ legacy vault loot)' : ''
+      }`,
+      'success',
+    );
+    this.hudFeedback(TRADING_POST_FUNDS_PROMPT, 'success');
+
+    return {
+      waterCryoCells,
+      loxCylinders,
+      he3Flasks,
+      canisterCount,
+      legacyLootFenced: legacyPayload !== null,
+      creditsCredited: totalCredits,
+      depositedKg: deposits,
+      reservesAfter: { ...this.localLiquidityReserves },
+    };
+  }
+
+  /**
+   * Is the active carrier (buggy when driven, suit otherwise) inside the
+   * trading post's 15 m delivery envelope at (220, −180)?
+   */
+  isNearTradingPost(radiusM: number = TRADING_POST_DELIVERY_RADIUS_M): boolean {
+    if (this.disposed) return false;
+    const p = this.activePosition();
+    return (
+      Math.hypot(p.x - FRONTIER_TRADING_POST_POSITION.x, p.y - FRONTIER_TRADING_POST_POSITION.y) <=
+      radiusM
+    );
+  }
+
+  /**
+   * What the fence would take right now (no state touched): hopper
+   * canister counts, the canonical fence valuation, and the legacy-loot
+   * flag. Harness/terminal readback for the Phase 6 smoke gate.
+   */
+  getTradingPostCargoPreview(): {
+    waterCryoCells: number;
+    loxCylinders: number;
+    he3Flasks: number;
+    canisterCount: number;
+    volatileCredits: number;
+    legacyLootCredits: number;
+    totalCredits: number;
+    legacyLootPresent: boolean;
+  } {
+    const items = this.disposed ? [] : (this.buggy?.getHopperCargoItems() ?? []);
+    let waterCryoCells = 0;
+    let loxCylinders = 0;
+    let he3Flasks = 0;
+    for (const item of items) {
+      if (item.type === 'WATER_CRYO_CELL') waterCryoCells += 1;
+      else if (item.type === 'LOX_CYLINDER') loxCylinders += 1;
+      else if (item.type === 'HE3_FLASK') he3Flasks += 1;
+    }
+    const volatileCredits = heistMoonCargoValueCredits({
+      waterCryoCells,
+      loxCylinders,
+      he3Flasks,
+    });
+    const legacyPayload =
+      this.heistContrabandSecured ? this.trainHeistDirector?.getLootPayload() ?? null : null;
+    const legacyLootCredits =
+      legacyPayload !== null ? heistMoonCargoValueCredits(legacyPayload) : 0;
+    return {
+      waterCryoCells,
+      loxCylinders,
+      he3Flasks,
+      canisterCount: waterCryoCells + loxCylinders + he3Flasks,
+      volatileCredits,
+      legacyLootCredits,
+      totalCredits: volatileCredits + legacyLootCredits,
+      legacyLootPresent: legacyPayload !== null,
+    };
+  }
+
+  /** Live copy of the client liquidity mirror (harness/terminal readback). */
+  getLocalLiquidityReserves(): Record<string, number> {
+    return { ...this.localLiquidityReserves };
+  }
+
+  /**
+   * Per-frame trading-post pump: landmark-recognition banner on first entry
+   * of the envelope (hysteresis re-arm past 2× the radius, same law as the
+   * Relay 04 spire), and the automatic cargo transfer + credit settlement
+   * every frame spent inside it — arrival with a loaded hopper fences the
+   * haul without a button press, and a bed that fills while parked settles
+   * the next frame. No cargo, no cost: the settlement bails out null.
+   */
+  private stepTradingPostDelivery(): void {
+    if (this.disposed) return;
+    const p = this.activePosition();
+    const distM = Math.hypot(
+      p.x - FRONTIER_TRADING_POST_POSITION.x,
+      p.y - FRONTIER_TRADING_POST_POSITION.y,
+    );
+    const inside = distM <= TRADING_POST_DELIVERY_RADIUS_M;
+    if (this.tradingPostArrivalArmed && inside) {
+      this.tradingPostArrivalArmed = false;
+      this.audio?.playCommsChirp('incoming');
+      this.hud?.showLandmarkArrival('FRONTIER TRADING POST');
+    } else if (!inside && distM > TRADING_POST_DELIVERY_RADIUS_M * 2) {
+      this.tradingPostArrivalArmed = true;
+    }
+    if (inside) this.settleCargoAtTradingPost();
   }
 
   // -- Spec 27 Phase 4: The Gauss Needle export minigame ---------------------------------

@@ -1068,6 +1068,24 @@ export const GILDED_SERPENT_QUEST_ID = 'operation-gilded-serpent';
  */
 export const SECURE_HAUL_TO_TRADING_POST_OBJECTIVE_ID = 'SECURE_HAUL_TO_TRADING_POST';
 
+/**
+ * Spec 36 §3 Phase 5: the Frontier Trading Post — the fence desk at
+ * (220, −180). `ClientApp` keeps a delivery interaction envelope here: a
+ * buggy rolling in with hopper volatiles has its cargo auto-transferred to
+ * the post's liquidity pool and the player credited through
+ * `heistMoonCargoValueCredits()`. Kept as a QuestEngine literal (the engine
+ * holds its zero-runtime-import contract) alongside the objective it feeds.
+ */
+export const FRONTIER_TRADING_POST_POSITION: WorldPosition = { x: 220, y: -180, z: 0 };
+/** Delivery envelope radius around the trading post (Spec 36 §3 Phase 5: 15 m). */
+export const TRADING_POST_DELIVERY_RADIUS_M = 15;
+/**
+ * Spec 36 §3 Phase 5: the funds-cleared terminal prompt shown verbatim the
+ * frame a delivery settles — points the runner at the Phase-6+ garage loop.
+ */
+export const TRADING_POST_FUNDS_PROMPT =
+  'FUNDS CREDITED // VISIT GARAGE TERMINAL FOR VEHICLE UPGRADES';
+
 /** Stage 1 marker: the canyon ridge overlook above the service corridor. */
 export const CANYON_OVERLOOK_POSITION: WorldPosition = { x: 850, y: 620, z: 0 };
 /** Stage 1 arrival radius (Spec 26 §3.4: proximity 25 m). */
