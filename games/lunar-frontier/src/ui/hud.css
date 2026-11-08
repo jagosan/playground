@@ -3131,3 +3131,366 @@
     box-shadow: 0 0 22px 4px rgba(86, 224, 230, 0.28);
   }
 }
+
+/* ==========================================================================
+   Spec 37 Phase 4 — Holographic Garage Terminal (#garage-terminal).
+
+   Glassmorphic purchase modal floating above the canvas: smoked-glass slab,
+   hairline cyan rules, monospace telemetry, green positive delta callouts.
+   `pointer-events` is live only while the modal is visible so the parked
+   world never receives stray clicks through a hidden hologram.
+   ========================================================================== */
+
+#garage-terminal {
+  position: fixed;
+  inset: 0;
+  z-index: 140;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding:
+    max(16px, var(--lf-safe-top))
+    max(16px, var(--lf-safe-right))
+    max(16px, var(--lf-safe-bottom))
+    max(16px, var(--lf-safe-left));
+  background: radial-gradient(ellipse at 50% 40%, rgba(8, 20, 30, 0.62), rgba(2, 8, 8, 0.86));
+  backdrop-filter: blur(14px) saturate(130%);
+  -webkit-backdrop-filter: blur(14px) saturate(130%);
+  color: var(--lf-text);
+  font-family: var(--lf-mono);
+  pointer-events: auto;
+}
+
+#garage-terminal.is-hidden {
+  display: none;
+  pointer-events: none !important;
+}
+
+/* --- header --------------------------------------------------------------- */
+
+#garage-terminal .garage-head {
+  width: min(880px, 94vw);
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 12px 18px;
+  border: 1px solid var(--lf-rule);
+  border-radius: var(--lf-radius);
+  background: var(--lf-glass-solid);
+  box-shadow: 0 0 26px rgba(86, 224, 255, 0.08) inset;
+}
+
+#garage-terminal .garage-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  color: var(--lf-cyan);
+  text-shadow: 0 0 12px rgba(86, 224, 255, 0.35);
+}
+
+#garage-terminal .garage-balance-field {
+  margin-left: auto;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+#garage-terminal .garage-balance-label {
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  color: var(--lf-dim);
+}
+
+#garage-terminal .garage-balance-value {
+  font-size: 16px;
+  font-weight: 700;
+  color: #ffd700;
+  text-shadow: 0 0 10px rgba(255, 215, 0, 0.30);
+}
+
+#garage-terminal .garage-close-btn {
+  min-width: 44px;
+  min-height: 44px;
+  border: 1px solid var(--lf-rule);
+  border-radius: 10px;
+  background: rgba(10, 16, 24, 0.6);
+  color: var(--lf-text);
+  font-size: 15px;
+  cursor: pointer;
+}
+
+#garage-terminal .garage-close-btn:hover {
+  border-color: var(--lf-bad);
+  color: var(--lf-bad);
+}
+
+/* --- category tabs --------------------------------------------------------- */
+
+.garage-category-tabs {
+  width: min(880px, 94vw);
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+}
+
+.garage-category-tabs .garage-category-tab {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  min-height: 72px;
+  padding: 10px 8px;
+  border: 1px solid var(--lf-rule);
+  border-radius: var(--lf-radius);
+  background: var(--lf-glass);
+  color: var(--lf-dim);
+  font-family: var(--lf-mono);
+  cursor: pointer;
+  transition: border-color 120ms ease, color 120ms ease, box-shadow 120ms ease;
+}
+
+.garage-category-tabs .garage-category-tab:hover {
+  color: var(--lf-text);
+  border-color: rgba(120, 220, 255, 0.45);
+}
+
+.garage-category-tabs .garage-category-tab.is-active {
+  color: var(--lf-cyan);
+  border-color: var(--lf-cyan);
+  box-shadow: 0 0 18px rgba(86, 224, 255, 0.22), 0 0 10px rgba(86, 224, 255, 0.12) inset;
+  background: rgba(10, 24, 34, 0.78);
+}
+
+.garage-category-tabs .garage-tab-icon {
+  font-size: 20px;
+  line-height: 1;
+}
+
+.garage-category-tabs .garage-tab-label {
+  font-size: 10px;
+  letter-spacing: 0.12em;
+}
+
+.garage-tier-pips {
+  display: inline-flex;
+  gap: 4px;
+  font-size: 9px;
+  line-height: 1;
+}
+
+.garage-tier-pip {
+  color: rgba(223, 238, 251, 0.18);
+}
+
+.garage-tier-pip.is-filled {
+  color: var(--lf-good);
+  text-shadow: 0 0 8px rgba(92, 230, 164, 0.5);
+}
+
+/* --- tier cards ------------------------------------------------------------ */
+
+.garage-tier-panel {
+  width: min(880px, 94vw);
+  max-height: 52vh;
+  overflow-y: auto;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(86, 224, 255, 0.35) transparent;
+}
+
+.garage-tier-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px 14px;
+  border: 1px solid var(--lf-rule);
+  border-radius: var(--lf-radius);
+  background: var(--lf-glass);
+  cursor: pointer;
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+
+.garage-tier-card:hover {
+  border-color: rgba(120, 220, 255, 0.45);
+}
+
+.garage-tier-card.is-selected {
+  border-color: var(--lf-cyan);
+  box-shadow: 0 0 16px rgba(86, 224, 255, 0.25);
+}
+
+.garage-tier-card.is-installed {
+  border-color: rgba(92, 230, 164, 0.4);
+}
+
+.garage-tier-card.is-locked {
+  opacity: 0.55;
+}
+
+.garage-tier-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.garage-tier-name {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  color: var(--lf-text);
+}
+
+.garage-tier-status {
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  color: var(--lf-warn);
+  white-space: nowrap;
+}
+
+.garage-tier-status.is-good {
+  color: var(--lf-good);
+}
+
+.garage-tier-status.is-bad {
+  color: var(--lf-bad);
+}
+
+.garage-tier-desc {
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--lf-dim);
+}
+
+/* --- telemetry delta meters ------------------------------------------------ */
+
+.garage-stat-delta {
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  color: var(--lf-text);
+  padding-left: 10px;
+  border-left: 2px solid rgba(120, 220, 255, 0.35);
+}
+
+.garage-stat-delta.is-positive {
+  border-left-color: var(--lf-good);
+}
+
+.garage-stat-delta.is-positive::after {
+  content: " ▲";
+  color: var(--lf-good);
+  font-size: 9px;
+}
+
+/* The (+44%) callout rides the same line in green. */
+.garage-stat-delta.is-positive {
+  text-shadow: 0 0 10px rgba(92, 230, 164, 0.18);
+}
+
+/* --- footer / purchase ------------------------------------------------------ */
+
+#garage-terminal .garage-foot {
+  width: min(880px, 94vw);
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 12px 18px;
+  border: 1px solid var(--lf-rule);
+  border-radius: var(--lf-radius);
+  background: var(--lf-glass-solid);
+}
+
+#garage-terminal .garage-cost-field {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+#garage-terminal .garage-cost-label {
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  color: var(--lf-dim);
+}
+
+#garage-terminal .garage-cost-value {
+  font-size: 14px;
+  font-weight: 700;
+  color: #ffd700;
+}
+
+.garage-buy-btn {
+  min-width: 210px;
+  min-height: 44px;
+  padding: 10px 22px;
+  border: 1px solid var(--lf-good);
+  border-radius: 12px;
+  background: rgba(24, 64, 44, 0.55);
+  color: var(--lf-good);
+  font-family: var(--lf-mono);
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  cursor: pointer;
+  transition: box-shadow 120ms ease, opacity 120ms ease;
+}
+
+.garage-buy-btn:hover {
+  box-shadow: 0 0 18px rgba(92, 230, 164, 0.35);
+}
+
+.garage-buy-btn.is-disabled {
+  border-color: var(--lf-rule);
+  background: rgba(10, 16, 24, 0.5);
+  color: var(--lf-dim);
+  cursor: default;
+  box-shadow: none;
+}
+
+#garage-terminal .garage-feedback {
+  flex: 1;
+  min-width: 0;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--lf-dim);
+}
+
+#garage-terminal .garage-feedback.is-good {
+  color: var(--lf-good);
+}
+
+#garage-terminal .garage-feedback.is-bad {
+  color: var(--lf-bad);
+}
+
+/* --- responsive: ≤960px (Spec 33 §2.4 breakpoint) --------------------------- */
+
+@media (max-width: 960px) {
+  .garage-tier-panel {
+    grid-template-columns: 1fr;
+    max-height: 46vh;
+  }
+
+  #garage-terminal .garage-title {
+    font-size: 12px;
+    letter-spacing: 0.08em;
+  }
+
+  .garage-category-tabs .garage-tab-label {
+    font-size: 8px;
+    letter-spacing: 0.06em;
+  }
+
+  #garage-terminal .garage-foot {
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+
+  .garage-buy-btn {
+    min-width: 160px;
+  }
+}

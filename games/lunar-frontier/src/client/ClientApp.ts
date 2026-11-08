@@ -161,6 +161,15 @@ import {
   type MobilePerformanceProfile,
 } from './MobileSettings.ts';
 import { TactileHaptics } from '../audio/TactileHaptics.ts';
+// Spec 37 Phase 4: holographic garage terminal modal + client-side upgrade
+// facade (localStorage-backed; purchases commit through `hud.setCredits`,
+// the server reconciles on the next sync — MarketEngine stays server-side).
+import { GarageTerminalUI } from '../ui/GarageTerminalUI.ts';
+import { BuggyUpgradeSystem } from '../garage/BuggyUpgradeSystem.ts';
+import type { PurchaseResult } from '../garage/BuggyUpgradeSystem.ts';
+
+/** Structural document handle the garage terminal builds against. */
+type GarageTerminalDoc = NonNullable<ConstructorParameters<typeof GarageTerminalUI>[0]['document']>;
 
 // ---------------------------------------------------------------------------
 // Tunables
@@ -583,6 +592,8 @@ export const ACTION_KEYS: Readonly<Record<string, string>> = {
   KeyX: 'mine',
   KeyC: 'claim',
   KeyT: 'trade',
+  // Spec 37 Phase 4: `[G]` raises/lowers the holographic garage terminal.
+  KeyG: 'garage',
   // Spec 17 Phase 4: environment toggle — Earth Proving Grounds ⇄ Lunar.
   KeyR: 'track',
   // Spec 18 §6.2: comms log toggle — hide/re-open the last transmission.
@@ -1286,6 +1297,13 @@ export class ClientApp {
   private suit: EvaSuitAvatar | null = null;
   private buggy: OpenBuggy | null = null;
   private traversal: TraversalController | null = null;
+  // Spec 37 Phase 4: buggy workshop layer. The facade owns the installed
+  // build (localStorage), the terminal is the glassmorphic purchase modal,
+  // and `garageCreditBalance` mirrors `network.credits` so multi-purchase
+  // sessions stay coherent offline / between market syncs.
+  private buggyUpgrades: BuggyUpgradeSystem | null = null;
+  private garageTerminal: GarageTerminalUI | null = null;
+  private garageCreditBalance: number | null = null;
 
   private mode: TravelMode = 'suit';
   /** EVA camera mode to restore when dismounting the buggy. */
@@ -1732,6 +1750,47 @@ export class ClientApp {
           onReplayIntro: () => this.replayIntro(),
           // Spec 25 §2.5 — the in-HUD audio mixer drives the engine.
           onAudioVolumes: (volumes) => this.audio?.setVolumes(volumes),
+        });
+      }
+    }
+
+    // Spec 37 Phase 4: buggy workshop layer. The upgrade facade restores the
+    // persisted build, binds it into the chassis visuals AND the traversal
+    // physics (Phase 2/3 contracts), and mounts the holographic garage
+    // terminal beside the HUD. Headless runs without any document keep
+    // bookkeeping-only state (no modal is constructed).
+    if (this.buggyUpgrades === null) this.buggyUpgrades = new BuggyUpgradeSystem();
+    this.buggyUpgrades.load();
+    const restoredBuild = this.buggyUpgrades.getInstalled();
+    const restoredStats = this.buggy.applyUpgrades(restoredBuild);
+    // Legacy-constants law (`setUpgradeStats` contract): a rover that has
+    // never been bound keeps its pre-Spec-37 physics. A factory-stock save
+    // therefore binds nothing at boot — the first non-stock purchase binds
+    // through `commitGaragePurchase`. Only restored non-stock builds bind
+    // here, so a fresh player's drive laws stay bit-identical to Spec 36.
+    if (
+      restoredBuild.cargo_bed > 1 ||
+      restoredBuild.powertrain > 1 ||
+      restoredBuild.suspension > 1 ||
+      restoredBuild.mining_suite > 1
+    ) {
+      this.buggy.physics.setUpgradeStats(restoredStats);
+    }
+
+    if (this.hud !== null) {
+      const garageDoc = (globalThis as unknown as { document?: Document }).document;
+      if (garageDoc !== undefined && garageDoc !== null) {
+        this.garageTerminal = new GarageTerminalUI({
+          document: garageDoc as unknown as GarageTerminalDoc,
+          upgradeSystem: this.buggyUpgrades,
+          getBalance: () => this.getCreditBalance(),
+          audio: {
+            cashRegister: () => this.audio?.playCashRegisterChime(),
+            pneumaticClank: () => this.audio?.playPneumaticClank(),
+            weldingBuzz: () => this.audio?.playWeldingBuzz(),
+          },
+          onPurchaseSuccess: (result) => this.commitGaragePurchase(result),
+          onClose: () => this.hudFeedback('garage terminal closed — drive safe', 'info'),
         });
       }
     }
@@ -2374,6 +2433,11 @@ export class ClientApp {
     this.audio?.dispose();
     this.audio = null;
     this.world.dispose();
+    // Spec 37 Phase 4: garage modal first (its DOM lives beside the HUD),
+    // then the facade handle (state-only, idempotent).
+    this.garageTerminal?.dispose();
+    this.garageTerminal = null;
+    this.buggyUpgrades = null;
     this.hud?.dispose();
     this.hud = null;
   }
@@ -2810,6 +2874,14 @@ export class ClientApp {
       }
     }
 
+    // Spec 37 Phase 4: while the garage terminal owns the screen it routes
+    // every key (branch/tier navigation, purchase, dismissal). World inputs
+    // stay parked exactly like the trade-terminal convention.
+    const garageTerm = this.garageTerminal;
+    if (garageTerm !== null && garageTerm.isOpen()) {
+      return garageTerm.handleKey(code, phase);
+    }
+
     const tradeOpen = this.hud?.isTradeDialogOpen() ?? false;
 
     if (code === 'Escape') {
@@ -2934,7 +3006,11 @@ export class ClientApp {
     // axes sleep with the page keys (B still closes via the edge pump).
     const pad = this.pollGamepad();
     this.lastGamepadButtons = pad === null ? [] : pad.buttons.map((b) => b.pressed);
-    if (pad === null || (this.hud?.isTradeDialogOpen() ?? false)) {
+    if (
+      pad === null ||
+      (this.hud?.isTradeDialogOpen() ?? false) ||
+      (this.garageTerminal?.isOpen() ?? false)
+    ) {
       // Pad asleep (or absent): no driver demand, no haptic cue, no reverse.
       this.lastThrottleDemand = 0;
       this.lastBrakeDemand = 0;
@@ -3193,7 +3269,8 @@ export class ClientApp {
     const taps = this.touchInput.consumeActions();
     if (taps.length > 0) {
       this.inputSource = 'touch';
-      const tradeOpen = this.hud?.isTradeDialogOpen() ?? false;
+      const tradeOpen =
+        (this.hud?.isTradeDialogOpen() ?? false) || (this.garageTerminal?.isOpen() ?? false);
       for (const tap of taps) {
         this.dispatchTouchAction(tap, tradeOpen);
       }
@@ -3579,6 +3656,19 @@ export class ClientApp {
         this.hudViewHoldFired = false;
         return;
       }
+      // Spec 37 Phase 4: while the garage terminal owns the screen the world
+      // lane sleeps and the qualified pad drives the terminal instead
+      // (bumpers / D-Pad ←/→ switch branches, ↑/↓ move tiers, (A) installs,
+      // (B) dismisses) — same modal convention the trade terminal follows,
+      // with self-contained rising edges inside the UI.
+      const garageTerm = this.garageTerminal;
+      if (garageTerm !== null && garageTerm.isOpen()) {
+        if (garageTerm.pumpGamepad(now, timestamp)) this.inputSource = 'gamepad';
+        this.hudTogglePrevButtons = [];
+        this.hudViewHoldMs = 0;
+        this.hudViewHoldFired = false;
+        return;
+      }
       // Spec 30 §2.3.2 — HUD visibility-toggle lanes (double-tap R3, long-
       // press View/Back). Runs BEFORE the map branch so a held View answers
       // regardless of overlay state, but parks while the trade terminal owns
@@ -3799,6 +3889,9 @@ export class ClientApp {
         // Spec 30 §2.3.2: [U]/[H] cycle standard → minimal → hidden.
         this.cycleHudMode();
         break;
+      case 'garage':
+        this.toggleGarageTerminal();
+        break;
       case 'close-ui':
         this.hud?.hideTradeDialog();
         break;
@@ -3824,6 +3917,82 @@ export class ClientApp {
   /** Active HUD visibility mode (harness readback), null with no HUD. */
   getHudMode(): HUDMode | null {
     return this.hud?.getHUDMode() ?? null;
+  }
+
+  // -- Spec 37 Phase 4: garage terminal ------------------------------------------------
+
+  /** Garage terminal visibility (harness readback). */
+  isGarageOpen(): boolean {
+    return this.garageTerminal?.isOpen() ?? false;
+  }
+
+  /**
+   * `[G]` / UI trigger — raise or lower the holographic garage terminal.
+   * Opening parks the world: held keys are dropped and competing overlays
+   * (trade dialog, topo map) are dismissed, so nothing drives behind the
+   * modal. Returns the new visibility, or `null` with no display surface.
+   */
+  toggleGarageTerminal(): boolean | null {
+    if (this.disposed) return null;
+    const term = this.garageTerminal;
+    if (term === null) {
+      this.hudFeedback('garage terminal unavailable — no display surface', 'error');
+      return null;
+    }
+    if (term.isOpen()) {
+      term.hide();
+      return false;
+    }
+    this.pressed.clear();
+    const hud = this.hud;
+    if (hud !== null && hud.isTradeDialogOpen()) hud.hideTradeDialog();
+    if (hud !== null && hud.isMapVisible()) hud.hideMap();
+    term.refresh();
+    term.show();
+    this.hudFeedback(
+      'BUGGY WORKSHOP · TAB switch branch · ↑↓ select tier · ENTER install · ESC exit',
+      'info',
+    );
+    return true;
+  }
+
+  /** Client-facing buggy upgrade facade (harness readback), null after dispose. */
+  getBuggyUpgrades(): BuggyUpgradeSystem | null {
+    return this.buggyUpgrades;
+  }
+
+  /** Mounted garage terminal (harness readback), null headless / after dispose. */
+  getGarageTerminal(): GarageTerminalUI | null {
+    return this.garageTerminal;
+  }
+
+  /**
+   * Spec 37 Phase 4: credit balance visible to the garage wallet. The
+   * server identity owns the wallet online (same client law as vault loot
+   * and export payouts: debits push through `hud.setCredits`, MarketEngine
+   * stays server-authoritative and is never imported client-side); the
+   * local mirror keeps multi-purchase sessions coherent and lets offline
+   * runs transact until the next market sync overwrites it.
+   */
+  private getCreditBalance(): number {
+    if (this.garageCreditBalance !== null) return this.garageCreditBalance;
+    return this.network?.credits ?? 0;
+  }
+
+  /**
+   * Commit a successful garage purchase atomically: debit the wallet, mount
+   * the new components on the live chassis (`applyUpgrades`), and re-bind
+   * the drive / suspension / nitro / RCS laws (`setUpgradeStats`).
+   */
+  private commitGaragePurchase(result: PurchaseResult): void {
+    if (this.disposed) return;
+    this.garageCreditBalance = result.newBalance;
+    this.hud?.setCredits(result.newBalance);
+    const buggy = this.buggy;
+    if (buggy !== null) {
+      const stats = buggy.applyUpgrades(result.installed);
+      buggy.physics.setUpgradeStats(stats);
+    }
   }
 
   // -- gameplay actions ----------------------------------------------------------------
@@ -6791,7 +6960,12 @@ export class ClientApp {
       const amount = finite(frame['amount']) ?? 0;
       const earned = finite(frame['earned']) ?? 0;
       const credits = finite(frame['credits']);
-      if (credits !== null) this.hud?.setCredits(credits);
+      if (credits !== null) {
+        this.hud?.setCredits(credits);
+        // Spec 37 Phase 4: keep the garage wallet mirror in step with the
+        // server identity (purchases debit it locally until the next sync).
+        this.garageCreditBalance = credits;
+      }
       this.hudSay(`drew ${amount} u · +${earned} cr`);
       const inventory = frame['inventory'];
       if (typeof inventory === 'object' && inventory !== null) {
@@ -6815,6 +6989,7 @@ export class ClientApp {
   private onWelcome(ev: WelcomeEvent): void {
     this.hud?.setUsername(ev.player.username, ev.player.faction);
     this.hud?.setCredits(ev.player.credits);
+    this.garageCreditBalance = ev.player.credits;
     this.syncLocalInventory(ev.inventory);
     this.hud?.updateInventory(ev.inventory);
     const market = ev.market as

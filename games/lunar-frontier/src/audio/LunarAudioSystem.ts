@@ -1874,6 +1874,133 @@ export class LunarAudioSystem {
     return this.lastRcsThrustAt;
   }
 
+  // -- Spec 37 Phase 4: garage terminal transaction cues --------------------------
+
+  /**
+   * Cash-register chime for a completed upgrade purchase: a bright square
+   * 1568 Hz "ka-chick" transient followed by a 2093/3136 Hz bell tail —
+   * the workshop saying "deal struck". Headless-safe (mock-backed ctx).
+   */
+  playCashRegisterChime(): void {
+    if (!this.ready()) return;
+    const ctx = this.ctx!;
+    const t0 = ctx.currentTime + 0.01;
+
+    // Strike transient: short square blip.
+    const strike = ctx.createOscillator();
+    strike.type = 'square';
+    strike.frequency.setValueAtTime(1568, t0);
+    const strikeGain = ctx.createGain();
+    strikeGain.gain.setValueAtTime(0, t0);
+    strikeGain.gain.linearRampToValueAtTime(BASE_LEVEL.oneShot * 0.35, t0 + 0.004);
+    strikeGain.gain.exponentialRampToValueAtTime(SILENT, t0 + 0.09);
+    strike.connect(strikeGain);
+    strikeGain.connect(this.sfxBus!);
+    strike.start(t0);
+    strike.stop(t0 + 0.11);
+
+    // Bell tail: fundamental + fifth, staggered like a hanging register bell.
+    const bell = (freq: number, offset: number, decay: number, level: number): void => {
+      const osc = ctx.createOscillator();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(freq, t0 + offset);
+      const gain = ctx.createGain();
+      gain.gain.setValueAtTime(0, t0 + offset);
+      gain.gain.linearRampToValueAtTime(level, t0 + offset + 0.006);
+      gain.gain.exponentialRampToValueAtTime(SILENT, t0 + offset + decay);
+      osc.connect(gain);
+      gain.connect(this.sfxBus!);
+      osc.start(t0 + offset);
+      osc.stop(t0 + offset + decay + 0.05);
+    };
+    bell(2093, 0.06, 0.55, BASE_LEVEL.oneShot * 0.45);
+    bell(3136, 0.06, 0.85, BASE_LEVEL.oneShot * 0.16);
+
+    void this.resumeIfSuspended();
+  }
+
+  /**
+   * Pneumatic clank for the hydraulic lift / garage modal cycling: a
+   * band-passed air bleed (1.2 kHz, ~140 ms) closed by a metallic 130 → 72 Hz
+   * frame thud — the sound of the platform locking under the rover.
+   */
+  playPneumaticClank(): void {
+    if (!this.ready()) return;
+    const ctx = this.ctx!;
+    const t0 = ctx.currentTime + 0.005;
+
+    const bleed = this.createNoiseSource();
+    if (bleed !== null) {
+      const band = ctx.createBiquadFilter();
+      band.type = 'bandpass';
+      band.frequency.setValueAtTime(1200, t0);
+      band.frequency.exponentialRampToValueAtTime(420, t0 + 0.14);
+      const bleedGain = ctx.createGain();
+      bleedGain.gain.setValueAtTime(BASE_LEVEL.oneShot * 0.22, t0);
+      bleedGain.gain.exponentialRampToValueAtTime(SILENT, t0 + 0.14);
+      bleed.connect(band);
+      band.connect(bleedGain);
+      bleedGain.connect(this.sfxBus!);
+      bleed.start(t0);
+      bleed.stop(t0 + 0.16);
+    }
+
+    const thud = ctx.createOscillator();
+    thud.type = 'sine';
+    thud.frequency.setValueAtTime(130, t0 + 0.06);
+    thud.frequency.exponentialRampToValueAtTime(72, t0 + 0.18);
+    const thudGain = ctx.createGain();
+    thudGain.gain.setValueAtTime(0, t0 + 0.06);
+    thudGain.gain.linearRampToValueAtTime(BASE_LEVEL.oneShot * 0.5, t0 + 0.068);
+    thudGain.gain.exponentialRampToValueAtTime(SILENT, t0 + 0.24);
+    thud.connect(thudGain);
+    thudGain.connect(this.sfxBus!);
+    thud.start(t0 + 0.06);
+    thud.stop(t0 + 0.28);
+
+    void this.resumeIfSuspended();
+  }
+
+  /**
+   * Welding buzz for component mounting: a detuned sawtooth pair beating
+   * around 190 Hz through a gritty bandpass, amplitude wobbling over ~0.4 s
+   * like an arc catching on chassis steel.
+   */
+  playWeldingBuzz(): void {
+    if (!this.ready()) return;
+    const ctx = this.ctx!;
+    const t0 = ctx.currentTime + 0.01;
+    const DUR = 0.4;
+
+    const buzz = (freq: number, level: number): void => {
+      const osc = ctx.createOscillator();
+      osc.type = 'sawtooth';
+      osc.frequency.setValueAtTime(freq, t0);
+      osc.frequency.linearRampToValueAtTime(freq * 1.06, t0 + DUR);
+      const gain = ctx.createGain();
+      gain.gain.setValueAtTime(0, t0);
+      gain.gain.linearRampToValueAtTime(level, t0 + 0.03);
+      // Arc flicker: two wobble humps before the cutoff.
+      gain.gain.linearRampToValueAtTime(level * 0.55, t0 + DUR * 0.45);
+      gain.gain.linearRampToValueAtTime(level * 0.9, t0 + DUR * 0.75);
+      gain.gain.exponentialRampToValueAtTime(SILENT, t0 + DUR);
+      osc.connect(gain);
+      // Gritty bandpass shapes the arc buzz before it hits the sfx bus.
+      const grit = ctx.createBiquadFilter();
+      grit.type = 'bandpass';
+      grit.Q.value = 1.4;
+      grit.frequency.value = 780;
+      gain.connect(grit);
+      grit.connect(this.sfxBus!);
+      osc.start(t0);
+      osc.stop(t0 + DUR + 0.05);
+    };
+    buzz(190, BASE_LEVEL.oneShot * 0.2);
+    buzz(196.5, BASE_LEVEL.oneShot * 0.14); // beat beat against the first
+
+    void this.resumeIfSuspended();
+  }
+
   // -- internals ---------------------------------------------------------------------
 
   private chirpTone(offset: number, dur: number, freqStart: number, freqEnd: number): void {
