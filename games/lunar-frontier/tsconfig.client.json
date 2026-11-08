@@ -29,6 +29,7 @@
     "src/engine/WorldScene.ts",
     "src/engine/CameraRig.ts",
     "src/entities/AstronautSuit.ts",
+    "src/garage/BuggyUpgradeSystem.ts",
     "src/entities/OpenBuggy.ts",
     "src/entities/TransportLander.ts",
     "src/entities/NPCProspectorBot.ts",
