@@ -201,6 +201,11 @@ export interface HurryStridePose {
   shoulderRx: number;
   elbowLx: number;
   elbowRx: number;
+  /** Spec 35 §2.2 tuck ankle pitch target (rad, toes down/aft). Present only
+   *  on acrobatic-tuck frames; the current suit rig has no ankle pivot, so
+   *  this is pose data for future rigs / telemetry, never a mesh binding. */
+  ankleLx?: number;
+  ankleRx?: number;
   /** Torso pitch forward into the thrust vector (rad, upperBody.rotation.x). */
   torsoPitchRad: number;
   /** Torso roll toward the stance hip (rad, upperBody.rotation.z; + = toward left hip). */
@@ -210,10 +215,10 @@ export interface HurryStridePose {
   /** Head/visor horizon-stabilization pitch (rad, `eva-head` node rotation.x; Spec 31 §2.5). */
   headPitchRad: number;
   /**
-   * Extra avatar-root-mesh forward pitch (rad, Spec 32 §2.2). 0 outside an
-   * acrobatic roll; while a mid-air somersault runs it sweeps 0 → 2π across
-   * u ∈ [0.10, 0.90] so the avatar completes a full 360° forward flip and
-   * reads upright (2π ≡ 0) through the pre-landing claw and landing.
+   * Extra avatar-root-mesh forward pitch (rad, Spec 32 §2.2 / Spec 35 §2.2).
+   * STRICTLY 0 under all conditions: Spec 35 rectifies the Spec 32 360°
+   * root-mesh somersault — the avatar stays upright through the flight arc
+   * while the fluid low-G leg tuck flows through the limb channels instead.
    */
   flipPitchRad: number;
   /** True on the ballistic `flight_arc` half, false on `ground_brace`. */
@@ -385,24 +390,26 @@ export function hurryStridePose(
   const armRecovery = HURRY_PUMP_RECOVERY_AMP_RAD * cosU;
   const elbowStance = ELBOW_REST_RAD + HURRY_PUMP_ELBOW_STANCE_RAD * Math.max(0, -cosU);
   const elbowRecovery = ELBOW_REST_RAD + HURRY_PUMP_ELBOW_RECOVERY_RAD * Math.max(0, cosU);
-  // Spec 32 §2.2 acrobatic overlay: while a mid-air roll is active, every
-  // channel lerps onto the tuck envelope on w(u) — hips −1.25 / knees 1.85 /
-  // elbows −1.40 / torso 0.85 rad — curling in over the first tenth of the
-  // arc and unwinding back into the live Phase C claw channels over the last
-  // tenth, while flipPitchRad drives the 360° root-mesh somersault. With
-  // acrobatic = false w = 0 and every lerp below is the identity, keeping
-  // the Spec 31 cycle bit-identical.
-  const wAcro = acrobatic ? acrobaticTuckWeight(u) : 0;
-  const flipPitchRad = acrobatic ? acrobaticFlipPitchRad(u) : 0;
-  const hipLeadA = lerp(hipLead, ACRO_HIP_TUCK_RAD, wAcro);
-  const hipPushA = lerp(hipPush, ACRO_HIP_TUCK_RAD, wAcro);
-  const kneeLeadA = lerp(kneeLead, ACRO_KNEE_FOLD_RAD, wAcro);
-  const kneePushA = lerp(kneePush, ACRO_KNEE_FOLD_RAD, wAcro);
-  const armStanceA = lerp(armStance, ACRO_SHOULDER_TUCK_RAD, wAcro);
-  const armRecoveryA = lerp(armRecovery, ACRO_SHOULDER_TUCK_RAD, wAcro);
-  const elbowStanceA = lerp(elbowStance, ACRO_ELBOW_TUCK_RAD, wAcro);
-  const elbowRecoveryA = lerp(elbowRecovery, ACRO_ELBOW_TUCK_RAD, wAcro);
-  const torsoPitchA = lerp(torsoPitchRad, ACRO_TORSO_PITCH_RAD, wAcro);
+  // Spec 35 §2 fluid low-G airborne leg tuck overlay: while a tuck/roll
+  // input is held aloft, every limb channel lerps onto the fluid tuck
+  // envelope on the quintic weight W_tuck(u) — hips −1.20 / knees +1.80 /
+  // elbows −1.35 / torso 0.22 rad — folding bilaterally up into the torso
+  // just after toe-off, gliding aerodynamic through mid-hangtime, and
+  // uncurling smoothly over u ∈ [0.70, 0.90] back into the live Phase C
+  // landing-claw channels before touchdown. flipPitchRad stays strictly 0:
+  // the root NEVER somersaults (Spec 35 §2.2 rectification). With
+  // acrobatic = false W_tuck = 0 and every lerp below is the identity,
+  // keeping the Spec 31 cycle bit-identical.
+  const wAcro = acrobatic ? acrobaticTuckEnvelope(u) : 0;
+  const hipLeadA = lerp(hipLead, TUCK_HIP_FLEXION_RAD, wAcro);
+  const hipPushA = lerp(hipPush, TUCK_HIP_FLEXION_RAD, wAcro);
+  const kneeLeadA = lerp(kneeLead, TUCK_KNEE_FLEXION_RAD, wAcro);
+  const kneePushA = lerp(kneePush, TUCK_KNEE_FLEXION_RAD, wAcro);
+  const armStanceA = lerp(armStance, TUCK_SHOULDER_PITCH_RAD, wAcro);
+  const armRecoveryA = lerp(armRecovery, TUCK_SHOULDER_PITCH_RAD, wAcro);
+  const elbowStanceA = lerp(elbowStance, TUCK_ELBOW_FLEXION_RAD, wAcro);
+  const elbowRecoveryA = lerp(elbowRecovery, TUCK_ELBOW_FLEXION_RAD, wAcro);
+  const torsoPitchA = lerp(torsoPitchRad, TUCK_TORSO_PITCH_RAD, wAcro);
   return {
     hipLx: strideLegIsLeft ? hipLeadA : hipPushA,
     hipRx: strideLegIsLeft ? hipPushA : hipLeadA,
@@ -412,77 +419,104 @@ export function hurryStridePose(
     shoulderRx: powerIsLeft ? armRecoveryA : armStanceA,
     elbowLx: powerIsLeft ? elbowStanceA : elbowRecoveryA,
     elbowRx: powerIsLeft ? elbowRecoveryA : elbowStanceA,
+    // Spec 35 §2.2 streamlined ankle target, riding the same W_tuck envelope
+    // (pose data only — the rig has no ankle pivot to bind it to).
+    ankleLx: TUCK_ANKLE_PITCH_RAD * wAcro,
+    ankleRx: TUCK_ANKLE_PITCH_RAD * wAcro,
     torsoPitchRad: torsoPitchA,
     torsoYawRad,
     // +rotation.z tips the torso top toward the mesh-left hip.
     torsoRollRad,
     headPitchRad: HEAD_HORIZON_STABILITY_RATIO * torsoPitchA,
-    flipPitchRad,
+    // Spec 35 §2.2: strict zero — the 360° root somersault is rectified away.
+    flipPitchRad: TUCK_ROOT_FLIP_RAD,
     airborne,
     powerIsLeft,
     strideLegIsLeft,
   };
 }
 
-// -- Mid-air acrobatic tuck & 360° flip (Spec 32 §2.2 / Phase 2) ---------------
+// -- Fluid low-G airborne leg tuck (Spec 35 §2 / Phase 1) ---------------------
 /*
- * While the physics gait is bounding and the pilot holds the crouch/roll
- * input aloft, the stride channels blend onto the tuck envelope below on
- * w = acrobaticTuckWeight(u) and the avatar root pitches forward through a
- * full somersault over u ∈ [ACRO_FLIP_START_U, ACRO_FLIP_END_U]. All limb
- * angles follow the Spec 32 §2.1 sign law: NEGATIVE flexes a hanging limb
- * forward (elbows wrap the tucked arms around the shins), knees keep the
- * positive flexion convention of the stride law.
+ * Spec 35 rectifies the Spec 32 §2.2 maneuver: the 360° avatar-root-mesh
+ * somersault is completely removed (flipPitchRad ≡ 0 under all conditions)
+ * and replaced with a fluid bilateral leg tuck. While a tuck/roll input is
+ * held over a bounding flight arc, both hips and knees fold up into the
+ * pelvis/torso in ONE synchronized kinematic envelope, the arms bracket the
+ * knees, the torso holds a stable forward athletic rake, and the whole pose
+ * uncurls smoothly into the Phase C pre-landing claw before touchdown. All
+ * limb angles follow the Spec 32 §2.1 sign law: NEGATIVE flexes a hanging
+ * limb forward, knees keep the positive flexion convention of the stride law.
  */
-/** Aggressive forward torso pitch of the acrobatic tuck, rad. */
-export const ACRO_TORSO_PITCH_RAD = 0.85;
-/** Bilateral hip flexion of the tuck — knees up against the chest, rad. */
-export const ACRO_HIP_TUCK_RAD = -1.25;
-/** Bilateral knee fold — shins tightly tucked, rad. */
-export const ACRO_KNEE_FOLD_RAD = 1.85;
-/** Bilateral elbow flex — arms wrapped around the shins, rad (θ < 0 forward). */
-export const ACRO_ELBOW_TUCK_RAD = -1.40;
-/** Bilateral shoulder drive carrying the tucked arms around the shins, rad. */
-export const ACRO_SHOULDER_TUCK_RAD = -1.30;
-/** Normalized flight phase where the 360° somersault pitch starts. */
-export const ACRO_FLIP_START_U = 0.10;
-/** Normalized flight phase where the somersault completes (Δθ = 2π ≡ upright). */
-export const ACRO_FLIP_END_U = 0.90;
+/** Stable athletic forward torso pitch of the tuck, rad (≈12.6°; no somersault). */
+export const TUCK_TORSO_PITCH_RAD = 0.22;
+/** Bilateral hip flexion of the tuck — thighs up against the lower chest, rad. */
+export const TUCK_HIP_FLEXION_RAD = -1.20;
+/** Bilateral knee flexion of the tuck — shins folded against the hamstrings, rad. */
+export const TUCK_KNEE_FLEXION_RAD = 1.80;
+/** Ankle pitch of the tuck — boot toes pointed down/aft, streamlined profile,
+ *  rad. Pose data only: the current suit rig carries no ankle pivot. */
+export const TUCK_ANKLE_PITCH_RAD = -0.35;
+/** Bilateral elbow flex of the tuck — forearms wrapped around the knees, rad
+ *  (θ < 0 forward per the Spec 32 §2.1 sign law). */
+export const TUCK_ELBOW_FLEXION_RAD = -1.35;
+/** Bilateral shoulder pitch of the tuck — upper arms angled forward to
+ *  bracket the tucked knees, rad. */
+export const TUCK_SHOULDER_PITCH_RAD = -0.65;
+/** Avatar-root pitch contributed by the tuck: STRICT ZERO. The Spec 32 360°
+ *  root somersault is eliminated (Spec 35 §2.2) — the root stays upright. */
+export const TUCK_ROOT_FLIP_RAD = 0;
+/** Normalized flight phase where W_tuck starts its quintic fold-in ramp
+ *  (just after toe-off, clear of the explosive push-off stride). */
+export const TUCK_RAMP_IN_START_U = 0.15;
+/** Normalized flight phase where the full aerodynamic glide tuck is held. */
+export const TUCK_HOLD_START_U = 0.30;
+/** Normalized flight phase where the tuck starts uncurling toward the
+ *  pre-landing claw reach. */
+export const TUCK_UNFOLD_START_U = 0.70;
+/** Normalized flight phase where the tuck envelope has fully cleared for the
+ *  landing handoff (W_tuck = 0 from here through touchdown). */
+export const TUCK_RAMP_OUT_END_U = 0.90;
 
-/** Cosine-eased 0→1 ramp on [0, 1] (clamped outside). */
-const smooth01 = (t: number): number => {
-  const c = t < 0 ? 0 : t > 1 ? 1 : t;
-  return 0.5 - 0.5 * Math.cos(Math.PI * c);
+/** Quintic smoothstep S(x) = 6x⁵ − 15x⁴ + 10x³ on [0, 1]: C²-continuous,
+ *  zero first AND second derivatives at both endpoints (clamped outside). */
+const quinticSmoothstep01 = (x: number): number => {
+  const c = x < 0 ? 0 : x > 1 ? 1 : x;
+  return c * c * c * (c * (c * 6 - 15) + 10);
 };
 
 /**
- * Spec 32 §2.2 tuck-envelope blend weight on the normalized flight phase u:
- * ramps in smoothly over u ∈ [0, 0.10] (immediately after toe-off), holds a
- * full tuck across the flip window [0.10, 0.90], and unwinds smoothly to 0
- * over u ∈ [0.90, 1] so the limbs interpolate back into the Phase C
- * pre-landing claw pose before touchdown.
+ * Spec 35 §2.1 tuck blending weight W_tuck(u) on the normalized flight
+ * phase u = clamp(t_air / τ_flight, 0, 1):
+ *
+ * ```
+ *   0                                u < 0.15
+ *   S((u − 0.15) / 0.15)             0.15 ≤ u < 0.30   quintic fold-in
+ *   1                                0.30 ≤ u ≤ 0.70   aerodynamic glide
+ *   1 − S((u − 0.70) / 0.20)         0.70 < u ≤ 0.90   smooth unfold
+ *   0                                u > 0.90          landing handoff
+ * ```
+ *
+ * with S the quintic smoothstep, so both ramp edges are C¹ (in fact C²) and
+ * the legs fold in / reach out with zero velocity jolt at the seams.
  */
-export function acrobaticTuckWeight(u: number): number {
-  if (!Number.isFinite(u) || u <= 0) return 0;
-  if (u < ACRO_FLIP_START_U) return smooth01(u / ACRO_FLIP_START_U);
-  if (u <= ACRO_FLIP_END_U) return 1;
-  if (u < 1) return 1 - smooth01((u - ACRO_FLIP_END_U) / (1 - ACRO_FLIP_END_U));
+export function acrobaticTuckEnvelope(u: number): number {
+  if (!Number.isFinite(u)) return 0;
+  if (u < TUCK_RAMP_IN_START_U) return 0;
+  if (u < TUCK_HOLD_START_U) {
+    return quinticSmoothstep01(
+      (u - TUCK_RAMP_IN_START_U) / (TUCK_HOLD_START_U - TUCK_RAMP_IN_START_U));
+  }
+  if (u <= TUCK_UNFOLD_START_U) return 1;
+  if (u < TUCK_RAMP_OUT_END_U) {
+    return 1 - quinticSmoothstep01(
+      (u - TUCK_UNFOLD_START_U) / (TUCK_RAMP_OUT_END_U - TUCK_UNFOLD_START_U));
+  }
   return 0;
 }
 
 /**
- * Spec 32 §2.2 continuous forward somersault pitch of the avatar root mesh:
- * Δθ_flip(u) = 2π · (u − 0.10) / 0.80 across the flip window — zero before
- * launch, exactly 2π (upright again) from u ≥ 0.90 through landing.
- */
-export function acrobaticFlipPitchRad(u: number): number {
-  if (!Number.isFinite(u) || u <= ACRO_FLIP_START_U) return 0;
-  if (u >= ACRO_FLIP_END_U) return Math.PI * 2;
-  return (Math.PI * 2 * (u - ACRO_FLIP_START_U)) / (ACRO_FLIP_END_U - ACRO_FLIP_START_U);
-}
-
-/**
- * One frame of the Spec 32 §2.2 mid-air acrobatic tuck, expressed against
+ * One frame of the Spec 35 §2 fluid low-G airborne tuck, expressed against
  * NEUTRAL channel-zero values (see {@link acrobaticTuckPose}); the stride
  * overlay inside {@link hurryStridePose} blends the same envelope on top of
  * the live triple-jump channels instead.
@@ -496,40 +530,47 @@ export interface AcrobaticTuckPose {
   shoulderRx: number;
   elbowLx: number;
   elbowRx: number;
+  /** Streamlined tuck ankle pitch target (rad, pose data — no mesh pivot). */
+  ankleLx: number;
+  ankleRx: number;
   /** Forward torso pitch (upperBody.rotation.x), rad. */
   torsoPitchRad: number;
   /** Visor counter-pitch riding the horizon-lock ratio, rad. */
   headPitchRad: number;
-  /** Extra avatar-root pitch (rad): 0 → 2π forward somersault over the flip window. */
+  /** Extra avatar-root pitch (rad): STRICT ZERO — Spec 35 removes the flip. */
   flipPitchRad: number;
-  /** Tuck-envelope blend at this phase (0 = neutral, 1 = full tuck). */
+  /** Tuck-envelope blend W_tuck(u) at this phase (0 = neutral, 1 = full tuck). */
   tuckBlend: number;
 }
 
 /**
- * Standalone acrobatic tuck-pose generator (Spec 32 §2.2): bilateral
- * hip/knee tuck, arms wrapped around the shins (elbows −1.40 rad), 0.85 rad
- * forward torso pitch and the continuous 360° root-mesh flip pitch, all
- * ramped by {@link acrobaticTuckWeight} so the pose curls in at launch and
- * uncurls into the pre-landing claw posture before touchdown. ClientApp /
- * TraversalPhysics drive it with the live `hurryAirPhase` whenever the
- * crouch/roll input is held over a bounding flight arc.
+ * Standalone fluid low-G tuck-pose generator (Spec 35 §2): bilateral hip
+ * −1.20 / knee +1.80 fold into the torso, forearms wrapped around the knees
+ * (elbows −1.35 rad), shoulders bracketing at −0.65 rad, streamlined ankle
+ * −0.35 rad, stable 0.22 rad athletic rake and a strictly-zero root flip —
+ * all ramped by the quintic {@link acrobaticTuckEnvelope} so the pose folds
+ * in just after toe-off, glides through mid-hangtime, and uncurls into the
+ * pre-landing claw posture before touchdown. ClientApp / TraversalPhysics
+ * drive it with the live `hurryAirPhase` whenever the tuck/roll input is
+ * held over a bounding flight arc.
  */
 export function acrobaticTuckPose(u: number): AcrobaticTuckPose {
-  const w = acrobaticTuckWeight(u);
-  const torsoPitchRad = ACRO_TORSO_PITCH_RAD * w;
+  const w = acrobaticTuckEnvelope(u);
+  const torsoPitchRad = TUCK_TORSO_PITCH_RAD * w;
   return {
-    hipLx: ACRO_HIP_TUCK_RAD * w,
-    hipRx: ACRO_HIP_TUCK_RAD * w,
-    kneeLx: ACRO_KNEE_FOLD_RAD * w,
-    kneeRx: ACRO_KNEE_FOLD_RAD * w,
-    shoulderLx: ACRO_SHOULDER_TUCK_RAD * w,
-    shoulderRx: ACRO_SHOULDER_TUCK_RAD * w,
-    elbowLx: lerp(ELBOW_REST_RAD, ACRO_ELBOW_TUCK_RAD, w),
-    elbowRx: lerp(ELBOW_REST_RAD, ACRO_ELBOW_TUCK_RAD, w),
+    hipLx: TUCK_HIP_FLEXION_RAD * w,
+    hipRx: TUCK_HIP_FLEXION_RAD * w,
+    kneeLx: TUCK_KNEE_FLEXION_RAD * w,
+    kneeRx: TUCK_KNEE_FLEXION_RAD * w,
+    shoulderLx: TUCK_SHOULDER_PITCH_RAD * w,
+    shoulderRx: TUCK_SHOULDER_PITCH_RAD * w,
+    elbowLx: lerp(ELBOW_REST_RAD, TUCK_ELBOW_FLEXION_RAD, w),
+    elbowRx: lerp(ELBOW_REST_RAD, TUCK_ELBOW_FLEXION_RAD, w),
+    ankleLx: TUCK_ANKLE_PITCH_RAD * w,
+    ankleRx: TUCK_ANKLE_PITCH_RAD * w,
     torsoPitchRad,
     headPitchRad: HEAD_HORIZON_STABILITY_RATIO * torsoPitchRad,
-    flipPitchRad: acrobaticFlipPitchRad(u),
+    flipPitchRad: TUCK_ROOT_FLIP_RAD,
     tuckBlend: w,
   };
 }
@@ -2337,9 +2378,9 @@ export class EvaSuitAvatar {
       // Spec 31 §2: airborne frames ride the live normalized flight phase and
       // horizontal speed so the triple-jump cycling and hustle scale with the
       // arc; grounded frames ignore both and return the brace pose. Spec 32
-      // §2.2: an acrobatic roll held aloft (ClientApp latch or physics-
-      // mirrored `acrobaticRoll`) overlays the tuck envelope and the 360°
-      // somersault pitch on top of the same phase clock.
+      // §2.2 / Spec 35: a tuck/roll held aloft (ClientApp latch or physics-
+      // mirrored `acrobaticRoll`) overlays the fluid leg-tuck envelope on
+      // top of the same phase clock — no root somersault (flipPitchRad ≡ 0).
       const acrobatic = airborne && (this.acrobaticRoll
         || (state as SuitState & { acrobaticRoll?: boolean }).acrobaticRoll === true);
       this.acrobaticActive = acrobatic;
@@ -2376,11 +2417,10 @@ export class EvaSuitAvatar {
       upper.rotation.y = pose.torsoYawRad;
       upper.rotation.z = pose.torsoRollRad;
       if (this.head !== null) this.head.rotation.x = pose.headPitchRad;
-      // Spec 32 §2.2: the acrobatic somersault rides the avatar ROOT — add
-      // flipPitchRad on top of the look-pitch lean syncTransform just wrote
-      // (it rewrites root.rotation every frame, so the pose self-clears).
-      // 0 outside a roll; the full 2π at u ≥ 0.90 leaves the avatar upright
-      // for the Phase C claw and the landing brace.
+      // Spec 35 §2.2: the root-mesh flip is rectified away — pose.flipPitchRad
+      // is strictly 0, so the root keeps only the look-pitch lean
+      // syncTransform just wrote (it rewrites root.rotation every frame, so
+      // the pose self-clears). The tuck lives entirely in the limb channels.
       const root = this.root;
       if (root !== null) {
         root.rotation.x = PITCH_LEAN_SCALE * (state.pitch ?? 0) + pose.flipPitchRad;
