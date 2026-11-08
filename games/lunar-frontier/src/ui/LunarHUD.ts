@@ -2678,6 +2678,26 @@ export class LunarHUD {
     lootCaption.textContent = 'CONTRABAND SECURED';
     loot.appendChild(lootCaption);
     panel.appendChild(loot);
+
+    // -- 5. Spec 36 Phase 2: predictive throw aim / target lead reticle ---------
+    const cargo = this.make('div', 'lunar-hud-heist-cargo', 'heist-cargo-pill is-hidden', 'heist-cargo');
+    cargo.setAttribute('data-will-catch', 'false');
+    cargo.setAttribute('data-gap-s', '');
+    cargo.setAttribute('data-miss-m', '');
+    cargo.setAttribute('data-azimuth', '');
+    const cargoLabel = this.make('span', 'hud-heist-cargo-label', 'heist-cargo-label', 'heist-cargo-label');
+    cargoLabel.textContent = 'CARGO';
+    cargo.appendChild(cargoLabel);
+    const cargoValue = this.make('span', 'hud-heist-cargo-value', 'heist-cargo-value', 'heist-cargo-value');
+    cargoValue.textContent = 'GAP --.-s // MISS --.-m';
+    cargo.appendChild(cargoValue);
+    const cargoStatus = this.make('span', 'hud-heist-cargo-status', 'heist-cargo-status', 'heist-cargo-status');
+    cargoStatus.textContent = 'SOLVING VACUUM SOLUTION';
+    cargo.appendChild(cargoStatus);
+    const cargoCaught = this.make('span', 'hud-heist-cargo-caught', 'heist-cargo-caught', 'heist-cargo-caught');
+    cargoCaught.textContent = '×0';
+    cargo.appendChild(cargoCaught);
+    panel.appendChild(cargo);
   }
 
   /**
@@ -2765,6 +2785,39 @@ export class LunarHUD {
     this.setText('heist-loot-count', `×${stolen}`);
     for (let i = 0; i < HUD_HEIST_LOOT_SLOTS; i++) {
       this.setClass(`heist-loot-slot-${i}`, 'is-secured', i < stolen);
+    }
+
+    // -- 5. Spec 36 Phase 2: predictive throw aim / target lead reticle -----------
+    // While a canister rides in the hands the pill solves the vacuum
+    // trajectory toward the tracking buggy: the moving-frame gap-cross time,
+    // the miss distance past the bed centre, and the MAG-LOCK green once the
+    // magnetic hopper envelope would take the throw. Everything mirrors into
+    // data-* attributes so headless DOMs can assert without CSS.
+    const cargoAim = telemetry.cargoAim ?? null;
+    const caughtCount = Math.max(0, Math.round(finite(telemetry.cargoCaughtCount)));
+    this.setText('heist-cargo-caught', `×${caughtCount}`);
+    this.setClass('heist-cargo', 'is-hidden', cargoAim === null);
+    if (cargoAim !== null) {
+      const willCatch = cargoAim.willCatch === true;
+      this.setText('heist-cargo-label', String(cargoAim.label ?? 'CARGO').toUpperCase());
+      this.setText(
+        'heist-cargo-value',
+        `GAP ${num(cargoAim.gapCrossTimeS, 2)}s // MISS ${num(cargoAim.missDistanceM, 1)}m`,
+      );
+      this.setText(
+        'heist-cargo-status',
+        willCatch ? 'MAG-LOCK LOCKED // THROW NOW' : 'ADJUST BEARING — NO HOPPER LOCK',
+      );
+      this.setClass('heist-cargo', 'is-locked', willCatch);
+      const cargoEl = this.els.get('heist-cargo');
+      if (cargoEl !== undefined) {
+        cargoEl.setAttribute('data-will-catch', willCatch ? 'true' : 'false');
+        cargoEl.setAttribute('data-gap-s', num(cargoAim.gapCrossTimeS, 3));
+        cargoEl.setAttribute('data-miss-m', num(cargoAim.missDistanceM, 3));
+        cargoEl.setAttribute('data-azimuth', num(cargoAim.aimAzimuthDeg, 2));
+      }
+    } else {
+      this.setClass('heist-cargo', 'is-locked', false);
     }
   }
 

@@ -20,7 +20,12 @@
  *  • the Cyber-Lock bypass (6.0 s hold-to-hack), the loot siphon (3× He-3
  *    cryo-flasks, 1× quantum cipher slate, 2× superconducting coils), the
  *    44.0 s depot-proximity countdown, and the bailout jump kinematics
- *    v_exit = v_train + v_lateral (Spec 26 §3.3.3–§3.3.4).
+ *    v_exit = v_train + v_lateral (Spec 26 §3.3.3–§3.3.4);
+ *  • Spec 36 Phase 2 active cargo: roof-cradle unclamp & pick-up on the
+ *    vault-car catwalk, the moving-frame ballistic throw
+ *    v_cargo = v_train + v_throw (impulse 8.0–14.0 m/s, pitch ≈ 25°), and
+ *    the predictive lead readout the HUD reticle paints toward the tracking
+ *    buggy (blueprint 36 §"Physical Capture & Ballistic Envelopes").
  *
  * Phase machine (blueprint §2.1, canonical union in the Spec 26 Phase 3
  * contract): INACTIVE → INTERCEPTING ⇄ BOARDING_WINDOW → ON_BOARD_CRACKING →
@@ -51,6 +56,7 @@
  */
 import { Quaternion, Vector3 } from '@babylonjs/core/Maths/math.vector.js';
 import { babylonToWorld } from '../engine/CameraRig.ts';
+import { LUNAR_GRAVITY } from '../physics/TraversalPhysics.ts';
 import type { HighSpeedMaglev } from '../infrastructure/HighSpeedMaglev.ts';
 import type { XCorpCitadel } from '../infrastructure/XCorpCitadel.ts';
 
@@ -109,6 +115,102 @@ export const HEIST_MOON_CARGO: Readonly<Record<HeistMoonCargoType, HeistMoonCarg
 /** Type guard for externally supplied cargo-type strings (metadata, network). */
 export function isHeistMoonCargoType(value: unknown): value is HeistMoonCargoType {
   return typeof value === 'string' && (HEIST_MOON_CARGO_TYPES as readonly string[]).includes(value);
+}
+
+// -- Spec 36 Phase 2: active cargo pick-up, aim & ballistic throw -------------
+
+/** Spec 36 §2.1: lower bound of the player throw impulse (m/s). */
+export const CARGO_THROW_MIN_MPS = 8.0;
+/** Spec 36 §2.1: upper bound of the player throw impulse (m/s). */
+export const CARGO_THROW_MAX_MPS = 14.0;
+/** Spec 36 §2.1: standard uncharged-throw impulse (m/s). */
+export const CARGO_THROW_STANDARD_MPS = 10.0;
+/** Spec 36 §2.1: throw pitch elevation ≈ 25° above the local horizontal (rad). */
+export const CARGO_THROW_PITCH_RAD = 0.44;
+/** Spec 36 §2.2: soft electromagnetic catch-envelope radius R_catch (m). */
+export const CARGO_CATCH_RADIUS_M = 1.8;
+/** Spec 36 §2.2: relative-velocity ceiling for a magnetic capture (m/s). */
+export const CARGO_CATCH_RELATIVE_MAX_MPS = 6.0;
+/** Magnetic capture window: the gap cross must complete inside this (s).
+ *  Spec §2.1 books the canonical crossing at 0.45–0.55 s; the window is the
+ *  generous outer bound a weak (8 m/s) lob still lands inside. */
+export const CARGO_CAPTURE_WINDOW_S = 2.5;
+/** Two-handed chest carry / release height above the deck anchor (m). */
+export const CARGO_RELEASE_HEIGHT_M = 1.2;
+/** Buggy flatbed centre height — mid-point of the bed bounds
+ *  Z ∈ [0.20, 0.90] m above the chassis datum (m, Spec 36 §2.2). */
+export const BUGGY_BED_CENTRE_HEIGHT_M = 0.55;
+/** Unclamp & pick-up reach on the catwalk, horizontal car-local (m). */
+export const CARGO_PICKUP_RADIUS_M = 2.0;
+/** Containers clamped per roof cradle on a fresh run. */
+export const ROOF_CARGO_DEFAULT_COUNT_PER_TYPE = 2;
+
+/**
+ * Vault-car roof cradle stow points in the car-local frame (forward +z,
+ * up +y; deck skin tops out at {@link BAILOUT_DECK_HEIGHT_M} = 2.9 m, the
+ * cradles sit on the container deck above it). Phase 1's procedural PBR
+ * container meshes mount on these same points, so pick-up proximity, throw
+ * release and the clamp LEDs can never drift apart.
+ */
+export const ROOF_CARGO_CRADLES: Readonly<Record<HeistMoonCargoType, { x: number; y: number; z: number }>> = {
+  WATER_CRYO_CELL: { x: 0.0, y: 3.3, z: -4.0 },
+  LOX_CYLINDER: { x: 0.0, y: 3.3, z: 0.0 },
+  HE3_FLASK: { x: 0.0, y: 3.3, z: 4.0 },
+};
+
+/**
+ * Resolved snapshot of one cargo throw (Spec 36 §2.1/§2.2). The launch
+ * follows r(t) = r₀ + v_cargo·t + ½g·t² in vacuum (C_d = 0,
+ * g = 1.62 m/s²) with v_cargo = v_train + v_throw.
+ */
+export interface CargoThrowState {
+  cargoType: HeistMoonCargoType;
+  /** Human-readable container label (HUD / feedback). */
+  label: string;
+  /** World-frame release point of the canister (m). */
+  releasePoint: { x: number; y: number; z: number };
+  /** World-frame launch velocity v_cargo = v_train + v_throw (m/s). */
+  launchVelocity: { x: number; y: number; z: number };
+  /** Vacuum flight time until the canister crosses the buggy bed plane (s). */
+  flightTimeS: number;
+  /** Moving-frame time at which the canister closes the lateral gap (s). */
+  gapCrossTimeS: number;
+  /** Moving-frame miss distance of the ground track past the bed centre (m). */
+  missDistanceM: number;
+  /** Predicted intercept point on the bed plane (world m). */
+  interceptPoint: { x: number; y: number; z: number };
+  /** True once the throw is inside the magnetic capture envelope. */
+  caught: boolean;
+}
+
+/** Per-frame predictive throw aim for the HUD lead reticle (Spec 36 Phase 2). */
+export interface CargoAimTelemetry {
+  carriedCargoType: HeistMoonCargoType;
+  /** Container label for the HUD (e.g. `Water Cryo-Cell`). */
+  label: string;
+  /** Standard throw speed the prediction was solved at (m/s). */
+  throwSpeedMps: number;
+  /** Aim heading compass of the intercept bearing (deg, az 0 = +x). */
+  aimAzimuthDeg: number;
+  /** Moving-frame time to cross the lateral gap at this aim (s). */
+  gapCrossTimeS: number;
+  /** Moving-frame miss distance past the bed centre at this aim (m). */
+  missDistanceM: number;
+  /** Predicted intercept point on the buggy bed plane (world m). */
+  interceptPoint: { x: number; y: number; z: number };
+  /** True while the magnetic hopper would take the canister at this aim. */
+  willCatch: boolean;
+}
+
+/** Result of a catwalk pick-up proximity scan (prompt / touch verb). */
+export interface CargoPickupContact {
+  cargoType: HeistMoonCargoType;
+  /** Human-readable container label. */
+  label: string;
+  /** Horizontal catwalk distance from the player anchor to the cradle (m). */
+  distanceM: number;
+  /** World-frame cradle position (m). */
+  worldPosition: { x: number; y: number; z: number };
 }
 
 /**
@@ -259,6 +361,15 @@ export interface HeistTelemetry {
   countdownRemainingS: number;
   /** Secured loot items so far (0 before the crack, 6 after). */
   stolenCargoCount: number;
+  /** Spec 36 Phase 2: true while the avatar carries a canister. */
+  carryingCargo?: boolean;
+  /** Spec 36 Phase 2: carried container type (null with hands free). */
+  carriedCargoType?: HeistMoonCargoType | null;
+  /** Spec 36 Phase 2: canisters the buggy hopper has taken this run. */
+  cargoCaughtCount?: number;
+  /** Spec 36 Phase 2: predictive throw aim for the HUD lead reticle
+   *  (null with hands free or off the train). */
+  cargoAim?: CargoAimTelemetry | null;
 }
 
 /**
@@ -296,6 +407,13 @@ export interface TrainHeistOptions {
   bailoutLateralMps: number;
   vaultDeckLengthM: number;
   vaultDeckWidthM: number;
+  /** Spec 36 Phase 2: roof cradles clamp this many containers per type
+   *  on a fresh run (clamped 0–99; default {@link ROOF_CARGO_DEFAULT_COUNT_PER_TYPE}). */
+  roofCargoPerType?: number;
+  /** Spec 36 Phase 2: standard throw impulse (m/s). Out-of-band values
+   *  fall back to {@link CARGO_THROW_STANDARD_MPS}; per-throw callers may
+   *  still request anything inside [8.0, 14.0]. */
+  throwSpeedMps?: number;
   /** Loot table overrides (headless harnesses shrink the payload). */
   loot: Partial<HeistLootPayload>;
 }
@@ -421,6 +539,24 @@ export class TrainHeistDirector {
   private lastBailoutVelocity: { x: number; y: number; z: number } = { x: 0, y: 0, z: 0 };
   /** Last boarding-jump apex world point (catwalk deck + lift) — null pre-jump. */
   private lastBoardingApex: { x: number; y: number; z: number } | null = null;
+  /** Spec 36 Phase 2: canister in the avatar's hands (null with hands free). */
+  private carriedCargoType: HeistMoonCargoType | null = null;
+  /** Spec 36 Phase 2: containers still clamped per roof cradle type. */
+  private roofCargoRemaining: Record<HeistMoonCargoType, number> = {
+    WATER_CRYO_CELL: ROOF_CARGO_DEFAULT_COUNT_PER_TYPE,
+    LOX_CYLINDER: ROOF_CARGO_DEFAULT_COUNT_PER_TYPE,
+    HE3_FLASK: ROOF_CARGO_DEFAULT_COUNT_PER_TYPE,
+  };
+  /** Player throw aim (world horizontal unit vector); null = auto-track buggy. */
+  private cargoAimHeading: { x: number; y: number } | null = null;
+  /** Resolved snapshot of the most recent throw (null before the first). */
+  private lastCargoThrow: CargoThrowState | null = null;
+  /** Canisters the buggy's magnetic hopper has taken this run. */
+  private cargoCaughtCount = 0;
+  /** Standard throw impulse (m/s) — constructor-sanitised. */
+  private readonly throwSpeedMps: number;
+  /** Whole containers clamped per roof cradle — constructor-sanitised. */
+  private roofCradleStock: number;
   /** Last telemetry snapshot (HUD readback without re-evaluation). */
   private lastTelemetry: HeistTelemetry = this.buildTelemetry(0, 0, 0, 0, 0, false);
 
@@ -460,6 +596,26 @@ export class TrainHeistDirector {
     this.bailoutLateralMps = bailout;
     this.vaultDeckLengthM = deckL;
     this.vaultDeckWidthM = deckW;
+    // Spec 36 Phase 2: standard throw impulse — anything outside the
+    // [8.0, 14.0] canonical band (or non-finite) degrades to 10.0 m/s;
+    // per-throw callers may still pin any in-band speed explicitly.
+    const throwSpeed = finiteOr(options.throwSpeedMps, CARGO_THROW_STANDARD_MPS);
+    this.throwSpeedMps =
+      throwSpeed >= CARGO_THROW_MIN_MPS && throwSpeed <= CARGO_THROW_MAX_MPS
+        ? throwSpeed
+        : CARGO_THROW_STANDARD_MPS;
+    // Roof cradle stock: clamped whole containers per type (QA harnesses
+    // shrink it; a fresh run clamps the canonical pair of each commodity).
+    this.roofCradleStock = clamp(
+      Math.round(finiteOr(options.roofCargoPerType, ROOF_CARGO_DEFAULT_COUNT_PER_TYPE)),
+      0,
+      99,
+    );
+    this.roofCargoRemaining = {
+      WATER_CRYO_CELL: this.roofCradleStock,
+      LOX_CYLINDER: this.roofCradleStock,
+      HE3_FLASK: this.roofCradleStock,
+    };
     const loot = options.loot ?? {};
     // Spec 36 §3.1: volatile lines are carried ONLY when the table supplies
     // them — a canonical Spec 26 table stays exactly the legacy 3-key shape
@@ -659,6 +815,266 @@ export class TrainHeistDirector {
       return true;
     }
     return false;
+  }
+
+  // -- Spec 36 Phase 2: active cargo pick-up, aim & ballistic throw --------------
+
+  /**
+   * True while the avatar holds an unclamped canister in the two-handed
+   * carry stance (Spec 36 §3 Phase 2). False with hands free or disposed.
+   */
+  isCarryingCargo(): boolean {
+    return this.carriedCargoType !== null && !this.disposed;
+  }
+
+  /** The carried container type (null with hands free). */
+  getCarriedCargoType(): HeistMoonCargoType | null {
+    return this.isCarryingCargo() ? this.carriedCargoType : null;
+  }
+
+  /** Containers still clamped per roof cradle type (copy). */
+  getRoofCargoRemaining(): Record<HeistMoonCargoType, number> {
+    return { ...this.roofCargoRemaining };
+  }
+
+  /**
+   * Nearest stocked roof cradle within {@link CARGO_PICKUP_RADIUS_M} of the
+   * player's deck anchor (horizontal catwalk distance). Answers null while
+   * the hands are full, off the train, or nothing is in reach — drives the
+   * `[E] / (X) Unclamp & Pick Up Cargo` prompt and the touch smart-button
+   * verb.
+   */
+  nearestCargoPickup(): CargoPickupContact | null {
+    if (this.disposed || !this.isPlayerOnBoard() || this.isCarryingCargo()) return null;
+    const anchor = this.playerLocal;
+    let best: CargoPickupContact | null = null;
+    for (const type of HEIST_MOON_CARGO_TYPES) {
+      if ((this.roofCargoRemaining[type] ?? 0) <= 0) continue;
+      const cradle = ROOF_CARGO_CRADLES[type];
+      const distanceM = Math.hypot(anchor.x - cradle.x, anchor.z - cradle.z);
+      if (distanceM > CARGO_PICKUP_RADIUS_M + 1e-6) continue;
+      if (best === null || distanceM < best.distanceM) {
+        best = {
+          cargoType: type,
+          label: HEIST_MOON_CARGO[type].label,
+          distanceM,
+          worldPosition: this.localToWorld(cradle),
+        };
+      }
+    }
+    return best;
+  }
+
+  /**
+   * `[E]` / `(X)` Unclamp & Pick Up Cargo (Spec 36 §3 Phase 2): pops the
+   * clamp on the nearest stocked cradle and hands the container to the
+   * avatar in the two-handed carry stance. Returns the picked container
+   * type, or null when nothing was taken (off the train, hands full, no
+   * cradle in reach, or cradle empty).
+   */
+  interactCargoPickUp(): HeistMoonCargoType | null {
+    const contact = this.nearestCargoPickup();
+    if (contact === null) return null;
+    const remaining = this.roofCargoRemaining[contact.cargoType] ?? 0;
+    if (remaining <= 0) return null;
+    this.roofCargoRemaining[contact.cargoType] = remaining - 1;
+    this.carriedCargoType = contact.cargoType;
+    return contact.cargoType;
+  }
+
+  /**
+   * Aim the next throw along a player heading — a world-frame horizontal
+   * direction ({x, cos law of the avatar heading, e.g. {x: cos h, y: sin h}})
+   * or an angle in radians. Degenerate / non-finite input is ignored (the
+   * previous aim survives); `null` reverts to the default auto-track
+   * bearing on the tethered buggy.
+   */
+  setCargoAimHeading(heading: { x: number; y: number } | number | null): void {
+    if (heading === null) {
+      this.cargoAimHeading = null;
+      return;
+    }
+    if (typeof heading === 'number') {
+      if (!Number.isFinite(heading)) return;
+      this.cargoAimHeading = { x: Math.cos(heading), y: Math.sin(heading) };
+      return;
+    }
+    const x = finiteOr(heading?.x, 0);
+    const y = finiteOr(heading?.y, 0);
+    const len = Math.hypot(x, y);
+    if (!(len > 1e-6)) return;
+    this.cargoAimHeading = { x: x / len, y: y / len };
+  }
+
+  /** Chest-height throw release point (world m) — null when off the train. */
+  getCargoReleasePoint(): { x: number; y: number; z: number } | null {
+    if (this.disposed || !this.isPlayerOnBoard()) return null;
+    return this.localToWorld({
+      x: this.playerLocal.x,
+      y: this.playerLocal.y + CARGO_RELEASE_HEIGHT_M,
+      z: this.playerLocal.z,
+    });
+  }
+
+  /**
+   * Pure vacuum throw solution (Spec 36 §2.1/§2.2) — no state, no side
+   * effects:
+   *
+   *   v_cargo(0) = v_train + v_throw·(cos φ·û_aim + sin φ·k̂),  φ ≈ 25°
+   *   r(t) = r₀ + v_cargo·t − ½·g·k̂·t²                        (C_d = 0)
+   *
+   * Because the tethered autopilot mirrors the train (v_buggy ≈ v_train),
+   * the capture decision collapses into the MOVING FRAME exactly as §2.1
+   * books it ("traverses the 4.5 m lateral gap in ≈ 0.45–0.55 s,
+   * maintaining parallel forward velocity"): the canister's relative
+   * ground track is q(τ) = d₀ + v_throw,horiz·τ, and the magnetic hopper
+   * (§2.2, R_catch = 1.8 m with attractor damping that owns the vertical
+   * settlement in Phase 3) takes the canister when the track's closest
+   * approach to the bed centre sits inside the envelope within the capture
+   * window. Null when off the train or the bed-plane crossing is
+   * degenerate.
+   */
+  private solveCargoThrow(
+    throwSpeedMps: number,
+  ): Omit<CargoThrowState, 'cargoType' | 'label'> | null {
+    const releasePoint = this.getCargoReleasePoint();
+    if (releasePoint === null) return null;
+    const vault = this.vaultFrame();
+    const tether = this.getTetheredRoverTargetPos();
+    const bedCentre = { x: tether.x, y: tether.y, z: tether.z + BUGGY_BED_CENTRE_HEIGHT_M };
+    // Aim heading: the player's bearing, falling back to the auto-track
+    // release→buggy direction; a degenerate guideway falls back to starboard.
+    let aim = this.cargoAimHeading;
+    if (aim === null) {
+      const ax = bedCentre.x - releasePoint.x;
+      const ay = bedCentre.y - releasePoint.y;
+      const al = Math.hypot(ax, ay);
+      aim = al > 1e-6 ? { x: ax / al, y: ay / al } : { x: vault.tangent.y, y: -vault.tangent.x };
+    }
+    const cosPhi = Math.cos(CARGO_THROW_PITCH_RAD);
+    const sinPhi = Math.sin(CARGO_THROW_PITCH_RAD);
+    const launchVelocity = {
+      x: vault.velocity.x + throwSpeedMps * cosPhi * aim.x,
+      y: vault.velocity.y + throwSpeedMps * cosPhi * aim.y,
+      z: vault.velocity.z + throwSpeedMps * sinPhi,
+    };
+    // Bed-plane crossing of the vacuum arc: (g/2)t² − v_z t + (z_bed − z₀) = 0,
+    // positive root of the descending branch.
+    const g = LUNAR_GRAVITY;
+    const dz = releasePoint.z - bedCentre.z;
+    const disc = launchVelocity.z * launchVelocity.z + 2 * g * dz;
+    if (!(disc >= 0)) return null;
+    const flightTimeS = (launchVelocity.z + Math.sqrt(disc)) / g;
+    if (!(flightTimeS > 0) || !Number.isFinite(flightTimeS)) return null;
+    // Moving-frame ground track: d(τ) = d₀ + w·τ with d₀ = release − bed and
+    // w = v_cargo − v_buggy = the horizontal throw component (parallel frame).
+    const d0 = { x: releasePoint.x - bedCentre.x, y: releasePoint.y - bedCentre.y };
+    const w = { x: throwSpeedMps * cosPhi * aim.x, y: throwSpeedMps * cosPhi * aim.y };
+    const wSq = w.x * w.x + w.y * w.y;
+    const gapCrossTimeS = wSq > 1e-12 ? Math.max(0, -(d0.x * w.x + d0.y * w.y) / wSq) : 0;
+    const qx = d0.x + w.x * gapCrossTimeS;
+    const qy = d0.y + w.y * gapCrossTimeS;
+    const missDistanceM = Math.hypot(qx, qy);
+    const caught = missDistanceM <= CARGO_CATCH_RADIUS_M && gapCrossTimeS <= CARGO_CAPTURE_WINDOW_S;
+    // Predicted intercept on the bed plane along the full vacuum arc.
+    const interceptPoint = {
+      x: releasePoint.x + launchVelocity.x * flightTimeS,
+      y: releasePoint.y + launchVelocity.y * flightTimeS,
+      z: bedCentre.z,
+    };
+    if (!Number.isFinite(interceptPoint.x) || !Number.isFinite(interceptPoint.y)) return null;
+    return {
+      releasePoint,
+      launchVelocity,
+      flightTimeS,
+      gapCrossTimeS,
+      missDistanceM,
+      interceptPoint,
+      caught,
+    };
+  }
+
+  /**
+   * Predictive throw aim for the HUD lead reticle (Spec 36 §3 Phase 2):
+   * the intercept bearing, moving-frame gap-cross time and miss distance
+   * the throw would take at the STANDARD impulse from the current stance.
+   * Null with hands free or off the train.
+   */
+  getCargoThrowAim(): CargoAimTelemetry | null {
+    const carried = this.getCarriedCargoType();
+    if (carried === null) return null;
+    const solved = this.solveCargoThrow(this.throwSpeedMps);
+    if (solved === null) return null;
+    const dxa = solved.interceptPoint.x - solved.releasePoint.x;
+    const dya = solved.interceptPoint.y - solved.releasePoint.y;
+    return {
+      carriedCargoType: carried,
+      label: HEIST_MOON_CARGO[carried].label,
+      throwSpeedMps: this.throwSpeedMps,
+      aimAzimuthDeg: (Math.atan2(dya, dxa) * 180) / Math.PI,
+      gapCrossTimeS: solved.gapCrossTimeS,
+      missDistanceM: solved.missDistanceM,
+      interceptPoint: solved.interceptPoint,
+      willCatch: solved.caught,
+    };
+  }
+
+  /**
+   * The ballistic cargo throw (Spec 36 §2.1): releases the carried canister
+   * with v_cargo = v_train + v_throw (impulse clamped to [8.0, 14.0] m/s,
+   * default 10.0, at the ≈25° pitch elevation along the current aim
+   * heading). The moving-frame capture arbiter (blueprint "Physical Capture
+   * & Ballistic Envelopes") credits the buggy's magnetic hopper on a clean
+   * gap cross — the secured canister lands on the payload's moon-volatile
+   * line and counts toward stolen cargo. Returns the resolved throw state,
+   * or null when nothing was released (hands free or off the train).
+   */
+  executeCargoThrow(throwSpeedMps?: number): CargoThrowState | null {
+    const carried = this.getCarriedCargoType();
+    if (carried === null) return null;
+    let speed = finiteOr(throwSpeedMps, this.throwSpeedMps);
+    speed = clamp(speed, CARGO_THROW_MIN_MPS, CARGO_THROW_MAX_MPS);
+    const solved = this.solveCargoThrow(speed);
+    if (solved === null) return null;
+    // The hands leave the canister behind either way.
+    this.carriedCargoType = null;
+    if (solved.caught) this.creditCaughtCargo(carried);
+    const state: CargoThrowState = {
+      cargoType: carried,
+      label: HEIST_MOON_CARGO[carried].label,
+      ...solved,
+    };
+    this.lastCargoThrow = state;
+    return { ...state };
+  }
+
+  /** Credit one magnetically-caught canister to the payload's moon line. */
+  private creditCaughtCargo(type: HeistMoonCargoType): void {
+    const p = this.securedLoot;
+    switch (type) {
+      case 'WATER_CRYO_CELL':
+        p.waterCryoCells = positiveCount(p.waterCryoCells) + 1;
+        break;
+      case 'LOX_CYLINDER':
+        p.loxCylinders = positiveCount(p.loxCylinders) + 1;
+        break;
+      case 'HE3_FLASK':
+        // Physical flask REPLACES the legacy cryo-flask line (same vessel) —
+        // credit on top of the post-replacement read so nothing double-counts.
+        p.he3Flasks = he3FlaskCount(p) + 1;
+        break;
+    }
+    this.cargoCaughtCount += 1;
+  }
+
+  /** Resolved snapshot of the most recent throw (null before the first). */
+  getLastCargoThrow(): CargoThrowState | null {
+    return this.lastCargoThrow === null ? null : { ...this.lastCargoThrow };
+  }
+
+  /** Canisters the buggy's magnetic hopper has taken this run. */
+  getCargoCaughtCount(): number {
+    return this.cargoCaughtCount;
   }
 
   // -- bailout & escape --------------------------------------------------------------------
@@ -931,6 +1347,16 @@ export class TrainHeistDirector {
     this.tetherActive = false;
     this.lastBailoutVelocity = { x: 0, y: 0, z: 0 };
     this.lastBoardingApex = null;
+    // Spec 36 Phase 2: hands free, cradles re-clamped, throw bookkeeping cold.
+    this.carriedCargoType = null;
+    this.roofCargoRemaining = {
+      WATER_CRYO_CELL: this.roofCradleStock,
+      LOX_CYLINDER: this.roofCradleStock,
+      HE3_FLASK: this.roofCradleStock,
+    };
+    this.cargoAimHeading = null;
+    this.lastCargoThrow = null;
+    this.cargoCaughtCount = 0;
   }
 
   /** Tear down: reset state and drop references. The director owns no meshes. */
@@ -955,6 +1381,9 @@ export class TrainHeistDirector {
     countdownRemainingS: number,
     canBoard: boolean,
   ): HeistTelemetry {
+    // Spec 36 Phase 2: throw aim readback rides every frame — null with
+    // hands free, solved once per build otherwise (pure, cheap).
+    const cargoAim = this.getCargoThrowAim();
     return {
       phase: this.phase,
       relativeSpeedMps,
@@ -964,6 +1393,10 @@ export class TrainHeistDirector {
       hackProgressFraction: clamp(hackProgressFraction, 0, 1),
       countdownRemainingS,
       stolenCargoCount: this.getStolenCargoCount(),
+      carryingCargo: this.isCarryingCargo(),
+      carriedCargoType: this.getCarriedCargoType(),
+      cargoCaughtCount: this.cargoCaughtCount,
+      cargoAim,
     };
   }
 }

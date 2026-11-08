@@ -80,7 +80,13 @@ import { RailSystem } from '../infrastructure/RailSystem.ts';
 import type { OreCartEntity } from '../infrastructure/RailSystem.ts';
 // Spec 26 §3.3 Phase 3: Train Heist Director — velocity-matching envelope,
 // relative platform kinematics, vault crack, depot countdown, bailout.
-import { TrainHeistDirector, heistLootCargoKg, type HeistTelemetry } from '../quests/TrainHeistDirector.ts';
+import {
+  TrainHeistDirector,
+  HEIST_MOON_CARGO,
+  heistLootCargoKg,
+  type CargoAimTelemetry,
+  type HeistTelemetry,
+} from '../quests/TrainHeistDirector.ts';
 import {
   ExportMinigameDirector,
   SYNDICATE_LAUNDER_COMMS,
@@ -3174,6 +3180,18 @@ export class ClientApp {
     if (this.mode === 'suit' && this.nearestVaultTerminal !== null) {
       return { icon: '\u{1F5A5}️', label: 'INTERFACE', active: true };
     }
+    // Spec 36 Phase 2: vault-car catwalk cargo verbs — the smart button
+    // becomes 🔓 UNCLAMP CARGO at a cradle and 🎯 THROW CARGO in the
+    // carry stance (the touch lane of the fire button).
+    const heistDirector = this.trainHeistDirector;
+    if (heistDirector !== null && heistDirector.isPlayerOnBoard()) {
+      if (heistDirector.isCarryingCargo()) {
+        return { icon: '\u{1F3AF}', label: 'THROW CARGO', active: true };
+      }
+      if (heistDirector.nearestCargoPickup() !== null) {
+        return { icon: '\u{1F513}', label: 'UNCLAMP CARGO', active: true };
+      }
+    }
     if (this.getSalvageableScrap() !== null) {
       return { icon: '♻️', label: 'SALVAGE', active: true };
     }
@@ -3217,6 +3235,12 @@ export class ClientApp {
       this.interfaceVaultTerminal(this.nearestVaultTerminal.vaultId);
       return true;
     }
+    // Spec 36 Phase 2: catwalk cargo verbs — the carry stance turns the
+    // smart button into the fire trigger (throw); otherwise it unclamps.
+    if (this.trainHeistDirector?.isCarryingCargo() === true) {
+      return this.requestHeistCargoThrow();
+    }
+    if (this.requestHeistCargoPickup()) return true;
     const scrap = this.getSalvageableScrap();
     if (scrap !== null) {
       this.salvageScrap(scrap);
@@ -3557,6 +3581,12 @@ export class ClientApp {
           this.inputSource = 'gamepad';
           this.toggleMap();
         }
+        // Spec 36 Phase 2: on the vault-car catwalk the throttle trigger
+        // doubles as the cargo release — with a canister in hand the RT
+        // edge throws it (dormant with free hands: RT stays pure throttle).
+        if (rising(GAMEPAD_BUTTONS.throttle) && this.requestHeistCargoThrow()) {
+          this.inputSource = 'gamepad';
+        }
         if (rising(GAMEPAD_BUTTONS.mount)) {
           // Spec 29 Phase 3: a radio-tower ladder latch/release under the
           // thumb outranks all (mirrors the keyboard [E] routing).
@@ -3568,6 +3598,8 @@ export class ClientApp {
             // ladder handled — no other action this press
           } else if (this.mode === 'suit' && this.nearestVaultTerminal !== null) {
             this.interfaceVaultTerminal(this.nearestVaultTerminal.vaultId);
+          } else if (this.requestHeistCargoPickup()) {
+            // Spec 36 Phase 2: roof-cradle cargo unclamp consumed the press.
           } else if (
             this.mode === 'suit' &&
             padSuit !== null &&
@@ -3619,6 +3651,9 @@ export class ClientApp {
             this.interfaceVaultTerminal(terminal.vaultId);
             break;
           }
+          // Spec 36 Phase 2: a vault-car roof cradle at the boots unclamps
+          // cargo ahead of the legacy mount-chain verbs.
+          if (this.requestHeistCargoPickup()) break;
           const scrap = this.getSalvageableScrap();
           if (scrap) {
             this.salvageScrap(scrap);
@@ -4861,6 +4896,16 @@ export class ClientApp {
       if (targetScrap !== null) {
         prompts.push({ key: 'E', label: 'Salvage Scrap Component' });
       }
+      // Spec 36 Phase 2: vault-car catwalk cargo verbs — pick up at a
+      // cradle, fire to throw once a canister rides in the hands.
+      const heistCargoDirector = this.trainHeistDirector;
+      if (heistCargoDirector !== null && heistCargoDirector.isPlayerOnBoard()) {
+        if (heistCargoDirector.isCarryingCargo()) {
+          prompts.push({ key: 'LMB', label: 'Throw Cargo to Buggy', order: 2 });
+        } else if (heistCargoDirector.nearestCargoPickup() !== null) {
+          prompts.push({ key: 'E', label: 'Unclamp & Pick Up Cargo', order: 2 });
+        }
+      }
       // Spec 21 §2.4: security terminal beside a vault bulkhead.
       if (this.nearestVaultTerminal !== null) {
         prompts.push({ key: 'E', kind: 'vault' });
@@ -5227,6 +5272,62 @@ export class ClientApp {
   requestHeistBailout(): boolean {
     if (this.disposed) return false;
     return this.trainHeistDirector?.executeBailoutJump() ?? false;
+  }
+
+  /**
+   * Spec 36 Phase 2: `[E]` / `(X)` Unclamp & Pick Up Cargo at the vault-car
+   * roof cradle. Returns true when a canister came away with the avatar
+   * (clamp-pop cue + toast fire on the winning frame).
+   */
+  requestHeistCargoPickup(): boolean {
+    if (this.disposed) return false;
+    const director = this.trainHeistDirector;
+    if (director === null) return false;
+    const picked = director.interactCargoPickUp();
+    if (picked === null) return false;
+    this.audio?.playMagLockDisengage();
+    this.hudFeedback(
+      `${HEIST_MOON_CARGO[picked].label} unclamped — aim for the buggy flatbed`,
+      'info',
+    );
+    return true;
+  }
+
+  /**
+   * Spec 36 Phase 2: release the ballistic cargo throw — the fire button
+   * (`[Left Click]` / gamepad RT / the touch action verb). The impulse is
+   * player-directed along the avatar heading at the canonical ≈25° pitch
+   * elevation, launching v_cargo = v_train + v_throw into the vacuum gap;
+   * a clean moving-frame gap cross is credited to the buggy's magnetic
+   * hopper. Returns true when a canister was released.
+   */
+  requestHeistCargoThrow(): boolean {
+    if (this.disposed) return false;
+    const director = this.trainHeistDirector;
+    if (director === null || !director.isCarryingCargo()) return false;
+    // Player-directed aim heading: the avatar's facing in the world
+    // horizontal plane (the same (cos h, sin h) law as buildMoveState).
+    const suit = this.suit;
+    if (suit !== null) {
+      const heading = suit.getState().heading;
+      director.setCargoAimHeading({ x: Math.cos(heading), y: Math.sin(heading) });
+    }
+    const thrown = director.executeCargoThrow();
+    if (thrown === null) return false;
+    this.audio?.playCanisterVacuumWhistle();
+    if (thrown.caught) {
+      this.audio?.playMagneticCaptureChime();
+      this.hudFeedback(`${thrown.label} CAUGHT — magnetic hopper secured the haul`, 'success');
+    } else {
+      this.hudFeedback(`${thrown.label} away — missed the hopper envelope`, 'error');
+    }
+    return true;
+  }
+
+  /** Spec 36 Phase 2: predictive throw aim for the HUD lead reticle. */
+  getHeistCargoAim(): CargoAimTelemetry | null {
+    if (this.disposed) return null;
+    return this.trainHeistDirector?.getCargoThrowAim() ?? null;
   }
 
   /**
@@ -6680,9 +6781,32 @@ export class ClientApp {
     this.domKeyUp = (ev) => {
       if (ev.code !== undefined) this.handleKeyInput(ev.code, 'up');
     };
+    // Spec 36 Phase 2: the desktop fire button. Left button down throws the
+    // carried heist canister (inert unless the director is carrying cargo —
+    // the pointer otherwise stays with the camera rig).
+    this.domMouseDown = (ev) => {
+      if (ev.button === 0) this.handleFirePress();
+    };
     target.addEventListener('keydown', this.domKeyDown);
     target.addEventListener('keyup', this.domKeyUp);
+    (target as unknown as {
+      addEventListener: (type: string, fn: (ev: { button?: number }) => void) => void;
+    }).addEventListener('mousedown', this.domMouseDown);
     this.domAttached = true;
+  }
+
+  /**
+   * Fire-button lane (`[Left Click]`): while the heist director carries a
+   * canister, the click releases the ballistic throw. Modals park the lane
+   * like every other world action.
+   */
+  private handleFirePress(): void {
+    if (this.disposed) return;
+    if (this.hud?.isTradeDialogOpen() ?? false) return;
+    if (this.trainHeistDirector?.isCarryingCargo() === true) {
+      this.inputSource = 'keyboard';
+      this.requestHeistCargoThrow();
+    }
   }
 
   private detachDomInput(): void {
@@ -6693,6 +6817,7 @@ export class ClientApp {
     try {
       win?.removeEventListener?.('keydown', this.domKeyDown);
       win?.removeEventListener?.('keyup', this.domKeyUp);
+      win?.removeEventListener?.('mousedown', this.domMouseDown);
     } catch {
       /* headless teardown — nothing was attached anyway */
     }
@@ -6701,6 +6826,7 @@ export class ClientApp {
 
   private domKeyDown: (ev: { code?: string; preventDefault?: () => void }) => void = () => {};
   private domKeyUp: (ev: { code?: string }) => void = () => {};
+  private domMouseDown: (ev: { button?: number }) => void = () => {};
 
   // -- helpers --------------------------------------------------------------------------------
 
