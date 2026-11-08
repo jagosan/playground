@@ -77,26 +77,126 @@ export const LOOT_QUANTUM_CIPHER_SLATES = 1;
 export const LOOT_SUPERCONDUCTING_COILS = 2;
 
 /**
+ * Spec 36 §3.1: the Apex Express hauls the moon's most vital survival
+ * commodities — pressurized liquid water ice, high-pressure oxygen and
+ * enriched Helium-3. Canonical physical-container identities for the heist:
+ * per-unit mass (kg) and base fence value (credits) of each container type.
+ *
+ * `HE3_FLASK` is the Spec 36 physical-container identity of the Spec 26
+ * "Enriched He-3 Cryo-Flask" loot line — the same 4.0 kg vessel, modelled
+ * and throwable from Phase 2 onward.
+ */
+export const HEIST_MOON_CARGO_TYPES = ['WATER_CRYO_CELL', 'LOX_CYLINDER', 'HE3_FLASK'] as const;
+
+export type HeistMoonCargoType = (typeof HEIST_MOON_CARGO_TYPES)[number];
+
+/** Physical / economic spec of one moon-cargo container type (Spec 36 §3.1). */
+export interface HeistMoonCargoSpec {
+  /** Human-readable container label for HUD prompts. */
+  label: string;
+  /** Full container unit mass (kg) — drives throw ballistics and hopper load. */
+  unitMassKg: number;
+  /** Base per-container value at the Frontier Trading Post (credits). */
+  unitValueCredits: number;
+}
+
+export const HEIST_MOON_CARGO: Readonly<Record<HeistMoonCargoType, HeistMoonCargoSpec>> = {
+  WATER_CRYO_CELL: { label: 'Water Cryo-Cell', unitMassKg: 10.0, unitValueCredits: 1200 },
+  LOX_CYLINDER: { label: 'LOX Cylinder', unitMassKg: 8.0, unitValueCredits: 950 },
+  HE3_FLASK: { label: 'Enriched He-3 Flask', unitMassKg: 4.0, unitValueCredits: 4500 },
+};
+
+/** Type guard for externally supplied cargo-type strings (metadata, network). */
+export function isHeistMoonCargoType(value: unknown): value is HeistMoonCargoType {
+  return typeof value === 'string' && (HEIST_MOON_CARGO_TYPES as readonly string[]).includes(value);
+}
+
+/**
  * Spec 26 Phase 4: per-item cargo mass of the vault loot (kg). The siphon
  * hands the secured payload to the player's carrier (suit backpack, then
  * buggy flatbed) at the clamshell pop — the full canonical 3/1/2 table
  * weighs 3×4.0 + 1×1.0 + 2×5.5 = 24 kg.
+ *
+ * Spec 36 §3.1 adds the moon-volatile container masses alongside the legacy
+ * lines; the He-3 flask entry aliases the canonical {@link HEIST_MOON_CARGO}
+ * value so the physical and bookkeeping models can never drift.
  */
 export const HEIST_LOOT_UNIT_MASS_KG = {
-  he3CryoFlask: 4.0,
+  he3CryoFlask: HEIST_MOON_CARGO.HE3_FLASK.unitMassKg, // 4.0 kg (Spec 26 line)
   quantumCipherSlate: 1.0,
   superconductingCoil: 5.5,
+  /** Spec 36 §3.1: liquid water ice container. */
+  waterCryoCell: HEIST_MOON_CARGO.WATER_CRYO_CELL.unitMassKg, // 10.0 kg
+  /** Spec 36 §3.1: high-pressure oxygen cylinder. */
+  loxCylinder: HEIST_MOON_CARGO.LOX_CYLINDER.unitMassKg, // 8.0 kg
+  /** Spec 36 §3.1: physical He-3 flask (same vessel as he3CryoFlask). */
+  he3Flask: HEIST_MOON_CARGO.HE3_FLASK.unitMassKg, // 4.0 kg
 } as const;
 
-/** Total cargo mass (kg) of a loot payload; NaN/negative counts read 0. */
+function positiveCount(value: number | undefined): number {
+  return Number.isFinite(value) && (value as number) > 0 ? (value as number) : 0;
+}
+
+/**
+ * Spec 36-aware He-3 count: the physical `he3Flasks` line, when present and
+ * finite, REPLACES the legacy `he3CryoFlasks` line (same vessel — never both,
+ * or the same flasks would be weighed twice). Unset reads the legacy field.
+ */
+function he3FlaskCount(payload: Partial<HeistLootPayload>): number {
+  return Number.isFinite(payload.he3Flasks)
+    ? positiveCount(payload.he3Flasks)
+    : positiveCount(payload.he3CryoFlasks);
+}
+
+/**
+ * Total cargo mass (kg) of a loot payload; NaN/negative counts read 0.
+ * Covers the Spec 26 canonical 3/1/2 table plus the Spec 36 §3.1 moon
+ * volatiles (water cryo-cells ×10.0, LOX cylinders ×8.0, He-3 flasks ×4.0),
+ * which contribute 0 while absent — legacy payloads weigh exactly as before.
+ */
 export function heistLootCargoKg(payload: Partial<HeistLootPayload> | null | undefined): number {
   if (payload === null || payload === undefined) return 0;
-  const k = (v: number | undefined): number => (Number.isFinite(v) && (v as number) > 0 ? (v as number) : 0);
   return (
-    k(payload.he3CryoFlasks) * HEIST_LOOT_UNIT_MASS_KG.he3CryoFlask +
-    k(payload.quantumCipherSlates) * HEIST_LOOT_UNIT_MASS_KG.quantumCipherSlate +
-    k(payload.superconductingCoils) * HEIST_LOOT_UNIT_MASS_KG.superconductingCoil
+    he3FlaskCount(payload) * HEIST_LOOT_UNIT_MASS_KG.he3Flask +
+    positiveCount(payload.quantumCipherSlates) * HEIST_LOOT_UNIT_MASS_KG.quantumCipherSlate +
+    positiveCount(payload.superconductingCoils) * HEIST_LOOT_UNIT_MASS_KG.superconductingCoil +
+    positiveCount(payload.waterCryoCells) * HEIST_LOOT_UNIT_MASS_KG.waterCryoCell +
+    positiveCount(payload.loxCylinders) * HEIST_LOOT_UNIT_MASS_KG.loxCylinder
   );
+}
+
+/**
+ * Secured count of one moon-cargo type in a payload (Spec 36 §3.1). The
+ * HE3_FLASK type folds the legacy he3CryoFlasks line (see {@link he3FlaskCount}).
+ */
+export function heistMoonCargoCount(
+  payload: Partial<HeistLootPayload> | null | undefined,
+  type: HeistMoonCargoType,
+): number {
+  if (payload === null || payload === undefined) return 0;
+  switch (type) {
+    case 'WATER_CRYO_CELL':
+      return positiveCount(payload.waterCryoCells);
+    case 'LOX_CYLINDER':
+      return positiveCount(payload.loxCylinders);
+    case 'HE3_FLASK':
+      return he3FlaskCount(payload);
+  }
+}
+
+/**
+ * Base fence value (credits) of the moon-volatile lines of a payload
+ * (water 1,200 / LOX 950 / He-3 flask 4,500 per Spec 36 §3.1). The Spec 26
+ * slate/coil lines have no canonical credit value yet, so they read 0 here;
+ * the Phase 5 trading-post settlement layers them on when specified.
+ */
+export function heistMoonCargoValueCredits(payload: Partial<HeistLootPayload> | null | undefined): number {
+  if (payload === null || payload === undefined) return 0;
+  let credits = 0;
+  for (const type of HEIST_MOON_CARGO_TYPES) {
+    credits += heistMoonCargoCount(payload, type) * HEIST_MOON_CARGO[type].unitValueCredits;
+  }
+  return credits;
 }
 
 /** Spec 26 §3.3.4: exactly 44.0 s from the intrusion alarm to depot entry. */
@@ -161,11 +261,27 @@ export interface HeistTelemetry {
   stolenCargoCount: number;
 }
 
-/** The Cyber-Lock container payload (Spec 26 §3.3.3). */
+/**
+ * The Cyber-Lock container payload (Spec 26 §3.3.3), extended by Spec 36
+ * §3.1 with the moon-volatile lines. The three legacy fields stay canonical
+ * (default heist tables carry only them); the Spec 36 fields are optional
+ * and simply absent from un-migrated payloads — see {@link heistLootCargoKg}
+ * and {@link heistMoonCargoCount} for the fold/replace semantics.
+ */
 export interface HeistLootPayload {
   he3CryoFlasks: number;
   quantumCipherSlates: number;
   superconductingCoils: number;
+  /** Spec 36 §3.1: secured WATER_CRYO_CELL containers (10.0 kg / 1,200 cr). */
+  waterCryoCells?: number;
+  /** Spec 36 §3.1: secured LOX_CYLINDER cylinders (8.0 kg / 950 cr). */
+  loxCylinders?: number;
+  /**
+   * Spec 36 §3.1: physical HE3_FLASK count (4.0 kg / 4,500 cr). When present
+   * it REPLACES the legacy he3CryoFlasks line — the same vessel, so setting
+   * both would double-count the same flasks.
+   */
+  he3Flasks?: number;
 }
 
 /** Construction options; every field falls back to the Spec 26 canonical. */
@@ -345,6 +461,14 @@ export class TrainHeistDirector {
     this.vaultDeckLengthM = deckL;
     this.vaultDeckWidthM = deckW;
     const loot = options.loot ?? {};
+    // Spec 36 §3.1: volatile lines are carried ONLY when the table supplies
+    // them — a canonical Spec 26 table stays exactly the legacy 3-key shape
+    // (loot-payload serialization gates, cargo mass and counts unchanged).
+    const volatileCount = (raw: number | undefined): number | null =>
+      raw === undefined ? null : clamp(Math.round(finiteOr(raw, 0)), 0, 999);
+    const water = volatileCount(loot.waterCryoCells);
+    const lox = volatileCount(loot.loxCylinders);
+    const he3Flask = volatileCount(loot.he3Flasks);
     this.lootTable = {
       he3CryoFlasks: clamp(Math.round(finiteOr(loot.he3CryoFlasks, LOOT_HE3_CRYO_FLASKS)), 0, 999),
       quantumCipherSlates: clamp(
@@ -353,6 +477,9 @@ export class TrainHeistDirector {
         999,
       ),
       superconductingCoils: clamp(Math.round(finiteOr(loot.superconductingCoils, LOOT_SUPERCONDUCTING_COILS)), 0, 999),
+      ...(water !== null ? { waterCryoCells: water } : {}),
+      ...(lox !== null ? { loxCylinders: lox } : {}),
+      ...(he3Flask !== null ? { he3Flasks: he3Flask } : {}),
     };
   }
 
@@ -727,12 +854,16 @@ export class TrainHeistDirector {
     return { ...this.securedLoot };
   }
 
-  /** Total secured item count (0 before, 6 with the full canonical table). */
+  /** Total secured item count (0 before, 6 with the full canonical table;
+   *  Spec 36 volatile lines count on top, He-3 folds the legacy line). */
   getStolenCargoCount(): number {
+    const p = this.securedLoot;
     return (
-      this.securedLoot.he3CryoFlasks +
-      this.securedLoot.quantumCipherSlates +
-      this.securedLoot.superconductingCoils
+      p.quantumCipherSlates +
+      p.superconductingCoils +
+      heistMoonCargoCount(p, 'WATER_CRYO_CELL') +
+      heistMoonCargoCount(p, 'LOX_CYLINDER') +
+      heistMoonCargoCount(p, 'HE3_FLASK')
     );
   }
 

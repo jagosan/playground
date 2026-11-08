@@ -87,6 +87,16 @@ export const CHEVRON_PERIOD_M = 40.0;
 export const MAGLEV_CAR_TYPES = ['locomotive', 'vault', 'executive', 'escort'] as const;
 export type MaglevCarType = (typeof MAGLEV_CAR_TYPES)[number];
 
+/**
+ * Spec 36 §3.1: moon-volatile container identities riding the armored vault
+ * car roof (Phase 1 stows the Cryo Tanker payload on the vault car — the
+ * consist stays the canonical 4-car gate shape). The strings are compatible
+ * with TrainHeistDirector's HEIST_MOON_CARGO_TYPES by contract; duplicated
+ * locally so the infrastructure layer never imports from quests/.
+ */
+export const MAGLEV_CARGO_TYPES = ['WATER_CRYO_CELL', 'LOX_CYLINDER', 'HE3_FLASK'] as const;
+export type MaglevCargoType = (typeof MAGLEV_CARGO_TYPES)[number];
+
 /** Root/material name prefix. */
 export const MAGLEV_NAME_PREFIX = 'high-speed-maglev';
 
@@ -192,6 +202,11 @@ interface MaglevMaterials {
   searchlight: PBRMaterial;
   road: PBRMaterial;
   barcode: PBRMaterial;
+  // Spec 36 §3.1: moon-cargo container shells + clamp status LED.
+  cargoCryo: PBRMaterial;
+  cargoLox: PBRMaterial;
+  cargoHe3: PBRMaterial;
+  ledClamp: PBRMaterial;
 }
 
 // ================================================================================
@@ -574,6 +589,7 @@ export class HighSpeedMaglev {
     if (!this.disposed && this.built) {
       this.drawCars(state);
       this.drawRailChevrons();
+      this.drawCargoLeds();
     }
     return state;
   }
@@ -631,6 +647,15 @@ export class HighSpeedMaglev {
       }
       node.computeWorldMatrix(true);
     }
+  }
+
+  /** Blinking amber cargo-clamp status LEDs on the vault roof loadout (Spec 36 §3.1). */
+  private drawCargoLeds(): void {
+    const m = this.materials;
+    if (m === null) return;
+    // Hard on/off beacon blink (~2.6 Hz), not a soft sine pulse.
+    const blink = Math.sin(this.elapsed * 8.2) > 0 ? 1 : 0.12;
+    m.ledClamp.emissiveColor.set(1.0 * blink, 0.45 * blink, 0.05 * blink);
   }
 
   /** Traveling forward-chevron light pulse on the twin stator rails. */
@@ -696,6 +721,7 @@ export class HighSpeedMaglev {
     this.built = true;
     this.drawCars(this.getTrainState());
     this.drawRailChevrons();
+    this.drawCargoLeds();
     return this;
   }
 
@@ -756,11 +782,25 @@ export class HighSpeedMaglev {
    * Meshes tagged with a part id — 'pylon' | 'deck' | 'stator_rail' | 'road' |
    * 'terminal_pad' | 'locomotive' | 'vault' | 'executive' | 'escort' |
    * 'coupler' | 'catwalk' | 'vault_container' | 'vault_lock' | 'glass' |
-   * 'interior' | 'searchlight' | 'drone' | 'dish' | 'trim' | 'barcode' — the
-   * smoke suite's structural assertion handle.
+   * 'interior' | 'searchlight' | 'drone' | 'dish' | 'trim' | 'barcode' |
+   * 'cargo_container' | 'cargo_cradle' | 'clamp_led' — the smoke suite's
+   * structural assertion handle.
    */
   getPartMeshes(part: string): Mesh[] {
     return this.meshList.filter((m) => (m.metadata?.part as string | undefined) === part);
+  }
+
+  /**
+   * Vault-roof moon-cargo container meshes (Spec 36 §3.1), optionally narrowed
+   * to one container type. Container shells carry `metadata.cargoType`
+   * ('WATER_CRYO_CELL' | 'LOX_CYLINDER' | 'HE3_FLASK'); the Phase 2 unclamp /
+   * pick-up interaction resolves its targets through here.
+   */
+  getCargoMeshes(cargoType?: MaglevCargoType): Mesh[] {
+    return this.meshList.filter((mesh) => {
+      const tagType = mesh.metadata?.cargoType as string | undefined;
+      return tagType !== undefined && (cargoType === undefined || tagType === cargoType);
+    });
   }
 
   /** Last emitted train state (readback without re-evaluation). */
@@ -804,6 +844,13 @@ export class HighSpeedMaglev {
       searchlight: HighSpeedMaglev.mk(`${MAGLEV_NAME_PREFIX}-searchlight`, scene, [0.9, 0.88, 0.75], 0.2, 0.3, [1.0, 0.97, 0.85], 0),
       road: HighSpeedMaglev.mk(`${MAGLEV_NAME_PREFIX}-road`, scene, [0.09, 0.085, 0.08], 0.05, 0.95, undefined, 0.08),
       barcode: HighSpeedMaglev.mk(`${MAGLEV_NAME_PREFIX}-barcode`, scene, [0.85, 0.85, 0.9], 0.4, 0.3, [0.6, 0.6, 0.7], 0),
+      // Spec 36 §3.1: moon-cargo shells — frosted cryo steel (water ice),
+      // safety-orange pressure vessel (LOX), faintly glowing He-3 flask.
+      cargoCryo: HighSpeedMaglev.mk(`${MAGLEV_NAME_PREFIX}-cargo-cryo`, scene, [0.72, 0.84, 0.9], 0.55, 0.3, [0.02, 0.07, 0.06], 0.2),
+      cargoLox: HighSpeedMaglev.mk(`${MAGLEV_NAME_PREFIX}-cargo-lox`, scene, [0.78, 0.3, 0.06], 0.6, 0.42, [0.06, 0.015, 0], 0.15),
+      cargoHe3: HighSpeedMaglev.mk(`${MAGLEV_NAME_PREFIX}-cargo-he3`, scene, [0.25, 0.85, 0.4], 0.3, 0.25, [0.08, 0.5, 0.18], 0.1),
+      // Cargo-clamp status LED — amber, blink-driven by drawCargoLeds().
+      ledClamp: HighSpeedMaglev.mk(`${MAGLEV_NAME_PREFIX}-led-clamp`, scene, [0.2, 0.06, 0.01], 0, 0.4, [1.0, 0.45, 0.05], 0),
     };
     materials.glass.alpha = 0.45;
     for (const material of Object.values(materials)) this.materialList.push(material);
@@ -974,6 +1021,59 @@ export class HighSpeedMaglev {
         // Roof-mounted X-Corp Cyber-Lock vault container (the heist target).
         body('vault_container', MeshBuilder.CreateBox(tag('vault-box'), { width: 2.3, height: 1.5, depth: 3.4 }, scene), m.hazard, 0, 3.65, 0);
         body('vault_lock', MeshBuilder.CreateBox(tag('vault-lock'), { width: 0.5, height: 0.5, depth: 0.12 }, scene), m.coil, 0, 3.65, 1.76);
+
+        // -- Spec 36 §3.1: moon-cargo loadout lashed to the vault roof ----------
+        // 2× water cryo-cell (frosty horizontal tanks, fore deck), 3× LOX
+        // cylinder (orange pressure vessels, aft deck) and 2× He-3 flask
+        // (glowing globes flanking the Cyber-Lock box), each cradle fitted
+        // with amber clamp status LEDs (blinked by drawCargoLeds()). The
+        // Cryo Tanker's volatile payload is stowed here in Phase 1 — a
+        // dedicated tanker car would break the canonical 4-car consist gate.
+        const cargo = (
+          cargoType: MaglevCargoType,
+          partId: string,
+          mesh: Mesh,
+          mat: PBRMaterial,
+          x: number,
+          y: number,
+          z: number,
+        ): Mesh => {
+          const made = body(partId, mesh, mat, x, y, z);
+          made.metadata = { ...(made.metadata as Record<string, unknown>), cargoType };
+          return made;
+        };
+        const led = (x: number, y: number, z: number): Mesh =>
+          body('clamp_led', MeshBuilder.CreateBox(tag('clamp-led'), { width: 0.18, height: 0.1, depth: 0.06 }, scene), m.ledClamp, x, y, z);
+
+        // Fore deck (z ≈ +4.4): twin water cryo-cells on a steel cradle.
+        body('cargo_cradle', MeshBuilder.CreateBox(tag('cryo-cradle'), { width: 2.9, height: 0.16, depth: 3.1 }, scene), m.steel, 0, 2.98, 4.4);
+        for (const sgn of [-1, 1]) {
+          cargo('WATER_CRYO_CELL', 'cargo_container',
+            MeshBuilder.CreateCylinder(tag(`cryo-cell-${sgn}`), { diameter: 0.9, height: 2.7, tessellation: 12 }, scene),
+            m.cargoCryo, sgn * 0.72, 3.51, 4.4)
+            .rotation.x = Math.PI / 2;
+          led(sgn * 1.42, 3.14, 4.4);
+        }
+        body('cargo_cradle', MeshBuilder.CreateBox(tag('cryo-holddown'), { width: 2.9, height: 0.08, depth: 0.34 }, scene), m.hazard, 0, 3.98, 4.4);
+
+        // Aft deck (z ≈ −4.3): three upright LOX cylinders + shoulder band.
+        body('cargo_cradle', MeshBuilder.CreateBox(tag('lox-cradle'), { width: 2.9, height: 0.16, depth: 2.3 }, scene), m.steel, 0, 2.98, -4.3);
+        for (const x of [-1.0, 0, 1.0]) {
+          cargo('LOX_CYLINDER', 'cargo_container',
+            MeshBuilder.CreateCylinder(tag(`lox-cyl-${x}`), { diameter: 0.6, height: 1.8, tessellation: 12 }, scene),
+            m.cargoLox, x, 3.96, -4.3);
+        }
+        body('cargo_cradle', MeshBuilder.CreateBox(tag('lox-band'), { width: 2.85, height: 0.12, depth: 0.72 }, scene), m.hazard, 0, 4.52, -4.3);
+        for (const sgn of [-1, 1]) led(sgn * 1.42, 3.14, -4.3);
+
+        // Mid deck: He-3 flasks in lit pedestals fore/aft of the vault box.
+        for (const z of [2.9, -2.9]) {
+          body('cargo_cradle', MeshBuilder.CreateCylinder(tag(`he3-pedestal-${z}`), { diameter: 0.7, height: 0.25, tessellation: 10 }, scene), m.titanium, 0, 3.1, z);
+          cargo('HE3_FLASK', 'cargo_container',
+            MeshBuilder.CreateSphere(tag(`he3-flask-${z}`), { diameter: 0.5, segments: 10 }, scene),
+            m.cargoHe3, 0, 3.47, z);
+          led(0.52, 3.05, z);
+        }
       } else if (type === 'executive') {
         // Translucent carbon-glass roof over a warm luxury cabin.
         body('executive', MeshBuilder.CreateBox(tag('body'), { width: 3.4, height: 2.9, depth: 13.6 }, scene), m.steel, 0, 1.45, 0);
