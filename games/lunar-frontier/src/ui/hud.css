@@ -598,6 +598,16 @@
   background: rgba(255, 93, 92, 0.12);
 }
 
+/* Spec 35 §3 Phase 3: AERODYNAMIC TUCK status pill (life-support panel) —
+   lit with a cyan glide glow while the fluid leg-tuck envelope holds past
+   mid-fold (W_tuck > 0.5); clears on release / touchdown. */
+#hud-chip-tuck {
+  color: var(--lf-cyan);
+  border-color: rgba(86, 224, 255, 0.55);
+  background: rgba(86, 224, 255, 0.14);
+  box-shadow: 0 0 10px 1px rgba(86, 224, 255, 0.35);
+}
+
 /* --- speedometer ---------------------------------------------------------- */
 
 .hud-speed-row {
@@ -2733,8 +2743,9 @@
   bottom: calc(24px + env(safe-area-inset-bottom));
 }
 
-/* [ROLL / TUCK]: left of the smart key. */
-#btn-touch-roll {
+/* [AIRBORNE TUCK]: left of the smart key (Spec 35 Phase 3 — fluid low-G leg
+   tuck; formerly #btn-touch-roll / ROLL). */
+#btn-touch-tuck {
   width: 64px;
   height: 64px;
   right: 112px;

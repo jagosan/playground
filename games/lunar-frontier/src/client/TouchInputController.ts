@@ -36,7 +36,8 @@
  *   • ACTION BUTTON CLUSTER (Spec 33 §2.2.4, Phase 3): a glassmorphic
  *     bottom-right cluster with `[JUMP / RCS BOOST]` (`#btn-touch-jump`,
  *     live hold latch feeding `jump` — physics edge-detects the hop and the
- *     airborne PLSS boost), `[ROLL / TUCK]` (`#btn-touch-roll`), a dynamic
+ *     airborne PLSS boost), `[AIRBORNE TUCK]` (`#btn-touch-tuck`, Spec 35
+ *     Phase 3 — the fluid low-G leg tuck, formerly the acrobatic roll), a dynamic
  *     `[CONTEXTUAL ACTION]` smart button (`#btn-touch-action`, label/icon/
  *     glow driven by {@link TouchInputController.setContextualAction}), and
  *     `[MAP]` / `[UI]` utility toggles. Every button keeps a ≥ 52 px hit
@@ -158,10 +159,14 @@ export type TouchActionId = 'jump' | 'roll' | 'action' | 'map' | 'ui' | 'camera'
 
 /**
  * DOM element id an action button mounts under. The Spec 34 `'camera'` verb
- * mounts as `#btn-touch-cam` (§2.2.2); every other verb uses its own name.
+ * mounts as `#btn-touch-cam` (§2.2.2) and the Spec 35 Phase 3 `'roll'` verb
+ * (fluid airborne leg tuck) mounts as `#btn-touch-tuck`; every other verb
+ * uses its own name.
  */
 export function touchButtonDomId(id: TouchActionId): string {
-  return id === 'camera' ? 'btn-touch-cam' : `btn-touch-${id}`;
+  if (id === 'camera') return 'btn-touch-cam';
+  if (id === 'roll') return 'btn-touch-tuck';
+  return `btn-touch-${id}`;
 }
 
 /** Every action id, in cluster iteration order. */
@@ -220,8 +225,9 @@ export interface TouchInputState {
    */
   jump: boolean;
   /**
-   * Spec 33 §2.2.4: `[ROLL / TUCK]` button held (raw live latch; consumed
-   * as the Spec 32 acrobatic somersault while airborne, crouch on ground).
+   * Spec 33 §2.2.4 / Spec 35 Phase 3: `[AIRBORNE TUCK]` button held (raw live
+   * latch; folded into the Spec 35 fluid low-G leg tuck while airborne — the
+   * Spec 32 360° somersault is rectified away. No-op on the ground).
    */
   roll: boolean;
 }
@@ -1240,7 +1246,7 @@ export class TouchInputController {
    *   #lf-touch-actions                 (fixed overlay, pointer-events: none)
    *     #btn-touch-jump   ⤒ JUMP        (bottom-right, above the smart key)
    *     #btn-touch-action ✋ ACTION      (dynamic label/icon/glow)
-   *     #btn-touch-roll   ⟳ ROLL        (left of the smart key)
+   *     #btn-touch-tuck   ⟳ TUCK        (left of the smart key, Spec 35)
    *     #btn-touch-map    🗺 MAP         (top-left utility corner)
    *     #btn-touch-ui     👁 UI          (top-right utility corner)
    *     #btn-touch-cam    🎥 VIEW        (utility row, left of UI, Spec 34)
@@ -1296,7 +1302,7 @@ export class TouchInputController {
     this.contextBtnEl = ctx.btn;
     this.contextIconEl = ctx.iconEl;
     this.contextLabelEl = ctx.labelEl;
-    makeButton('roll', '⟳', 'ROLL');
+    makeButton('roll', '⟳', 'TUCK');
     makeButton('map', '🗺', 'MAP');
     makeButton('ui', '👁', 'UI');
     makeButton('camera', '🎥', 'VIEW');

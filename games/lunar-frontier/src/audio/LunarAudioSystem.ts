@@ -277,6 +277,28 @@ const PNEUMATIC_POP_S = 0.05;
 const PNEUMATIC_POP_PEAK = 0.2;
 
 /**
+ * Airborne tuck compression (Spec 35 §2.3): pneumatic suit-valve adjustment
+ * hiss — noise through a band-pass swept 440 Hz → 220 Hz (Q = 1.6) across
+ * 150 ms (15 ms attack, full-length decay) peaking at −18 dB ≈ 0.126, layered
+ * with a triangle valve tone riding the same downward glide (peak 0.06).
+ * Rides the sfx bus directly (suit-conducted, survives the vacuum cut).
+ */
+export const TUCK_COMPRESS_SWEEP_HIGH_HZ = 440;
+export const TUCK_COMPRESS_SWEEP_LOW_HZ = 220;
+export const TUCK_COMPRESS_SWEEP_Q = 1.6;
+const TUCK_COMPRESS_S = 0.15;
+const TUCK_COMPRESS_ATTACK_S = 0.015;
+const TUCK_COMPRESS_PEAK = 0.126; // ≈ −18 dB (Spec 35 §2.3 "low amplitude")
+const TUCK_COMPRESS_TONE_PEAK = 0.06;
+/**
+ * Extension pre-touchdown latch (Spec 35 §2.3): hydraulic latch-engagement
+ * click — a 1.2 kHz short transient, 15 ms, fired from
+ * {@link SuitState.hurryPreLanding} as the boots lock into landing prep.
+ */
+export const TUCK_LATCH_CLICK_HZ = 1200;
+const TUCK_LATCH_CLICK_S = 0.015;
+
+/**
  * Cold-gas PLSS RCS jump-boost thrust (Spec 32 §2.3.3): sustained valve
  * hiss — band-passed noise swept 1 900 Hz → 650 Hz (Q = 3.0) over 220 ms
  * (8 ms attack / 205 ms decay peaking at 0.16), layered over a muffled
@@ -558,6 +580,11 @@ export class LunarAudioSystem {
   /** Spec 32 §2.3.3: PLSS RCS cold-gas boost bursts (count + last context time). */
   private rcsThrustCount = 0;
   private lastRcsThrustAt = Number.NEGATIVE_INFINITY;
+  /** Spec 35 §2.3: tuck compression + extension pre-landing latch cues. */
+  private lastTuckCompressAt = Number.NEGATIVE_INFINITY;
+  private lastTuckExtensionLatchAt = Number.NEGATIVE_INFINITY;
+  private tuckCompressCount = 0;
+  private tuckExtensionLatchCount = 0;
   /** Last flyby record (null before the first pass). */
   private lastFlyby: MaglevFlybyRecord | null = null;
 
@@ -695,6 +722,10 @@ export class LunarAudioSystem {
     this.pneumaticLaunchCount = 0;
     this.rcsThrustCount = 0;
     this.lastRcsThrustAt = Number.NEGATIVE_INFINITY;
+    this.lastTuckCompressAt = Number.NEGATIVE_INFINITY;
+    this.lastTuckExtensionLatchAt = Number.NEGATIVE_INFINITY;
+    this.tuckCompressCount = 0;
+    this.tuckExtensionLatchCount = 0;
     this.musicFilter = null;
     this.noiseBuffer = null;
   }
@@ -1643,6 +1674,113 @@ export class LunarAudioSystem {
   /** Context time of the last pneumatic launch (−∞ before the first). */
   getLastPneumaticLaunchAt(): number {
     return this.lastPneumaticLaunchAt;
+  }
+
+  // -- Spec 35 §2.3: fluid airborne leg-tuck procedural voices ------------------
+
+  /**
+   * Airborne tuck compression (Spec 35 §2.3): fired on the rising edge of the
+   * mid-air crouch/roll latch ([C] / [Ctrl] / pad B / LB / `#btn-touch-tuck`)
+   * — the suit valves adjusting as both legs fold into the pelvis. Acoustic
+   * signature: band-passed noise swept 440 Hz → 220 Hz (Q = 1.6) across
+   * 150 ms (15 ms attack, full-length decay) peaking at −18 dB ≈ 0.126,
+   * doubled with a triangle valve tone gliding the same decade down
+   * (peak 0.06). Rides the sfx bus directly (suit-conducted). Deterministic
+   * headlessly via the mock context; safe before `init()` / after `dispose()`
+   * (silent no-op).
+   */
+  playAirborneTuckCompress(): void {
+    if (!this.ready()) return;
+    const ctx = this.ctx!;
+    const t0 = ctx.currentTime + 0.005;
+    this.lastTuckCompressAt = t0;
+    this.tuckCompressCount++;
+
+    // Pneumatic valve hiss: Q=1.6 band-pass sliding 440 → 220 Hz over 150 ms.
+    const hiss = this.createNoiseSource();
+    if (hiss !== null) {
+      const band = ctx.createBiquadFilter();
+      band.type = 'bandpass';
+      band.Q.value = TUCK_COMPRESS_SWEEP_Q;
+      band.frequency.setValueAtTime(TUCK_COMPRESS_SWEEP_HIGH_HZ, t0);
+      band.frequency.exponentialRampToValueAtTime(TUCK_COMPRESS_SWEEP_LOW_HZ, t0 + TUCK_COMPRESS_S);
+      const hissGain = ctx.createGain();
+      hissGain.gain.setValueAtTime(0, t0);
+      hissGain.gain.linearRampToValueAtTime(TUCK_COMPRESS_PEAK, t0 + TUCK_COMPRESS_ATTACK_S);
+      hissGain.gain.exponentialRampToValueAtTime(SILENT, t0 + TUCK_COMPRESS_S);
+      hiss.connect(band);
+      band.connect(hissGain);
+      hissGain.connect(this.sfxBus!);
+      hiss.start(t0);
+      hiss.stop(t0 + TUCK_COMPRESS_S + 0.05);
+    }
+
+    // Valve tone: quiet triangle doubling the same downward glide.
+    const tone = ctx.createOscillator();
+    tone.type = 'triangle';
+    tone.frequency.setValueAtTime(TUCK_COMPRESS_SWEEP_HIGH_HZ, t0);
+    tone.frequency.exponentialRampToValueAtTime(TUCK_COMPRESS_SWEEP_LOW_HZ, t0 + TUCK_COMPRESS_S);
+    const toneGain = ctx.createGain();
+    toneGain.gain.setValueAtTime(0, t0);
+    toneGain.gain.linearRampToValueAtTime(TUCK_COMPRESS_TONE_PEAK, t0 + TUCK_COMPRESS_ATTACK_S);
+    toneGain.gain.exponentialRampToValueAtTime(SILENT, t0 + TUCK_COMPRESS_S);
+    tone.connect(toneGain);
+    toneGain.connect(this.sfxBus!);
+    tone.start(t0);
+    tone.stop(t0 + TUCK_COMPRESS_S + 0.02);
+
+    void this.resumeIfSuspended();
+  }
+
+  /**
+   * Extension pre-touchdown latch (Spec 35 §2.3): fired on the rising edge of
+   * {@link SuitState.hurryPreLanding} (u ≥ 0.90) — the hydraulic latch click
+   * as the legs uncurl and the boots lock into the landing claw just before
+   * touchdown. Acoustic signature: 1.2 kHz short transient, 15 ms
+   * (1 ms attack, decay to silence by 25 ms). Rides the sfx bus directly.
+   * Deterministic headlessly; safe before `init()` / after `dispose()`.
+   */
+  playTuckExtensionLatch(): void {
+    if (!this.ready()) return;
+    const ctx = this.ctx!;
+    const t0 = ctx.currentTime + 0.002;
+    this.lastTuckExtensionLatchAt = t0;
+    this.tuckExtensionLatchCount++;
+
+    // Latch click: square transient pinned at 1.2 kHz for 15 ms.
+    const click = ctx.createOscillator();
+    click.type = 'square';
+    click.frequency.setValueAtTime(TUCK_LATCH_CLICK_HZ, t0);
+    const clickGain = ctx.createGain();
+    clickGain.gain.setValueAtTime(0, t0);
+    clickGain.gain.linearRampToValueAtTime(BASE_LEVEL.oneShot * 0.45, t0 + 0.001);
+    clickGain.gain.exponentialRampToValueAtTime(SILENT, t0 + TUCK_LATCH_CLICK_S + 0.01);
+    click.connect(clickGain);
+    clickGain.connect(this.sfxBus!);
+    click.start(t0);
+    click.stop(t0 + TUCK_LATCH_CLICK_S + 0.02);
+
+    void this.resumeIfSuspended();
+  }
+
+  /** Lifetime count of tuck compression cues fired since `init()`. */
+  getAirborneTuckCompressCount(): number {
+    return this.tuckCompressCount;
+  }
+
+  /** Context time of the last tuck compression (−∞ before the first). */
+  getLastAirborneTuckCompressAt(): number {
+    return this.lastTuckCompressAt;
+  }
+
+  /** Lifetime count of extension pre-landing latch clicks since `init()`. */
+  getTuckExtensionLatchCount(): number {
+    return this.tuckExtensionLatchCount;
+  }
+
+  /** Context time of the last extension latch click (−∞ before the first). */
+  getLastTuckExtensionLatchAt(): number {
+    return this.lastTuckExtensionLatchAt;
   }
 
   /**

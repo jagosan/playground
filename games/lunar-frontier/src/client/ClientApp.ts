@@ -43,7 +43,12 @@ import type { Mesh } from '@babylonjs/core/Meshes/mesh.js';
 
 import { WorldScene, worldToBabylon, babylonToWorld, type CameraMode, type MiningBeamEffect } from '../engine/index.ts';
 import { ProvingGroundsScene, type LapTelemetry } from '../engine/ProvingGroundsScene.ts';
-import { EvaSuitAvatar, SUIT_MAX_CARGO_KG, climbInwardHeadingRad } from '../entities/AstronautSuit.ts';
+import {
+  EvaSuitAvatar,
+  SUIT_MAX_CARGO_KG,
+  acrobaticTuckEnvelope,
+  climbInwardHeadingRad,
+} from '../entities/AstronautSuit.ts';
 import { OpenBuggy, MOUNT_RADIUS_M, type BuggyDashTelemetry } from '../entities/OpenBuggy.ts';
 import { TraversalController } from './TraversalController.ts';
 import {
@@ -110,6 +115,7 @@ import NetworkClient, {
   type WorldDeltaEvent,
 } from '../network/NetworkClient.ts';
 import LunarHUD, {
+  HUD_TUCK_PILL_MIN_W,
   type HudCompassTargets,
   type HudExportGunnerTelemetry,
   type HudInputSource,
@@ -725,9 +731,11 @@ export interface ClientInputFrame {
   /** Space held — hop (physics tracks its own rising edge). */
   jump: boolean;
   /**
-   * Spec 32 §2.2: `[KeyC]`/`[ControlLeft]` or gamepad `[B]`/`[LB]` held —
-   * mid-air acrobatic roll (crouch/roll somersault). Consumed only while
-   * airborne; ignored on the ground (B keeps its trade role there).
+   * Spec 32 §2.2 / Spec 35 §2: `[KeyC]`/`[ControlLeft]` or gamepad
+   * `[B]`/`[LB]` (or `#btn-touch-tuck`) held — mid-air airborne leg tuck
+   * (the fluid low-G fold; the Spec 32 360° somersault is rectified away).
+   * Consumed only while airborne; ignored on the ground (B keeps its trade
+   * role there).
    */
   roll?: boolean;
   /** 0..1 analog service brake (gamepad left trigger); 0 from the keyboard. */
@@ -1459,6 +1467,18 @@ export class ClientApp {
   private audioFootPrevGrounded: boolean | null = null;
   /** Metres walked since the last `playFootstep()` thump. */
   private audioFootTravelled = 0;
+  /**
+   * Spec 35 §2.3: previous frame's airborne-tuck latch (`acrobaticRoll`) —
+   * the pneumatic compression hiss fires on the rising edge and re-arms on
+   * release or touchdown.
+   */
+  private tuckCompressPrevLatched = false;
+  /**
+   * Spec 35 §2.3: extension pre-landing latch click — fires once per arc on
+   * the rising edge of `SuitState.hurryPreLanding`, re-armed by the next
+   * grounded frame (physics pins the signal false whenever boots are down).
+   */
+  private preLandingLatchFired = false;
   /**
    * Spec 32 §2.3.3: plume/hiss re-arm clock while `SuitState.rcsBoostActive`
    * holds — the 0.22 s cold-gas burst cadence for the PLSS backpack vents.
@@ -4184,9 +4204,9 @@ export class ClientApp {
       const latched = suit.getState().ladderLatchActive === true;
       const speedScale = frame.sprint ? 1 : 0.55;
       const moveScale = latched ? 1 : speedScale;
-      // Spec 32 §2.2: the crouch/roll latch (KeyC / Ctrl / B / LB) is live
-      // only on free-airborne frames — grounded and ladder-latched frames
-      // deactivate the somersault envelope.
+      // Spec 32 §2.2 / Spec 35 §2: the airborne-tuck latch (KeyC / Ctrl /
+      // B / LB / #btn-touch-tuck) is live only on free-airborne frames —
+      // grounded and ladder-latched frames deactivate the leg-tuck envelope.
       const acrobaticRoll =
         frame.roll === true && !suit.getState().isGrounded && !latched;
       const input: SuitInput = {
@@ -4214,6 +4234,9 @@ export class ClientApp {
       // Spec 32 §2.3.3: while the PLSS cold-gas RCS jump boost fires, fire
       // the twin backpack upper-port vapor plumes + thruster hiss.
       this.pumpRcsBoostFx(dt, suit);
+      // Spec 35 §2.3: tuck compression hiss (latch rising edge) + extension
+      // pre-touchdown latch click (SuitState.hurryPreLanding rising edge).
+      this.pumpTuckAudioFx(suit);
       // Spec 29 Phase 4: after the step, the gantry railing holds the
       // climber on the deck (hatch sector excepted). Latched frames skip.
       this.clampToDeckBoundary();
@@ -4405,6 +4428,33 @@ export class ClientApp {
       // Spec 33 §2.6: haptic micro-tap rides every footfall audio cue.
       this.haptics.footfall();
     }
+  }
+
+  /**
+   * Spec 35 §2.3 — airborne tuck audio pump, one call per frame on the EVA
+   * path. Fires the pneumatic tuck compression hiss (`playAirborneTuckCompress`)
+   * on the rising edge of the mid-air crouch/roll latch, and the hydraulic
+   * extension latch click (`playTuckExtensionLatch`) on the rising edge of
+   * {@link SuitState.hurryPreLanding} (u ≥ 0.90, boots locking into the
+   * landing claw). Both hooks are pure per-frame edges: the compression
+   * re-arms on release/touchdown, and the latch click re-arms on the next
+   * grounded frame — exactly one click per bounding arc, never during the
+   * grounded brace itself.
+   */
+  private pumpTuckAudioFx(suit: EvaSuitAvatar): void {
+    const st = suit.getState();
+    const tucking = st.acrobaticRoll === true && !st.isGrounded;
+    if (tucking && !this.tuckCompressPrevLatched) {
+      this.audio?.playAirborneTuckCompress();
+    }
+    this.tuckCompressPrevLatched = tucking;
+
+    const preLanding = st.hurryPreLanding === true;
+    if (preLanding && !this.preLandingLatchFired) {
+      this.audio?.playTuckExtensionLatch();
+      this.preLandingLatchFired = true;
+    }
+    if (st.isGrounded) this.preLandingLatchFired = false;
   }
 
   /**
@@ -4758,9 +4808,21 @@ export class ClientApp {
 
     const suit = this.requireSuit();
     const buggy = this.requireBuggy();
+    // Spec 35 §3 Phase 3: feed the `AERODYNAMIC TUCK` pill from the live
+    // quintic envelope W_tuck(u). Non-zero only while the airborne tuck
+    // latch holds (physics self-clears it on release/touchdown), so the
+    // pill folds in at u ≈ 0.22, holds through the glide, and drops well
+    // before the landing handoff.
+    const suitState = suit.getState();
+    const tuckWeight =
+      suitState.acrobaticRoll === true && !suitState.isGrounded
+        ? acrobaticTuckEnvelope(suitState.hurryAirPhase ?? 0)
+        : 0;
     hud.updateSuitTelemetry({
       ...suit.getTelemetry(),
       speed: suit.getSpeed(),
+      tuckWeight,
+      airborneTuck: tuckWeight > HUD_TUCK_PILL_MIN_W,
     });
 
     const buggyTelemetry = buggy.getTelemetry();

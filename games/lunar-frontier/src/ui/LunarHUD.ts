@@ -531,7 +531,26 @@ export interface HudSuitTelemetry {
   cargoMass?: number;
   /** Backpack ceiling in kg (spec: 50). */
   cargoCapacity?: number;
+  /**
+   * Spec 35 §3 Phase 3: live quintic blend weight W_tuck(u) ∈ [0, 1] of the
+   * fluid low-G airborne leg tuck (0 whenever grounded or no tuck latched).
+   * Drives the `AERODYNAMIC TUCK` pill via {@link HUD_TUCK_PILL_MIN_W}.
+   */
+  tuckWeight?: number;
+  /**
+   * Spec 35 §3 Phase 3: explicit pill override. When absent the pill follows
+   * `tuckWeight > HUD_TUCK_PILL_MIN_W`.
+   */
+  airborneTuck?: boolean;
 }
+
+/**
+ * Spec 35 §3 Phase 3: minimum tuck blend weight W_tuck at which the
+ * `AERODYNAMIC TUCK` status pill lights — mid-fold of the quintic envelope
+ * (held across the u ∈ [0.30, 0.70] aerodynamic glide, off during the ramp
+ * in/out and every grounded frame).
+ */
+export const HUD_TUCK_PILL_MIN_W = 0.5;
 
 export interface HudBuggyTelemetry {
   /** Road speed in m/s (km/h is derived for display). */
@@ -1345,6 +1364,13 @@ export class LunarHUD {
     if (t.isGrounded !== undefined) {
       this.setText('contact-value', t.isGrounded ? 'CONTACT' : 'AIRBORNE');
     }
+    // Spec 35 §3 Phase 3: `AERODYNAMIC TUCK` pill while the fluid leg-tuck
+    // envelope holds past mid-fold (W_tuck > HUD_TUCK_PILL_MIN_W). Callers
+    // report W_tuck = 0 on grounded frames (the physics latch self-clears at
+    // touchdown), so the pill drops with the envelope; an explicit
+    // `airborneTuck` override wins for harnesses.
+    const tuckActive = t.airborneTuck ?? (t.tuckWeight ?? 0) > HUD_TUCK_PILL_MIN_W;
+    this.setChip('tuck-chip', tuckActive);
     this.setLamp('suit-lamp', t.headlightOn);
 
     if (t.operational === false) {
@@ -1649,16 +1675,17 @@ export class LunarHUD {
     if (this.inputSource === 'touch') {
       this.legendEl.textContent =
         '\u{1F446} drag LEFT to steer · swipe RIGHT to look · TAP action buttons ' +
-        '(⤒ jump · ⟳ roll · smart ACTION) · 🗺 map · 👁 UI cycle';
+        '(⤒ jump · ⟳ airborne tuck · smart ACTION) · 🗺 map · 👁 UI cycle';
       return;
     }
     this.legendEl.textContent =
       this.inputSource === 'gamepad'
         ? '(L-Stick) move · (A) hop / handbrake · (LB) sprint · (X) buggy · (Y) lamps · ' +
           '(R3) camera · (2×R3) UI · (RB) mine · (C) claim · (B) trade · (D-Up) comms · ' +
-          '(LT) brake / reverse'
-        : '[WASD] move · [Space] hop · [Shift] sprint · [E] buggy · [F] lamps · ' +
-          '[V] camera · [M] mine · [C] claim · [T] trade · [U]/[H] UI · [Esc] close';
+          '(LT) brake / reverse · aloft: (B/LB) airborne tuck'
+        : '[WASD] move · [Space] hop · [Shift] sprint · [Ctrl]/[C] airborne tuck · ' +
+          '[E] buggy · [F] lamps · [V] camera · [M] mine · [C] claim · [T] trade · ' +
+          '[U]/[H] UI · [Esc] close';
   }
 
   private orderOf(prompt: HudPrompt): number {
@@ -3313,6 +3340,15 @@ export class LunarHUD {
     panel.appendChild(this.lamp('hud-suit-lamp', 'SUIT LAMP', 'suit-lamp'));
     panel.appendChild(this.labeledField('altitude', 'ALT', '—'));
     panel.appendChild(this.labeledField('contact', 'GND', '—'));
+
+    // Spec 35 §3 Phase 3: aerodynamic-tuck status pill — lit while the fluid
+    // low-G leg-tuck envelope holds past mid-fold (W_tuck > 0.5), cleared on
+    // release and every grounded frame.
+    const suitChips = this.make('div', 'lunar-hud-suit-chips', 'hud-chips');
+    const tuckChip = this.make('span', 'hud-chip-tuck', 'hud-chip is-hidden', 'tuck-chip');
+    tuckChip.textContent = 'AERODYNAMIC TUCK';
+    suitChips.appendChild(tuckChip);
+    panel.appendChild(suitChips);
   }
 
   private buildBuggyPanel(): void {
