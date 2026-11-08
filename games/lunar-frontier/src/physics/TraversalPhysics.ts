@@ -184,6 +184,14 @@ export const SUIT_HURRY_BRACE_DURATION_S = 0.12;
  * normalized flight phase u = clamp(t_air / τ, 0, 1) advances against.
  */
 export const SUIT_HURRY_FLIGHT_TIME_S = (2 * SUIT_HURRY_LAUNCH_VZ) / LUNAR_GRAVITY;
+/**
+ * Spec 35 Phase 2: normalized flight phase at which the tuck envelope has
+ * fully uncurled into the Phase C landing claw (W_tuck ≡ 0 for u above this)
+ * and the grounded stance-compression handoff is armed. Exposed on
+ * {@link SuitState.hurryPreLanding} so animation / audio layers can schedule
+ * the extension latch-click against the physics stride clock.
+ */
+export const SUIT_HURRY_PRE_LANDING_U = 0.90;
 
 /**
  * Spec 30 §2.2.2: the stance/pushing leg of the alternating stride. Toggles
@@ -319,10 +327,12 @@ export interface SuitInput {
   /** Rising edge while grounded triggers a hop. */
   jump: boolean;
   /**
-   * Spec 32 §2.2: hold the crouch/roll key while airborne to tuck and
-   * somersault. Mirrored verbatim onto {@link SuitState.acrobaticRoll} so
-   * animation consumers can read the latch. Optional so pre-Spec-32 callers
-   * stay source-compatible.
+   * Spec 32 §2.2 / Spec 35 §2: hold the crouch/roll key while airborne to
+   * fold the fluid low-G leg tuck (the Spec 32 360° root somersault is
+   * rectified away). Mirrored onto {@link SuitState.acrobaticRoll} on
+   * airborne frames only — the latch self-clears the instant the boots
+   * touch down so the tuck weight hands off to stance compression within a
+   * single frame. Optional so pre-Spec-32 callers stay source-compatible.
    */
   acrobaticRoll?: boolean;
   /**
@@ -378,9 +388,12 @@ export interface SuitState {
    */
   rcsBoostActive: boolean;
   /**
-   * Spec 32 §2.2: mid-air crouch/roll latch mirrored from
-   * {@link SuitInput.acrobaticRoll} — true while the astronaut is performing
-   * a somersault, so the rig and HUD consumers know it.
+   * Spec 32 §2.2 / Spec 35 Phase 2: mid-air crouch/roll latch mirrored from
+   * {@link SuitInput.acrobaticRoll} — true only while the astronaut is
+   * aloft and performing the fluid leg tuck, so the rig and HUD consumers
+   * know it. Grounded frames (including the touchdown frame itself) always
+   * report false: the tuck envelope resets to zero on contact and the pose
+   * hands off to the grounded stance-compression state without hitching.
    */
   acrobaticRoll?: boolean;
   /**
@@ -418,6 +431,14 @@ export interface SuitState {
    * triple-jump stride cycle without exposing raw seconds to the rig.
    */
   hurryAirPhase?: number;
+  /**
+   * Spec 35 Phase 2: true on airborne frames once the flight phase reaches
+   * {@link SUIT_HURRY_PRE_LANDING_U} (u ≥ 0.90) — the tuck is fully unfolded
+   * into the landing claw and touchdown will hand straight off to the
+   * grounded stance-compression window. False on every grounded frame
+   * (including touchdown itself), so it is a pure pre-landing edge signal.
+   */
+  hurryPreLanding?: boolean;
   /**
    * Spec 31 §2: expected hangtime (s) of the hurry bound — always
    * {@link SUIT_HURRY_FLIGHT_TIME_S}, refreshed every frame so animation and
@@ -908,6 +929,10 @@ export class LunarEvaSuit {
     // While bounding the leap owns the horizontal channel: momentum carries
     // through the flight arc (restitution at touchdown, push at launch), so
     // the surface chase/friction laws stand down for the committed stride.
+    // Spec 35 §2 (continuous velocity preservation): the acrobatic tuck latch
+    // is deliberately absent from every force term below — folding the legs
+    // aloft never perturbs v_xy; the ballistic parabola stays unperturbed
+    // except for the Spec 32 RCS boost channels.
     const accel = s.isGrounded ? SUIT_GROUND_ACCEL : SUIT_AIR_ACCEL;
     if (magnitude > 1e-4 && !bounding) {
       s.vx = approach(s.vx, targetVx, accel / Math.max(1, Math.abs(targetVx)), step)
@@ -1015,6 +1040,10 @@ export class LunarEvaSuit {
     // hop holds its button through the arc without stealing this channel —
     // and the valve cuts the instant the button lifts, boots touch down, or
     // the reservoir runs dry.
+    // Spec 35 Phase 2: the boost rides its own jump-button channel and the
+    // tuck rides crouch/roll, so a tactical RCS burst fires concurrently
+    // with the acrobatic leg tuck — the plume adds up/forward acceleration
+    // mid-glide without touching the tuck latch or degrading v_xy.
     if (jumpRisingEdge && !wasGrounded && s.oxygen > 0) {
       this.rcsBoostEngaged = true;
     }
@@ -1054,6 +1083,10 @@ export class LunarEvaSuit {
         // with restitution η (≥ 88 % of the approach speed survives into
         // the next push-off); the stance foot anchors, opening the
         // ground_brace window, and the animation layer dusts the boots.
+        // Spec 35 Phase 2: on a nominal arc the tuck has already uncurled
+        // (u ≥ 0.90 pre-landing band), so the brace window opens against a
+        // landed-claw pose and ramps Δz ≈ −0.08 m shock compression with no
+        // pose pop and no velocity step beyond the spec'd restitution η.
         s.vx *= SUIT_HURRY_RESTITUTION;
         s.vy *= SUIT_HURRY_RESTITUTION;
         s.hangtime = this.boundClock; // report the completed leap's hangtime
@@ -1095,13 +1128,23 @@ export class LunarEvaSuit {
       !s.isGrounded && this.boundPhase === 'bound_flight'
         ? clamp(this.boundClock / SUIT_HURRY_FLIGHT_TIME_S, 0, 1)
         : 0;
+    // Spec 35 Phase 2: pre-landing band. From u ≥ 0.90 the tuck envelope is
+    // fully unfolded into the landing claw (W_tuck ≡ 0) and the grounded
+    // stance-compression handoff is armed; every grounded frame pins the
+    // signal false so consumers get a clean airborne-only edge into the
+    // Δz ≈ −0.08 m brace window the moment z crosses the floor barrier.
+    s.hurryPreLanding = s.hurryAirPhase >= SUIT_HURRY_PRE_LANDING_U;
     // Spec 30 §2.2.2: the stride fields are always reported — grounded
     // frames are the stance/brace phase, airborne frames the flight arc.
     s.hurryStrideLeg = this.hurryLeg;
     s.hurryStepPhase = s.isGrounded ? 'ground_brace' : 'flight_arc';
-    // Spec 32 §2.2: mirror the mid-air crouch/roll latch onto the state so
-    // the rig / HUD consumers see the somersault without a second channel.
-    s.acrobaticRoll = input.acrobaticRoll === true;
+    // Spec 32 §2.2 / Spec 35 Phase 2: mirror the mid-air crouch/roll latch
+    // onto the state so the rig / HUD consumers see the fluid leg tuck
+    // without a second channel. Airborne frames only: on the touchdown frame
+    // the latch self-clears, pinning the tuck weight to 0 within one frame
+    // and handing the pose off to the grounded stance-compression window
+    // with no state hitching.
+    s.acrobaticRoll = input.acrobaticRoll === true && !s.isGrounded;
     s.gaitMode = bounding
       ? 'bounding'
       : Math.hypot(s.vx, s.vy) > 0.08
