@@ -36,7 +36,7 @@
  * idempotent; after disposal `update()` keeps stepping physics and returns
  * state instead of throwing.
  */
-import { Color3 } from '@babylonjs/core/Maths/math.color.js';
+import { Color3, Color4 } from '@babylonjs/core/Maths/math.color.js';
 import { Quaternion, Vector3 } from '@babylonjs/core/Maths/math.vector.js';
 import { NullEngine } from '@babylonjs/core/Engines/nullEngine.js';
 import { Engine } from '@babylonjs/core/Engines/engine.js';
@@ -49,6 +49,7 @@ import { MeshBuilder } from '@babylonjs/core/Meshes/meshBuilder.js';
 import { TransformNode } from '@babylonjs/core/Meshes/transformNode.js';
 import { Scene } from '@babylonjs/core/scene.js';
 import { Mesh } from '@babylonjs/core/Meshes/mesh.js';
+import { ParticleSystem } from '@babylonjs/core/Particles/particleSystem.js';
 
 import {
   BUGGY_BATTERY_KWH,
@@ -74,6 +75,13 @@ import {
   HEIST_MOON_CARGO,
   type HeistMoonCargoType,
 } from '../quests/TrainHeistDirector.ts';
+import {
+  calculateBuggyStats,
+  defaultInstalledUpgrades,
+  validateInstalledShape,
+  type BuggyStats,
+  type InstalledUpgrades,
+} from '../garage/BuggyUpgradeSystem.ts';
 
 /** Distance within which the prospector can drop into the driver seat (m). */
 export const MOUNT_RADIUS_M = 3.5;
@@ -369,6 +377,37 @@ const HOPPER_BED_FLOOR_Y = 0.34;
  *  the hopper and is quietly dropped from tracking (s). */
 export const HOPPER_INBOUND_MAX_AGE_S = 5.0;
 
+// -- Spec 37 Phase 2: modular upgrade geometry --------------------------------
+
+/**
+ * Spec 37 §2.1 Tier 2 (Extended Freight Flatbed): hopper ceiling grows from
+ * the stock 6 slots to a 12-slot double-tier stack (the original 2×3 lower
+ * grid plus a mirrored 2×3 upper deck above it, served by the double-tiered
+ * side rails). {@link BuggyCargoHopper.setCapacity} moves the ceiling; the
+ * stock constant {@link HOPPER_CAPACITY} stays 6 for Tier-1 builds.
+ */
+export const HOPPER_EXTENDED_CAPACITY = 12;
+/** Vertical rise of the upper cargo deck above the bed floor (m): clears the
+ *  tallest container (0.44 m LOX cylinder) with stacking headroom. */
+export const HOPPER_UPPER_DECK_Y = 0.54;
+/** Rear subframe extension of the Tier-2 flatbed along model −z (m) —
+ *  mirrors the catalog's `subframeExtensionM: 0.6` (Spec 37 §2.1). */
+export const UPGRADE_SUBFRAME_EXTENSION_M = 0.6;
+/** Model-frame z of the rear frame rail the extended subframe splices onto. */
+const REAR_FRAME_Z = -1.45;
+/** Lateral x of the cargo side rails (bed half-width + a knuckle, m). */
+const SIDE_RAIL_X = 0.7;
+
+/**
+ * Grid slot for the double-tier stack: slot index `s` maps to column `s % 6`
+ * of {@link HOPPER_GRID_SLOTS} and deck 0 (floor) or 1 (upper) — slots 6..11
+ * ride the upper deck (Spec 37 §2.1 Tier 2).
+ */
+export function hopperGridSlot(s: number): { x: number; z: number; deck: 0 | 1 } {
+  const base = HOPPER_GRID_SLOTS[s % HOPPER_GRID_SLOTS.length] ?? HOPPER_GRID_SLOTS[0]!;
+  return { x: base.x, z: base.z, deck: s >= HOPPER_GRID_SLOTS.length ? 1 : 0 };
+}
+
 /** Per-type container envelope + PBR silhouette for the bed stack. */
 interface HopperCargoShape {
   /** Container diameter across (m). */
@@ -515,6 +554,35 @@ export class OpenBuggy {
   private hopper: BuggyCargoHopper | null = null;
   /** Per-cargo-type PBR materials for the bed stack (created on demand). */
   private hopperMaterials: Partial<Record<HeistMoonCargoType, PBRMaterial>> = {};
+
+  // -- Spec 37 Phase 2: modular upgrade attachments ---------------------------
+  /** Installed tier per tree (drives which attachments are mounted). */
+  private installed: InstalledUpgrades = defaultInstalledUpgrades();
+  /** Compounded stats of the current build (cargo ceiling, visuals, Phase 3). */
+  private stats: BuggyStats = calculateBuggyStats();
+  /**
+   * Procedural upgrade attachment meshes. Deliberately kept OUT of
+   * `this.parts` (own bookkeeping + own dispose, like the Spec 23 beam
+   * cones) so the stock 69-mesh contract and picking contracts hold; the
+   * readback surface is {@link getUpgradeMeshes}.
+   */
+  private upgradeParts: Mesh[] = [];
+  /** Dedicated PBR materials for upgrade attachments (disposed with entity). */
+  private upgradeMaterials: PBRMaterial[] = [];
+  /** Dedicated unlit/blend materials (holo webbing, plume sprites). */
+  private upgradeBlendMaterials: StandardMaterial[] = [];
+  /** Textures owned by upgrade attachments (particle sprite spritesheet). */
+  private upgradeTextures: RawTexture[] = [];
+  /** Tier-4 RCS cold-gas plume emitters (one per chassis corner). */
+  private rcsPlumes: ParticleSystem[] = [];
+  /** Transform nodes owned by upgrade attachments (plume emitter anchors). */
+  private upgradeNodes: TransformNode[] = [];
+  /** Pulsing electromagnetic cargo-net material (Tier 3, animated per frame). */
+  private magNetMaterial: StandardMaterial | null = null;
+  /** Four wheel-hub meshes (index = wheel slot) — cyan hub-cap attach points. */
+  private wheelHubs: Mesh[] = [];
+  /** Four coilover top-mount nodes (index = wheel slot) — nitro canister mounts. */
+  private coilMounts: TransformNode[] = [];
   private lamps: SpotLight[] = [];
   /**
    * Spec 23 §2.4.2 / ADR-023-4: procedural translucent light cones drifting
@@ -540,6 +608,8 @@ export class OpenBuggy {
   private disposed = false;
   /** Road-wheel spin phase (rad), integrated from `WheelState.spin`. */
   private wheelPhase = 0;
+  /** Wall-clock seconds of synced visuals — drives Spec 37 pulse animations. */
+  private visualTimeS = 0;
   /** Most recently stepped state — keeps getters honest across scene life. */
   private last: BuggyState;
   /** Previous cumulative motor energy (J) for the kW dash readout. */
@@ -668,6 +738,10 @@ export class OpenBuggy {
       this.hopper = null;
     }
     this.hopperMaterials = {};
+
+    // Spec 37 Phase 2: tear the upgrade attachments down with the entity —
+    // root/physics are dropped below, attachments never survive a dispose.
+    this.disposeUpgradeVisuals();
 
     for (const lamp of this.lamps) OpenBuggy.disposeQuietly(lamp);
     this.lamps = [];
@@ -979,6 +1053,8 @@ export class OpenBuggy {
           this.last = this.physics.getState();
         },
       });
+      // Spec 37 Phase 2: a Tier-2+ flatbed build starts with 12 slots.
+      this.hopper.setCapacity(this.stats.canisterCapacity);
     }
     return this.hopper;
   }
@@ -1072,6 +1148,502 @@ export class OpenBuggy {
     this.hopperMaterials[type] = mat;
     this.materials.push(mat);
     return mat;
+  }
+
+  // -- Spec 37 Phase 2: dynamic 3D mesh attachments & visual upgrades ----------
+
+  /**
+   * Install a modular upgrade build (Spec 37 §3 Phase 2). Recomputes the
+   * compounded stats, raises the hopper slot ceiling (6 → 12 with the
+   * Tier-2 flatbed) and re-mounts the procedural 3D attachments live on the
+   * existing chassis hierarchy — the physics root is never rebuilt and the
+   * rover's motion is untouched. Idempotent: applying the same build twice
+   * churns nothing user-visible beyond a visual refresh.
+   *
+   * Scene-less safe: before `init()` the build is recorded (attachments are
+   * mounted by `buildRover`); after `dispose()` it stays bookkeeping-only.
+   *
+   * @throws Error when `installed` is not a valid {@link InstalledUpgrades}.
+   */
+  applyUpgrades(installed: InstalledUpgrades): BuggyStats {
+    if (!validateInstalledShape(installed)) {
+      throw new Error('OpenBuggy.applyUpgrades: invalid InstalledUpgrades shape.');
+    }
+    this.installed = { ...installed };
+    this.stats = calculateBuggyStats(this.installed);
+    if (this.hopper !== null) this.hopper.setCapacity(this.stats.canisterCapacity);
+    if (this.built && !this.disposed) this.applyUpgradeVisuals();
+    return { ...this.stats };
+  }
+
+  /** Copy of the installed upgrade tiers driving the current attachments. */
+  getInstalledUpgrades(): InstalledUpgrades {
+    return { ...this.installed };
+  }
+
+  /** Copy of the compounded physical stats of the current build. */
+  getUpgradeStats(): BuggyStats {
+    return { ...this.stats };
+  }
+
+  /**
+   * Procedural upgrade attachment meshes (empty for a stock Tier-1 build or
+   * after `dispose()`). Kept out of {@link getMeshes} so the stock 69-mesh
+   * contract holds; this is the headless readback for Spec 37 harnesses.
+   */
+  getUpgradeMeshes(): Mesh[] {
+    return [...this.upgradeParts];
+  }
+
+  /** Tier-4 RCS plume particle systems (empty unless suspension Tier 4). */
+  getRcsPlumes(): ParticleSystem[] {
+    return [...this.rcsPlumes];
+  }
+
+  /**
+   * Rebuild every active mesh attachment from `this.installed`. Disposes
+   * only the tracked attachment set — never the root, wheels, suspension or
+   * materials of the base rover — then re-creates what the current tiers
+   * require. Gracefully no-ops with no scene (NullEngine headless runs
+   * simply keep bookkeeping state).
+   */
+  private applyUpgradeVisuals(): void {
+    this.disposeUpgradeVisuals();
+    const scene = this.scene;
+    // Runs from buildRover() before `built` flips — the live scene + chassis
+    // hierarchy are the real precondition, not the built flag.
+    if (this.disposed || scene === null || scene.isDisposed || this.chassisBody === null) {
+      return;
+    }
+    this.buildCargoBedUpgrades(scene);
+    this.buildPowertrainUpgrades(scene);
+    this.buildSuspensionUpgrades(scene);
+    this.buildMiningUpgrades(scene);
+  }
+
+  /** Tear down every tracked upgrade attachment, material, texture, node. */
+  private disposeUpgradeVisuals(): void {
+    for (const ps of this.rcsPlumes) {
+      try {
+        ps.dispose();
+      } catch {
+        // Engine torn down first — never propagate.
+      }
+    }
+    this.rcsPlumes = [];
+    for (const mesh of this.upgradeParts) OpenBuggy.disposeQuietly(mesh);
+    this.upgradeParts = [];
+    for (const node of this.upgradeNodes) OpenBuggy.disposeQuietly(node);
+    this.upgradeNodes = [];
+    for (const mat of this.upgradeMaterials) OpenBuggy.disposeQuietly(mat);
+    this.upgradeMaterials = [];
+    for (const mat of this.upgradeBlendMaterials) OpenBuggy.disposeQuietly(mat);
+    this.upgradeBlendMaterials = [];
+    for (const tex of this.upgradeTextures) OpenBuggy.disposeQuietly(tex);
+    this.upgradeTextures = [];
+    this.magNetMaterial = null;
+  }
+
+  /** Register an upgrade attachment mesh: material + chassis-body parent +
+   *  bookkeeping (kept OUT of `this.parts`, see {@link getUpgradeMeshes}). */
+  private upgradePart(mesh: Mesh, mat: PBRMaterial | StandardMaterial): Mesh {
+    mesh.material = mat;
+    mesh.parent = this.chassisBody;
+    mesh.isPickable = false;
+    mesh.receiveShadows = false;
+    this.upgradeParts.push(mesh);
+    return mesh;
+  }
+
+  /** Chassis-local upgrade tube between two points (same solve as §4 tubes). */
+  private upgradeTube(
+    scene: Scene,
+    name: string,
+    from: readonly [number, number, number],
+    to: readonly [number, number, number],
+    mat: PBRMaterial,
+    diameter: number = GEO.tube.diameter,
+  ): Mesh {
+    const dx = to[0] - from[0];
+    const dy = to[1] - from[1];
+    const dz = to[2] - from[2];
+    const len = Math.hypot(dx, dy, dz);
+    this.scratchDir.set(dx, dy, dz).normalize();
+    alignYTo(this.scratchDir, this.scratchQuat);
+    const rod = MeshBuilder.CreateCylinder(name, { diameter, height: len, tessellation: 10 }, scene);
+    rod.rotationQuaternion = this.scratchQuat.clone();
+    rod.position.set((from[0] + to[0]) / 2, (from[1] + to[1]) / 2, (from[2] + to[2]) / 2);
+    return this.upgradePart(rod, mat);
+  }
+
+  /** On-demand PBR material for an upgrade component (disposed with set). */
+  private upgradePbrMaterial(
+    name: string,
+    albedo: Color3,
+    metallic: number,
+    roughness: number,
+    emissive?: Color3,
+  ): PBRMaterial {
+    const scene = this.scene;
+    if (scene === null || scene.isDisposed) {
+      throw new Error('OpenBuggy.upgradePbrMaterial: no scene — call init() first');
+    }
+    const mat = new PBRMaterial(name, scene);
+    mat.albedoColor = albedo;
+    mat.metallic = metallic;
+    mat.roughness = roughness;
+    if (emissive !== undefined) mat.emissiveColor = emissive;
+    mat.environmentIntensity = 0.05;
+    this.upgradeMaterials.push(mat);
+    return mat;
+  }
+
+  /**
+   * `cargo_bed` tree (Spec 37 §2.1):
+   * Tier 2+: extended rear flatbed subframe (+0.6 m splice), double-tiered
+   * side rails and the upper cargo deck serving the 12-slot stack.
+   * Tier 3: pulsing blue holographic energy webbing over the bed (the
+   * electromagnetic cargo net — alpha-animated in `animateUpgradeVisuals`).
+   * Tier 4: rear tractor-beam emitter gantry with projector head.
+   */
+  private buildCargoBedUpgrades(scene: Scene): void {
+    const p = this.prefix;
+    const tier = this.installed.cargo_bed;
+    if (tier < 2) return;
+
+    const ext =
+      this.stats.subframeExtensionM > 0 ? this.stats.subframeExtensionM : UPGRADE_SUBFRAME_EXTENSION_M;
+    const rearZ = REAR_FRAME_Z - ext;
+    const midZ = (REAR_FRAME_Z + rearZ) / 2;
+
+    const alu = this.upgradePbrMaterial(`${p}-up-freight-alu`, new Color3(0.72, 0.74, 0.78), 0.9, 0.35);
+    const railMat = this.upgradePbrMaterial(`${p}-up-freight-rail`, new Color3(0.82, 0.6, 0.12), 0.4, 0.5);
+
+    // -- Tier 2: extended rear flatbed subframe ----------------------------
+    this.upgradePart(
+      MeshBuilder.CreateBox(`${p}-up-flatbed-deck`, { width: 1.46, height: 0.07, depth: ext + 0.08 }, scene),
+      alu,
+    ).position.set(0, 0.245, midZ - 0.02);
+    for (const side of [1, -1] as const) {
+      const tag = side > 0 ? 'l' : 'r';
+      this.upgradePart(
+        MeshBuilder.CreateBox(`${p}-up-subframe-beam-${tag}`, { width: 0.08, height: 0.1, depth: ext }, scene),
+        alu,
+      ).position.set(side * 0.6, 0.12, midZ);
+      // Double-tiered side rails: lower + upper rails with rear stanchions.
+      this.upgradeTube(scene, `${p}-up-side-rail-lower-${tag}`, [side * SIDE_RAIL_X, 0.44, -0.08], [side * SIDE_RAIL_X, 0.44, rearZ + 0.02], railMat, 0.055);
+      this.upgradeTube(scene, `${p}-up-side-rail-upper-${tag}`, [side * SIDE_RAIL_X, 0.9, -0.08], [side * SIDE_RAIL_X, 0.9, rearZ + 0.02], railMat, 0.055);
+      this.upgradeTube(scene, `${p}-up-rail-stanchion-${tag}`, [side * SIDE_RAIL_X, 0.44, rearZ + 0.04], [side * SIDE_RAIL_X, 0.9, rearZ + 0.04], railMat, 0.05);
+    }
+    // Upper cargo deck for slots 6..11 of the double-tier stack.
+    if (this.stats.canisterCapacity > HOPPER_CAPACITY) {
+      this.upgradePart(
+        MeshBuilder.CreateBox(`${p}-up-upper-deck`, { width: 1.34, height: 0.04, depth: 1.46 }, scene),
+        alu,
+      ).position.set(0, HOPPER_BED_FLOOR_Y + HOPPER_UPPER_DECK_Y - 0.02, -0.65);
+    }
+
+    // -- Tier 3: electromagnetic cargo net (pulsing holo webbing) -----------
+    if (tier >= 3) {
+      const netLen = rearZ - -0.05;
+      const net = MeshBuilder.CreateBox(
+        `${p}-up-mag-net`,
+        { width: 1.36, height: 0.62, depth: Math.abs(netLen) },
+        scene,
+      );
+      const holo = new StandardMaterial(`${p}-up-mag-net-mat`, scene);
+      holo.disableLighting = true;
+      holo.emissiveColor = new Color3(0.22, 0.55, 1.0); // Spec 37: pulsing blue
+      holo.diffuseColor = new Color3(0, 0, 0);
+      holo.specularColor = new Color3(0, 0, 0);
+      holo.alpha = 0.12;
+      holo.alphaMode = Engine.ALPHA_ADD;
+      holo.backFaceCulling = false;
+      this.upgradeBlendMaterials.push(holo);
+      this.magNetMaterial = holo;
+      this.upgradePart(net, holo).position.set(0, 0.68, (-0.05 + rearZ) / 2);
+    }
+
+    // -- Tier 4: rear tractor-beam emitter gantry ---------------------------
+    if (tier >= 4) {
+      const gz = REAR_FRAME_Z - 0.45;
+      const cyan = this.upgradePbrMaterial(
+        `${p}-up-tractor-emissive`,
+        new Color3(0.15, 0.85, 0.95),
+        0.2,
+        0.2,
+        new Color3(0.05, 0.6, 0.7),
+      );
+      for (const side of [1, -1] as const) {
+        const tag = side > 0 ? 'l' : 'r';
+        this.upgradeTube(scene, `${p}-up-gantry-post-${tag}`, [side * 0.66, 0.26, gz], [side * 0.66, 1.24, gz - 0.06], railMat, 0.06);
+      }
+      this.upgradeTube(scene, `${p}-up-gantry-crossbar`, [-0.66, 1.24, gz - 0.06], [0.66, 1.24, gz - 0.06], railMat, 0.06);
+      this.upgradePart(
+        MeshBuilder.CreateCylinder(`${p}-up-tractor-housing`, { diameter: 0.24, height: 0.18, tessellation: 14 }, scene),
+        alu,
+      ).position.set(0, 1.12, gz - 0.06);
+      this.upgradePart(
+        MeshBuilder.CreateCylinder(`${p}-up-tractor-lens`, { diameter: 0.18, height: 0.04, tessellation: 14 }, scene),
+        cyan,
+      ).position.set(0, 1.02, gz - 0.06);
+    }
+  }
+
+  /**
+   * `powertrain` tree (Spec 37 §2.2): Tier 3+ quad hyper-induction drive
+   * gets cyan emissive hub-motor caps on all four wheel hubs (parented to
+   * the corner pivots so they follow steering yaw and suspension droop).
+   */
+  private buildPowertrainUpgrades(scene: Scene): void {
+    if (this.installed.powertrain < 3) return;
+    const p = this.prefix;
+    const cyan = this.upgradePbrMaterial(
+      `${p}-up-hubcap`,
+      new Color3(0.1, 0.85, 0.95),
+      0.45,
+      0.25,
+      new Color3(0.04, 0.55, 0.62),
+    );
+    for (let i = 0; i < WHEEL_SLOTS.length; i++) {
+      const pivot = this.cornerPivots[i];
+      if (pivot === undefined || pivot.isDisposed()) continue;
+      const side = WHEEL_SLOTS[i]?.side ?? 1;
+      const cap = MeshBuilder.CreateCylinder(
+        `${p}-up-hubcap-${i}`,
+        { diameter: 0.24, height: 0.045, tessellation: 16 },
+        scene,
+      );
+      cap.rotation.set(0, 0, -Math.PI / 2);
+      cap.material = cyan;
+      cap.parent = pivot;
+      cap.position.set(side * 0.195, 0, 0);
+      cap.isPickable = false;
+      cap.receiveShadows = false;
+      this.upgradeParts.push(cap);
+    }
+  }
+
+  /**
+   * `suspension` tree (Spec 37 §2.3):
+   * Tier 2+: anodized gold nitrogen reservoir canisters riding each
+   * coilover strut (parented to the coilover mount node).
+   * Tier 4: quad cold-gas RCS thruster nozzle cones on the four chassis
+   * corners, each with a downward plume particle emitter.
+   */
+  private buildSuspensionUpgrades(scene: Scene): void {
+    const p = this.prefix;
+    const tier = this.installed.suspension;
+
+    if (tier >= 2) {
+      const gold = this.upgradePbrMaterial(
+        `${p}-up-nitro-gold`,
+        new Color3(0.95, 0.68, 0.14),
+        0.85,
+        0.28,
+        new Color3(0.08, 0.04, 0.0),
+      );
+      const capMat = this.upgradePbrMaterial(`${p}-up-nitro-cap`, new Color3(0.15, 0.15, 0.16), 0.6, 0.4);
+      for (let i = 0; i < this.coilMounts.length; i++) {
+        const mount = this.coilMounts[i];
+        if (mount === undefined || mount.isDisposed()) continue;
+        const can = MeshBuilder.CreateCylinder(
+          `${p}-up-nitro-canister-${i}`,
+          { diameter: 0.09, height: 0.3, tessellation: 12 },
+          scene,
+        );
+        can.material = gold;
+        can.parent = mount;
+        can.position.set(0.115, 0.27, 0);
+        can.isPickable = false;
+        this.upgradeParts.push(can);
+        const cap = MeshBuilder.CreateCylinder(
+          `${p}-up-nitro-canister-cap-${i}`,
+          { diameter: 0.05, height: 0.06, tessellation: 10 },
+          scene,
+        );
+        cap.material = capMat;
+        cap.parent = mount;
+        cap.position.set(0.115, 0.44, 0);
+        cap.isPickable = false;
+        this.upgradeParts.push(cap);
+      }
+    }
+
+    if (tier >= 4) {
+      const steel = this.upgradePbrMaterial(`${p}-up-rcs-steel`, new Color3(0.3, 0.32, 0.34), 0.9, 0.3);
+      let k = 0;
+      for (const zc of [GEO.wheel.axle, -GEO.wheel.axle]) {
+        for (const side of [1, -1] as const) {
+          // Nozzle cone: narrow inlet at the chassis, wide exit bell below.
+          const nozzle = MeshBuilder.CreateCylinder(
+            `${p}-up-rcs-nozzle-${k}`,
+            { diameterTop: 0.06, diameterBottom: 0.18, height: 0.2, tessellation: 12 },
+            scene,
+          );
+          this.upgradePart(nozzle, steel).position.set(side * 0.66, -0.02, zc);
+          // Downward cold-gas plume emitter anchored under the nozzle bell.
+          const anchor = new TransformNode(`${p}-up-rcs-emitter-${k}`, scene);
+          anchor.parent = this.chassisBody;
+          anchor.position.set(side * 0.66, -0.16, zc);
+          this.upgradeNodes.push(anchor);
+          this.buildRcsPlume(scene, k, anchor);
+          k += 1;
+        }
+      }
+    }
+  }
+
+  /** One cold-gas plume particle system (NullEngine-safe: failures degrade
+   *  to "no plume" — the geometry and bookkeeping stay intact). */
+  private buildRcsPlume(scene: Scene, index: number, anchor: TransformNode): void {
+    try {
+      const p = this.prefix;
+      const sprite = this.plumeSpriteTexture(scene);
+      const ps = new ParticleSystem(`${p}-up-rcs-plume-${index}`, 48, scene);
+      ps.particleTexture = sprite;
+      // Node emitters are supported at runtime; the CLI type union is narrow.
+      ps.emitter = anchor as unknown as Mesh;
+      ps.minEmitBox.set(-0.02, 0, -0.02);
+      ps.maxEmitBox.set(0.02, 0, 0.02);
+      ps.direction1 = new Vector3(-0.15, -1, -0.15);
+      ps.direction2 = new Vector3(0.15, -1, 0.15);
+      ps.color1 = new Color4(0.78, 0.9, 1.0, 0.85);
+      ps.color2 = new Color4(0.35, 0.6, 1.0, 0.5);
+      ps.colorDead = new Color4(0.2, 0.35, 0.6, 0);
+      ps.minSize = 0.05;
+      ps.maxSize = 0.16;
+      ps.minLifeTime = 0.12;
+      ps.maxLifeTime = 0.3;
+      ps.emitRate = 48;
+      ps.blendMode = ParticleSystem.BLENDMODE_ADD;
+      ps.gravity.set(0, 0, 0);
+      ps.start();
+      this.rcsPlumes.push(ps);
+    } catch {
+      // Headless / restricted engine: plume is cosmetic, degrade silently.
+    }
+  }
+
+  /** 16×16 soft radial white sprite for the RCS plumes (RawTexture, so it
+   *  works under NullEngine with no DOM canvas). */
+  private plumeSpriteTexture(scene: Scene): RawTexture {
+    const S = 16;
+    const px = new Uint8Array(S * S * 4);
+    for (let y = 0; y < S; y++) {
+      for (let x = 0; x < S; x++) {
+        const i = (y * S + x) * 4;
+        const d = Math.hypot(x - (S - 1) / 2, y - (S - 1) / 2) / ((S - 1) / 2);
+        const a = Math.pow(clamp(1 - d, 0, 1), 1.5);
+        px[i] = 255;
+        px[i + 1] = 255;
+        px[i + 2] = 255;
+        px[i + 3] = Math.round(a * 255);
+      }
+    }
+    const tex = new RawTexture(px, S, S, Engine.TEXTUREFORMAT_RGBA, scene, false);
+    tex.hasAlpha = true;
+    this.upgradeTextures.push(tex);
+    return tex;
+  }
+
+  /**
+   * `mining_suite` tree (Spec 37 §2.4):
+   * Tier 2+: thermal resonance beam emitter mounted to the frontal bumper
+   * (orange emissive projector barrel).
+   * Tier 3: wide-swath regolith scoop array on the frontal bumper.
+   * Tier 4: deep-core resonator — seismic emitter dish under the chassis.
+   */
+  private buildMiningUpgrades(scene: Scene): void {
+    const p = this.prefix;
+    const tier = this.installed.mining_suite;
+    if (tier < 2) return;
+
+    const steel = this.upgradePbrMaterial(`${p}-up-mining-steel`, new Color3(0.35, 0.37, 0.4), 0.85, 0.35);
+    const thermal = this.upgradePbrMaterial(
+      `${p}-up-thermal-emissive`,
+      new Color3(0.95, 0.45, 0.1),
+      0.3,
+      0.3,
+      new Color3(0.7, 0.18, 0.02),
+    );
+
+    // -- Tier 2: thermal resonance beam emitter on the front bumper --------
+    this.upgradePart(
+      MeshBuilder.CreateBox(`${p}-up-thermal-mount`, { width: 0.26, height: 0.14, depth: 0.14 }, scene),
+      steel,
+    ).position.set(0.36, 0.27, GEO.bumper.z - 0.02);
+    const barrel = MeshBuilder.CreateCylinder(
+      `${p}-up-thermal-barrel`,
+      { diameter: 0.08, height: 0.4, tessellation: 12 },
+      scene,
+    );
+    barrel.rotation.set(Math.PI / 2, 0, 0);
+    this.upgradePart(barrel, steel).position.set(0.36, 0.27, GEO.bumper.z + 0.18);
+    const tip = MeshBuilder.CreateCylinder(
+      `${p}-up-thermal-tip`,
+      { diameter: 0.09, height: 0.05, tessellation: 12 },
+      scene,
+    );
+    tip.rotation.set(Math.PI / 2, 0, 0);
+    this.upgradePart(tip, thermal).position.set(0.36, 0.27, GEO.bumper.z + 0.4);
+
+    // -- Tier 3: wide-swath regolith collector scoop ------------------------
+    if (tier >= 3) {
+      const scoopMat = this.upgradePbrMaterial(`${p}-up-scoop`, new Color3(0.8, 0.6, 0.15), 0.6, 0.45);
+      const plate = MeshBuilder.CreateBox(`${p}-up-scoop-plate`, { width: 2.6, height: 0.05, depth: 0.62 }, scene);
+      plate.rotation.set(-0.5, 0, 0); // leading lip kicks up over the regolith
+      this.upgradePart(plate, scoopMat).position.set(0, 0.13, GEO.bumper.z + 0.3);
+      for (const side of [1, -1] as const) {
+        const tag = side > 0 ? 'l' : 'r';
+        const cheek = MeshBuilder.CreateBox(`${p}-up-scoop-cheek-${tag}`, { width: 0.06, height: 0.3, depth: 0.55 }, scene);
+        cheek.rotation.set(-0.5, 0, 0);
+        this.upgradePart(cheek, scoopMat).position.set(side * 1.26, 0.17, GEO.bumper.z + 0.28);
+      }
+      // Scoop intake glow strip.
+      this.upgradePart(
+        MeshBuilder.CreateBox(`${p}-up-scoop-glow`, { width: 2.4, height: 0.03, depth: 0.03 }, scene),
+        thermal,
+      ).position.set(0, 0.06, GEO.bumper.z + 0.06);
+    }
+
+    // -- Tier 4: deep-core resonator seismic dish (underbody) ---------------
+    if (tier >= 4) {
+      const seismic = this.upgradePbrMaterial(
+        `${p}-up-resonator-emissive`,
+        new Color3(0.65, 0.3, 0.95),
+        0.3,
+        0.3,
+        new Color3(0.3, 0.08, 0.5),
+      );
+      this.upgradePart(
+        MeshBuilder.CreateCylinder(`${p}-up-resonator-dish`, { diameterTop: 0.44, diameterBottom: 0.2, height: 0.12, tessellation: 16 }, scene),
+        steel,
+      ).position.set(0, -0.1, 0.15);
+      this.upgradePart(
+        MeshBuilder.CreateCylinder(`${p}-up-resonator-core`, { diameter: 0.14, height: 0.05, tessellation: 14 }, scene),
+        seismic,
+      ).position.set(0, -0.17, 0.15);
+    }
+  }
+
+  /** Per-frame Spec 37 pulse animation: holo cargo-net webbing breathes and
+   *  the RCS plumes crackle. Cheap; no-ops on a stock build. */
+  private animateUpgradeVisuals(dt: number): void {
+    if (this.magNetMaterial === null && this.rcsPlumes.length === 0) return;
+    if (Number.isFinite(dt) && dt > 0) this.visualTimeS += dt;
+    const t = this.visualTimeS;
+    if (this.magNetMaterial !== null) {
+      const pulse = 0.5 + 0.5 * Math.sin(t * 3.2);
+      this.magNetMaterial.alpha = 0.07 + 0.09 * pulse;
+    }
+    for (const ps of this.rcsPlumes) {
+      try {
+        if (ps.isStarted()) ps.emitRate = 36 + 24 * (0.5 + 0.5 * Math.sin(t * 11));
+      } catch {
+        // Engine detached mid-frame — plume flicker is cosmetic.
+      }
+    }
   }
 
   // -- quest dashboard telemetry (Spec 18 §6.3, ADR-18-3) ------------------------
@@ -1598,6 +2170,7 @@ export class OpenBuggy {
     const damperRods: Mesh[] = [];
     const tieRods: Mesh[] = [];
     const hubList: Mesh[] = [];
+    const coilGroups: TransformNode[] = [];
     const wheelsList: Mesh[] = [];
     const mudFlapsList: Mesh[] = [];
 
@@ -1680,6 +2253,7 @@ export class OpenBuggy {
       coilGroup.position.copyFrom(upper);
       alignYTo(coilAxis, this.scratchQuat);
       coilGroup.rotationQuaternion = this.scratchQuat.clone();
+      coilGroups.push(coilGroup);
 
       const coils: Mesh[] = [];
       const coilCount = 6;
@@ -1773,6 +2347,9 @@ export class OpenBuggy {
     this.coilovers = coilovers;
     this.damperRods = damperRods;
     this.tieRods = tieRods;
+    // Spec 37 Phase 2: attachment attach-points for upgrade visuals.
+    this.wheelHubs = hubList;
+    this.coilMounts = coilGroups;
 
     this.parts = [
       ...chassisMeshes,
@@ -1828,6 +2405,9 @@ export class OpenBuggy {
     this.lamps = lamps;
 
     this.buildBeamCones(scene);
+    // Spec 37 Phase 2: mount the procedural components the current build has
+    // purchased (no-op at factory Tier-1-everywhere state).
+    this.applyUpgradeVisuals();
   }
 
   /**
@@ -2126,6 +2706,8 @@ export class OpenBuggy {
 
     this.applyWheelSpin(state, dt);
     this.applyLamps(state);
+    // Spec 37 Phase 2: pulse the holographic cargo webbing / upgrade glows.
+    this.animateUpgradeVisuals(dt);
   }
 
   /**
@@ -2298,20 +2880,36 @@ export class BuggyCargoHopper {
   private items: HopperTrackedItem[] = [];
   private nextId = 1;
   private hopperDisposed = false;
+  /**
+   * Spec 37 Phase 2: live ceiling — 6 on the stock hopper, raised to 12 by
+   * the Tier-2 Extended Freight Flatbed through {@link setCapacity}.
+   */
+  private capacity = HOPPER_CAPACITY;
 
   constructor(owner: OpenBuggy, options: BuggyCargoHopperOptions = {}) {
     this.owner = owner;
     this.options = options;
   }
 
-  /** Hopper ceiling: 6 physical canisters (Spec 36 §3 Phase 3). */
+  /** Hopper ceiling: 6 stock canisters, 12 with the Tier-2 flatbed. */
   getCapacity(): number {
-    return HOPPER_CAPACITY;
+    return this.capacity;
+  }
+
+  /**
+   * Raise/restore the slot ceiling (Spec 37 §2.1 Tier 2: 6 → 12). Clamped
+   * to `[1, HOPPER_EXTENDED_CAPACITY]`; returns the ceiling now in force.
+   * Latched items are untouched — shrinking never drops cargo.
+   */
+  setCapacity(slots: number): number {
+    if (!Number.isFinite(slots)) return this.capacity;
+    this.capacity = Math.min(HOPPER_EXTENDED_CAPACITY, Math.max(1, Math.trunc(slots)));
+    return this.capacity;
   }
 
   /** True once every grid slot holds a latched canister. */
   isFull(): boolean {
-    return this.latchedCount() >= HOPPER_CAPACITY;
+    return this.latchedCount() >= this.capacity;
   }
 
   /**
@@ -2549,18 +3147,20 @@ export class BuggyCargoHopper {
     for (const item of this.items) {
       if (item.state === 'LATCHED') used.add(item.slot);
     }
-    for (let s = 0; s < HOPPER_CAPACITY; s++) {
+    for (let s = 0; s < this.capacity; s++) {
       if (!used.has(s)) return s;
     }
     return -1;
   }
 
   /** Rest offset in the Babylon model frame for `type` in grid `slot`:
-   *  grid column/row + half the container height off the bed floor. */
+   *  grid column/row (upper deck for slots 6..11, Spec 37 Tier 2) + half
+   *  the container height off that deck's floor. */
   private static restOffset(type: HeistMoonCargoType, slot: number): HopperVec3 {
-    const grid = HOPPER_GRID_SLOTS[slot] ?? HOPPER_GRID_SLOTS[0]!;
+    const grid = hopperGridSlot(slot);
     const shape = HOPPER_ITEM_SHAPE[type];
-    return { x: grid.x, y: HOPPER_BED_FLOOR_Y + shape.height / 2, z: grid.z };
+    const deckY = HOPPER_BED_FLOOR_Y + (grid.deck === 1 ? HOPPER_UPPER_DECK_Y : 0);
+    return { x: grid.x, y: deckY + shape.height / 2, z: grid.z };
   }
 
   /** World offset from the bed centre → hopper-local (lat, lon, up) about
