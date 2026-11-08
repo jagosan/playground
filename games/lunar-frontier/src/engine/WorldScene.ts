@@ -63,6 +63,7 @@ import { Constants } from '@babylonjs/core/Engines/constants.js';
 import { Scene } from '@babylonjs/core/scene.js';
 import { DirectionalLight } from '@babylonjs/core/Lights/directionalLight.js';
 import { HemisphericLight } from '@babylonjs/core/Lights/hemisphericLight.js';
+import { SpotLight } from '@babylonjs/core/Lights/spotLight.js';
 import { ShadowGenerator } from '@babylonjs/core/Lights/Shadows/shadowGenerator.js';
 import { PBRMaterial } from '@babylonjs/core/Materials/PBR/pbrMaterial.js';
 import { Material } from '@babylonjs/core/Materials/material.js';
@@ -707,6 +708,75 @@ export function buildMesoDetailData(seed: number): Uint8Array {
 }
 
 // ---------------------------------------------------------------------------
+// Spec 37 Phase 5: Outpost Maintenance Bay (world furniture)
+// ---------------------------------------------------------------------------
+
+/** Canonical seat of the outpost maintenance bay, adjacent to the Trading Post. */
+export const MAINTENANCE_BAY_POSITION = { x: 240, y: -160 } as const;
+
+/** Proximity ring radius around {@link MAINTENANCE_BAY_POSITION} (m). */
+export const MAINTENANCE_BAY_RADIUS_M = 12;
+
+/** Hydraulic lift deck footprint: 7 m × 4.5 m, raised 0.35 m over the pad. */
+export const MAINTENANCE_BAY_LIFT = { width: 7, length: 4.5, height: 0.35 } as const;
+
+/** Texture size for the procedural diamond-plate deck map (px). */
+const DIAMOND_PLATE_TEX_SIZE = 128;
+
+/**
+ * Procedural diamond-plate steel map (NullEngine-safe typed-array upload).
+ * Grey brushed-steel base with bright raised diamond lozenges on a staggered
+ * grid — one texture tile ≈ one 0.7 m plate panel once the deck applies its
+ * UV scale.
+ */
+export function buildDiamondPlateData(size: number = DIAMOND_PLATE_TEX_SIZE): Uint8Array {
+  const data = new Uint8Array(size * size * 4);
+  const cell = size / 4; // 4×4 plate panels per tile
+  for (let iy = 0; iy < size; iy++) {
+    for (let ix = 0; ix < size; ix++) {
+      const i = (iy * size + ix) * 4;
+      // Brushed-steel base with faint horizontal streaks.
+      const streak = ((ix * 7 + iy * 13) % 11) * 1.6;
+      let r = 118 + streak;
+      let g = 121 + streak;
+      let b = 127 + streak;
+      // Diamond lozenge: |u|+|v| in a staggered cell < 0.42 → raised stud.
+      const stagger = Math.floor(iy / cell) % 2 === 0 ? 0 : cell / 2;
+      const u = Math.abs(((ix + stagger) % cell) - cell / 2) / (cell / 2);
+      const v = Math.abs((iy % cell) - cell / 2) / (cell / 2);
+      if (u + v < 0.84) {
+        // Bright facet face with a darker shadowed lower-right edge.
+        const edge = u + v > 0.62 ? -26 : 22;
+        r += edge;
+        g += edge;
+        b += edge;
+      }
+      data[i] = Math.max(0, Math.min(255, Math.round(r)));
+      data[i + 1] = Math.max(0, Math.min(255, Math.round(g)));
+      data[i + 2] = Math.max(0, Math.min(255, Math.round(b)));
+      data[i + 3] = 255;
+    }
+  }
+  return data;
+}
+
+/** Live assembly of the outpost maintenance bay (built once, disposed on teardown). */
+export interface MaintenanceBayAssembly {
+  /** Root transform placed at (bay centre, pad surface) in the Babylon frame. */
+  root: TransformNode;
+  /** Every mesh in the assembly (harness readback / shadow-caster audit). */
+  meshes: Mesh[];
+  /** The four overhead halogen floodlights over the lift bay. */
+  lights: SpotLight[];
+  /** Bay seat in the physics frame (x, y). */
+  center: { x: number; y: number };
+  /** Proximity-ring radius (m). */
+  radiusM: number;
+  /** Pad-surface elevation (world-frame metres) after the terrain clamp. */
+  padTopZ: number;
+}
+
+// ---------------------------------------------------------------------------
 // WorldScene
 // ---------------------------------------------------------------------------
 
@@ -817,6 +887,11 @@ export class WorldScene {
   private orbitalTransport: OrbitalTransportSystem | null = null;
   /** Spec 29: Frontier Radio Tower (null before {@link buildRadioTower} / after dispose). */
   private radioTower: RadioTower | null = null;
+  /**
+   * Spec 37 Phase 5: outpost maintenance bay beside the Trading Post (null
+   * before {@link buildMaintenanceBay} / after dispose).
+   */
+  private maintenanceBay: MaintenanceBayAssembly | null = null;
 
   constructor(options: WorldSceneOptions = {}) {
     this.options = {
@@ -865,6 +940,9 @@ export class WorldScene {
     this.buildTerrainSkirt();
     this.buildRockFields();
     this.buildScrapSites();
+    // Spec 37 Phase 5: outpost maintenance bay beside the Frontier Trading
+    // Post (fixed canonical seat 240, −160 — always-on world furniture).
+    this.buildMaintenanceBay();
     // Spec 25 §2.4: derelict rival-team outposts anchored on snapshot nodes
     // / crater rims (idempotent accessor: `getRivalBases()`).
     this.buildRivalBases();
@@ -1175,6 +1253,25 @@ export class WorldScene {
         /* already gone */
       }
       this.radioTower = null;
+    }
+
+    // Spec 37 Phase 5: tear down the outpost maintenance bay — floodlights
+    // explicitly (lights live outside the node tree), assembly + its
+    // bay-private materials/texture via the root's recursive dispose.
+    if (this.maintenanceBay !== null) {
+      for (const light of this.maintenanceBay.lights) {
+        try {
+          light.dispose();
+        } catch {
+          /* already gone */
+        }
+      }
+      try {
+        this.maintenanceBay.root.dispose(false, true);
+      } catch {
+        /* already gone */
+      }
+      this.maintenanceBay = null;
     }
 
     for (const mesh of this.entities) mesh.parent = null;
@@ -1586,6 +1683,476 @@ export class WorldScene {
   /** The Frontier Radio Tower, or null before build / after dispose. */
   getRadioTower(): RadioTower | null {
     return this.disposed ? null : this.radioTower;
+  }
+
+  // -- Spec 37 Phase 5: outpost maintenance bay ----------------------------------
+
+  /**
+   * Build the Outpost Maintenance Bay beside the Frontier Trading Post
+   * (Spec 37 §1: canonical seat X = 240 m, Y = −160 m). Idempotent — repeat
+   * calls return the live assembly.
+   *
+   * Contents: a diamond-plate hydraulic drive-on lift platform (7 m × 4.5 m
+   * × 0.35 m) ringed by yellow/black hazard caution stripes, four overhead
+   * steel stanchions whose halogen SpotLights rake crisp local light across
+   * the lift bay, a service gantry with hoist trolley, and a tool rack
+   * stringing pneumatic hose coils. The whole assembly clamps to the
+   * sampled terrain: the pad top sits at the highest ground sample inside
+   * its footprint (never below grade), and every structure stands on it.
+   */
+  buildMaintenanceBay(
+    options: { position?: { x: number; y: number }; radiusM?: number } = {},
+  ): MaintenanceBayAssembly {
+    if (this.maintenanceBay !== null) return this.maintenanceBay;
+    const scene = this.requireScene();
+    const centerX = options.position?.x ?? MAINTENANCE_BAY_POSITION.x;
+    const centerY = options.position?.y ?? MAINTENANCE_BAY_POSITION.y;
+    const radiusM = options.radiusM ?? MAINTENANCE_BAY_RADIUS_M;
+
+    // -- Terrain clamp -------------------------------------------------------
+    // Sample the centre + the four corners of the 22 m × 14 m pad footprint;
+    // the pad deck rides at the HIGHEST sample (never buried by a local
+    // high side) and its foundation skirt sinks past the lowest.
+    const PAD_W = 22;
+    const PAD_D = 14;
+    const groundSamples = [
+      this.getGroundHeightAt(centerX, centerY),
+      this.getGroundHeightAt(centerX - PAD_W / 2, centerY - PAD_D / 2),
+      this.getGroundHeightAt(centerX + PAD_W / 2, centerY - PAD_D / 2),
+      this.getGroundHeightAt(centerX - PAD_W / 2, centerY + PAD_D / 2),
+      this.getGroundHeightAt(centerX + PAD_W / 2, centerY + PAD_D / 2),
+    ];
+    const padTopZ = Math.max(...groundSamples);
+    const padBottomZ = Math.min(...groundSamples) - 0.45;
+
+    const root = new TransformNode('maintenance-bay-root', scene);
+    root.position.copyFrom(worldToBabylon({ x: centerX, y: centerY, z: padTopZ }));
+    if (this.terrainRoot !== null) root.parent = this.terrainRoot;
+
+    const meshes: Mesh[] = [];
+    /** Parent a mesh at local (dx, dy, z) — physics frame → Babylon (x, z↑, −y). */
+    const put = (m: Mesh, dx: number, dy: number, z: number): Mesh => {
+      m.parent = root;
+      m.position.set(dx, z, -dy);
+      meshes.push(m);
+      return m;
+    };
+
+    // -- Materials -----------------------------------------------------------
+    const steelMat = new PBRMaterial('bay-steel', scene);
+    steelMat.albedoColor = new Color3(0.56, 0.58, 0.6);
+    steelMat.metallic = 0.9;
+    steelMat.roughness = 0.35;
+
+    const darkSteelMat = new PBRMaterial('bay-dark-steel', scene);
+    darkSteelMat.albedoColor = new Color3(0.2, 0.21, 0.23);
+    darkSteelMat.metallic = 0.85;
+    darkSteelMat.roughness = 0.5;
+
+    const hazardYellowMat = new StandardMaterial('bay-hazard-yellow', scene);
+    hazardYellowMat.diffuseColor = new Color3(0.98, 0.78, 0.04);
+    hazardYellowMat.emissiveColor = new Color3(0.16, 0.12, 0.005);
+    hazardYellowMat.specularColor = new Color3(0.2, 0.2, 0.2);
+
+    const hazardBlackMat = new StandardMaterial('bay-hazard-black', scene);
+    hazardBlackMat.diffuseColor = new Color3(0.04, 0.04, 0.045);
+    hazardBlackMat.specularColor = new Color3(0.05, 0.05, 0.05);
+
+    const toolRedMat = new StandardMaterial('bay-tool-red', scene);
+    toolRedMat.diffuseColor = new Color3(0.75, 0.16, 0.08);
+    toolRedMat.specularColor = new Color3(0.2, 0.2, 0.2);
+
+    const hoseMat = new StandardMaterial('bay-pneumatic-hose', scene);
+    hoseMat.diffuseColor = new Color3(0.85, 0.45, 0.06);
+    hoseMat.specularColor = new Color3(0.35, 0.35, 0.35);
+
+    const lensMat = new StandardMaterial('bay-halogen-lens', scene);
+    lensMat.emissiveColor = new Color3(1.0, 0.94, 0.78);
+    lensMat.disableLighting = true;
+
+    const signMat = new StandardMaterial('bay-service-cross', scene);
+    signMat.emissiveColor = new Color3(0.15, 0.95, 0.35);
+    signMat.disableLighting = true;
+
+    // Diamond-plate deck map (procedural RawTexture, NullEngine-safe).
+    const plateTex = new RawTexture(
+      buildDiamondPlateData(),
+      DIAMOND_PLATE_TEX_SIZE,
+      DIAMOND_PLATE_TEX_SIZE,
+      Constants.TEXTUREFORMAT_RGBA,
+      scene,
+      true,
+      false,
+      Constants.TEXTURE_TRILINEAR_SAMPLINGMODE,
+    );
+    plateTex.wrapU = Constants.TEXTURE_WRAP_ADDRESSMODE;
+    plateTex.wrapV = Constants.TEXTURE_WRAP_ADDRESSMODE;
+    // ~0.7 m per texture tile across the 7 m deck.
+    plateTex.uScale = 10;
+    plateTex.vScale = 6.4;
+    const deckMat = new PBRMaterial('bay-diamond-plate', scene);
+    deckMat.albedoTexture = plateTex;
+    deckMat.metallic = 0.85;
+    deckMat.roughness = 0.35;
+
+    // -- Pad slab --------------------------------------------------------------
+    put(
+      MeshBuilder.CreateBox(
+        'bay-pad-slab',
+        { width: PAD_W, depth: PAD_D, height: padTopZ - padBottomZ },
+        scene,
+      ),
+      0,
+      0,
+      (padTopZ + padBottomZ) / 2 - padTopZ,
+    ).material = darkSteelMat;
+
+    // -- Hydraulic lift platform (7 × 4.5 × 0.35 raised) ----------------------
+    const L = MAINTENANCE_BAY_LIFT;
+    const RAM_H = 0.17;
+    for (const rx of [-2.4, 2.4]) {
+      for (const ry of [-1.4, 1.4]) {
+        put(
+          MeshBuilder.CreateCylinder(
+            `bay-lift-ram-${rx}_${ry}`,
+            { diameter: 0.5, height: RAM_H, tessellation: 14 },
+            scene,
+          ),
+          rx,
+          ry,
+          RAM_H / 2,
+        ).material = steelMat;
+      }
+    }
+    put(
+      MeshBuilder.CreateBox(
+        'bay-lift-deck',
+        { width: L.width, depth: L.length, height: L.height - RAM_H },
+        scene,
+      ),
+      0,
+      0,
+      RAM_H + (L.height - RAM_H) / 2,
+    ).material = deckMat;
+
+    // Yellow/black caution stripes ringing the deck perimeter.
+    const STRIPE_H = 0.05;
+    const STRIPE_BAND = 0.55;
+    const deckTopZ = L.height;
+    let stripeIndex = 0;
+    const stripe = (name: string, dx: number, dy: number, w: number, d: number): void => {
+      put(
+        MeshBuilder.CreateBox(name, { width: w, depth: d, height: STRIPE_H }, scene),
+        dx,
+        dy,
+        deckTopZ + STRIPE_H / 2,
+      ).material = stripeIndex % 2 === 0 ? hazardYellowMat : hazardBlackMat;
+      stripeIndex++;
+    };
+    // Long sides run along x (10 × 0.7 m stripes each).
+    for (const sy of [-1, 1]) {
+      for (let i = 0; i < 10; i++) {
+        stripe(
+          `bay-stripe-long-${sy}_${i}`,
+          -L.width / 2 + 0.35 + i * 0.7,
+          sy * (L.length / 2 - STRIPE_BAND / 2),
+          0.7,
+          STRIPE_BAND,
+        );
+      }
+    }
+    // Short sides run along y, inset between the corner stripes (6 each).
+    for (const sx of [-1, 1]) {
+      for (let i = 0; i < 6; i++) {
+        const seg = 3.4 / 12; // 3.4 m clear run between corner stripes
+        stripe(
+          `bay-stripe-short-${sx}_${i}`,
+          sx * (L.width / 2 - STRIPE_BAND / 2),
+          -1.7 + seg * (1 + 2 * i),
+          STRIPE_BAND,
+          seg,
+        );
+      }
+    }
+
+    // -- Four overhead stanchions with halogen floodlights ---------------------
+    const lights: SpotLight[] = [];
+    const STANCHION_H = 5.6;
+    const targetBabylon = worldToBabylon({ x: centerX, y: centerY, z: padTopZ + L.height });
+    for (const sx of [-1, 1]) {
+      for (const sy of [-1, 1]) {
+        const stX = sx * 5.6;
+        const stY = sy * 4.2;
+        put(
+          MeshBuilder.CreateCylinder(
+            `bay-stanchion-${sx}_${sy}`,
+            { diameter: 0.32, height: STANCHION_H, tessellation: 10 },
+            scene,
+          ),
+          stX,
+          stY,
+          STANCHION_H / 2,
+        ).material = steelMat;
+        // Base gusset plate.
+        put(
+          MeshBuilder.CreateBox(
+            `bay-stanchion-base-${sx}_${sy}`,
+            { width: 0.8, depth: 0.8, height: 0.08 },
+            scene,
+          ),
+          stX,
+          stY,
+          0.04,
+        ).material = darkSteelMat;
+
+        // Inward-reaching lamp arm + head + emissive lens.
+        const inv = 1 / Math.hypot(stX, stY);
+        const ux = -stX * inv;
+        const uy = -stY * inv;
+        const armLen = 1.7;
+        const arm = put(
+          MeshBuilder.CreateBox(
+            `bay-lamp-arm-${sx}_${sy}`,
+            { width: armLen, height: 0.18, depth: 0.18 },
+            scene,
+          ),
+          stX + ux * (armLen / 2),
+          stY + uy * (armLen / 2),
+          STANCHION_H - 0.1,
+        );
+        arm.material = steelMat;
+        arm.rotation.y = Math.atan2(uy, ux);
+
+        const tipX = stX + ux * armLen;
+        const tipY = stY + uy * armLen;
+        put(
+          MeshBuilder.CreateBox(
+            `bay-lamp-head-${sx}_${sy}`,
+            { width: 0.6, depth: 0.45, height: 0.5 },
+            scene,
+          ),
+          tipX,
+          tipY,
+          STANCHION_H - 0.35,
+        ).material = darkSteelMat;
+        put(
+          MeshBuilder.CreateBox(
+            `bay-lamp-lens-${sx}_${sy}`,
+            { width: 0.5, depth: 0.35, height: 0.08 },
+            scene,
+          ),
+          tipX,
+          tipY,
+          STANCHION_H - 0.62,
+        ).material = lensMat;
+
+        // Real halogen SpotLight raking the lift bay from the lamp head.
+        const headBabylon = worldToBabylon({ x: centerX + tipX, y: centerY + tipY, z: padTopZ + STANCHION_H - 0.6 });
+        const dir = targetBabylon.subtract(headBabylon);
+        dir.normalize();
+        const flood = new SpotLight(
+          `bay-flood-${sx}_${sy}`,
+          headBabylon,
+          dir,
+          1.15,
+          1.6,
+          scene,
+        );
+        flood.diffuse = new Color3(1.0, 0.92, 0.72);
+        flood.intensity = 14;
+        flood.range = 26;
+        lights.push(flood);
+      }
+    }
+
+    // -- Service gantry frame (portal on +x side, cantilever hoist jib) --------
+    const GANTRY_H = 4.4;
+    for (const gy of [-5.4, 5.4]) {
+      put(
+        MeshBuilder.CreateBox(
+          `bay-gantry-leg-${gy}`,
+          { width: 0.32, depth: 0.32, height: GANTRY_H },
+          scene,
+        ),
+        6.0,
+        gy,
+        GANTRY_H / 2,
+      ).material = steelMat;
+    }
+    put(
+      MeshBuilder.CreateBox(
+        'bay-gantry-beam',
+        { width: 0.35, depth: 11.45, height: 0.35 },
+        scene,
+      ),
+      6.0,
+      0,
+      GANTRY_H,
+    ).material = steelMat;
+    // Cantilever jib running inboard toward the lift centreline.
+    put(
+      MeshBuilder.CreateBox(
+        'bay-gantry-jib',
+        { width: 5.6, depth: 0.25, height: 0.28 },
+        scene,
+      ),
+      3.2,
+      0,
+      GANTRY_H - 0.05,
+    ).material = steelMat;
+    // Hoist trolley + cable + hook block over the bay.
+    put(
+      MeshBuilder.CreateBox('bay-hoist-trolley', { width: 0.8, depth: 0.6, height: 0.32 }, scene),
+      3.0,
+      0,
+      GANTRY_H - 0.35,
+    ).material = toolRedMat;
+    put(
+      MeshBuilder.CreateCylinder(
+        'bay-hoist-cable',
+        { diameter: 0.04, height: 1.8, tessellation: 6 },
+        scene,
+      ),
+      3.0,
+      0,
+      GANTRY_H - 1.4,
+    ).material = darkSteelMat;
+    put(
+      MeshBuilder.CreateBox('bay-hoist-block', { width: 0.3, depth: 0.25, height: 0.35 }, scene),
+      3.0,
+      0,
+      GANTRY_H - 2.4,
+    ).material = steelMat;
+    // Green service-cross beacon on the jib so the bay reads at a glance.
+    put(
+      MeshBuilder.CreateBox('bay-sign-cross-h', { width: 1.0, depth: 0.12, height: 0.3 }, scene),
+      5.2,
+      0,
+      GANTRY_H - 0.65,
+    ).material = signMat;
+    put(
+      MeshBuilder.CreateBox('bay-sign-cross-v', { width: 0.3, depth: 0.12, height: 1.0 }, scene),
+      5.2,
+      0,
+      GANTRY_H - 0.65,
+    ).material = signMat;
+
+    // -- Tool rack with pneumatic hose coils (−x side) --------------------------
+    const rackX = -7.6;
+    for (const ry of [1.5, 3.5]) {
+      put(
+        MeshBuilder.CreateBox(
+          `bay-rack-post-${ry}`,
+          { width: 0.14, depth: 0.14, height: 2.2 },
+          scene,
+        ),
+        rackX,
+        ry,
+        1.1,
+      ).material = steelMat;
+    }
+    for (const shelfZ of [0.7, 1.3, 1.9]) {
+      put(
+        MeshBuilder.CreateBox(
+          `bay-rack-shelf-${shelfZ}`,
+          { width: 0.6, depth: 2.4, height: 0.08 },
+          scene,
+        ),
+        rackX,
+        2.5,
+        shelfZ,
+      ).material = darkSteelMat;
+      // Two tool bins per shelf.
+      for (const by of [1.95, 3.05]) {
+        put(
+          MeshBuilder.CreateBox(
+            `bay-tool-bin-${shelfZ}_${by}`,
+            { width: 0.45, depth: 0.7, height: 0.3 },
+            scene,
+          ),
+          rackX,
+          by,
+          shelfZ + 0.19,
+        ).material = toolRedMat;
+      }
+    }
+    // Pneumatic air line along the rack header + two hanging hose coils.
+    const airLine = put(
+      MeshBuilder.CreateCylinder(
+        'bay-air-line',
+        { diameter: 0.07, height: 2.3, tessellation: 8 },
+        scene,
+      ),
+      rackX - 0.25,
+      2.5,
+      2.08,
+    );
+    airLine.material = hoseMat;
+    airLine.rotation.x = Math.PI / 2;
+    for (const [coilY, coilD, coilZ] of [
+      [3.1, 0.8, 1.5],
+      [1.95, 0.62, 1.15],
+    ] as const) {
+      const coil = put(
+        MeshBuilder.CreateTorus(
+          `bay-hose-coil-${coilY}`,
+          { diameter: coilD, thickness: 0.07, tessellation: 18 },
+          scene,
+        ),
+        rackX - 0.35,
+        coilY,
+        coilZ,
+      );
+      coil.material = hoseMat;
+      coil.rotation.z = Math.PI / 2; // hang the ring vertical, face along x
+    }
+    const reelHub = put(
+      MeshBuilder.CreateCylinder(
+        'bay-hose-reel-hub',
+        { diameter: 0.22, height: 0.24, tessellation: 10 },
+        scene,
+      ),
+      rackX - 0.3,
+      2.5,
+      1.5,
+    );
+    reelHub.material = darkSteelMat;
+    reelHub.rotation.z = Math.PI / 2;
+
+    // -- Register everything with the sun's shadow map --------------------------
+    for (const m of meshes) {
+      this.addEntity(m);
+    }
+
+    this.maintenanceBay = {
+      root,
+      meshes,
+      lights,
+      center: { x: centerX, y: centerY },
+      radiusM,
+      padTopZ,
+    };
+    return this.maintenanceBay;
+  }
+
+  /** The outpost maintenance bay assembly, or null before build / after dispose. */
+  getMaintenanceBay(): MaintenanceBayAssembly | null {
+    return this.disposed ? null : this.maintenanceBay;
+  }
+
+  /**
+   * True when a world-frame position sits inside the maintenance bay's
+   * proximity ring (planar distance ≤ radius, default 12 m of the seat).
+   */
+  isInMaintenanceBay(
+    pos: { x: number; y: number; z?: number },
+    radiusM: number = this.maintenanceBay?.radiusM ?? MAINTENANCE_BAY_RADIUS_M,
+  ): boolean {
+    if (this.disposed || this.maintenanceBay === null) return false;
+    return (
+      Math.hypot(pos.x - this.maintenanceBay.center.x, pos.y - this.maintenanceBay.center.y) <=
+      radiusM
+    );
   }
 
   // -- surface detritus & salvage (Spec 21 §2.1) -------------------------------

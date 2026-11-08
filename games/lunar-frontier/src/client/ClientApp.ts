@@ -41,7 +41,7 @@ import { StandardMaterial } from '@babylonjs/core/Materials/standardMaterial.js'
 import { Color3 } from '@babylonjs/core/Maths/math.color.js';
 import type { Mesh } from '@babylonjs/core/Meshes/mesh.js';
 
-import { WorldScene, worldToBabylon, babylonToWorld, type CameraMode, type MiningBeamEffect } from '../engine/index.ts';
+import { WorldScene, worldToBabylon, babylonToWorld, type CameraMode, type MiningBeamEffect, MAINTENANCE_BAY_POSITION, MAINTENANCE_BAY_RADIUS_M } from '../engine/index.ts';
 import { ProvingGroundsScene, type LapTelemetry } from '../engine/ProvingGroundsScene.ts';
 import {
   EvaSuitAvatar,
@@ -1132,7 +1132,25 @@ export const NAV_POI_DIRECTORY: readonly NavPoi[] = [
       'fence',
       'market',
       'exchange',
+    ],
+  },
+  {
+    // Spec 37 §3 Phase 5: the Outpost Maintenance Bay beside the Trading
+    // Post — hydraulic lift, halogen floodlights, [G] garage terminal.
+    // Owns the bare 'garage' keyword intent from here on.
+    id: 'outpost-garage',
+    name: 'Outpost Maintenance Bay',
+    shortName: 'Garage Bay',
+    position: { x: MAINTENANCE_BAY_POSITION.x, y: MAINTENANCE_BAY_POSITION.y },
+    keywords: [
       'garage',
+      'outpost garage',
+      'garage bay',
+      'maintenance',
+      'maintenance bay',
+      'workshop',
+      'repair',
+      'lift',
     ],
   },
 ];
@@ -3921,6 +3939,21 @@ export class ClientApp {
 
   // -- Spec 37 Phase 4: garage terminal ------------------------------------------------
 
+  /**
+   * Spec 37 Phase 5: true when EITHER the rover OR the avatar sits inside
+   * the outpost maintenance bay's proximity ring (planar distance ≤ radius,
+   * default {@link MAINTENANCE_BAY_RADIUS_M} = 12 m of the bay seat at
+   * (240, −160)). Drives the `[G] OPEN GARAGE TERMINAL` HUD prompt; safe to
+   * call before avatars spawn (returns false).
+   */
+  isNearMaintenanceBay(radiusM: number = MAINTENANCE_BAY_RADIUS_M): boolean {
+    if (this.disposed) return false;
+    const near = (q: { x: number; y: number; z: number } | null): boolean =>
+      q !== null &&
+      Math.hypot(q.x - MAINTENANCE_BAY_POSITION.x, q.y - MAINTENANCE_BAY_POSITION.y) <= radiusM;
+    return near(this.suit?.getPosition() ?? null) || near(this.buggy?.getPosition() ?? null);
+  }
+
   /** Garage terminal visibility (harness readback). */
   isGarageOpen(): boolean {
     return this.garageTerminal?.isOpen() ?? false;
@@ -5207,6 +5240,13 @@ export class ClientApp {
     const target = this.getNearestVein();
     if (target !== null && target.rangeM <= MINE_RANGE_M) {
       prompts.push({ key: 'M', kind: 'mine', label: `Mine ${target.vein.kind.replace(/_/g, ' ')}` });
+    }
+    // Spec 37 Phase 5: maintenance bay proximity — with the rover parked on
+    // (or the avatar standing in) the lift bay, the [G] garage terminal
+    // prompt lights up. Works from either mount state: the workshop travels
+    // with the buggy.
+    if (this.isNearMaintenanceBay()) {
+      prompts.push({ key: 'G', label: 'OPEN GARAGE TERMINAL', order: 6 });
     }
     if (this.network !== null) {
       prompts.push({ key: 'C', kind: 'claim' });

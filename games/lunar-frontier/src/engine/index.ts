@@ -25,6 +25,13 @@ export {
   buildMacroAlbedoData,
   buildMicroGritNormalData,
   buildMesoDetailData,
+  // Spec 37 Phase 5: outpost maintenance bay seat/constants + diamond-plate
+  // texture synthesis (client proximity wiring + headless harnesses).
+  MAINTENANCE_BAY_POSITION,
+  MAINTENANCE_BAY_RADIUS_M,
+  MAINTENANCE_BAY_LIFT,
+  buildDiamondPlateData,
+  type MaintenanceBayAssembly,
 } from './WorldScene.ts';
 
 // Spec 23 §2.2 / ADR-023-2: clast-field archetypes (re-exported for harnesses).
