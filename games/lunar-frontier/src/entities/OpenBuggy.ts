@@ -68,6 +68,12 @@ import {
   type GroundElevationFn,
 } from '../physics/TraversalPhysics.ts';
 import { babylonToWorld, worldToBabylon } from '../engine/CameraRig.ts';
+import {
+  CARGO_CATCH_RADIUS_M,
+  CARGO_CATCH_RELATIVE_MAX_MPS,
+  HEIST_MOON_CARGO,
+  type HeistMoonCargoType,
+} from '../quests/TrainHeistDirector.ts';
 
 /** Distance within which the prospector can drop into the driver seat (m). */
 export const MOUNT_RADIUS_M = 3.5;
@@ -295,6 +301,144 @@ const DASH_POWER_FSKW = 72;
 /** Quest range-ladder full scale (Spec 18 §6.3): 120 m to the objective. */
 const DASH_RANGE_FULL_M = 120;
 
+// -- Spec 36 Phase 3: flatbed magnetic cargo hopper ---------------------------
+
+/**
+ * Spec 36 §2.2 / §3 Phase 3: the flatbed hopper holds up to six physical
+ * canisters in an aligned 2×3 grid. Caught mass rides the physics cargo
+ * loader, so inertia and suspension compression follow automatically
+ * (M_total = M_chassis + Σ M_cargo).
+ */
+export const HOPPER_CAPACITY = 6;
+/** Spec 36 §2.2: magnetic attractor strength k_mag (N). */
+export const HOPPER_K_MAG_N = 120;
+/** Spec 36 §2.2: relative-velocity damping c_damp (N·s/m). */
+export const HOPPER_C_DAMP_NS_M = 35;
+/** Spec 36 §2.2: soft electromagnetic capture gradient R_catch (m). Aliases
+ *  the director's {@link CARGO_CATCH_RADIUS_M} so aim prediction and the
+ *  physical catch can never drift apart. */
+export const HOPPER_CATCH_RADIUS_M = CARGO_CATCH_RADIUS_M;
+/** Spec 36 §2.2: relative-velocity ceiling for a magnetic capture (m/s). */
+export const HOPPER_RELATIVE_MAX_MPS = CARGO_CATCH_RELATIVE_MAX_MPS;
+/**
+ * Spec 36 §2.2: physical bed bounding envelope in the buggy hopper frame —
+ * X ∈ [−0.75, +0.75] m (width), Y ∈ [−1.20, −0.10] m (aft bed),
+ * Z ∈ [0.20, 0.90] m (height above the chassis datum). The spec's Y/Z pair
+ * maps onto the OpenBuggy model frame (x = left, y = up, z = nose) as
+ * model-y = spec-Z and model-z = spec-Y: the envelope is the air column
+ * above the carbon cargo bed, aft of the cockpit.
+ */
+export const HOPPER_BED_BOUNDS = {
+  x: [-0.75, 0.75],
+  y: [-1.2, -0.1],
+  z: [0.2, 0.9],
+} as const;
+/** Hopper-frame bed-centre point (m): mid of Y and Z extents. The height
+ *  matches the director's BUGGY_BED_CENTRE_HEIGHT_M = 0.55 m. */
+export const HOPPER_BED_CENTRE = { x: 0, y: -0.65, z: 0.55 } as const;
+/**
+ * The bed centre expressed in the Babylon model frame (x left, y up, z
+ * nose): (0, 0.55, −0.65) — parent point for latched canister meshes.
+ */
+const HOPPER_BED_CENTRE_MODEL = { x: 0, y: HOPPER_BED_CENTRE.z, z: HOPPER_BED_CENTRE.y };
+/** Half-extents derived from {@link HOPPER_BED_BOUNDS} in model axes
+ *  (lat = spec X, lon = spec Y, up = spec Z). */
+const HOPPER_BED_HALF = {
+  lat: (HOPPER_BED_BOUNDS.x[1] - HOPPER_BED_BOUNDS.x[0]) / 2,
+  lon: (HOPPER_BED_BOUNDS.y[1] - HOPPER_BED_BOUNDS.y[0]) / 2,
+  up: (HOPPER_BED_BOUNDS.z[1] - HOPPER_BED_BOUNDS.z[0]) / 2,
+} as const;
+/**
+ * Aligned 2×3 stacking grid (model frame, x = left, z = nose): column 0 is
+ * port (x = +0.36 m), column 1 starboard; three rows aft → forward. Slot
+ * pitch keeps ≥ 70 mm clearance between the widest container (the 0.30 m
+ * water cryo-cell).
+ */
+export const HOPPER_GRID_SLOTS: ReadonlyArray<{ x: number; z: number }> = [
+  { x: 0.36, z: -1.02 },
+  { x: 0.36, z: -0.65 },
+  { x: 0.36, z: -0.28 },
+  { x: -0.36, z: -1.02 },
+  { x: -0.36, z: -0.65 },
+  { x: -0.36, z: -0.28 },
+];
+/** Canister rest plane: the cargo-bed floor top in model y (m) — the carbon
+ *  bed box tops out at 0.25 + 0.18/2 = 0.34 and latched canisters sit on it. */
+const HOPPER_BED_FLOOR_Y = 0.34;
+/** An inbound canister that has not latched within this window has missed
+ *  the hopper and is quietly dropped from tracking (s). */
+export const HOPPER_INBOUND_MAX_AGE_S = 5.0;
+
+/** Per-type container envelope + PBR silhouette for the bed stack. */
+interface HopperCargoShape {
+  /** Container diameter across (m). */
+  diameter: number;
+  /** Container height along its rest axis (m) — flask reads as a sphere. */
+  height: number;
+  /** True to render a sphere (He-3 flask) instead of a cylinder. */
+  flask: boolean;
+}
+const HOPPER_ITEM_SHAPE: Readonly<Record<HeistMoonCargoType, HopperCargoShape>> = {
+  WATER_CRYO_CELL: { diameter: 0.3, height: 0.34, flask: false },
+  LOX_CYLINDER: { diameter: 0.22, height: 0.44, flask: false },
+  HE3_FLASK: { diameter: 0.24, height: 0.24, flask: true },
+};
+
+/** A plain {x, y, z} triple (physics frame unless stated otherwise). */
+type HopperVec3 = { x: number; y: number; z: number };
+
+/** Lifecycle of one tracked hopper canister (Spec 36 §2.2). */
+export type BuggyCargoItemState = 'INBOUND' | 'LATCHED';
+
+/** Public snapshot of one canister tracked by the hopper. */
+export interface BuggyCargoItem {
+  /** Monotonic per-hopper id. */
+  id: number;
+  /** Moon-volatile container identity (Spec 36 §3.1). */
+  type: HeistMoonCargoType;
+  /** Human-readable container label. */
+  label: string;
+  /** Full container mass (kg), from the canonical cargo table. */
+  massKg: number;
+  /** Inbound (integrating through the attractor) or hard-latched. */
+  state: BuggyCargoItemState;
+  /** Occupied 2×3 grid slot 0..5; −1 while inbound. */
+  slot: number;
+  /** Latched mesh offset in the Babylon model frame (x left, y up, z nose). */
+  localOffset: HopperVec3;
+  /** Live world-frame centre (m); rest pose once latched. */
+  position: HopperVec3;
+}
+
+/** One evaluation of the magnetic attractor field (Spec 36 §2.2). */
+export interface HopperCaptureField {
+  /** Slant distance from the canister to the bed centre (m). */
+  distanceToBedCentreM: number;
+  /** ‖v_cargo − v_buggy‖ (m/s). */
+  relativeSpeedMps: number;
+  /** True when inside R_catch AND under the relative-velocity ceiling. */
+  withinCatchEnvelope: boolean;
+  /** True when inside the hard physical bed bounding envelope. */
+  insideBedBounds: boolean;
+  /**
+   * F_mag = −k_mag·r̂ − c_damp·(v_cargo − v_buggy) in the world frame (N);
+   * zero outside the capture envelope.
+   */
+  force: HopperVec3;
+}
+
+/** Wiring for {@link BuggyCargoHopper}; all hooks optional except owner. */
+export interface BuggyCargoHopperOptions {
+  /** Procedural mesh factory for a latched canister (null when sceneless). */
+  createItemMesh?: (type: HeistMoonCargoType, slot: number, offset: HopperVec3) => Mesh | null;
+  /** Disposer for hopper meshes (defaults to `mesh.dispose()`). */
+  disposeItemMesh?: (mesh: Mesh) => void;
+  /** Mass bookkeeping: apply ±kg to the buggy (inertia + suspension). */
+  applyMassDelta?: (deltaKg: number) => void;
+  /** Fired after a canister hard-latches into the bed. */
+  onLatch?: (item: BuggyCargoItem) => void;
+}
+
 function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
 }
@@ -364,6 +508,13 @@ export class OpenBuggy {
   private cargoCrates: Mesh | null = null;
   private taillights: Mesh | null = null;
   private taillightMaterial: PBRMaterial | null = null;
+  /**
+   * Spec 36 Phase 3: flatbed magnetic cargo hopper (lazily constructed —
+   * bookkeeping works sceneless, meshes appear once the rover is built).
+   */
+  private hopper: BuggyCargoHopper | null = null;
+  /** Per-cargo-type PBR materials for the bed stack (created on demand). */
+  private hopperMaterials: Partial<Record<HeistMoonCargoType, PBRMaterial>> = {};
   private lamps: SpotLight[] = [];
   /**
    * Spec 23 §2.4.2 / ADR-023-4: procedural translucent light cones drifting
@@ -471,6 +622,9 @@ export class OpenBuggy {
     this.buildRover(this.scene);
     this.built = true;
     this.syncTransform(this.last, 0);
+    // Spec 36 Phase 3: canisters that latched before/without a scene get
+    // their bed meshes now that the chassis hierarchy exists.
+    this.hopper?.rebuildMeshes();
     return this;
   }
 
@@ -493,6 +647,9 @@ export class OpenBuggy {
   update(dt: number, input: BuggyInput = IDLE_BUGGY_INPUT): BuggyState {
     const state = this.physics.step(dt, input);
     this.last = state;
+    // Spec 36 Phase 3: inbound hopper canisters integrate against the
+    // freshly stepped chassis pose/velocity before visuals sync.
+    if (this.hopper !== null && !this.disposed) this.hopper.step(dt);
     if (this.built && !this.disposed) this.syncTransform(state, dt);
     return { ...state };
   }
@@ -503,6 +660,14 @@ export class OpenBuggy {
     this.disposed = true;
     this.built = false;
     this.mounted = false;
+
+    // Spec 36 Phase 3: drop the hopper (bed canister meshes + bookkeeping)
+    // before tearing down the chassis body the canisters parent to.
+    if (this.hopper !== null) {
+      this.hopper.dispose();
+      this.hopper = null;
+    }
+    this.hopperMaterials = {};
 
     for (const lamp of this.lamps) OpenBuggy.disposeQuietly(lamp);
     this.lamps = [];
@@ -792,6 +957,121 @@ export class OpenBuggy {
     const before = this.getCargoMass();
     this.setCargoMass(before + amountKg);
     return this.getCargoMass() - before;
+  }
+
+  // -- Spec 36 Phase 3: flatbed magnetic cargo hopper -------------------------
+
+  /**
+   * The flatbed cargo hopper: magnetic catch envelope, 2×3 physical
+   * stacking grid and caught-mass bookkeeping (Spec 36 §2.2/§3 Phase 3).
+   * Lazily constructed; null after `dispose()`.
+   */
+  getCargoHopper(): BuggyCargoHopper | null {
+    if (this.disposed) return null;
+    if (this.hopper === null) {
+      this.hopper = new BuggyCargoHopper(this, {
+        createItemMesh: (type, slot, offset) => this.buildHopperItemMesh(type, slot, offset),
+        disposeItemMesh: (mesh) => OpenBuggy.disposeQuietly(mesh),
+        applyMassDelta: (deltaKg) => {
+          // Route caught mass through the physics cargo loader so inertia
+          // and suspension compression follow (M_total = M_chassis + ΣM).
+          this.physics.loadCargo(deltaKg);
+          this.last = this.physics.getState();
+        },
+      });
+    }
+    return this.hopper;
+  }
+
+  /** Convenience: hard-latch a moon-cargo canister into the hopper bed
+   *  (what the moving-frame capture arbiter does on a clean throw). */
+  addHopperCargo(type: HeistMoonCargoType): BuggyCargoItem | null {
+    return this.getCargoHopper()?.addCargo(type) ?? null;
+  }
+
+  /** Convenience: unload every canister from the hopper bed. */
+  clearHopperCargo(): void {
+    this.hopper?.clearCargo();
+  }
+
+  /** Convenience: snapshots of the tracked hopper canisters. */
+  getHopperCargoItems(): BuggyCargoItem[] {
+    return this.hopper?.getCargoItems() ?? [];
+  }
+
+  /** Convenience: latched hopper cargo mass aboard (kg). */
+  getHopperCargoMassKg(): number {
+    return this.hopper?.getCargoMassKg() ?? 0;
+  }
+
+  /**
+   * Procedural PBR container mesh for a latched hopper canister: cylinder
+   * silhouettes for the water cryo-cell and LOX cylinder, a sphere for the
+   * He-3 flask, each in its cargo-type material, parented to the chassis
+   * body and positioned on the 2×3 stacking grid. Null when the rover has
+   * no scene yet (bookkeeping still proceeds; `rebuildMeshes()` catches up).
+   */
+  private buildHopperItemMesh(
+    type: HeistMoonCargoType,
+    slot: number,
+    offset: { x: number; y: number; z: number },
+  ): Mesh | null {
+    if (this.disposed || !this.built || this.scene === null || this.scene.isDisposed) return null;
+    const shape = HOPPER_ITEM_SHAPE[type];
+    const name = `${this.prefix}-hopper-cargo-${slot}-${type.toLowerCase()}`;
+    const mesh = shape.flask
+      ? MeshBuilder.CreateSphere(name, { diameter: shape.diameter, segments: 12 }, this.scene)
+      : MeshBuilder.CreateCylinder(
+          name,
+          { diameter: shape.diameter, height: shape.height, tessellation: 14 },
+          this.scene,
+        );
+    mesh.material = this.hopperMaterial(type);
+    mesh.parent = this.chassisBody;
+    mesh.position.set(offset.x, offset.y, offset.z);
+    mesh.isPickable = true;
+    mesh.receiveShadows = false;
+    return mesh;
+  }
+
+  /**
+   * Cargo-type PBR palette (Spec 36 §3 Phase 3): translucent ice-blue for
+   * water cryo-cells, frosted white metal for LOX cylinders, emissive
+   * amber for the enriched He-3 flasks. Created once per entity and
+   * disposed with the rest of the material set.
+   */
+  private hopperMaterial(type: HeistMoonCargoType): PBRMaterial {
+    const existing = this.hopperMaterials[type];
+    if (existing !== undefined && this.materials.includes(existing)) return existing;
+    const scene = this.scene;
+    if (scene === null || scene.isDisposed) {
+      throw new Error('OpenBuggy.hopperMaterial: no scene — call init() first');
+    }
+    const mat = new PBRMaterial(`${this.prefix}-hopper-${type.toLowerCase()}-mat`, scene);
+    switch (type) {
+      case 'WATER_CRYO_CELL':
+        mat.albedoColor = new Color3(0.55, 0.82, 0.95); // pressurized ice blue
+        mat.emissiveColor = new Color3(0.04, 0.1, 0.18);
+        mat.metallic = 0.15;
+        mat.roughness = 0.18;
+        break;
+      case 'LOX_CYLINDER':
+        mat.albedoColor = new Color3(0.88, 0.9, 0.92); // frosted white bottle
+        mat.emissiveColor = new Color3(0.02, 0.03, 0.04);
+        mat.metallic = 0.65;
+        mat.roughness = 0.3;
+        break;
+      case 'HE3_FLASK':
+        mat.albedoColor = new Color3(0.95, 0.75, 0.25); // glowing enriched amber
+        mat.emissiveColor = new Color3(0.55, 0.32, 0.05);
+        mat.metallic = 0.3;
+        mat.roughness = 0.25;
+        break;
+    }
+    mat.environmentIntensity = 0.05;
+    this.hopperMaterials[type] = mat;
+    this.materials.push(mat);
+    return mat;
   }
 
   // -- quest dashboard telemetry (Spec 18 §6.3, ADR-18-3) ------------------------
@@ -1988,6 +2268,383 @@ export class OpenBuggy {
       // Node already gone or engine torn down first — never propagate.
     }
   }
+}
+
+/**
+ * Spec 36 Phase 3: the flatbed magnetic cargo hopper.
+ *
+ * Tracks physical canisters thrown from the speeding Apex Express (Spec 36
+ * §2.1/§2.2): inbound canisters integrate under lunar gravity plus the
+ * electromagnetic attractor
+ *
+ *   F_mag = −k_mag·r̂ − c_damp·(v_cargo − v_buggy)
+ *
+ * while inside the soft capture gradient (R_catch = 1.8 m from the bed
+ * centre, relative speed ≤ 6.0 m/s). Crossing the hard physical bed
+ * bounding envelope ({@link HOPPER_BED_BOUNDS}) hard-latches the canister:
+ * it snaps to the next free slot of the aligned 2×3 stacking grid, gains a
+ * procedural PBR child mesh parented to the chassis body, and its mass is
+ * loaded through the buggy physics cargo loader — so total mass, inertia
+ * and suspension compression all follow (M_total = M_chassis + Σ M_cargo).
+ *
+ * Sceneless-safe: without a `createItemMesh` factory (or before `init()`)
+ * items latch bookkeeping-only and `rebuildMeshes()` catches the visuals up
+ * once the rover is built. All state mutations flow through this class —
+ * `OpenBuggy` never touches the item list directly.
+ */
+export class BuggyCargoHopper {
+  private readonly owner: OpenBuggy;
+  private readonly options: BuggyCargoHopperOptions;
+  private items: HopperTrackedItem[] = [];
+  private nextId = 1;
+  private hopperDisposed = false;
+
+  constructor(owner: OpenBuggy, options: BuggyCargoHopperOptions = {}) {
+    this.owner = owner;
+    this.options = options;
+  }
+
+  /** Hopper ceiling: 6 physical canisters (Spec 36 §3 Phase 3). */
+  getCapacity(): number {
+    return HOPPER_CAPACITY;
+  }
+
+  /** True once every grid slot holds a latched canister. */
+  isFull(): boolean {
+    return this.latchedCount() >= HOPPER_CAPACITY;
+  }
+
+  /**
+   * Mount a canister straight into the next free grid slot (hard latch),
+   * as the moving-frame capture arbiter does on a clean gap cross. Returns
+   * the item snapshot, or null when the hopper is already full.
+   */
+  addCargo(type: HeistMoonCargoType): BuggyCargoItem | null {
+    if (this.hopperDisposed || this.isFull()) return null;
+    const item = this.makeItem(type);
+    this.items.push(item);
+    this.latchItem(item);
+    return BuggyCargoHopper.copyItem(item);
+  }
+
+  /**
+   * Release a canister into the attractor field with a world-frame
+   * position and velocity (e.g. `v_train + v_throw` from the catwalk). The
+   * canister integrates through {@link step} until it crosses the bed
+   * envelope (latch) or ages out of the window (dropped).
+   */
+  launchCargo(type: HeistMoonCargoType, position: HopperVec3, velocity: HopperVec3): BuggyCargoItem | null {
+    if (this.hopperDisposed || this.isFull()) return null;
+    if (!Number.isFinite(position.x) || !Number.isFinite(position.y) || !Number.isFinite(position.z)) {
+      return null;
+    }
+    const item = this.makeItem(type);
+    item.state = 'INBOUND';
+    item.slot = -1;
+    item.position = { x: position.x, y: position.y, z: position.z };
+    item.velocity = {
+      x: Number.isFinite(velocity.x) ? velocity.x : 0,
+      y: Number.isFinite(velocity.y) ? velocity.y : 0,
+      z: Number.isFinite(velocity.z) ? velocity.z : 0,
+    };
+    this.items.push(item);
+    return BuggyCargoHopper.copyItem(item);
+  }
+
+  /**
+   * Advance every inbound canister one frame: vacuum ballistics (g = 1.62
+   * m/s² down) plus the magnetic attractor while inside the capture
+   * envelope, then hard-latch on bed-envelope containment. Returns the
+   * canisters that latched on this frame (empty most frames).
+   */
+  step(dt: number): BuggyCargoItem[] {
+    const latched: BuggyCargoItem[] = [];
+    if (this.hopperDisposed || !Number.isFinite(dt) || dt <= 0) return latched;
+    for (const item of [...this.items]) {
+      if (item.state !== 'INBOUND') continue;
+      item.ageS += dt;
+      const field = this.evaluateCapture(item.position, item.velocity);
+      const invMass = 1 / item.massKg;
+      item.velocity.x += field.force.x * invMass * dt;
+      item.velocity.y += field.force.y * invMass * dt;
+      item.velocity.z += (field.force.z * invMass - LUNAR_GRAVITY) * dt;
+      item.position.x += item.velocity.x * dt;
+      item.position.y += item.velocity.y * dt;
+      item.position.z += item.velocity.z * dt;
+      if (field.insideBedBounds && !this.isFull()) {
+        this.latchItem(item);
+        latched.push(BuggyCargoHopper.copyItem(item));
+        continue;
+      }
+      if (item.ageS > HOPPER_INBOUND_MAX_AGE_S) {
+        // Missed the hopper — drop it from tracking (never weighed).
+        const idx = this.items.indexOf(item);
+        if (idx >= 0) this.items.splice(idx, 1);
+      }
+    }
+    return latched;
+  }
+
+  /**
+   * Sample the attractor field at a candidate canister state (world-frame
+   * position + velocity): distance/relative-speed gates and the F_mag
+   * vector the field would apply. Pure — mutates nothing.
+   */
+  evaluateCapture(position: HopperVec3, velocity: HopperVec3): HopperCaptureField {
+    const centre = this.bedCentreWorld();
+    const buggyV = this.buggyVelocityWorld();
+    const dx = position.x - centre.x;
+    const dy = position.y - centre.y;
+    const dz = position.z - centre.z;
+    const dist = Math.hypot(dx, dy, dz);
+    const rvx = velocity.x - buggyV.x;
+    const rvy = velocity.y - buggyV.y;
+    const rvz = velocity.z - buggyV.z;
+    const relSpeed = Math.hypot(rvx, rvy, rvz);
+    const within =
+      dist <= HOPPER_CATCH_RADIUS_M && relSpeed <= HOPPER_RELATIVE_MAX_MPS;
+    let fx = 0;
+    let fy = 0;
+    let fz = 0;
+    if (within && dist > 1e-9) {
+      const kOverDist = HOPPER_K_MAG_N / dist;
+      fx = -kOverDist * dx - HOPPER_C_DAMP_NS_M * rvx;
+      fy = -kOverDist * dy - HOPPER_C_DAMP_NS_M * rvy;
+      fz = -kOverDist * dz - HOPPER_C_DAMP_NS_M * rvz;
+    }
+    return {
+      distanceToBedCentreM: dist,
+      relativeSpeedMps: relSpeed,
+      withinCatchEnvelope: within,
+      insideBedBounds: BuggyCargoHopper.insideBedLocal(this.bedLocalOffset(position, centre), this.owner.getHeading()),
+      force: { x: fx, y: fy, z: fz },
+    };
+  }
+
+  /** World-frame bed-centre point (chassis datum + {@link HOPPER_BED_CENTRE}). */
+  bedCentreWorld(): HopperVec3 {
+    return this.owner.pointAt(HOPPER_BED_CENTRE_MODEL.z, HOPPER_BED_CENTRE_MODEL.x, HOPPER_BED_CENTRE_MODEL.y);
+  }
+
+  /** True when `point` sits inside the hard physical bed envelope. */
+  isInsideBedBounds(point: HopperVec3): boolean {
+    return BuggyCargoHopper.insideBedLocal(
+      this.bedLocalOffset(point, this.bedCentreWorld()),
+      this.owner.getHeading(),
+    );
+  }
+
+  /**
+   * Unload the flatbed: every tracked canister (inbound or latched) is
+   * dropped, its mesh disposed, and the latched mass is taken back off the
+   * physics loader. The bed returns to empty.
+   */
+  clearCargo(): void {
+    if (this.hopperDisposed) return;
+    let massKg = 0;
+    for (const item of this.items) {
+      if (item.state === 'LATCHED') massKg += item.massKg;
+      this.dropMesh(item);
+    }
+    this.items = [];
+    if (massKg > 0) this.options.applyMassDelta?.(-massKg);
+  }
+
+  /** Snapshots of every tracked canister (inbound + latched), slot order. */
+  getCargoItems(): BuggyCargoItem[] {
+    return this.items.map(BuggyCargoHopper.copyItem);
+  }
+
+  /** Latched cargo mass aboard the flatbed (kg) — Σ M_cargo. */
+  getCargoMassKg(): number {
+    let kg = 0;
+    for (const item of this.items) {
+      if (item.state === 'LATCHED') kg += item.massKg;
+    }
+    return kg;
+  }
+
+  /** M_chassis + Σ M_cargo (kg), straight off the physics loader. */
+  getGrossVehicleMassKg(): number {
+    return this.owner.physics.totalMass;
+  }
+
+  /** Latched canister meshes (visual readback for headless harnesses). */
+  getMeshes(): Mesh[] {
+    const meshes: Mesh[] = [];
+    for (const item of this.items) {
+      if (item.state === 'LATCHED' && item.mesh !== null) meshes.push(item.mesh);
+    }
+    return meshes;
+  }
+
+  /**
+   * Create meshes for latched items that latched while sceneless (e.g. a
+   * test harness or a pre-`init()` catch). Idempotent; safe to call on
+   * every `OpenBuggy.init()`.
+   */
+  rebuildMeshes(): void {
+    if (this.hopperDisposed) return;
+    for (const item of this.items) {
+      if (item.state === 'LATCHED' && item.mesh === null) this.attachMesh(item);
+    }
+  }
+
+  /** Release the hopper's own mesh refs (the owner disposes the entity). */
+  dispose(): void {
+    if (this.hopperDisposed) return;
+    this.clearCargo();
+    this.hopperDisposed = true;
+  }
+
+  // -- internals -----------------------------------------------------------------
+
+  /** Latched subset count. */
+  private latchedCount(): number {
+    let n = 0;
+    for (const item of this.items) if (item.state === 'LATCHED') n += 1;
+    return n;
+  }
+
+  /** Fresh bookkeeping record for one canister (mass from the cargo table). */
+  private makeItem(type: HeistMoonCargoType): HopperTrackedItem {
+    const spec = HEIST_MOON_CARGO[type];
+    return {
+      id: this.nextId++,
+      type,
+      label: spec.label,
+      massKg: spec.unitMassKg,
+      state: 'LATCHED',
+      slot: -1,
+      localOffset: { x: 0, y: 0, z: 0 },
+      position: this.bedCentreWorld(),
+      velocity: { x: 0, y: 0, z: 0 },
+      ageS: 0,
+      mesh: null,
+    };
+  }
+
+  /**
+   * Hard-latch: assign the first free 2×3 grid slot, rest the canister on
+   * the bed floor above it, mount the procedural mesh, and load the mass
+   * through the physics cargo loader (inertia + suspension follow).
+   */
+  private latchItem(item: HopperTrackedItem): void {
+    const slot = this.firstFreeSlot();
+    if (slot < 0) return;
+    item.state = 'LATCHED';
+    item.slot = slot;
+    item.localOffset = BuggyCargoHopper.restOffset(item.type, slot);
+    // World rest pose from the model offset (pointAt takes forward/left/up).
+    item.position = this.owner.pointAt(item.localOffset.z, item.localOffset.x, item.localOffset.y);
+    item.velocity = { x: 0, y: 0, z: 0 };
+    this.attachMesh(item);
+    this.options.applyMassDelta?.(item.massKg);
+    this.options.onLatch?.(BuggyCargoHopper.copyItem(item));
+  }
+
+  /** Next unoccupied grid slot in stack order, or −1 when the bed is full. */
+  private firstFreeSlot(): number {
+    const used = new Set<number>();
+    for (const item of this.items) {
+      if (item.state === 'LATCHED') used.add(item.slot);
+    }
+    for (let s = 0; s < HOPPER_CAPACITY; s++) {
+      if (!used.has(s)) return s;
+    }
+    return -1;
+  }
+
+  /** Rest offset in the Babylon model frame for `type` in grid `slot`:
+   *  grid column/row + half the container height off the bed floor. */
+  private static restOffset(type: HeistMoonCargoType, slot: number): HopperVec3 {
+    const grid = HOPPER_GRID_SLOTS[slot] ?? HOPPER_GRID_SLOTS[0]!;
+    const shape = HOPPER_ITEM_SHAPE[type];
+    return { x: grid.x, y: HOPPER_BED_FLOOR_Y + shape.height / 2, z: grid.z };
+  }
+
+  /** World offset from the bed centre → hopper-local (lat, lon, up) about
+   *  the buggy heading (pitch/roll ignored: the envelope rides the datum). */
+  private bedLocalOffset(point: HopperVec3, centre: HopperVec3): { lat: number; lon: number; up: number } {
+    const h = this.owner.getHeading();
+    const cos = Math.cos(h);
+    const sin = Math.sin(h);
+    const dx = point.x - centre.x;
+    const dy = point.y - centre.y;
+    const dz = point.z - centre.z;
+    return {
+      lat: -dx * sin + dy * cos,
+      lon: dx * cos + dy * sin,
+      up: dz,
+    };
+  }
+
+  /** Containment test in hopper-local half-extents. */
+  private static insideBedLocal(ofs: { lat: number; lon: number; up: number }, _heading: number): boolean {
+    return (
+      Math.abs(ofs.lat) <= HOPPER_BED_HALF.lat &&
+      Math.abs(ofs.lon) <= HOPPER_BED_HALF.lon &&
+      Math.abs(ofs.up) <= HOPPER_BED_HALF.up
+    );
+  }
+
+  /** Chassis-datum world velocity (vLong/vLat rotated by heading + heave). */
+  private buggyVelocityWorld(): HopperVec3 {
+    const h = this.owner.getHeading();
+    const cos = Math.cos(h);
+    const sin = Math.sin(h);
+    const vLong = this.owner.getVLong();
+    const vLat = this.owner.getVLat();
+    const state = this.owner.getState() as BuggyState & { vBody?: number };
+    return {
+      x: vLong * cos - vLat * sin,
+      y: vLong * sin + vLat * cos,
+      z: Number.isFinite(state.vBody) ? (state.vBody as number) : 0,
+    };
+  }
+
+  /** Mount the procedural PBR canister mesh for a latched item. */
+  private attachMesh(item: HopperTrackedItem): void {
+    if (item.mesh !== null) return;
+    const mesh = this.options.createItemMesh?.(item.type, item.slot, item.localOffset) ?? null;
+    item.mesh = mesh;
+  }
+
+  /** Dispose + unbind an item's mesh (quietly — teardown races allowed). */
+  private dropMesh(item: HopperTrackedItem): void {
+    const mesh = item.mesh;
+    if (mesh === null) return;
+    item.mesh = null;
+    try {
+      if (this.options.disposeItemMesh !== undefined) this.options.disposeItemMesh(mesh);
+      else mesh.dispose();
+    } catch {
+      // Engine torn down first — never propagate.
+    }
+  }
+
+  /** Public view of a tracked item (mesh/velocity/age stripped off). */
+  private static copyItem(item: HopperTrackedItem): BuggyCargoItem {
+    return {
+      id: item.id,
+      type: item.type,
+      label: item.label,
+      massKg: item.massKg,
+      state: item.state,
+      slot: item.slot,
+      localOffset: { ...item.localOffset },
+      position: { x: item.position.x, y: item.position.y, z: item.position.z },
+    };
+  }
+}
+
+/** Internal bookkeeping record: public item + integration/visual state. */
+interface HopperTrackedItem extends BuggyCargoItem {
+  velocity: HopperVec3;
+  /** Seconds since release (inbound); frozen at latch. */
+  ageS: number;
+  /** Procedural bed mesh while latched (null when sceneless). */
+  mesh: Mesh | null;
 }
 
 export default OpenBuggy;

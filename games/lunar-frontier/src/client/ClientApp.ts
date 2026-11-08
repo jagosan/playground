@@ -5317,7 +5317,19 @@ export class ClientApp {
     this.audio?.playCanisterVacuumWhistle();
     if (thrown.caught) {
       this.audio?.playMagneticCaptureChime();
-      this.hudFeedback(`${thrown.label} CAUGHT — magnetic hopper secured the haul`, 'success');
+      // Spec 36 Phase 3: the magnetic catch mounts the canister into the
+      // buggy's physical flatbed hopper — grid slot, PBR bed mesh and the
+      // caught mass (inertia + suspension compression follow).
+      const hopper = this.buggy?.getCargoHopper() ?? null;
+      const latched = hopper?.addCargo(thrown.cargoType) ?? null;
+      const stack =
+        latched !== null && hopper !== null
+          ? ` [${hopper.getCargoItems().length}/${hopper.getCapacity()}]`
+          : '';
+      this.hudFeedback(
+        `${thrown.label} CAUGHT — magnetic hopper secured the haul${stack}`,
+        'success',
+      );
     } else {
       this.hudFeedback(`${thrown.label} away — missed the hopper envelope`, 'error');
     }
