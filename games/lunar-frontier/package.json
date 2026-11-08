@@ -25,6 +25,7 @@
     "smoke:spec34": "npx tsx scripts/smoke-spec34-dual-sticks-view.ts",
     "smoke:spec35": "npx tsx scripts/smoke-spec35-airborne-tuck.ts",
     "smoke:spec36": "npx tsx scripts/smoke-spec36-heist-overhaul.ts",
+    "smoke:spec37": "npx tsx scripts/smoke-spec37-buggy-upgrades.ts",
     "lunar:smoke:cleanup": "npx tsx scripts/smoke-general-cleanup.ts",
     "verify:surface": "npx tsx tests/verify-surface-rendering.ts",
     "typecheck:server": "tsc -p tsconfig.server.json"
