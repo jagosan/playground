@@ -79,6 +79,11 @@ import { TransformNode } from '@babylonjs/core/Meshes/transformNode.js';
 import { VertexData } from '@babylonjs/core/Meshes/mesh.vertexData.js';
 import type { AbstractMesh } from '@babylonjs/core/Meshes/abstractMesh.js';
 
+// Spec 38 Phase 2: procedural subterranean base (shaft + unlocked tier chambers).
+import {
+  SubterraneanChamberBuilder,
+} from '../base/SubterraneanChamberBuilder.ts';
+import type { DepthTierIndex } from '../base/SubterraneanExcavator.ts';
 import {
   LunarWorldGenerator,
   ROCK_ARCHETYPE_SIZES,
@@ -892,6 +897,11 @@ export class WorldScene {
    * before {@link buildMaintenanceBay} / after dispose).
    */
   private maintenanceBay: MaintenanceBayAssembly | null = null;
+  /**
+   * Spec 38 Phase 2: procedural subterranean base (null before
+   * {@link buildSubterraneanBase} / after dispose).
+   */
+  private subterraneanBase: SubterraneanChamberBuilder | null = null;
 
   constructor(options: WorldSceneOptions = {}) {
     this.options = {
@@ -1019,6 +1029,9 @@ export class WorldScene {
    */
   update(dtMs: number, playerWorldPos: { x: number; y: number; z: number }): CitadelPerimeterStatus | null {
     if (this.disposed) return null;
+    // Spec 38 Phase 2 §3: per-frame subterranean occlusion culling — camera
+    // elevation is the physics-frame z (z↑), matching the builder's datum.
+    this.subterraneanBase?.updateVisibility(playerWorldPos.z);
     if (this.highSpeedMaglev !== null) {
       this.highSpeedMaglev.update(dtMs / 1000);
     }
@@ -1272,6 +1285,16 @@ export class WorldScene {
         /* already gone */
       }
       this.maintenanceBay = null;
+    }
+
+    // Spec 38 Phase 2: tear down the procedural subterranean base.
+    if (this.subterraneanBase !== null) {
+      try {
+        this.subterraneanBase.dispose();
+      } catch {
+        /* already gone */
+      }
+      this.subterraneanBase = null;
     }
 
     for (const mesh of this.entities) mesh.parent = null;
@@ -2153,6 +2176,30 @@ export class WorldScene {
       Math.hypot(pos.x - this.maintenanceBay.center.x, pos.y - this.maintenanceBay.center.y) <=
       radiusM
     );
+  }
+
+  // -- Spec 38 Phase 2: procedural subterranean base -----------------------------
+
+  /**
+   * Build the central vertical shaft plus every unlocked depth-tier chamber
+   * (Spec 38 §3 Phase 2). Idempotent — repeat calls return the live builder.
+   * The whole system is parented to the terrain root; teardown runs from
+   * `dispose()`. Headless-safe: builds fine on a NullEngine scene.
+   */
+  buildSubterraneanBase(unlockedTier: DepthTierIndex): SubterraneanChamberBuilder {
+    if (this.subterraneanBase !== null) return this.subterraneanBase;
+    const scene = this.requireScene();
+    const builder = new SubterraneanChamberBuilder(scene);
+    builder.build(unlockedTier);
+    const rootNode = builder.getRootNode();
+    if (rootNode !== null) rootNode.parent = this.terrainRoot ?? null;
+    this.subterraneanBase = builder;
+    return builder;
+  }
+
+  /** The procedural subterranean base, or null before build / after dispose. */
+  getSubterraneanBase(): SubterraneanChamberBuilder | null {
+    return this.disposed ? null : this.subterraneanBase;
   }
 
   // -- surface detritus & salvage (Spec 21 §2.1) -------------------------------
