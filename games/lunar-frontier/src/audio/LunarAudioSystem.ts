@@ -2115,6 +2115,56 @@ export class LunarAudioSystem {
     this.playDrillSpoilsDischarge();
   }
 
+  /**
+   * Spec 38 Phase 4: Autoclave & Sintering Unit on Tier 2.
+   * Heavy hydraulic compaction press (85 Hz -> 38 Hz exponential thud)
+   * coupled with a high-temperature thermal steam / pressure vent hiss.
+   */
+  playAutoclaveSinter(durationS = 1.2): void {
+    if (!this.ready()) return;
+    const ctx = this.ctx!;
+    const t0 = ctx.currentTime + 0.01;
+
+    // 1. Compaction hydraulic press: heavy low-frequency punch
+    const osc = ctx.createOscillator();
+    osc.type = 'triangle';
+    osc.frequency.setValueAtTime(85, t0);
+    osc.frequency.exponentialRampToValueAtTime(38, t0 + durationS * 0.7);
+
+    const pressGain = ctx.createGain();
+    pressGain.gain.setValueAtTime(0, t0);
+    pressGain.gain.linearRampToValueAtTime(BASE_LEVEL.oneShot * 0.45, t0 + 0.03);
+    pressGain.gain.exponentialRampToValueAtTime(SILENT, t0 + durationS);
+
+    osc.connect(pressGain);
+    pressGain.connect(this.sfxBus!);
+    osc.start(t0);
+    osc.stop(t0 + durationS + 0.05);
+
+    // 2. High-temperature sintering hiss / pressure vent
+    const noise = this.createNoiseSource();
+    if (noise !== null) {
+      const filter = ctx.createBiquadFilter();
+      filter.type = 'bandpass';
+      filter.frequency.setValueAtTime(1400, t0);
+      filter.frequency.exponentialRampToValueAtTime(450, t0 + durationS * 0.8);
+      filter.Q.value = 2.5;
+
+      const hissGain = ctx.createGain();
+      hissGain.gain.setValueAtTime(0, t0);
+      hissGain.gain.linearRampToValueAtTime(BASE_LEVEL.oneShot * 0.25, t0 + 0.05);
+      hissGain.gain.exponentialRampToValueAtTime(SILENT, t0 + durationS * 0.8);
+
+      noise.connect(filter);
+      filter.connect(hissGain);
+      hissGain.connect(this.sfxBus!);
+      noise.start(t0);
+      noise.stop(t0 + durationS * 0.8 + 0.05);
+    }
+
+    void this.resumeIfSuspended();
+  }
+
   // -- internals ---------------------------------------------------------------------
 
   private chirpTone(offset: number, dur: number, freqStart: number, freqEnd: number): void {
