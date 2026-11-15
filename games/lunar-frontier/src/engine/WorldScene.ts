@@ -79,10 +79,14 @@ import { TransformNode } from '@babylonjs/core/Meshes/transformNode.js';
 import { VertexData } from '@babylonjs/core/Meshes/mesh.vertexData.js';
 import type { AbstractMesh } from '@babylonjs/core/Meshes/abstractMesh.js';
 
-// Spec 38 Phase 2: procedural subterranean base (shaft + unlocked tier chambers).
+// Spec 38 Phase 2/3: procedural subterranean base (shaft + unlocked tier chambers) & rotary core drill.
 import {
   SubterraneanChamberBuilder,
 } from '../base/SubterraneanChamberBuilder.ts';
+import {
+  CoreMiningRig,
+  type CoreMiningRigOptions,
+} from '../base/CoreMiningRig.ts';
 import type { DepthTierIndex } from '../base/SubterraneanExcavator.ts';
 import {
   LunarWorldGenerator,
@@ -903,6 +907,12 @@ export class WorldScene {
    */
   private subterraneanBase: SubterraneanChamberBuilder | null = null;
 
+  /**
+   * Spec 38 Phase 3: rotary core drill machine (null before
+   * {@link buildCoreMiningRig} / after dispose).
+   */
+  private coreMiningRig: CoreMiningRig | null = null;
+
   constructor(options: WorldSceneOptions = {}) {
     this.options = {
       ...options,
@@ -1029,9 +1039,12 @@ export class WorldScene {
    */
   update(dtMs: number, playerWorldPos: { x: number; y: number; z: number }): CitadelPerimeterStatus | null {
     if (this.disposed) return null;
-    // Spec 38 Phase 2 §3: per-frame subterranean occlusion culling — camera
-    // elevation is the physics-frame z (z↑), matching the builder's datum.
+    // Spec 38 Phase 2/3: per-frame subterranean occlusion culling & rig simulation
     this.subterraneanBase?.updateVisibility(playerWorldPos.z);
+    this.coreMiningRig?.updateVisibility(playerWorldPos.z);
+    if (this.coreMiningRig !== null) {
+      this.coreMiningRig.update(dtMs / 1000);
+    }
     if (this.highSpeedMaglev !== null) {
       this.highSpeedMaglev.update(dtMs / 1000);
     }
@@ -1295,6 +1308,16 @@ export class WorldScene {
         /* already gone */
       }
       this.subterraneanBase = null;
+    }
+
+    // Spec 38 Phase 3: tear down the rotary core drill rig.
+    if (this.coreMiningRig !== null) {
+      try {
+        this.coreMiningRig.dispose();
+      } catch {
+        /* already gone */
+      }
+      this.coreMiningRig = null;
     }
 
     for (const mesh of this.entities) mesh.parent = null;
@@ -2200,6 +2223,27 @@ export class WorldScene {
   /** The procedural subterranean base, or null before build / after dispose. */
   getSubterraneanBase(): SubterraneanChamberBuilder | null {
     return this.disposed ? null : this.subterraneanBase;
+  }
+
+  /**
+   * Build the 3D rotary core drill machine stationed at the base of `unlockedTier`
+   * (Spec 38 §3 Phase 3). Idempotent — repeat calls return the live rig.
+   * Headless-safe under NullEngine.
+   */
+  buildCoreMiningRig(unlockedTier: DepthTierIndex = 1, options?: CoreMiningRigOptions): CoreMiningRig {
+    if (this.coreMiningRig !== null) return this.coreMiningRig;
+    const scene = this.requireScene();
+    const rig = new CoreMiningRig(scene, { ...options, tier: unlockedTier });
+    rig.build(unlockedTier);
+    const rootNode = rig.getRootNode();
+    if (rootNode !== null) rootNode.parent = this.terrainRoot ?? null;
+    this.coreMiningRig = rig;
+    return rig;
+  }
+
+  /** The procedural core mining rig, or null before build / after dispose. */
+  getCoreMiningRig(): CoreMiningRig | null {
+    return this.disposed ? null : this.coreMiningRig;
   }
 
   // -- surface detritus & salvage (Spec 21 §2.1) -------------------------------

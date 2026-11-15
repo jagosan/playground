@@ -2001,6 +2001,120 @@ export class LunarAudioSystem {
     void this.resumeIfSuspended();
   }
 
+  /**
+   * Spec 38 Phase 3: Low-frequency seismic rumble (35--65 Hz) for the rotary
+   * core drill rig. An oscillating deep sine wave modulated across the bedrock
+   * band with low-pass dampening, simulating deep crustal vibrations.
+   */
+  playDrillSeismicRumble(durationS = 1.8): void {
+    if (!this.ready()) return;
+    const ctx = this.ctx!;
+    const t0 = ctx.currentTime + 0.01;
+    const dur = Math.max(0.2, durationS);
+
+    const osc = ctx.createOscillator();
+    osc.type = 'sine';
+    // Frequency sweeps/oscillates within the 35--65 Hz band
+    osc.frequency.setValueAtTime(35, t0);
+    osc.frequency.linearRampToValueAtTime(65, t0 + dur * 0.4);
+    osc.frequency.linearRampToValueAtTime(42, t0 + dur);
+
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(0, t0);
+    gain.gain.linearRampToValueAtTime(BASE_LEVEL.oneShot * 0.45, t0 + 0.08);
+    gain.gain.exponentialRampToValueAtTime(SILENT, t0 + dur);
+
+    const lowpass = ctx.createBiquadFilter();
+    lowpass.type = 'lowpass';
+    lowpass.frequency.setValueAtTime(120, t0);
+
+    osc.connect(gain);
+    gain.connect(lowpass);
+    lowpass.connect(this.sfxBus!);
+
+    osc.start(t0);
+    osc.stop(t0 + dur + 0.05);
+
+    void this.resumeIfSuspended();
+  }
+
+  /**
+   * Spec 38 Phase 3: Metallic stone shearing sound: high-torque carbide cutter
+   * teeth grinding into hard basalt rock. Gritty bandpass filtered sawtooth pair.
+   */
+  playDrillStoneShearing(durationS = 1.5): void {
+    if (!this.ready()) return;
+    const ctx = this.ctx!;
+    const t0 = ctx.currentTime + 0.01;
+    const dur = Math.max(0.2, durationS);
+
+    const saw = ctx.createOscillator();
+    saw.type = 'sawtooth';
+    saw.frequency.setValueAtTime(220, t0);
+    saw.frequency.linearRampToValueAtTime(290, t0 + dur);
+
+    const band = ctx.createBiquadFilter();
+    band.type = 'bandpass';
+    band.Q.value = 2.8;
+    band.frequency.setValueAtTime(950, t0);
+    band.frequency.linearRampToValueAtTime(1400, t0 + dur);
+
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(0, t0);
+    gain.gain.linearRampToValueAtTime(BASE_LEVEL.oneShot * 0.32, t0 + 0.05);
+    gain.gain.exponentialRampToValueAtTime(SILENT, t0 + dur);
+
+    saw.connect(band);
+    band.connect(gain);
+    gain.connect(this.sfxBus!);
+
+    saw.start(t0);
+    saw.stop(t0 + dur + 0.05);
+
+    void this.resumeIfSuspended();
+  }
+
+  /**
+   * Spec 38 Phase 3: Pneumatic spoils discharge: high-pressure air puff
+   * venting pulverized rock dust and basalt spoils through the discharge chute.
+   */
+  playDrillSpoilsDischarge(): void {
+    if (!this.ready()) return;
+    const ctx = this.ctx!;
+    const t0 = ctx.currentTime + 0.005;
+
+    const noise = this.createNoiseSource();
+    if (noise !== null) {
+      const filter = ctx.createBiquadFilter();
+      filter.type = 'bandpass';
+      filter.frequency.setValueAtTime(2400, t0);
+      filter.frequency.exponentialRampToValueAtTime(380, t0 + 0.35);
+
+      const gain = ctx.createGain();
+      gain.gain.setValueAtTime(BASE_LEVEL.oneShot * 0.28, t0);
+      gain.gain.exponentialRampToValueAtTime(SILENT, t0 + 0.35);
+
+      noise.connect(filter);
+      filter.connect(gain);
+      gain.connect(this.sfxBus!);
+
+      noise.start(t0);
+      noise.stop(t0 + 0.4);
+    }
+
+    void this.resumeIfSuspended();
+  }
+
+  /**
+   * Spec 38 Phase 3: Complete drilling pulse audio sequence combining low-frequency
+   * seismic rumble, metallic stone shearing, and pneumatic spoils discharge.
+   */
+  playDrillPulse(durationS = 1.8): void {
+    this.playDrillSeismicRumble(durationS);
+    this.playDrillStoneShearing(durationS * 0.85);
+    this.playDrillSpoilsDischarge();
+  }
+
   // -- internals ---------------------------------------------------------------------
 
   private chirpTone(offset: number, dur: number, freqStart: number, freqEnd: number): void {
