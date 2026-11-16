@@ -3414,7 +3414,13 @@ export interface LunarBuggy {
   setStateParked(): void;
   /** @internal */
   rollRateProxy(): number;
+  /** Direct state patch (Spec 38 Phase 5 moving platforms / elevator transport). */
+  setState(patch: Partial<BuggyState>): void;
 }
+
+LunarBuggy.prototype.setState = function (this: { state: BuggyState }, patch: Partial<BuggyState>): void {
+  Object.assign(this.state, patch);
+};
 
 LunarBuggy.prototype.setStateFromMount = function (this: { state: BuggyState }, vLong: number, vLat: number): void {
   this.state.vLong = clamp(vLong, -BUGGY_SPEED_LIMIT, BUGGY_SPEED_LIMIT);

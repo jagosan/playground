@@ -2165,6 +2165,100 @@ export class LunarAudioSystem {
     void this.resumeIfSuspended();
   }
 
+  // ---------------------------------------------------------------------------
+  // Spec 38 Phase 5: Vertical Elevator Kinematics & Transport Audio
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Continuous hydraulic motor hum & cable spool whirr during elevator travel:
+   * Low-frequency hydraulic drive (55 -> 120 Hz) with harmonic cable friction.
+   */
+  playElevatorMove(speedRatio = 1.0): void {
+    if (!this.ready()) return;
+    const ctx = this.ctx!;
+    const t0 = ctx.currentTime + 0.005;
+    const dur = 0.35;
+    const ratio = Math.max(0.1, Math.min(1.0, speedRatio));
+
+    const osc = ctx.createOscillator();
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(55 * ratio, t0);
+    osc.frequency.linearRampToValueAtTime(75 * ratio, t0 + dur);
+
+    const filter = ctx.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.frequency.setValueAtTime(180, t0);
+
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(0, t0);
+    gain.gain.linearRampToValueAtTime(BASE_LEVEL.oneShot * 0.18, t0 + 0.05);
+    gain.gain.exponentialRampToValueAtTime(SILENT, t0 + dur);
+
+    osc.connect(filter);
+    filter.connect(gain);
+    gain.connect(this.sfxBus!);
+
+    osc.start(t0);
+    osc.stop(t0 + dur + 0.02);
+    void this.resumeIfSuspended();
+  }
+
+  /**
+   * Elevator arrival lock: pneumatic brake engage (heavy clamp) + 2-tone chime
+   * (440 Hz -> 880 Hz) indicating platform arrival at target floor.
+   */
+  playElevatorArrive(): void {
+    if (!this.ready()) return;
+    const ctx = this.ctx!;
+    const t0 = ctx.currentTime + 0.005;
+
+    // 1. Pneumatic brake clamping thud
+    this.playPneumaticClank();
+
+    // 2. Clear harmonic arrival chime (440 -> 880 Hz bell tone)
+    const bell = ctx.createOscillator();
+    bell.type = 'sine';
+    bell.frequency.setValueAtTime(440, t0 + 0.1);
+    bell.frequency.setValueAtTime(880, t0 + 0.22);
+
+    const bellGain = ctx.createGain();
+    bellGain.gain.setValueAtTime(0, t0);
+    bellGain.gain.setValueAtTime(BASE_LEVEL.oneShot * 0.25, t0 + 0.1);
+    bellGain.gain.exponentialRampToValueAtTime(SILENT, t0 + 0.6);
+
+    bell.connect(bellGain);
+    bellGain.connect(this.sfxBus!);
+
+    bell.start(t0 + 0.1);
+    bell.stop(t0 + 0.65);
+    void this.resumeIfSuspended();
+  }
+
+  /**
+   * Elevator call button press: crisp 1,200 Hz acknowledgment beep.
+   */
+  playElevatorCall(): void {
+    if (!this.ready()) return;
+    const ctx = this.ctx!;
+    const t0 = ctx.currentTime + 0.005;
+
+    const beep = ctx.createOscillator();
+    beep.type = 'sine';
+    beep.frequency.setValueAtTime(1200, t0);
+
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(0, t0);
+    gain.gain.linearRampToValueAtTime(BASE_LEVEL.oneShot * 0.2, t0 + 0.01);
+    gain.gain.exponentialRampToValueAtTime(SILENT, t0 + 0.12);
+
+    beep.connect(gain);
+    gain.connect(this.sfxBus!);
+
+    beep.start(t0);
+    beep.stop(t0 + 0.14);
+    void this.resumeIfSuspended();
+  }
+
   // -- internals ---------------------------------------------------------------------
 
   private chirpTone(offset: number, dur: number, freqStart: number, freqEnd: number): void {

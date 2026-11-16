@@ -927,6 +927,20 @@ export class OpenBuggy {
     return this.physics.getState();
   }
 
+  /** Direct state patch (Spec 38 Phase 5 moving platforms / elevator transport). */
+  setState(patch: Partial<BuggyState>): void {
+    this.physics.setState(patch);
+    this.last = this.physics.getState();
+    if (this.root !== null) {
+      this.root.position.copyFrom(worldToBabylon(this.last));
+    }
+  }
+
+  /** Direct position update (Spec 38 Phase 5 elevator passenger transform). */
+  setPosition(pos: { x?: number; y?: number; z?: number }): void {
+    this.setState(pos);
+  }
+
   /** World-frame point at (forward, left, up) metres from the chassis datum. */
   pointAt(forward: number, lateral = 0, up = 0): { x: number; y: number; z: number } {
     const s = this.last;

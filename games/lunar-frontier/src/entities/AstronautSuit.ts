@@ -1256,6 +1256,11 @@ export class EvaSuitAvatar {
     if (this.built) this.syncTransform(this.last);
   }
 
+  /** Direct position update (Spec 38 Phase 5 elevator passenger transform). */
+  setPosition(pos: { x?: number; y?: number; z?: number }): void {
+    this.setState(pos);
+  }
+
   /** Respawn onto sampled ground at world (x, y) with zero velocity. */
   teleport(x: number, y: number): void {
     this.setState({

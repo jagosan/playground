@@ -296,6 +296,9 @@ export class CoreMiningRig {
   // Audio Telemetry & Trigger History
   private audioHistory: AudioTriggerEvent[] = [];
 
+  // Spec 38 Phase 5: Central Vertical Elevator
+  private elevator: VerticalElevator | null = null;
+
   private built = false;
   private disposed = false;
 
@@ -342,12 +345,23 @@ export class CoreMiningRig {
     this.buildSpoilsSystem(mats);
     this.buildParticleEmitters();
 
+    // Spec 38 Phase 5: Build central vertical elevator
+    this.elevator = new VerticalElevator(this.scene, {
+      initialFloor: this.tier,
+      audioSystem: this.audioSystem,
+      excavator: this.excavator,
+    });
+    this.elevator.build(this.tier);
+    if (this.root !== null && this.elevator.getRootNode() !== null) {
+      this.elevator.getRootNode()!.parent = this.root.parent ?? null;
+    }
+
     this.built = true;
     return this;
   }
 
   /**
-   * Occlusion culling: hide rig and exposed vein meshes when camera is on the
+   * Occlusion culling: hide rig, elevator, and exposed vein meshes when camera is on the
    * lunar surface (cameraZ >= -2.0m).
    */
   updateVisibility(cameraZ: number): void {
@@ -356,12 +370,16 @@ export class CoreMiningRig {
     for (const mesh of this.meshList) {
       mesh.isVisible = underground;
     }
+    this.elevator?.updateVisibility(cameraZ);
   }
 
   /** Tear down every mesh, material, particle emitter, and node. Idempotent. */
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+
+    this.elevator?.dispose();
+    this.elevator = null;
 
     for (const mesh of this.meshList) {
       try {
@@ -942,6 +960,7 @@ export class CoreMiningRig {
       this.stepSimulation(step);
       remaining -= step;
     }
+    this.elevator?.update(dtS);
   }
 
   private stepSimulation(safeDt: number): void {
@@ -1041,14 +1060,16 @@ export class CoreMiningRig {
     return this.exposedVeinList;
   }
 
-  /** Complete list of all meshes created by the rig. */
+  /** Complete list of all meshes created by the rig and its vertical elevator. */
   getMeshes(): Mesh[] {
-    return [...this.meshList];
+    return [...this.meshList, ...(this.elevator?.getMeshes() ?? [])];
   }
 
-  /** Filter meshes by metadata part identifier. */
+  /** Filter meshes by metadata part identifier across rig and elevator. */
   getPartMeshes(part: string): Mesh[] {
-    return this.meshList.filter((m) => (m.metadata?.part as string | undefined) === part);
+    const rigMatches = this.meshList.filter((m) => (m.metadata?.part as string | undefined) === part);
+    const elevMatches = this.elevator?.getPartMeshes(part) ?? [];
+    return [...rigMatches, ...elevMatches];
   }
 
   /** Root transform node. */
@@ -1084,5 +1105,690 @@ export class CoreMiningRig {
   /** Clear recorded audio telemetry history. */
   clearAudioHistory(): void {
     this.audioHistory = [];
+  }
+
+  // -- elevator delegation (Spec 38 Phase 5) ----------------------------------
+
+  /** The central vertical elevator subsystem. */
+  getElevator(): VerticalElevator {
+    if (this.elevator === null) {
+      this.elevator = new VerticalElevator(this.scene, {
+        initialFloor: this.tier,
+        audioSystem: this.audioSystem,
+        excavator: this.excavator,
+      });
+      if (this.built) this.elevator.build(this.tier);
+    }
+    return this.elevator;
+  }
+
+  /** Call the elevator to `tier` (0..3). */
+  callElevator(tier: DepthTierIndex): boolean {
+    return this.getElevator().pressCallButton(tier);
+  }
+
+  /** Current elevation of the elevator platform (Babylon-local y == World z). */
+  getElevatorElevation(): number {
+    return this.elevator?.getElevation() ?? ELEVATOR_FLOOR_DEPTHS[this.tier];
+  }
+
+  /** Current or destination floor of the elevator. */
+  getElevatorFloor(): DepthTierIndex {
+    return this.elevator?.getCurrentFloor() ?? this.tier;
+  }
+
+  /** True while the elevator is moving between floors. */
+  isElevatorMoving(): boolean {
+    return this.elevator?.isMoving() ?? false;
+  }
+
+  /** Board a character or vehicle passenger onto the elevator platform. */
+  boardElevator(passenger: ElevatorPassenger): boolean {
+    return this.getElevator().board(passenger);
+  }
+
+  /** Remove a passenger from the elevator platform. */
+  unboardElevator(id: string): boolean {
+    return this.getElevator().unboard(id);
+  }
+
+  /** Read-only list of passengers currently boarded on the elevator platform. */
+  getElevatorPassengers(): readonly ElevatorPassenger[] {
+    return this.elevator?.getPassengers() ?? [];
+  }
+
+  /** Read-only list of call stations across every floor. */
+  getElevatorCallStations(): readonly ElevatorCallStation[] {
+    return this.elevator?.getCallStations() ?? [];
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Spec 38 Phase 5: Vertical Elevator Kinematics & Transport Contracts
+// ---------------------------------------------------------------------------
+
+export const ELEVATOR_NAME_PREFIX = 'core-elevator';
+
+/** Maximum traversal velocity of the elevator car in m/s (Spec 38 §2.2). */
+export const ELEVATOR_MAX_VELOCITY_MPS = 6.0;
+
+/** Baseline acceleration / deceleration rate in m/s^2. */
+export const ELEVATOR_ACCELERATION_MPS2 = 2.5;
+
+/** Floor tiers accessible by the central elevator (Surface 0 down to Deep Core 3). */
+export const ELEVATOR_FLOOR_TIERS: readonly DepthTierIndex[] = [0, 1, 2, 3];
+
+/**
+ * Floor datum elevations in metres (Babylon-local y == World z).
+ * Matches {@link CHAMBER_TIER_CONFIGS} floorY.
+ */
+export const ELEVATOR_FLOOR_DEPTHS: Readonly<Record<DepthTierIndex, number>> = {
+  0: 0.0,
+  1: -15.0,
+  2: -45.0,
+  3: -95.0,
+};
+
+/** Elevator car platform lateral dimensions (m). */
+export const ELEVATOR_PLATFORM_WIDTH_M = 4.8;
+export const ELEVATOR_PLATFORM_LENGTH_M = 6.2;
+export const ELEVATOR_PLATFORM_THICKNESS_M = 0.25;
+export const ELEVATOR_RAILING_HEIGHT_M = 2.4;
+
+/** Proximity reach to interact with elevator call station buttons (m). */
+export const ELEVATOR_CALL_STATION_RANGE_M = 3.2;
+
+export type ElevatorMotionState = 'IDLE' | 'ACCELERATING' | 'CRUISING' | 'DECELERATING' | 'ARRIVED';
+
+export interface ElevatorPassenger {
+  id: string;
+  kind: 'suit' | 'buggy' | 'custom';
+  getPosition(): { x: number; y: number; z: number };
+  setPosition(pos: { x?: number; y?: number; z?: number }): void;
+  setVelocity?(vel: { vx?: number; vy?: number; vz?: number }): void;
+}
+
+export interface ElevatorCallStation {
+  floorTier: DepthTierIndex;
+  elevationM: number;
+  worldPosition: { x: number; y: number; z: number };
+  babylonPosition: Vector3;
+  called: boolean;
+  pedestalMesh?: Mesh;
+  buttonMesh?: Mesh;
+  buttonMaterial?: StandardMaterial;
+  indicatorPanelMesh?: Mesh;
+  indicatorLampMeshes?: Mesh[];
+  indicatorLampMaterials?: StandardMaterial[];
+}
+
+export interface ElevatorTelemetry {
+  currentElevationM: number;
+  targetElevationM: number;
+  currentFloor: DepthTierIndex;
+  targetFloor: DepthTierIndex;
+  velocityMps: number;
+  motionState: ElevatorMotionState;
+  isMoving: boolean;
+  passengerCount: number;
+  doorsOpen: boolean;
+  unlockedMaxTier: DepthTierIndex;
+}
+
+export interface VerticalElevatorOptions {
+  initialFloor?: DepthTierIndex;
+  maxVelocityMps?: number;
+  accelerationMps2?: number;
+  audioSystem?: LunarAudioSystem | null;
+  excavator?: SubterraneanExcavator | null;
+}
+
+/**
+ * Spec 38 Phase 5: Central Vertical Elevator
+ * Provides 100% NullEngine-safe procedural platform kinematics spanning Z=0 to Z=-95m.
+ * Synchronously translates suited avatars and loaded buggies without jitter.
+ */
+export class VerticalElevator {
+  private readonly scene: Scene;
+  private readonly maxVelocityMps: number;
+  private readonly accelerationMps2: number;
+  private audioSystem: LunarAudioSystem | null = null;
+  private excavator: SubterraneanExcavator | null = null;
+
+  private built = false;
+  private disposed = false;
+
+  private currentElevationM = 0.0;
+  private targetElevationM = 0.0;
+  private currentFloor: DepthTierIndex = 0;
+  private targetFloor: DepthTierIndex = 0;
+  private velocityMps = 0.0;
+  private motionState: ElevatorMotionState = 'IDLE';
+
+  private rootNode: TransformNode | null = null;
+  private cageNode: TransformNode | null = null;
+  private gateNode: TransformNode | null = null;
+  private counterweightNode: TransformNode | null = null;
+  private cableLeftNode: TransformNode | null = null;
+  private cableRightNode: TransformNode | null = null;
+
+  private readonly meshList: Mesh[] = [];
+  private readonly materialList: Array<PBRMaterial | StandardMaterial> = [];
+  private readonly passengers = new Map<string, ElevatorPassenger>();
+  private readonly callStations: ElevatorCallStation[] = [];
+
+  constructor(scene: Scene, options: VerticalElevatorOptions = {}) {
+    if (!scene) throw new Error('VerticalElevator: a Scene is required');
+    this.scene = scene;
+    this.maxVelocityMps = options.maxVelocityMps ?? ELEVATOR_MAX_VELOCITY_MPS;
+    this.accelerationMps2 = options.accelerationMps2 ?? ELEVATOR_ACCELERATION_MPS2;
+    this.audioSystem = options.audioSystem ?? null;
+    this.excavator = options.excavator ?? null;
+    if (options.initialFloor !== undefined) {
+      this.currentFloor = options.initialFloor;
+      this.targetFloor = options.initialFloor;
+      this.currentElevationM = ELEVATOR_FLOOR_DEPTHS[options.initialFloor] ?? 0.0;
+      this.targetElevationM = this.currentElevationM;
+    }
+  }
+
+  build(maxUnlockedTier?: DepthTierIndex): this {
+    if (this.disposed) throw new Error('VerticalElevator: build() after dispose()');
+    if (this.built) return this;
+
+    const maxTier = maxUnlockedTier !== undefined ? Math.max(0, Math.min(3, maxUnlockedTier)) : 3;
+
+    this.rootNode = new TransformNode(`${ELEVATOR_NAME_PREFIX}-root`, this.scene);
+    this.rootNode.position.set(0, 0, 0);
+
+    this.buildMaterials();
+    this.buildGuideRails();
+    this.buildElevatorCar();
+    this.buildCounterweight();
+    this.buildCallStations(maxTier);
+
+    this.syncVisuals();
+    this.built = true;
+    return this;
+  }
+
+  private buildMaterials(): void {
+    const pbr = (name: string, albedo: [number, number, number], metallic: number, roughness: number) => {
+      const m = new PBRMaterial(`${ELEVATOR_NAME_PREFIX}-${name}`, this.scene);
+      m.albedoColor = Color3.FromArray(albedo);
+      m.metallic = metallic;
+      m.roughness = roughness;
+      this.materialList.push(m);
+      return m;
+    };
+    const std = (name: string, diffuse: [number, number, number], emissive: [number, number, number]) => {
+      const m = new StandardMaterial(`${ELEVATOR_NAME_PREFIX}-${name}`, this.scene);
+      m.diffuseColor = Color3.FromArray(diffuse);
+      m.emissiveColor = Color3.FromArray(emissive);
+      this.materialList.push(m);
+      return m;
+    };
+
+    pbr('platformSteel', [0.22, 0.24, 0.26], 0.9, 0.4);
+    std('safetyYellow', [0.95, 0.8, 0.05], [0.15, 0.12, 0.01]);
+    std('safetyGate', [0.95, 0.75, 0.05], [0.12, 0.1, 0.01]);
+    pbr('counterweightIron', [0.18, 0.19, 0.2], 0.95, 0.3);
+    pbr('cableSteel', [0.55, 0.58, 0.62], 0.98, 0.2);
+    pbr('callPedestal', [0.25, 0.28, 0.3], 0.85, 0.4);
+    std('buttonIdle', [0.8, 0.5, 0.1], [0.35, 0.2, 0.04]);
+    std('lampOff', [0.08, 0.08, 0.1], [0.03, 0.03, 0.05]);
+  }
+
+  private getMaterial(name: string): PBRMaterial | StandardMaterial {
+    const m = this.materialList.find(mat => mat.name === `${ELEVATOR_NAME_PREFIX}-${name}`);
+    if (!m) throw new Error(`Material ${name} not found`);
+    return m;
+  }
+
+  private registerMesh(mesh: Mesh, partId: string, materialName: string, parent: TransformNode | null): void {
+    mesh.metadata = { ...mesh.metadata, part: partId };
+    mesh.material = this.getMaterial(materialName);
+    if (parent !== null) mesh.parent = parent;
+    this.meshList.push(mesh);
+  }
+
+  private buildGuideRails(): void {
+    const height = 98.0;
+    const yCenter = -47.0; // Spans from +2 to -96
+    const leftRail = MeshBuilder.CreateBox(`${ELEVATOR_NAME_PREFIX}-guide-rail-left`, { width: 0.2, depth: 0.35, height }, this.scene);
+    leftRail.position.set(-2.45, yCenter, 0);
+    this.registerMesh(leftRail, 'elevator-guide-rail', 'platformSteel', this.rootNode);
+
+    const rightRail = MeshBuilder.CreateBox(`${ELEVATOR_NAME_PREFIX}-guide-rail-right`, { width: 0.2, depth: 0.35, height }, this.scene);
+    rightRail.position.set(2.45, yCenter, 0);
+    this.registerMesh(rightRail, 'elevator-guide-rail', 'platformSteel', this.rootNode);
+  }
+
+  private buildElevatorCar(): void {
+    this.cageNode = new TransformNode(`${ELEVATOR_NAME_PREFIX}-car-root`, this.scene);
+    this.cageNode.position.set(0, this.currentElevationM, 0);
+    this.cageNode.parent = this.rootNode;
+
+    const platform = MeshBuilder.CreateBox(`${ELEVATOR_NAME_PREFIX}-platform-deck`, {
+      width: ELEVATOR_PLATFORM_WIDTH_M,
+      depth: ELEVATOR_PLATFORM_LENGTH_M,
+      height: ELEVATOR_PLATFORM_THICKNESS_M,
+    }, this.scene);
+    platform.position.set(0, ELEVATOR_PLATFORM_THICKNESS_M / 2, 0);
+    this.registerMesh(platform, 'elevator-platform', 'platformSteel', this.cageNode);
+
+    // Safety Railings (Left, Right, Aft)
+    const ry = ELEVATOR_RAILING_HEIGHT_M / 2 + ELEVATOR_PLATFORM_THICKNESS_M;
+    const leftR = MeshBuilder.CreateBox(`${ELEVATOR_NAME_PREFIX}-railing-left`, { width: 0.1, depth: ELEVATOR_PLATFORM_LENGTH_M, height: ELEVATOR_RAILING_HEIGHT_M }, this.scene);
+    leftR.position.set(-ELEVATOR_PLATFORM_WIDTH_M / 2 + 0.05, ry, 0);
+    this.registerMesh(leftR, 'elevator-railing', 'safetyYellow', this.cageNode);
+
+    const rightR = MeshBuilder.CreateBox(`${ELEVATOR_NAME_PREFIX}-railing-right`, { width: 0.1, depth: ELEVATOR_PLATFORM_LENGTH_M, height: ELEVATOR_RAILING_HEIGHT_M }, this.scene);
+    rightR.position.set(ELEVATOR_PLATFORM_WIDTH_M / 2 - 0.05, ry, 0);
+    this.registerMesh(rightR, 'elevator-railing', 'safetyYellow', this.cageNode);
+
+    const aftR = MeshBuilder.CreateBox(`${ELEVATOR_NAME_PREFIX}-railing-aft`, { width: ELEVATOR_PLATFORM_WIDTH_M - 0.2, depth: 0.1, height: ELEVATOR_RAILING_HEIGHT_M }, this.scene);
+    aftR.position.set(0, ry, -ELEVATOR_PLATFORM_LENGTH_M / 2 + 0.05);
+    this.registerMesh(aftR, 'elevator-railing', 'safetyYellow', this.cageNode);
+
+    // Overhead Bridle
+    const arch = MeshBuilder.CreateBox(`${ELEVATOR_NAME_PREFIX}-arch`, { width: ELEVATOR_PLATFORM_WIDTH_M, depth: 0.3, height: 0.2 }, this.scene);
+    arch.position.set(0, ELEVATOR_RAILING_HEIGHT_M + 0.1, 0);
+    this.registerMesh(arch, 'elevator-railing', 'safetyYellow', this.cageNode);
+
+    // Front Gate
+    this.gateNode = new TransformNode(`${ELEVATOR_NAME_PREFIX}-gate-root`, this.scene);
+    this.gateNode.position.set(0, 1.2, ELEVATOR_PLATFORM_LENGTH_M / 2 - 0.05);
+    this.gateNode.parent = this.cageNode;
+    const gateBar = MeshBuilder.CreateBox(`${ELEVATOR_NAME_PREFIX}-gate-bar`, { width: ELEVATOR_PLATFORM_WIDTH_M - 0.2, depth: 0.1, height: 0.15 }, this.scene);
+    gateBar.position.set(0, 0, 0);
+    this.registerMesh(gateBar, 'elevator-gate', 'safetyGate', this.gateNode);
+
+    // Console
+    const con = MeshBuilder.CreateBox(`${ELEVATOR_NAME_PREFIX}-console`, { width: 0.35, depth: 0.4, height: 0.6 }, this.scene);
+    con.position.set(ELEVATOR_PLATFORM_WIDTH_M / 2 - 0.2, 1.2, 0.8);
+    this.registerMesh(con, 'elevator-console', 'platformSteel', this.cageNode);
+  }
+
+  private buildCounterweight(): void {
+    this.counterweightNode = new TransformNode(`${ELEVATOR_NAME_PREFIX}-cw-root`, this.scene);
+    this.counterweightNode.position.set(0, -95.0, -3.3);
+    this.counterweightNode.parent = this.rootNode;
+    const cw = MeshBuilder.CreateBox(`${ELEVATOR_NAME_PREFIX}-counterweight`, { width: 4.2, depth: 0.4, height: 3.0 }, this.scene);
+    cw.position.set(0, 0, 0);
+    this.registerMesh(cw, 'elevator-counterweight', 'counterweightIron', this.counterweightNode);
+    
+    // Cables (Twin static visual cables stretching from sheaves to cage)
+    this.cableLeftNode = new TransformNode(`${ELEVATOR_NAME_PREFIX}-cable-l`, this.scene);
+    this.cableLeftNode.parent = this.rootNode;
+    const cL = MeshBuilder.CreateCylinder(`${ELEVATOR_NAME_PREFIX}-cable-mesh-l`, { diameter: 0.04, height: 96.0 }, this.scene);
+    cL.position.set(-2.0, -45.0, 0);
+    this.registerMesh(cL, 'elevator-cable', 'cableSteel', this.cableLeftNode);
+  }
+
+  private buildCallStations(maxTier: number): void {
+    const idleMat = this.getMaterial('buttonIdle') as StandardMaterial;
+    const lampOffMat = this.getMaterial('lampOff') as StandardMaterial;
+
+    for (let i = 0; i <= 3; i++) {
+      const tier = i as DepthTierIndex;
+      const y = ELEVATOR_FLOOR_DEPTHS[tier];
+      
+      const stnNode = new TransformNode(`${ELEVATOR_NAME_PREFIX}-station-${i}`, this.scene);
+      stnNode.position.set(3.2, y + 0.6, 1.5);
+      stnNode.parent = this.rootNode;
+
+      const pedestal = MeshBuilder.CreateBox(`${ELEVATOR_NAME_PREFIX}-call-pedestal-tier-${i}`, { width: 0.4, depth: 0.4, height: 1.2 }, this.scene);
+      this.registerMesh(pedestal, 'elevator-call-pedestal', 'callPedestal', stnNode);
+      pedestal.metadata.tier = tier;
+
+      const button = MeshBuilder.CreateCylinder(`${ELEVATOR_NAME_PREFIX}-call-button-tier-${i}`, { diameter: 0.16, height: 0.06, tessellation: 12 }, this.scene);
+      button.rotation.x = Math.PI / 2;
+      button.position.set(0, 0.2, -0.2);
+      this.registerMesh(button, 'elevator-call-button', 'callPedestal', stnNode);
+      button.metadata.tier = tier;
+      const buttonMat = idleMat.clone(`${ELEVATOR_NAME_PREFIX}-button-mat-${i}`);
+      button.material = buttonMat;
+      this.materialList.push(buttonMat);
+
+      const panel = MeshBuilder.CreateBox(`${ELEVATOR_NAME_PREFIX}-indicator-panel-tier-${i}`, { width: 0.45, depth: 0.12, height: 0.35 }, this.scene);
+      panel.position.set(0, 0.75, -0.15);
+      this.registerMesh(panel, 'elevator-floor-indicator', 'callPedestal', stnNode);
+      panel.metadata.tier = tier;
+
+      const lamps: Mesh[] = [];
+      const lampMats: StandardMaterial[] = [];
+      for (let L = 0; L <= 3; L++) {
+        const lamp = MeshBuilder.CreateBox(`${ELEVATOR_NAME_PREFIX}-lamp-tier-${i}-L${L}`, { width: 0.06, depth: 0.04, height: 0.08 }, this.scene);
+        lamp.position.set((L - 1.5) * 0.09, 0.75, -0.21);
+        this.registerMesh(lamp, 'elevator-indicator-lamp', 'callPedestal', stnNode);
+        lamp.metadata.tier = tier;
+        lamp.metadata.lampTier = L;
+        const lMat = lampOffMat.clone(`${ELEVATOR_NAME_PREFIX}-lamp-mat-${i}-L${L}`);
+        lamp.material = lMat;
+        this.materialList.push(lMat);
+        lamps.push(lamp);
+        lampMats.push(lMat);
+      }
+
+      this.callStations.push({
+        floorTier: tier,
+        elevationM: y,
+        worldPosition: { x: 3.2, y: -1.5, z: y },
+        babylonPosition: new Vector3(3.2, y + 0.6, 1.5),
+        called: false,
+        pedestalMesh: pedestal,
+        buttonMesh: button,
+        buttonMaterial: buttonMat,
+        indicatorPanelMesh: panel,
+        indicatorLampMeshes: lamps,
+        indicatorLampMaterials: lampMats,
+      });
+    }
+  }
+
+  update(dtS: number, candidatePassengers?: ElevatorPassenger[]): void {
+    if (!this.built || this.disposed) return;
+    if (!Number.isFinite(dtS) || dtS <= 0) return;
+    
+    // Dynamic passenger onboarding from candidates
+    if (candidatePassengers && candidatePassengers.length > 0) {
+      for (const cand of candidatePassengers) {
+        if (!cand) continue;
+        const pos = cand.getPosition();
+        if (this.isInsidePlatform(pos)) {
+          if (!this.passengers.has(cand.id)) {
+            this.board(cand);
+          }
+        } else {
+          this.unboard(cand.id);
+        }
+      }
+    }
+
+    const totalDt = Math.min(dtS, 5.0);
+    const maxSubStep = 0.02; // 50 Hz sub-stepping for ultra-smooth platform motion
+    let remaining = totalDt;
+    while (remaining > 0) {
+      const step = Math.min(remaining, maxSubStep);
+      this.stepKinematics(step);
+      remaining -= step;
+    }
+
+    this.syncVisuals();
+  }
+
+  private stepKinematics(dt: number): void {
+    const prevY = this.currentElevationM;
+    const deltaToTarget = this.targetElevationM - this.currentElevationM;
+    const distToTarget = Math.abs(deltaToTarget);
+
+    if (distToTarget < 0.002 && Math.abs(this.velocityMps) < 0.05) {
+      this.currentElevationM = this.targetElevationM;
+      this.velocityMps = 0;
+      this.currentFloor = this.targetFloor;
+      if (this.motionState !== 'IDLE') {
+        this.motionState = 'ARRIVED';
+        const station = this.callStations[this.currentFloor];
+        if (station) station.called = false;
+        this.audioSystem?.playElevatorArrive();
+        this.motionState = 'IDLE';
+      }
+    } else {
+      const dir = Math.sign(deltaToTarget);
+      const stopDist = (this.velocityMps * this.velocityMps) / (2 * this.accelerationMps2);
+
+      let a = 0;
+      if (distToTarget <= stopDist + 0.05) {
+        this.motionState = 'DECELERATING';
+        a = -dir * this.accelerationMps2;
+      } else {
+        const targetV = dir * this.maxVelocityMps;
+        const diff = targetV - this.velocityMps;
+        if (Math.abs(diff) > 0.05) {
+          this.motionState = 'ACCELERATING';
+          a = Math.max(-this.accelerationMps2, Math.min(this.accelerationMps2, diff / dt));
+        } else {
+          this.motionState = 'CRUISING';
+          this.velocityMps = targetV;
+          a = 0;
+        }
+      }
+
+      this.velocityMps += a * dt;
+      this.velocityMps = Math.max(-this.maxVelocityMps, Math.min(this.maxVelocityMps, this.velocityMps));
+      this.currentElevationM += this.velocityMps * dt;
+
+      if ((dir > 0 && this.currentElevationM >= this.targetElevationM) ||
+          (dir < 0 && this.currentElevationM <= this.targetElevationM)) {
+        this.currentElevationM = this.targetElevationM;
+        this.velocityMps = 0;
+        this.currentFloor = this.targetFloor;
+        this.motionState = 'ARRIVED';
+        const station = this.callStations[this.currentFloor];
+        if (station) station.called = false;
+        this.audioSystem?.playElevatorArrive();
+        this.motionState = 'IDLE';
+      }
+    }
+
+    // Step onboard passengers along with the platform translation
+    const deltaY = this.currentElevationM - prevY;
+    if (Math.abs(deltaY) > 0 || Math.abs(this.velocityMps) > 0) {
+      for (const passenger of this.passengers.values()) {
+        const p = passenger.getPosition();
+        passenger.setPosition({ x: p.x, y: p.y, z: p.z + deltaY });
+        if (typeof passenger.setVelocity === 'function') {
+          passenger.setVelocity({ vz: this.velocityMps });
+        }
+      }
+    }
+  }
+
+  private syncVisuals(): void {
+    if (this.cageNode !== null) {
+      this.cageNode.position.y = this.currentElevationM;
+    }
+    if (this.counterweightNode !== null) {
+      this.counterweightNode.position.y = -95.0 + (0.0 - this.currentElevationM);
+    }
+    if (this.gateNode !== null) {
+      const gateOpenY = this.motionState === 'IDLE' ? 2.5 : 1.2;
+      this.gateNode.position.y = gateOpenY;
+    }
+
+    for (const station of this.callStations) {
+      if (station.buttonMaterial) {
+        if (station.called) {
+          station.buttonMaterial.emissiveColor.set(0.1, 0.95, 0.25);
+        } else if (this.currentFloor === station.floorTier && this.motionState === 'IDLE') {
+          station.buttonMaterial.emissiveColor.set(0.2, 0.7, 0.9);
+        } else {
+          station.buttonMaterial.emissiveColor.set(0.35, 0.22, 0.04);
+        }
+      }
+
+      if (station.indicatorLampMaterials) {
+        for (let t = 0; t < station.indicatorLampMaterials.length; t++) {
+          const mat = station.indicatorLampMaterials[t];
+          if (!mat) continue;
+          if (t === this.currentFloor) {
+            mat.emissiveColor.set(0.15, 0.85, 1.0);
+          } else if (this.motionState !== 'IDLE' && t === this.targetFloor) {
+            mat.emissiveColor.set(0.9, 0.7, 0.1);
+          } else {
+            mat.emissiveColor.set(0.04, 0.04, 0.06);
+          }
+        }
+      }
+    }
+  }
+
+  moveToFloor(targetFloor: DepthTierIndex): boolean {
+    if (!this.built || this.disposed) return false;
+    if (targetFloor < 0 || targetFloor > 3) return false;
+
+    if (this.excavator !== null && targetFloor > this.excavator.getCurrentTier().tier) {
+      return false;
+    }
+
+    this.targetFloor = targetFloor;
+    const destY = ELEVATOR_FLOOR_DEPTHS[targetFloor];
+    if (destY === undefined) return false;
+    this.targetElevationM = destY;
+
+    if (Math.abs(this.targetElevationM - this.currentElevationM) < 0.002) {
+      this.currentFloor = targetFloor;
+      this.motionState = 'IDLE';
+      const station = this.callStations[targetFloor];
+      if (station) station.called = false;
+      return true;
+    }
+
+    this.motionState = 'ACCELERATING';
+    this.audioSystem?.playElevatorMove(1.0);
+    return true;
+  }
+
+  pressCallButton(tier: DepthTierIndex): boolean {
+    if (!this.built || this.disposed) return false;
+    if (tier < 0 || tier > 3) return false;
+    if (this.excavator !== null && tier > this.excavator.getCurrentTier().tier) return false;
+    const station = this.callStations[tier];
+    if (station) station.called = true;
+    this.audioSystem?.playElevatorCall();
+    return this.moveToFloor(tier);
+  }
+
+  cycleFloor(): DepthTierIndex {
+    const maxUnlocked = this.excavator?.getCurrentTier().tier ?? 3;
+    const next = ((this.targetFloor + 1) % (maxUnlocked + 1)) as DepthTierIndex;
+    this.moveToFloor(next);
+    return next;
+  }
+
+  board(passenger: ElevatorPassenger): boolean {
+    if (!passenger || !passenger.id) return false;
+    this.passengers.set(passenger.id, passenger);
+    return true;
+  }
+
+  unboard(id: string): boolean {
+    return this.passengers.delete(id);
+  }
+
+  isPassengerBoarded(id: string): boolean {
+    return this.passengers.has(id);
+  }
+
+  getPassengers(): readonly ElevatorPassenger[] {
+    return Array.from(this.passengers.values());
+  }
+
+  isInsidePlatform(pos: { x: number; y: number; z?: number }): boolean {
+    if (!Number.isFinite(pos.x) || !Number.isFinite(pos.y)) return false;
+    const halfW = ELEVATOR_PLATFORM_WIDTH_M / 2 + 0.2;
+    const halfL = ELEVATOR_PLATFORM_LENGTH_M / 2 + 0.2;
+    // World x, y are lateral
+    if (Math.abs(pos.x) > halfW || Math.abs(pos.y) > halfL) return false;
+    if (typeof pos.z === 'number') {
+      const minZ = this.currentElevationM - 0.6;
+      const maxZ = this.currentElevationM + ELEVATOR_RAILING_HEIGHT_M + 1.2;
+      if (pos.z < minZ || pos.z > maxZ) return false;
+    }
+    return true;
+  }
+
+  getPlatformGroundElevation(x: number, y: number, bodyZ?: number): number | null {
+    if (!this.built || this.disposed) return null;
+    const halfW = ELEVATOR_PLATFORM_WIDTH_M / 2 + 0.2;
+    const halfL = ELEVATOR_PLATFORM_LENGTH_M / 2 + 0.2;
+    if (Math.abs(x) > halfW || Math.abs(y) > halfL) return null;
+    if (typeof bodyZ === 'number') {
+      if (bodyZ < this.currentElevationM - 0.8 || bodyZ > this.currentElevationM + 6.0) {
+        return null;
+      }
+    }
+    return this.currentElevationM;
+  }
+
+  getElevation(): number { return this.currentElevationM; }
+  getCurrentFloor(): DepthTierIndex { return this.currentFloor; }
+  getTargetFloor(): DepthTierIndex { return this.targetFloor; }
+  getVelocity(): number { return this.velocityMps; }
+  getMotionState(): ElevatorMotionState { return this.motionState; }
+  isMoving(): boolean { return this.motionState !== 'IDLE'; }
+  getCallStations(): readonly ElevatorCallStation[] { return this.callStations; }
+  
+  getCallStationAt(tier: DepthTierIndex): ElevatorCallStation | undefined {
+    return this.callStations[tier];
+  }
+
+  getNearestCallStation(pos: { x: number; y: number; z: number }): { station: ElevatorCallStation; distanceM: number } | null {
+    let nearest: ElevatorCallStation | null = null;
+    let minDist = Infinity;
+    for (const station of this.callStations) {
+      const d = Math.hypot(pos.x - station.worldPosition.x, pos.y - station.worldPosition.y, pos.z - station.worldPosition.z);
+      if (d < minDist) {
+        minDist = d;
+        nearest = station;
+      }
+    }
+    if (nearest === null || minDist > ELEVATOR_CALL_STATION_RANGE_M) return null;
+    return { station: nearest, distanceM: minDist };
+  }
+
+  getTelemetry(): ElevatorTelemetry {
+    return {
+      currentElevationM: this.currentElevationM,
+      targetElevationM: this.targetElevationM,
+      currentFloor: this.currentFloor,
+      targetFloor: this.targetFloor,
+      velocityMps: this.velocityMps,
+      motionState: this.motionState,
+      isMoving: this.motionState !== 'IDLE',
+      passengerCount: this.passengers.size,
+      doorsOpen: this.motionState === 'IDLE',
+      unlockedMaxTier: this.excavator?.getCurrentTier().tier ?? 3,
+    };
+  }
+
+  getRootNode(): TransformNode | null { return this.rootNode; }
+  getCageNode(): TransformNode | null { return this.cageNode; }
+  getMeshes(): Mesh[] { return [...this.meshList]; }
+  getPartMeshes(part: string): Mesh[] { return this.meshList.filter(m => m.metadata?.part === part); }
+
+  updateVisibility(cameraZ: number): void {
+    if (!this.built || this.disposed) return;
+    const underground = Number.isFinite(cameraZ) && cameraZ < VISIBILITY_THRESHOLD_Z_M;
+    const carNearSurface = this.currentElevationM >= -2.0;
+    for (const mesh of this.meshList) {
+      const part = mesh.metadata?.part as string | undefined;
+      if (part === 'elevator-call-pedestal' || part === 'elevator-call-button' || part === 'elevator-floor-indicator' || part === 'elevator-indicator-lamp') {
+        const tier = mesh.metadata?.tier as number | undefined;
+        mesh.isVisible = tier === 0 ? !underground : underground;
+      } else {
+        mesh.isVisible = underground || carNearSurface;
+      }
+    }
+  }
+
+  dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    for (const mesh of this.meshList) { try { mesh.dispose(); } catch {} }
+    this.meshList.length = 0;
+    for (const mat of this.materialList) { try { mat.dispose(); } catch {} }
+    this.materialList.length = 0;
+    try { this.rootNode?.dispose(false, true); } catch {}
+    this.rootNode = null;
+    this.cageNode = null;
+    this.gateNode = null;
+    this.counterweightNode = null;
+    this.cableLeftNode = null;
+    this.cableRightNode = null;
+    this.passengers.clear();
+    this.callStations.length = 0;
+    this.built = false;
   }
 }

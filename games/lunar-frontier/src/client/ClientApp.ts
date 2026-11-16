@@ -2335,6 +2335,17 @@ export class ClientApp {
         if (bodyZ !== null && bodyZ >= deckZ - 0.6) return Math.max(surface, deckZ);
       }
     }
+    
+    // Spec 38 Phase 5: Central Vertical Elevator Platform
+    const rig = this.world.getCoreMiningRig();
+    if (rig !== null) {
+      const elevator = rig.getElevator();
+      if (elevator !== null) {
+        const deckZ = elevator.getPlatformGroundElevation(x, y, probeBodyZ() ?? undefined);
+        if (deckZ !== null) return Math.max(surface, deckZ);
+      }
+    }
+
     // Spec 21 §2.4: once a body has descended into the tunnel/bunker
     // interior, the walkable floor is the bore/chamber interior, not the
     // surface heightfield overhead — otherwise one physics frame pops the
@@ -3409,6 +3420,7 @@ export class ClientApp {
     }
     // Ladder latch / latch / release (mirrors keyboard [E] + [C] cancel).
     if (this.tryLadderInteraction()) return true;
+    if (this.tryElevatorInteraction()) return true;
     if (this.mode === 'suit' && this.nearestVaultTerminal !== null) {
       this.interfaceVaultTerminal(this.nearestVaultTerminal.vaultId);
       return true;
@@ -3787,6 +3799,8 @@ export class ClientApp {
           const padSuit = this.suit;
           if (this.tryLadderInteraction()) {
             // ladder handled — no other action this press
+          } else if (this.tryElevatorInteraction()) {
+            // elevator handled
           } else if (this.mode === 'suit' && this.nearestVaultTerminal !== null) {
             this.interfaceVaultTerminal(this.nearestVaultTerminal.vaultId);
           } else if (this.requestHeistCargoPickup()) {
@@ -3837,6 +3851,8 @@ export class ClientApp {
           // Spec 29 Phase 3: a radio-tower ladder at the player's boots
           // outranks everything on [E] — latch on, or release while climbing.
           if (this.tryLadderInteraction()) break;
+          // Spec 38 Phase 5: central vertical elevator call stations & car panel.
+          if (this.tryElevatorInteraction()) break;
           const terminal = this.mode === 'suit' ? this.nearestVaultTerminal : null;
           if (terminal !== null) {
             this.interfaceVaultTerminal(terminal.vaultId);
@@ -4110,6 +4126,51 @@ export class ClientApp {
       { minZ: deckZ - DECK_BOUNDARY_BAND_M },
     );
     if (fixed.clamped) this.suit.setState({ x: fixed.x, y: fixed.y });
+  }
+
+  // -- Spec 38 Phase 5: Elevator Interaction ----------------------------------
+
+  /** 
+   * `[E]` — elevator proximity interactions:
+   * 1. Check if near any floor call station. If so, call elevator to that floor.
+   * 2. Check if inside elevator car. If so, cycle to next floor.
+   */
+  tryElevatorInteraction(): boolean {
+    if (this.disposed) return false;
+    const rig = this.world.getCoreMiningRig();
+    if (rig === null) return false;
+    const elevator = rig.getElevator();
+    if (elevator === null) return false;
+
+    const suit = this.suit;
+    if (suit === null) return false;
+    const playerPos = this.mode === 'buggy' && this.buggy !== null ? this.buggy.getPosition() : suit.getPosition();
+
+    // 1. Check if inside elevator car
+    if (elevator.isInsidePlatform(playerPos)) {
+      if (elevator.isMoving()) {
+        this.hudFeedback('Elevator is already in transit', 'error');
+        return true;
+      }
+      const nextFloor = elevator.cycleFloor();
+      this.hudFeedback(`Elevator dispatched to Floor ${nextFloor}`, 'info');
+      return true;
+    }
+
+    // 2. Check if near any floor call station
+    const nearest = elevator.getNearestCallStation(playerPos);
+    // ELEVATOR_CALL_STATION_RANGE_M = 3.2
+    if (nearest !== null && nearest.distanceM <= 3.2) {
+      const ok = elevator.pressCallButton(nearest.station.floorTier);
+      if (ok) {
+        this.hudFeedback(`Elevator called to Floor ${nearest.station.floorTier}`, 'info');
+      } else {
+        this.hudFeedback(`Elevator call failed — tier ${nearest.station.floorTier} locked`, 'error');
+      }
+      return true;
+    }
+
+    return false;
   }
 
   /** `[E]` — climb into the buggy when near it, climb out when mounted. */
@@ -4583,6 +4644,45 @@ export class ClientApp {
       }
       this.rumbleClockMs += dt * 1000;
     }
+    
+    // Spec 38 Phase 5: Elevator kinematics & platform physics
+    this.pumpElevatorKinematics(dt);
+  }
+
+  // -- elevator -------------------------------------------------------------------
+
+  private pumpElevatorKinematics(dt: number): void {
+    const rig = this.world.getCoreMiningRig();
+    if (rig === null) return;
+    const elevator = rig.getElevator();
+    if (elevator === null) return;
+
+    // Build onboard candidates map so the elevator can couple passenger transforms
+    const candidates: import('../base/CoreMiningRig.ts').ElevatorPassenger[] = [];
+    if (this.suit !== null) {
+      candidates.push({
+        id: 'suit-local',
+        kind: 'suit',
+        getPosition: () => this.suit!.getPosition(),
+        setPosition: (pos) => this.suit!.setPosition(pos),
+        setVelocity: (vel) => {
+          if (vel.vz !== undefined) this.suit!.setState({ vz: vel.vz });
+        }
+      });
+    }
+    if (this.buggy !== null) {
+      candidates.push({
+        id: 'buggy-local',
+        kind: 'buggy',
+        getPosition: () => this.buggy!.getPosition(),
+        setPosition: (pos) => this.buggy!.setPosition(pos),
+        setVelocity: (vel) => {
+          if (vel.vz !== undefined) this.buggy!.setState({ vBody: vel.vz });
+        }
+      });
+    }
+
+    elevator.update(dt, candidates);
   }
 
   // -- haptics --------------------------------------------------------------------
