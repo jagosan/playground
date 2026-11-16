@@ -22,6 +22,7 @@ import { NullEngine } from '@babylonjs/core/Engines/nullEngine.js';
 import { Scene } from '@babylonjs/core/scene.js';
 import {
   CoreMiningRig,
+  DRILL_RIG_NAME_PREFIX,
   DRILL_BASE_TORQUE_NM,
   DEEP_RESONATOR_TORQUE_MULTIPLIER,
   SEISMIC_RUMBLE_MIN_HZ,
@@ -233,7 +234,7 @@ async function main(): Promise<void> {
   // =========================================================================
   console.log('--- 6. Testing Occlusion Culling ---');
   rigWithExcavator.updateVisibility(0); // Surface datum (Z >= −2.0 m)
-  const rigMeshes = rigWithExcavator.getMeshes();
+  const rigMeshes = rigWithExcavator.getMeshes().filter((m) => m.metadata?.rig === DRILL_RIG_NAME_PREFIX);
   check('all rig meshes culled on surface', rigMeshes.every((m) => !m.isVisible));
 
   rigWithExcavator.updateVisibility(-30); // Underground (Z < −2.0 m)

@@ -26,6 +26,7 @@
     "smoke:spec35": "npx tsx scripts/smoke-spec35-airborne-tuck.ts",
     "smoke:spec36": "npx tsx scripts/smoke-spec36-heist-overhaul.ts",
     "smoke:spec37": "npx tsx scripts/smoke-spec37-buggy-upgrades.ts",
+    "smoke:spec38": "npx tsx scripts/smoke-spec38-core-excavation.ts",
     "smoke:spec38:phase2": "npx tsx scripts/probe-spec38-phase2.ts",
     "smoke:spec38:phase3": "npx tsx scripts/probe-spec38-phase3.ts",
     "smoke:spec38:phase4": "npx tsx scripts/probe-spec38-phase4.ts",
