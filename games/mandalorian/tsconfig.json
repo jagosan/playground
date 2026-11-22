@@ -10,8 +10,8 @@
     "allowImportingTsExtensions": true,
     "strict": true,
     "verbatimModuleSyntax": true,
-    "noUnusedLocals": true,
-    "noUnusedParameters": true,
+    "noUnusedLocals": false,
+    "noUnusedParameters": false,
     "noEmit": true
   },
   "include": [

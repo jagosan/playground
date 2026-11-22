@@ -10,7 +10,7 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview --port 5175",
     "test": "npx tsx tests/verify-mando-physics.ts",
-    "smoke": "npx tsx tests/verify-mando-physics.ts"
+    "smoke": "npx tsx scripts/smoke-mandalorian-m1.ts"
   },
   "dependencies": {
     "@babylonjs/core": "^9.26.0",
