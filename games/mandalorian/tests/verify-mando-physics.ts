@@ -35,7 +35,7 @@ import {
   JETPACK_RECHARGE_COOLDOWN_S,
   JETPACK_MAX_ALTITUDE_M,
   type MandoStructureCollider,
-} from '../src/physics/MandoPhysics.ts';
+} from '../src/MandoPhysics.ts';
 
 function assert(condition: unknown, message: string): void {
   if (!condition) {
