@@ -1,0 +1,28 @@
+{
+  "name": "mandalorian-nevarro",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Mandalorian: Nevarro Frontier (Spec 40) - Town Traversal & Z-6 Jetpack Flight",
+  "scripts": {
+    "client": "vite --host 0.0.0.0 --port 5175",
+    "dev": "vite --host 0.0.0.0 --port 5175",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview --port 5175",
+    "test": "npx tsx tests/verify-mando-physics.ts",
+    "smoke": "npx tsx tests/verify-mando-physics.ts"
+  },
+  "dependencies": {
+    "@babylonjs/core": "^9.26.0",
+    "@babylonjs/gui": "^9.26.0",
+    "@babylonjs/materials": "^9.26.0",
+    "three": "^0.168.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.2",
+    "@types/three": "^0.160.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.9.3",
+    "vite": "^5.4.21"
+  }
+}
