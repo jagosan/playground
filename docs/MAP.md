@@ -36,6 +36,7 @@
 - `docs/architecture/37-lunar-frontier-buggy-garage-modular-upgrades-and-progression.md`: Outpost garage workshop, 4 modular upgrade branches (extended flatbeds, 35 m/s quad hyper motors, nitrogen dampers, chassis RCS jump jets) & economic credit loops.
 - `docs/architecture/38-lunar-frontier-subterranean-excavation-and-deep-core-mining.md`: Rotary core drill rig, 3-tier vertical subterranean base excavation (Z = 0 to -95m), slag brick sintering, deep volcanic lava tube caverns & rare fissure mining.
 - `docs/architecture/39-lunar-frontier-home-base-life-support-solar-grids-and-farming.md`: Colony life-support infrastructure, dual-axis sun-tracking solar arrays, molten-salt night storage, closed-loop water/O2 refining, hydroponic algae bioreactors & colony export hauling.
+- `docs/architecture/40-mandalorian-nevarro-frontier.md`: Mandalorian Nevarro Frontier (M1) — standalone Babylon.js game reusing LunarWorldGenerator, 9.81 m/s² grounded walking, Z-6 jetpack flight, Season 1 Nevarro town, and Playground lobby entry.
 - `docs/architecture/15-subagent-context-pruning-and-turn-budgeting.md`: Subagent context pruning, N-3 turn-budget circuit breaker, AST extraction, and Beehive Neo4j symbol discovery.
 - `specs/`:
   - `specs/00-system-overview.md`: Project vision, minigame architecture, rendering stack.
@@ -70,6 +71,7 @@
   - `specs/37-lunar-frontier-buggy-garage-modular-upgrades-and-progression.md`: Outpost garage workshop, 4 modular upgrade branches (extended flatbeds, 35 m/s quad hyper motors, nitrogen dampers, chassis RCS jump jets) & economic credit loops.
   - `specs/38-lunar-frontier-subterranean-excavation-and-deep-core-mining.md`: Rotary core drill rig, 3-tier vertical subterranean base excavation (Z = 0 to -95m), slag brick sintering, deep volcanic lava tube caverns & rare fissure mining.
   - `specs/39-lunar-frontier-home-base-life-support-solar-grids-and-farming.md`: Colony life-support infrastructure, dual-axis sun-tracking solar arrays, molten-salt night storage, closed-loop water/O2 refining, hydroponic algae bioreactors & colony export hauling.
+  - `specs/40-mandalorian-nevarro-frontier.md`: Mandalorian Nevarro Frontier (M1) — Season 1 town walk & Z-6 jetpack flight, LunarWorldGenerator reuse, Beskar avatar & Playground lobby integration.
 
 ## Lunar Frontier Multiplayer & Economy Subsystem (Spec 12)
 - `games/lunar-frontier/server/`: Fastify + `ws` server, SQLite schema, market pricing, 20Hz tick (`LunarServer.ts`, `Database.ts`).
